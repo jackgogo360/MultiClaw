@@ -27,8 +27,15 @@ class EventBus:
             ]
 
     async def publish(self, event: Event) -> None:
-        handlers = self._handlers.get(event.type, []) + self._handlers.get("*", [])
-        for _sub_id, handler in handlers:
+        handlers = {
+            sid: h
+            for handlers_list in (
+                self._handlers.get(event.type, []),
+                self._handlers.get("*", []),
+            )
+            for sid, h in handlers_list
+        }
+        for handler in handlers.values():
             try:
                 await handler(event)
             except Exception:
