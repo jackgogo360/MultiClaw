@@ -1,0 +1,33 @@
+[app]
+name = "MultiClaw"
+version = "0.1.0"
+debug = false
+
+[database]
+path = "data/multiclaw.db"
+
+[llm]
+default_provider = "openai"
+default_model = "gpt-4o"
+
+[llm.providers.openai]
+api_key = ""
+base_url = "https://api.openai.com/v1"
+
+[llm.providers.anthropic]
+api_key = ""
+base_url = "https://api.anthropic.com"
+
+[llm.capability_tags]
+"gpt-4o" = ["text", "function_calling", "vision"]
+"gpt-4o-mini" = ["text", "function_calling"]
+"claude-opus-4-7" = ["text", "function_calling", "vision", "extended_thinking"]
+"claude-sonnet-4-6" = ["text", "function_calling", "vision"]
+
+[memory]
+short_term_limit = 100
+context_window_limit = 128000
+
+[governance]
+sandbox_mode = "process"
+audit_enabled = true
