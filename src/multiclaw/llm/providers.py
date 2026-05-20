@@ -15,6 +15,7 @@ class LLMResponse(BaseModel):
     content: str
     role: str = "assistant"
     tool_calls: list[ToolCall] = []
+    reasoning_content: str = ""
 
 
 class ProviderAdapter(ABC):
@@ -28,10 +29,14 @@ class ProviderAdapter(ABC):
         model: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        stream: bool = False,
     ) -> dict[str, Any]: ...
 
     @abstractmethod
     def parse_response(self, raw: dict[str, Any]) -> LLMResponse: ...
+
+    def parse_stream_chunk(self, raw: dict[str, Any]) -> str | None:
+        return None
 
 
 class OpenAIAdapter(ProviderAdapter):
@@ -40,6 +45,7 @@ class OpenAIAdapter(ProviderAdapter):
         model: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        stream: bool = False,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": model,
@@ -47,6 +53,9 @@ class OpenAIAdapter(ProviderAdapter):
         }
         if tools:
             body["tools"] = tools
+        if stream:
+            body["stream"] = True
+            body["stream_options"] = {"include_usage": True}
         return {
             "url": f"{self.base_url}/chat/completions",
             "headers": {
@@ -72,7 +81,15 @@ class OpenAIAdapter(ProviderAdapter):
             content=choice.get("content") or "",
             role=choice.get("role", "assistant"),
             tool_calls=tool_calls,
+            reasoning_content=choice.get("reasoning_content", ""),
         )
+
+    def parse_stream_chunk(self, raw: dict[str, Any]) -> str | None:
+        choices = raw.get("choices", [])
+        if choices:
+            delta = choices[0].get("delta", {})
+            return delta.get("content")
+        return None
 
 
 class AnthropicAdapter(ProviderAdapter):
@@ -81,6 +98,7 @@ class AnthropicAdapter(ProviderAdapter):
         model: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        stream: bool = False,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": model,
@@ -100,11 +118,21 @@ class AnthropicAdapter(ProviderAdapter):
         }
 
     def parse_response(self, raw: dict[str, Any]) -> LLMResponse:
-        text_parts = []
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
         for block in raw.get("content", []):
             if block["type"] == "text":
                 text_parts.append(block["text"])
+            elif block["type"] == "tool_use":
+                tool_calls.append(
+                    ToolCall(
+                        id=block.get("id", ""),
+                        name=block.get("name", ""),
+                        arguments=block.get("input", {}),
+                    )
+                )
         return LLMResponse(
             content="\n".join(text_parts),
             role="assistant",
+            tool_calls=tool_calls,
         )

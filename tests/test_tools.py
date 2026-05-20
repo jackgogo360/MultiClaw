@@ -4,10 +4,11 @@ import pytest
 from pydantic import BaseModel
 
 from multiclaw import tools
-from multiclaw.tools import builtin
+from multiclaw.tools import _common
 from multiclaw.tools import find_dir as find_dir_module
 from multiclaw.tools import glob as glob_module
 from multiclaw.tools import grep as grep_module
+from multiclaw.tools import list_dir as list_dir_module
 from multiclaw.events import EventBus
 from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
 from multiclaw.tools import (
@@ -18,17 +19,13 @@ from multiclaw.tools import (
     ToolRegistry,
     ToolStatus,
 )
-from multiclaw.tools.builtin import (
-    EditFileToolBuilder,
-    GlobToolBuilder,
-    ReadFileToolBuilder,
-    UndoEditToolBuilder,
-    WriteFileToolBuilder,
-)
+from multiclaw.tools.edit_file import EditFileToolBuilder, UndoEditToolBuilder
 from multiclaw.tools.find_dir import FindDirToolBuilder
+from multiclaw.tools.glob import GlobToolBuilder
 from multiclaw.tools.grep import GrepToolBuilder
-from multiclaw.tools import list_dir as list_dir_module
 from multiclaw.tools.list_dir import ListDirToolBuilder
+from multiclaw.tools.read_file import ReadFileToolBuilder
+from multiclaw.tools.write_file import WriteFileToolBuilder
 
 
 class EchoParams(BaseModel):

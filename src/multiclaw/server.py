@@ -27,16 +27,13 @@ from multiclaw.tools import (
     CoreToolScheduler,
     ToolRegistry,
 )
-from multiclaw.tools.builtin import (
-    EditFileToolBuilder,
-    GlobToolBuilder,
-    ReadFileToolBuilder,
-    UndoEditToolBuilder,
-    WriteFileToolBuilder,
-)
+from multiclaw.tools.edit_file import EditFileToolBuilder, UndoEditToolBuilder
 from multiclaw.tools.find_dir import FindDirToolBuilder
+from multiclaw.tools.glob import GlobToolBuilder
 from multiclaw.tools.grep import GrepToolBuilder
 from multiclaw.tools.list_dir import ListDirToolBuilder
+from multiclaw.tools.read_file import ReadFileToolBuilder
+from multiclaw.tools.write_file import WriteFileToolBuilder
 
 
 # ---------------------------------------------------------------------------
