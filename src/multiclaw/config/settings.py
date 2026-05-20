@@ -32,11 +32,26 @@ class LLMSettings(BaseModel):
 class MemorySettings(BaseModel):
     short_term_limit: int = 100
     context_window_limit: int = 128000
+    recent_turns: int = 8
+    context_history_ratio: float = 0.5
+    include_legacy_memory_in_retrieval: bool = False
 
 
 class GovernanceSettings(BaseModel):
     sandbox_mode: str = "process"
     audit_enabled: bool = True
+
+
+class AgentSettings(BaseModel):
+    max_tool_rounds: int = 10
+    system_prompt: str = (
+        "You are a helpful assistant with access to tools. "
+        "Use tools to read files, inspect directories, and gather information. "
+        "When a tool requires user approval, inform the user briefly. "
+        "After receiving tool results, summarize them clearly for the user. "
+        "If you cannot complete a task with the available tools, explain why "
+        "and suggest alternatives."
+    )
 
 
 class Settings(BaseSettings):
@@ -50,6 +65,7 @@ class Settings(BaseSettings):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
+    agent: AgentSettings = Field(default_factory=AgentSettings)
 
     def __init__(self, _config_file: str | None = None, **kwargs: Any):
         config_path = Path(_config_file) if _config_file else Path("multiclaw.toml")
@@ -105,4 +121,6 @@ class Settings(BaseSettings):
             result["memory"] = data["memory"]
         if "governance" in data:
             result["governance"] = data["governance"]
+        if "agent" in data:
+            result["agent"] = data["agent"]
         return result

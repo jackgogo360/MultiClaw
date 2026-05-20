@@ -1,4 +1,6 @@
 import pytest
+from unittest.mock import AsyncMock, Mock, patch
+
 from multiclaw.config.settings import Settings
 from multiclaw.llm.providers import ProviderAdapter, OpenAIAdapter, AnthropicAdapter
 from multiclaw.llm.router import ModelRouter, CapabilityTag
@@ -110,14 +112,27 @@ class TestModelRouter:
         assert isinstance(adapter, OpenAIAdapter)
         assert adapter.api_key == "test-key"
 
-    def test_completion_returns_mock_response(self, router):
-        result = router.completion(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": "hello"}],
-        )
+    @pytest.mark.asyncio
+    async def test_completion_makes_http_call_and_parses_response(self, router):
+        mock_http_response = Mock()
+        mock_http_response.json.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "hi from openai"}}]
+        }
+        mock_http_response.raise_for_status = Mock()
 
-        assert result.content != ""
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.return_value = mock_http_response
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.content == "hi from openai"
         assert result.role == "assistant"
+        mock_client.post.assert_called_once()
 
 
 class TestCapabilityTag:

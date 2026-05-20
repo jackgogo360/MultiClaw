@@ -1,0 +1,40 @@
+[app]
+name = "MultiClaw"
+version = "0.1.0"
+debug = true
+
+[database]
+path = "data/multiclaw.db"
+
+[llm]
+default_provider = "deepseek"
+default_model = "deepseek-v4-pro"
+
+[llm.providers.openai]
+api_key = "sk-your-key-here"
+base_url = "https://api.openai.com/v1"
+
+[llm.providers.anthropic]
+api_key = "sk-ant-your-key-here"
+base_url = "https://api.anthropic.com"
+
+[llm.providers.deepseek]
+api_key = "REMOVED_DEEPSEEK_API_KEY"
+base_url = "https://api.deepseek.com/v1"
+
+[llm.capability_tags]
+"gpt-4o-mini" = ["text", "function_calling"]
+"claude-sonnet-4-6" = ["text", "function_calling", "extended_thinking"]
+"deepseek-chat" = ["text", "function_calling", "streaming"]
+"deepseek-v4-pro" = ["text", "function_calling", "streaming"]
+
+[memory]
+short_term_limit = 100
+context_window_limit = 128000
+
+[governance]
+sandbox_mode = "process"
+audit_enabled = true
+
+[agent]
+max_tool_rounds = 10
