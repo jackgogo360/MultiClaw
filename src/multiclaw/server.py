@@ -29,12 +29,12 @@ from multiclaw.tools import (
 )
 from multiclaw.tools.builtin import (
     EditFileToolBuilder,
-    FindDirToolBuilder,
     GlobToolBuilder,
     ReadFileToolBuilder,
     UndoEditToolBuilder,
     WriteFileToolBuilder,
 )
+from multiclaw.tools.find_dir import FindDirToolBuilder
 from multiclaw.tools.grep import GrepToolBuilder
 from multiclaw.tools.list_dir import ListDirToolBuilder
 

@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from multiclaw import tools
 from multiclaw.tools import builtin
+from multiclaw.tools import find_dir as find_dir_module
 from multiclaw.tools import glob as glob_module
 from multiclaw.tools import grep as grep_module
 from multiclaw.events import EventBus
@@ -19,12 +20,12 @@ from multiclaw.tools import (
 )
 from multiclaw.tools.builtin import (
     EditFileToolBuilder,
-    FindDirToolBuilder,
     GlobToolBuilder,
     ReadFileToolBuilder,
     UndoEditToolBuilder,
     WriteFileToolBuilder,
 )
+from multiclaw.tools.find_dir import FindDirToolBuilder
 from multiclaw.tools.grep import GrepToolBuilder
 from multiclaw.tools import list_dir as list_dir_module
 from multiclaw.tools.list_dir import ListDirToolBuilder
@@ -570,7 +571,7 @@ class TestSearchTools:
             (workspace / f"dir-{index}").mkdir()
 
         builder = FindDirToolBuilder(str(workspace))
-        monkeypatch.setattr(builtin, "MAX_FIND_DIR_RESULTS", 3)
+        monkeypatch.setattr(find_dir_module, "MAX_FIND_DIR_RESULTS", 3)
 
         result = await builder.build(
             builder.validate({"pattern": "dir-*", "path": ".", "max_depth": 1})
