@@ -21,11 +21,12 @@ from multiclaw.tools.builtin import (
     FindDirToolBuilder,
     GlobToolBuilder,
     GrepToolBuilder,
-    ListDirToolBuilder,
     ReadFileToolBuilder,
     UndoEditToolBuilder,
     WriteFileToolBuilder,
 )
+from multiclaw.tools import list_dir as list_dir_module
+from multiclaw.tools.list_dir import ListDirToolBuilder
 
 
 class EchoParams(BaseModel):
