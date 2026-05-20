@@ -31,11 +31,11 @@ from multiclaw.tools.builtin import (
     EditFileToolBuilder,
     FindDirToolBuilder,
     GlobToolBuilder,
-    GrepToolBuilder,
     ReadFileToolBuilder,
     UndoEditToolBuilder,
     WriteFileToolBuilder,
 )
+from multiclaw.tools.grep import GrepToolBuilder
 from multiclaw.tools.list_dir import ListDirToolBuilder
 
 
