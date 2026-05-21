@@ -100,8 +100,8 @@ class _DuckDuckGoEngine:
         try:
             results = []
             with DDGS() as ddgs:
-                raw = ddgs.text(query, max_results=max_results, region=self.region,
-                                safesearch=self.safesearch)
+                raw = list(ddgs.text(query, max_results=max_results, region=self.region,
+                                     safesearch=self.safesearch))
                 for i, item in enumerate(raw):
                     if isinstance(item, dict):
                         results.append({
@@ -110,8 +110,12 @@ class _DuckDuckGoEngine:
                             "snippet": item.get("body", item.get("description", "")),
                             "source": "duckduckgo", "position": i + 1,
                         })
+            if not results:
+                logger.warning("duckduckgo returned 0 results for query=%r raw_items=%d",
+                               query, len(raw))
             return {"engine": "duckduckgo", "results": results, "error": ""}
         except Exception as e:
+            logger.warning("duckduckgo search error for query=%r: %s", query, e)
             return {"engine": "duckduckgo", "results": [], "error": str(e)}
 
 
