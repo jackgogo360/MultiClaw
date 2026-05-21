@@ -54,7 +54,7 @@
     background: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
     opacity: 0.6;
   }
-  #app { width: 100%; height: 100vh; display: flex; flex-direction: row; position: relative; z-index: 1; }
+  #app { width: 100%; height: 100vh; display: flex; flex-direction: row; position: relative; z-index: 1; overflow: hidden; }
 
   /* ---- sidebar ---- */
   #sidebar {
@@ -87,7 +87,7 @@
   #new-session-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 
   /* ---- main ---- */
-  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
   #main-top { padding: 12px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center;
     justify-content: space-between; min-height: 52px; }
   #current-session-title { font-size: 13px; font-weight: 500; color: var(--text-secondary); }
@@ -201,7 +201,7 @@
   @keyframes resolveFlash { 0% { opacity: 1; } 40% { opacity: 0.5; } 60% { opacity: 0.5; } 100% { opacity: 1; } }
 
   .approval-card {
-    align-self: flex-start; max-width: 72%; width: 420px; margin: 6px 0;
+    align-self: flex-start; max-width: 72%; width: 380px; margin: 4px 0;
     background: linear-gradient(165deg, #252528 0%, #1e1e22 100%);
     border: 1px solid rgba(212, 168, 83, 0.28);
     border-radius: var(--radius-xl);
@@ -216,39 +216,57 @@
     opacity: 0.7;
   }
   /* card inner structure */
-  .approval-card-inner { padding: 20px 22px 18px; }
+  .approval-card-inner { padding: 14px 16px 12px; }
 
   /* ---- header row ---- */
-  .approval-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .approval-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   .approval-shield {
-    width: 34px; height: 40px; flex-shrink: 0;
+    width: 24px; height: 28px; flex-shrink: 0;
     animation: shieldReveal 0.5s 0.15s cubic-bezier(0.34, 1.56, 0.64, 1) both;
   }
   .approval-shield svg { width: 100%; height: 100%; }
-  .approval-header-text { display: flex; flex-direction: column; gap: 2px; }
+  .approval-header-text { display: flex; flex-direction: column; gap: 1px; }
   .approval-header-text .label {
-    font-size: 9px; text-transform: uppercase; letter-spacing: 1.4px; font-weight: 600;
+    font-size: 8px; text-transform: uppercase; letter-spacing: 1.2px; font-weight: 600;
     color: var(--accent); opacity: 0.85;
   }
   .approval-header-text .tool-name {
-    font-size: 15px; font-weight: 500; color: var(--text-primary);
+    font-size: 14px; font-weight: 500; color: var(--text-primary);
     font-family: var(--font-body); letter-spacing: -0.2px;
   }
 
   /* ---- params block ---- */
   .approval-card .params {
-    font-size: 11.5px; color: #8b8b95; font-family: var(--font-mono);
-    background: #141418; padding: 12px 14px; border-radius: var(--radius-sm);
-    margin-bottom: 16px; line-height: 1.5; max-height: 120px; overflow-y: auto;
+    font-size: 11px; color: #8b8b95; font-family: var(--font-mono);
+    background: #141418; padding: 8px 10px; border-radius: var(--radius-sm);
+    margin-bottom: 10px; line-height: 1.4; max-height: 80px; overflow-y: auto;
     border: 1px solid rgba(255, 255, 255, 0.04);
   }
   .approval-card .params::-webkit-scrollbar { width: 3px; }
   .approval-card .params::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
+  /* ---- approval description ---- */
+  .approval-card .approval-desc {
+    font-size: 13px; color: var(--text-secondary); line-height: 1.5;
+    margin-bottom: 6px; word-break: break-word;
+  }
+  .approval-card .approval-details {
+    margin-bottom: 8px;
+  }
+  .approval-card .approval-details summary {
+    font-size: 10px; color: var(--text-tertiary); cursor: pointer;
+    padding: 2px 0; user-select: none;
+  }
+  .approval-card .approval-details pre {
+    background: #111113; border-radius: var(--radius-sm); padding: 8px 10px;
+    font-family: var(--font-mono); font-size: 10px; color: var(--text-tertiary);
+    margin: 4px 0 0; max-height: 100px; overflow-y: auto; white-space: pre-wrap;
+  }
+
   /* ---- actions ---- */
-  .approval-card .actions { display: flex; gap: 10px; }
+  .approval-card .actions { display: flex; gap: 8px; }
   .approval-card .actions button {
-    flex: 1; padding: 10px 16px; border-radius: var(--radius); border: none;
+    flex: 1; padding: 8px 14px; border-radius: var(--radius-sm); border: none;
     font-size: 13px; font-family: var(--font-body); font-weight: 500; cursor: pointer;
     transition: all 0.2s cubic-bezier(0.22, 0.61, 0.36, 1);
     letter-spacing: 0.2px; position: relative; overflow: hidden;
@@ -277,8 +295,8 @@
   .approval-card.resolved { animation: none; opacity: 0.85; }
   .approval-card.resolved .approval-shield { filter: grayscale(0.5); }
   .approval-card .resolution-badge {
-    display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: var(--radius);
-    font-size: 12.5px; font-weight: 500; letter-spacing: 0.2px;
+    display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: var(--radius-sm);
+    font-size: 12px; font-weight: 500; letter-spacing: 0.2px;
   }
   .approval-card .resolution-badge.approved {
     background: rgba(87, 171, 90, 0.1); color: #6cc070;
@@ -555,11 +573,13 @@ const SHIELD_SVG = '<svg viewBox="0 0 34 40" fill="none" xmlns="http://www.w3.or
   '<path d="M17 13L17 17" stroke="rgba(212,168,83,0.5)" stroke-width="2.2" stroke-linecap="round"/>' +
   '</svg>';
 
-function showApproval(requestId, tool, params) {
+function showApproval(requestId, tool, params, description) {
   hideWelcome();
   removeThinking();
   clearReasoning();
-  const div = document.createElement('div');
+  var desc = description || escapeHtml(JSON.stringify(params));
+  var detailsOpen = !description; // only default-open if showing raw JSON
+  var div = document.createElement('div');
   div.className = 'approval-card';
   div.id = 'approval-' + requestId;
   div.innerHTML =
@@ -571,7 +591,8 @@ function showApproval(requestId, tool, params) {
     '<span class="tool-name">' + escapeHtml(tool) + '</span>' +
     '</div>' +
     '</div>' +
-    '<div class="params">' + escapeHtml(JSON.stringify(params)) + '</div>' +
+    '<div class="approval-desc">' + escapeHtml(desc) + '</div>' +
+    '<details class="approval-details"><summary>Raw params</summary><pre>' + escapeHtml(JSON.stringify(params, null, 2)) + '</pre></details>' +
     '<div class="actions">' +
     '<button class="approve-btn" id="approve-' + requestId + '">Approve</button>' +
     '<button class="reject-btn" id="reject-' + requestId + '">Reject</button>' +
@@ -713,7 +734,7 @@ async function send() {
         } else if (data.type === 'tool_result') {
           showToolResult(data.name, data.content);
         } else if (data.type === 'approval_required') {
-          showApproval(data.request_id, data.tool, data.params);
+          showApproval(data.request_id, data.tool, data.params, data.description);
         } else if (data.type === 'error') {
           finalizeStream(null);
           addError(data.content);

@@ -6,6 +6,7 @@ import multiprocessing
 import sys
 import traceback
 from io import StringIO
+from typing import Any
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -166,6 +167,10 @@ class CodeExecToolBuilder(WorkspaceToolBuilder):
 
     def validate(self, params: dict) -> CodeExecParams:
         return CodeExecParams(**params)
+
+    def approval_description(self, params: dict[str, Any]) -> str:
+        code = params.get("code", "?")
+        return f"Run Python: {code[:80]}{'...' if len(code) > 80 else ''}"
 
     def build(self, params: CodeExecParams) -> ToolInvocation[CodeExecParams]:
         return CodeExecInvocation(name=self.name, params=params,

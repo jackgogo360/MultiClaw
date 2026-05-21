@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -131,6 +132,9 @@ class WriteFileToolBuilder(WorkspaceToolBuilder):
 
     def validate(self, params: dict) -> WriteFileParams:
         return WriteFileParams(**params)
+
+    def approval_description(self, params: dict[str, Any]) -> str:
+        return f"Write file: {params.get('file_path', '?')}"
 
     def build(self, params: WriteFileParams) -> ToolInvocation[WriteFileParams]:
         return WriteFileInvocation(

@@ -60,6 +60,7 @@ class CoreToolScheduler:
                             "request_id": request_id,
                             "tool": builder.name,
                             "params": raw_params,
+                            "description": builder.approval_description(raw_params),
                         },
                     )
                 )
