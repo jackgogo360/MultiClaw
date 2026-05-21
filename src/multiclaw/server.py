@@ -111,18 +111,11 @@ def create_agent() -> MultiClawAgent:
     scheduler = CoreToolScheduler(
         permission_checker=PermissionChecker(
             guarded_tools={
-                "read_file",
                 "write_file",
                 "edit_file",
                 "undo_edit",
-                "glob",
-                "list_dir",
-                "grep",
-                "find_dir",
                 "shell",
                 "code_exec",
-                "web_fetch",
-                "web_search",
             }
         ),
         sandbox=ProcessSandbox(),
