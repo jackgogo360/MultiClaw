@@ -92,11 +92,15 @@ class _DuckDuckGoEngine:
         self.safesearch = safesearch
 
     def search(self, query: str, max_results: int = DEFAULT_MAX_RESULTS) -> dict:
+        DDGS = None
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS  # new package name
         except ImportError:
-            return {"engine": "duckduckgo", "results": [],
-                    "error": "duckduckgo-search not installed: pip install duckduckgo-search"}
+            try:
+                from duckduckgo_search import DDGS  # legacy
+            except ImportError:
+                return {"engine": "duckduckgo", "results": [],
+                        "error": "ddgs not installed: pip install ddgs"}
         try:
             results = []
             with DDGS() as ddgs:
