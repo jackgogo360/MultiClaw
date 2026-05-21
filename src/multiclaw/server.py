@@ -46,6 +46,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger("multiclaw")
 
+
+def _friendly_error(exc: Exception) -> str:
+    msg = str(exc)
+    if "nodename nor servname" in msg or "Name or service not known" in msg:
+        return (
+            "Network error: DNS resolution failed. Please check your internet connection.\n\n"
+            f"Details: {msg}"
+        )
+    if "CERTIFICATE_VERIFY_FAILED" in msg or "self-signed certificate" in msg:
+        return (
+            "Network error: SSL verification failed. A proxy or VPN may be intercepting "
+            "the connection, or the server certificate is invalid.\n\n"
+            f"Details: {msg}"
+        )
+    if "ConnectError" in msg or "connect" in msg.lower():
+        return (
+            "Network error: Unable to connect to the API server. "
+            "Please check your internet connection and try again.\n\n"
+            f"Details: {msg}"
+        )
+    if "Timeout" in msg or "timed out" in msg:
+        return (
+            "Request timed out. The server may be busy or your connection is slow. "
+            "Please try again.\n\n"
+            f"Details: {msg}"
+        )
+    return msg
+
+
 from multiclaw.agent import MultiClawAgent
 from multiclaw.config import Settings
 from multiclaw.events import Event, EventBus
@@ -253,7 +282,8 @@ async def chat(req: ChatRequest):
                     await token_queue.put(item)
             except Exception as exc:
                 logger.exception("stream error")
-                await token_queue.put({"type": "error", "content": str(exc)})
+                msg = _friendly_error(exc)
+                await token_queue.put({"type": "error", "content": msg})
 
         stream_task = asyncio.create_task(run_stream())
 
