@@ -129,11 +129,28 @@ class MultiClawAgent(ToolCallAgent):
                 )
                 await self.remember(obs.content, "tool_result")
 
-        logger.error("max tool rounds (%d) exceeded for session=%s input=%r", max_rounds, session_id, user_input[:200])
-        return Observation(
-            type=ObservationType.ERROR,
-            content="I wasn't able to complete this task within the allowed rounds.",
+        # Max rounds exceeded — force a final summary without tools
+        logger.warning(
+            "max tool rounds (%d) exceeded for session=%s, forcing final summary with %d messages",
+            max_rounds, session_id, len(messages),
         )
+        try:
+            response = await self.router.completion(
+                model=self.settings.llm.default_model,
+                messages=messages,
+                tools=None,
+            )
+            await self._save_chat_msg(response.content, "assistant", session_id)
+            return Observation(
+                type=ObservationType.USER_RESPONSE,
+                content=response.content,
+            )
+        except Exception:
+            logger.exception("final summary failed")
+            return Observation(
+                type=ObservationType.ERROR,
+                content="I wasn't able to complete this task within the allowed rounds.",
+            )
 
     # ------------------------------------------------------------------
     # streaming path
@@ -260,16 +277,33 @@ class MultiClawAgent(ToolCallAgent):
                 }
                 return
 
-        # Max rounds exceeded
-        logger.error(
-            "max tool rounds (%d) exceeded for session=%s input=%r messages=%d",
-            max_rounds, session_id, user_input[:200], len(messages),
+        # Max rounds exceeded — force a final summary without tools
+        logger.warning(
+            "max tool rounds (%d) exceeded for session=%s, forcing final summary with %d messages",
+            max_rounds, session_id, len(messages),
         )
-        yield {
-            "type": "done",
-            "content": "I wasn't able to complete this task within the allowed rounds.",
-            "data": {},
-        }
+        full_text = ""
+        try:
+            async for event in self.router.stream_completion(
+                model=self.settings.llm.default_model,
+                messages=messages,
+                tools=None,  # no tools — force text response
+            ):
+                if event["type"] == "token":
+                    full_text += event["content"]
+                    yield event
+                elif event["type"] == "reasoning":
+                    yield event
+            if full_text:
+                await self._save_chat_msg(full_text, "assistant", session_id)
+            yield {"type": "done", "content": full_text, "data": {}}
+        except Exception:
+            logger.exception("final summary failed")
+            yield {
+                "type": "done",
+                "content": "I wasn't able to complete this task within the allowed rounds.",
+                "data": {},
+            }
 
     async def _save_chat_msg(self, content: str, role: str, session_id: str) -> None:
         await self.memory.save(
