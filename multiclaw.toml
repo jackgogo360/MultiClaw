@@ -37,4 +37,4 @@ sandbox_mode = "process"
 audit_enabled = true
 
 [agent]
-max_tool_rounds = 10
+max_tool_rounds = 6
