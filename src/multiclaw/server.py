@@ -27,12 +27,16 @@ from multiclaw.tools import (
     CoreToolScheduler,
     ToolRegistry,
 )
+from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.edit_file import EditFileToolBuilder, UndoEditToolBuilder
 from multiclaw.tools.find_dir import FindDirToolBuilder
 from multiclaw.tools.glob import GlobToolBuilder
 from multiclaw.tools.grep import GrepToolBuilder
 from multiclaw.tools.list_dir import ListDirToolBuilder
 from multiclaw.tools.read_file import ReadFileToolBuilder
+from multiclaw.tools.shell import ShellToolBuilder
+from multiclaw.tools.web_fetch import WebFetchToolBuilder
+from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
 
 
@@ -68,6 +72,10 @@ def create_agent() -> MultiClawAgent:
     registry.register(ListDirToolBuilder(workspace_root))
     registry.register(GrepToolBuilder(workspace_root))
     registry.register(FindDirToolBuilder(workspace_root))
+    registry.register(ShellToolBuilder(workspace_root))
+    registry.register(CodeExecToolBuilder(workspace_root))
+    registry.register(WebFetchToolBuilder(workspace_root))
+    registry.register(WebSearchToolBuilder(workspace_root))
 
     scheduler = CoreToolScheduler(
         permission_checker=PermissionChecker(
@@ -80,6 +88,10 @@ def create_agent() -> MultiClawAgent:
                 "list_dir",
                 "grep",
                 "find_dir",
+                "shell",
+                "code_exec",
+                "web_fetch",
+                "web_search",
             }
         ),
         sandbox=ProcessSandbox(),

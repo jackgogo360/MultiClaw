@@ -138,13 +138,17 @@ class TestToolRegistry:
         agent = create_agent()
 
         assert [tool.name for tool in agent.registry.list_all()] == [
+            "code_exec",
             "edit_file",
             "find_dir",
             "glob",
             "grep",
             "list_dir",
             "read_file",
+            "shell",
             "undo_edit",
+            "web_fetch",
+            "web_search",
             "write_file",
         ]
 
