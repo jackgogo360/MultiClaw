@@ -1,7 +1,10 @@
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
+
+import httpx
 
 from multiclaw.agent.context import ContextBuilder, ContextRequest
 from multiclaw.agent.models import Action, ActionType, Observation, ObservationType
@@ -126,6 +129,7 @@ class MultiClawAgent(ToolCallAgent):
                 )
                 await self.remember(obs.content, "tool_result")
 
+        logger.error("max tool rounds (%d) exceeded for session=%s input=%r", max_rounds, session_id, user_input[:200])
         return Observation(
             type=ObservationType.ERROR,
             content="I wasn't able to complete this task within the allowed rounds.",
@@ -171,84 +175,96 @@ class MultiClawAgent(ToolCallAgent):
                 logger.info("  msg[%d] role=%s tc=%s", i, msg.get("role"), bool(msg.get("tool_calls")))
             full_text = ""
 
-            async for event in self.router.stream_completion(
-                model=self.settings.llm.default_model,
-                messages=messages,
-                tools=tools,
-            ):
-                if event["type"] == "token":
-                    full_text += event["content"]
-                    yield event
+            try:
+                async for event in self.router.stream_completion(
+                    model=self.settings.llm.default_model,
+                    messages=messages,
+                    tools=tools,
+                ):
+                    if event["type"] == "token":
+                        full_text += event["content"]
+                        yield event
 
-                elif event["type"] == "reasoning":
-                    yield event
+                    elif event["type"] == "reasoning":
+                        yield event
 
-                elif event["type"] == "tool_calls":
-                    reasoning = event.get("reasoning_content", "")
-                    # Forward tool_calls as individual tool_call events
-                    for tc in event["calls"]:
-                        yield {
-                            "type": "tool_call",
-                            "name": tc["name"],
-                            "arguments": tc["arguments"],
-                        }
-
-                    # Build assistant message (preserve reasoning_content for DeepSeek)
-                    tool_calls_msg: dict = {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": tc["id"] or f"call_{i}",
-                                "type": "function",
-                                "function": {
-                                    "name": tc["name"],
-                                    "arguments": json.dumps(
-                                        tc["arguments"], ensure_ascii=False
-                                    ),
-                                },
+                    elif event["type"] == "tool_calls":
+                        reasoning = event.get("reasoning_content", "")
+                        for tc in event["calls"]:
+                            yield {
+                                "type": "tool_call",
+                                "name": tc["name"],
+                                "arguments": tc["arguments"],
                             }
-                            for i, tc in enumerate(event["calls"])
-                        ],
-                    }
-                    if reasoning:
-                        tool_calls_msg["reasoning_content"] = reasoning
-                    messages.append(tool_calls_msg)
 
-                    # Execute each tool
-                    for i, tc in enumerate(event["calls"]):
-                        call_id = tc["id"] or f"call_{i}"
-                        action = Action(
-                            type=ActionType.TOOL_CALL,
-                            tool_name=tc["name"],
-                            tool_params=tc["arguments"],
-                        )
-                        await self.transition(AgentState.ACTING)
-                        obs = await self.act(action)
-
-                        yield {
-                            "type": "tool_result",
-                            "name": tc["name"],
-                            "content": obs.content,
+                        tool_calls_msg: dict = {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": tc["id"] or f"call_{i}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["name"],
+                                        "arguments": json.dumps(
+                                            tc["arguments"], ensure_ascii=False
+                                        ),
+                                    },
+                                }
+                                for i, tc in enumerate(event["calls"])
+                            ],
                         }
+                        if reasoning:
+                            tool_calls_msg["reasoning_content"] = reasoning
+                        messages.append(tool_calls_msg)
 
-                        messages.append(
-                            _build_tool_result_msg(call_id, obs.content)
-                        )
-                        await self.remember(obs.content, "tool_result")
+                        for i, tc in enumerate(event["calls"]):
+                            call_id = tc["id"] or f"call_{i}"
+                            action = Action(
+                                type=ActionType.TOOL_CALL,
+                                tool_name=tc["name"],
+                                tool_params=tc["arguments"],
+                            )
+                            await self.transition(AgentState.ACTING)
+                            obs = await self.act(action)
 
-                    break  # tool_calls handled, continue outer loop
+                            yield {
+                                "type": "tool_result",
+                                "name": tc["name"],
+                                "content": obs.content,
+                            }
 
-            else:
-                # No tool_calls — pure text response, streaming complete
-                logger.info("streaming complete, text_len=%d", len(full_text))
-                await self._save_chat_msg(full_text, "assistant", session_id)
-                await self.transition(AgentState.FINISHED)
-                yield {"type": "done", "content": full_text, "data": {}}
+                            messages.append(
+                                _build_tool_result_msg(call_id, obs.content)
+                            )
+                            await self.remember(obs.content, "tool_result")
+
+                        break  # tool_calls handled, continue outer loop
+
+                else:
+                    # No tool_calls — pure text response
+                    logger.info("streaming complete, text_len=%d", len(full_text))
+                    await self._save_chat_msg(full_text, "assistant", session_id)
+                    await self.transition(AgentState.FINISHED)
+                    yield {"type": "done", "content": full_text, "data": {}}
+                    return
+
+            except (httpx.ReadTimeout, asyncio.TimeoutError) as exc:
+                logger.error(
+                    "stream timeout round=%d/%d session=%s input=%r",
+                    round_num + 1, max_rounds, session_id, user_input[:200],
+                )
+                yield {
+                    "type": "error",
+                    "content": f"Request timed out: {exc}",
+                }
                 return
 
         # Max rounds exceeded
-        logger.warning("max rounds (%d) exceeded", max_rounds)
+        logger.error(
+            "max tool rounds (%d) exceeded for session=%s input=%r messages=%d",
+            max_rounds, session_id, user_input[:200], len(messages),
+        )
         yield {
             "type": "done",
             "content": "I wasn't able to complete this task within the allowed rounds.",

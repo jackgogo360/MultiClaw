@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -139,7 +140,7 @@ class ModelRouter:
         reasoning_content = ""
         full_text = ""
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
             async with client.stream(
                 "POST", request["url"], headers=request["headers"], json=request["body"]
             ) as response:

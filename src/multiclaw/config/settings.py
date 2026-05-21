@@ -32,7 +32,7 @@ class LLMSettings(BaseModel):
 class MemorySettings(BaseModel):
     short_term_limit: int = 100
     context_window_limit: int = 128000
-    recent_turns: int = 8
+    recent_turns: int = 2
     context_history_ratio: float = 0.5
     include_legacy_memory_in_retrieval: bool = False
 
