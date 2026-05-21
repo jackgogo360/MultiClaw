@@ -19,7 +19,7 @@ DEFAULT_MAX_RESULTS = 5
 
 class WebSearchParams(BaseModel):
     query: str
-    max_results: int = Field(default=DEFAULT_MAX_RESULTS, ge=1, le=20)
+    max_results: int = Field(default=DEFAULT_MAX_RESULTS, ge=1, le=5)
     engine: str | None = None
 
 
