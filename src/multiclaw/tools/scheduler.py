@@ -1,10 +1,13 @@
 import asyncio
+import logging
 import uuid
 from typing import Any
 
 from multiclaw.events import Event, EventBus
 from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
 from multiclaw.tools.base import ToolBuilder, ToolExecutionResult, ToolStatus
+
+logger = logging.getLogger(__name__)
 
 
 class CoreToolScheduler:
@@ -50,6 +53,10 @@ class CoreToolScheduler:
             )
             if decision.requires_approval:
                 request_id = uuid.uuid4().hex[:12]
+                logger.info(
+                    "approval required: tool=%s request_id=%s reason=%s",
+                    builder.name, request_id, decision.reason,
+                )
                 event = asyncio.Event()
                 self._pending[request_id] = event
 
@@ -70,7 +77,19 @@ class CoreToolScheduler:
                     detail=f"approval required, request_id={request_id}",
                 )
 
-                await event.wait()
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "approval timeout: tool=%s request_id=%s",
+                        builder.name, request_id,
+                    )
+                    self._pending.pop(request_id, None)
+                    self._pending_results.pop(request_id, None)
+                    return ToolExecutionResult(
+                        status=ToolStatus.CANCELLED,
+                        content="Approval timed out after 120s.",
+                    )
                 approved = self._pending_results.pop(request_id, False)
                 self._pending.pop(request_id, None)
 
