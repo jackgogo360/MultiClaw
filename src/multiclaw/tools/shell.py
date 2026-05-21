@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 import os
 import signal
 import shlex
@@ -211,6 +212,10 @@ class ShellToolBuilder(WorkspaceToolBuilder):
 
     def validate(self, params: dict) -> ShellParams:
         return ShellParams(**params)
+
+    def approval_description(self, params: dict[str, Any]) -> str:
+        cmd = params.get("command", "?")
+        return f"Shell: {cmd[:80]}{'...' if len(cmd) > 80 else ''}"
 
     def build(self, params: ShellParams) -> ToolInvocation[ShellParams]:
         return ShellInvocation(

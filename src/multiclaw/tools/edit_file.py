@@ -1,5 +1,6 @@
 import re
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -218,6 +219,9 @@ class EditFileToolBuilder(WorkspaceToolBuilder):
     def validate(self, params: dict) -> EditFileParams:
         return EditFileParams(**params)
 
+    def approval_description(self, params: dict[str, Any]) -> str:
+        return f"Edit file: {params.get('file_path', '?')}"
+
     def build(self, params: EditFileParams) -> ToolInvocation[EditFileParams]:
         return EditFileInvocation(
             name=self.name,
@@ -265,6 +269,9 @@ class UndoEditToolBuilder(ToolBuilder[UndoEditParams]):
 
     def validate(self, params: dict) -> UndoEditParams:
         return UndoEditParams(**params)
+
+    def approval_description(self, params: dict[str, Any]) -> str:
+        return f"Undo edit: {params.get('file_path', '?')}"
 
     def build(self, params: UndoEditParams) -> ToolInvocation[UndoEditParams]:
         return UndoEditInvocation(name=self.name, params=params, edit_builder=self.edit_builder)

@@ -1,3 +1,4 @@
+import json
 from abc import ABC, abstractmethod
 from enum import Enum
 from pathlib import Path
@@ -50,3 +51,8 @@ class ToolBuilder(ABC, Generic[TParams]):
     @abstractmethod
     def build(self, params: TParams) -> ToolInvocation[TParams]:
         raise NotImplementedError
+
+    def approval_description(self, params: dict[str, Any]) -> str:
+        """Human-readable description of what this tool invocation will do.
+        Override in subclasses for tool-specific formatting."""
+        return json.dumps(params, ensure_ascii=False)

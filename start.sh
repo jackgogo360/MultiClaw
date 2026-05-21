@@ -7,4 +7,18 @@ cd "$(dirname "$0")"
 lsof -ti:15800 | xargs kill -9 2>/dev/null || true
 
 echo "Starting MultiClaw on http://localhost:15800"
-exec uv run uvicorn multiclaw.server:app --host 0.0.0.0 --port 15800 --reload
+uv run uvicorn multiclaw.server:app --host 0.0.0.0 --port 15800 --reload &
+SERVER_PID=$!
+
+LOG_FILE="$HOME/.multiclaw/logs/multiclaw.log"
+
+echo "Waiting for log file..."
+for _ in $(seq 1 30); do
+    if [ -f "$LOG_FILE" ]; then
+        break
+    fi
+    sleep 0.5
+done
+
+echo "Tailing $LOG_FILE — Ctrl-C to stop watching (server keeps running)"
+tail -50f "$LOG_FILE" || true
