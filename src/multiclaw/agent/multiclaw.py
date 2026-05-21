@@ -206,6 +206,12 @@ class MultiClawAgent(ToolCallAgent):
                         yield event
 
                     elif event["type"] == "tool_calls":
+                        tc_names = [tc["name"] for tc in event["calls"]]
+                        logger.info(
+                            "round %d/%d tool_calls=%s reasoning=%s",
+                            round_num + 1, max_rounds, tc_names,
+                            event.get("reasoning_content", "")[:120],
+                        )
                         reasoning = event.get("reasoning_content", "")
                         for tc in event["calls"]:
                             yield {
