@@ -43,12 +43,16 @@ class GovernanceSettings(BaseModel):
 
 
 class AgentSettings(BaseModel):
-    max_tool_rounds: int = 10
+    max_tool_rounds: int = 6
     system_prompt: str = (
         "You are a helpful assistant with access to tools. "
-        "Use tools to read files, inspect directories, and gather information. "
+        "Use web_search to find information, read_file to read files, and other "
+        "tools to inspect directories and gather information. "
+        "After receiving search results, summarize them directly for the user — "
+        "do not fetch every linked page unless the user specifically asks for details. "
+        "If a tool fails, try once more with a different approach; if it fails again, "
+        "work with what you have and respond. "
         "When a tool requires user approval, inform the user briefly. "
-        "After receiving tool results, summarize them clearly for the user. "
         "If you cannot complete a task with the available tools, explain why "
         "and suggest alternatives."
     )
