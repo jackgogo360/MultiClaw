@@ -2,16 +2,47 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+LOG_DIR = Path.home() / ".multiclaw" / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _log_namer(default_name: str) -> str:
+    # TimedRotatingFileHandler produces: /path/multiclaw.log.20260521
+    # Rename to:                        /path/multiclaw-20260521.log
+    parts = default_name.rsplit(".", 1)
+    if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 8:
+        return f"{parts[0]}-{parts[1]}.log"
+    return default_name
+
+
+_file_handler = TimedRotatingFileHandler(
+    filename=str(LOG_DIR / "multiclaw.log"),
+    when="midnight",
+    interval=1,
+    backupCount=30,
+    encoding="utf-8",
+)
+_file_handler.suffix = "%Y%m%d"
+_file_handler.namer = _log_namer
+_file_handler.setFormatter(
+    logging.Formatter(
+        "[%(asctime)s] %(levelname)s %(name)s %(message)s",
+        datefmt="%Y%m%d %H:%M:%S",
+    )
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(name)s %(message)s",
     datefmt="%Y%m%d %H:%M:%S",
+    handlers=[_file_handler],
 )
 logger = logging.getLogger("multiclaw")
 
