@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
@@ -9,6 +10,8 @@ from pydantic import BaseModel, Field
 
 from multiclaw.tools._common import WorkspaceToolBuilder, _error, _success
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_ENGINE = "duckduckgo"
 DEFAULT_MAX_RESULTS = 5
@@ -140,6 +143,17 @@ class _BingEngine:
                     snippet = re.sub(r"<[^>]+>", "", snippet).strip()
                     results.append({"title": title, "url": url, "snippet": snippet,
                                     "source": "bing", "position": i + 1})
+                if not results:
+                    # Log HTML sample to diagnose regex mismatch
+                    body_match = re.search(
+                        r'<ol[^>]*id="b_results"[^>]*>(.*?)</ol>', resp.text, re.DOTALL
+                    )
+                    if body_match:
+                        logger.warning("bing regex matched 0 results. b_results sample: %s",
+                                       body_match.group(0)[:1000])
+                    else:
+                        logger.warning("bing regex matched 0 results, no b_results found. url=%s html_snippet=%s",
+                                       str(resp.url), resp.text[:1000])
                 return {"engine": "bing", "results": results, "error": ""}
         except Exception as e:
             return {"engine": "bing", "results": [], "error": str(e)}
@@ -160,6 +174,11 @@ class _BaiduEngine:
                 resp = client.get("https://www.baidu.com/s",
                                   params={"wd": query, "rn": max_results}, headers=headers)
                 resp.raise_for_status()
+                # Check if Baidu redirected to CAPTCHA
+                if "wappass" in str(resp.url) or "captcha" in str(resp.url):
+                    logger.warning("baidu redirected to captcha: %s -> %s", query, str(resp.url))
+                    return {"engine": "baidu", "results": [],
+                            "error": f"Baidu CAPTCHA block, redirected to {resp.url}"}
                 results = []
                 snippet_pattern = re.compile(
                     r'<div[^>]*class="[^"]*result[^"]*".*?<h3[^>]*>.*?<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?<span[^>]*class="[^"]*content-right_[^"]*"[^>]*>(.*?)</span>',
@@ -170,6 +189,9 @@ class _BaiduEngine:
                     snippet = re.sub(r"<[^>]+>", "", snippet).strip()
                     results.append({"title": title, "url": url, "snippet": snippet,
                                     "source": "baidu", "position": i + 1})
+                if not results:
+                    logger.warning("baidu regex matched 0 results. url=%s html_snippet=%s",
+                                   str(resp.url), resp.text[:1000])
                 return {"engine": "baidu", "results": results, "error": ""}
         except Exception as e:
             return {"engine": "baidu", "results": [], "error": str(e)}
