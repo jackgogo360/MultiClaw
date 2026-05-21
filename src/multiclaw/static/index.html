@@ -500,6 +500,7 @@ function appendToken(token) {
 
 function finalizeStream(content) {
   clearReasoning();
+  _collapseAllTools();
   if (streamEl) {
     const body = streamEl.querySelector('.stream-body');
     body.innerHTML = marked.parse(content || streamContent);
@@ -537,11 +538,27 @@ function addError(content) {
 }
 
 // ---- tool call / result ----
+function _allToolCards() {
+  return document.querySelectorAll('.tool-card');
+}
+
+function _collapseAllTools() {
+  _allToolCards().forEach(function(c) {
+    c.querySelector('details').open = false;
+  });
+}
+
 function showToolCall(name, args) {
   hideWelcome();
   removeThinking();
   clearReasoning();
-  const card = document.createElement('div');
+  // Collapse all existing tool cards, mark any running dots as done
+  _allToolCards().forEach(function(c) {
+    c.querySelector('details').open = false;
+    var dot = c.querySelector('.dot.running');
+    if (dot) dot.className = 'dot done';
+  });
+  var card = document.createElement('div');
   card.className = 'tool-card';
   card.id = 'tool-' + name + '-' + Date.now();
   card.innerHTML = '<details open><summary><span class="dot running"></span> Calling <strong>' + escapeHtml(name) + '</strong></summary><div class="tool-body"><pre>' + escapeHtml(JSON.stringify(args, null, 2)) + '</pre></div></details>';
@@ -550,16 +567,14 @@ function showToolCall(name, args) {
 }
 
 function showToolResult(name, content) {
-  const cards = document.querySelectorAll('.tool-card');
-  for (const card of cards) {
-    const summary = card.querySelector('summary');
+  _allToolCards().forEach(function(card) {
+    var summary = card.querySelector('summary');
     if (summary && summary.textContent.includes(name) && card.querySelector('.dot.running')) {
       summary.querySelector('.dot').className = 'dot done';
-      const body = card.querySelector('.tool-body');
+      var body = card.querySelector('.tool-body');
       body.innerHTML = '<pre>' + escapeHtml(content) + '</pre>';
-      break;
     }
-  }
+  });
   showThinking();
   scrollDown();
 }
