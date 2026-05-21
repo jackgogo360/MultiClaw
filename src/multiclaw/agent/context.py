@@ -28,11 +28,16 @@ class ContextBuilder:
         messages: list[dict] = [{"role": "system", "content": request.system_prompt}]
 
         recent_entries = await self.memory.recent(
-            limit=self.recent_turns * 2,
+            limit=self.recent_turns * 4,
             entry_type="chat_message",
             session_id=request.session_id,
         )
-        recent_entries = list(reversed(recent_entries))
+        # Only keep user and assistant messages — tool messages are
+        # intermediate artifacts that bloat context and confuse the LLM.
+        recent_entries = [
+            e for e in reversed(recent_entries)
+            if e.role in ("user", "assistant")
+        ][: self.recent_turns * 2]
         for entry in recent_entries:
             messages.append({"role": entry.role, "content": entry.content})
 
