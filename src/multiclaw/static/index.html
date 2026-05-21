@@ -338,7 +338,7 @@
   }
 
   /* ---- input ---- */
-  #input-wrap { padding: 16px 24px 20px; }
+  #input-wrap { padding: 16px 24px 20px; flex-shrink: 0; }
   #input-area {
     display: flex; align-items: flex-end; gap: 8px;
     background: var(--bg-input); border: 1px solid var(--border);
@@ -616,7 +616,10 @@ function showApproval(requestId, tool, params, description) {
   msgs.appendChild(div);
   document.getElementById('approve-' + requestId).onclick = function() { resolveApproval(requestId, true); };
   document.getElementById('reject-' + requestId).onclick = function() { resolveApproval(requestId, false); };
-  scrollDown();
+  // Ensure buttons are visible — delay for browser layout
+  requestAnimationFrame(function() {
+    div.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+  });
 }
 
 async function resolveApproval(requestId, approved) {
