@@ -39,15 +39,18 @@ class WebSearchInvocation(ToolInvocation[WebSearchParams]):
         target_engine = self.params.engine or self.default_engine
         order = [target_engine] + [e for e in self.fallback_engines if e != target_engine]
 
+        errors: list[str] = []
         for eng_name in order:
             instance = self._get_engine(eng_name)
             if instance is None:
-                if eng_name == target_engine:
-                    return _error(f"Unknown engine: {eng_name}")
+                errors.append(f"{eng_name}: unknown engine")
                 continue
             try:
                 resp = instance.search(query, max_results=self.params.max_results)
-                if not resp.get("error") and resp.get("results"):
+                if resp.get("error"):
+                    errors.append(f"{eng_name}: {resp['error']}")
+                    continue
+                if resp.get("results"):
                     lines = [f"Search results for '{query}' ({resp['engine']}):"]
                     for r in resp["results"]:
                         lines.append(f"\n{r['position']}. {r['title']}")
@@ -59,10 +62,11 @@ class WebSearchInvocation(ToolInvocation[WebSearchParams]):
                         data={"query": query, "engine": resp["engine"],
                               "results": resp["results"]},
                     )
-            except Exception:
-                continue
+            except Exception as exc:
+                errors.append(f"{eng_name}: {exc}")
 
-        return _error(f"All engines failed for query: '{query}'")
+        err_detail = "; ".join(errors) if errors else "no engines available"
+        return _error(f"All engines failed for query '{query}': {err_detail}")
 
     def _get_engine(self, name: str):
         if name in self._instances:
