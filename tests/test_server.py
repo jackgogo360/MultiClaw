@@ -57,3 +57,46 @@ def test_chat_rejects_archived_session(tmp_path, monkeypatch):
         response = client.post("/chat", json={"message": "hello", "session_id": created["id"]})
 
     assert response.status_code == 409
+
+
+def test_delete_session_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    from multiclaw.server import app
+
+    with TestClient(app) as client:
+        created = client.post("/sessions", json={"title": "Alpha"}).json()
+        response = client.delete(f"/sessions/{created['id']}")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+    # Verify session is gone
+    with TestClient(app) as client:
+        listed = client.get("/sessions").json()
+    assert created["id"] not in [s["id"] for s in listed]
+
+
+def test_get_messages_endpoint_returns_empty_for_new_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    from multiclaw.server import app
+
+    with TestClient(app) as client:
+        created = client.post("/sessions", json={"title": "Alpha"}).json()
+        sid = created["id"]
+
+        response = client.get(f"/sessions/{sid}/messages")
+        assert response.status_code == 200
+        assert response.json() == []
+
+
+def test_get_messages_endpoint_respects_limit_param(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    from multiclaw.server import app
+
+    with TestClient(app) as client:
+        created = client.post("/sessions", json={"title": "Alpha"}).json()
+        sid = created["id"]
+
+        response = client.get(f"/sessions/{sid}/messages?limit=10")
+        assert response.status_code == 200
+        assert isinstance(response.json(), list)

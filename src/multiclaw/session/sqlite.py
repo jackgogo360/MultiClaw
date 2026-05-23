@@ -114,9 +114,13 @@ class SqliteSessionStore:
     async def delete(self, session_id: str) -> None:
         db = await self._ensure_db()
         await db.execute("BEGIN")
-        await db.execute("DELETE FROM memory_entries WHERE session_id = ?", (session_id,))
-        await db.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
-        await db.commit()
+        try:
+            await db.execute("DELETE FROM memory_entries WHERE session_id = ?", (session_id,))
+            await db.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+            await db.commit()
+        except Exception:
+            await db.execute("ROLLBACK")
+            raise
 
     async def get_messages(self, session_id: str, limit: int = 50) -> list[dict]:
         db = await self._ensure_db()

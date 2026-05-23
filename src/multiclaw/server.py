@@ -121,6 +121,15 @@ def create_agent() -> MultiClawAgent:
     settings = Settings(_config_file=str(config_path) if config_path.exists() else None)
     workspace_root = config_path.resolve().parent if config_path.exists() else Path.cwd().resolve()
 
+    from multiclaw.skills import SkillManager
+
+    skill_manager = SkillManager(
+        project_root=workspace_root,
+        max_active=settings.skill.max_active if hasattr(settings, 'skill') else 5,
+    )
+    if settings.skill.enabled if hasattr(settings, 'skill') else True:
+        skill_manager.discover()
+
     registry = ToolRegistry()
     read_builder = ReadFileToolBuilder(workspace_root)
     edit_builder = EditFileToolBuilder(workspace_root)
@@ -160,6 +169,7 @@ def create_agent() -> MultiClawAgent:
         memory=SqliteMemory(settings.database.path),
         planner=Planner(),
         event_bus=shared_bus,
+        skill_manager=skill_manager,
     )
     runtime_agent.session_store = SqliteSessionStore(settings.database.path)
     return runtime_agent
@@ -232,6 +242,17 @@ async def archive_session(session_id: str):
 async def restore_session(session_id: str):
     session = await agent.session_store.restore(session_id)
     return session.model_dump(mode="json")
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    await agent.session_store.delete(session_id)
+    return {"ok": True}
+
+
+@app.get("/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str, limit: int = 50):
+    return await agent.session_store.get_messages(session_id, limit)
 
 
 @app.post("/chat")
@@ -338,6 +359,10 @@ async def chat(req: ChatRequest):
                 while not event_queue.empty():
                     evt = event_queue.get_nowait()
                     if evt.type == "tool.awaiting_approval":
+                        logger.info(
+                            "SSE yield approval_required: request_id=%s tool=%s",
+                            evt.data.get("request_id"), evt.data.get("tool"),
+                        )
                         yield (
                             "data: "
                             + json.dumps(
@@ -346,6 +371,7 @@ async def chat(req: ChatRequest):
                                     "request_id": evt.data.get("request_id", ""),
                                     "tool": evt.data.get("tool", ""),
                                     "params": evt.data.get("params", {}),
+                                    "description": evt.data.get("description", ""),
                                 }
                             )
                             + "\n\n"
