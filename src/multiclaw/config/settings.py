@@ -45,7 +45,8 @@ class GovernanceSettings(BaseModel):
 class AgentSettings(BaseModel):
     max_tool_rounds: int = 6
     system_prompt: str = (
-        "You are a helpful assistant with access to tools. "
+        "You are MultiClaw, an AI assistant with access to tools. "
+        "You are powered by a large language model. "
         "Use web_search to find information, read_file to read files, and other "
         "tools to inspect directories and gather information. "
         "After receiving search results, summarize them directly for the user — "
@@ -56,6 +57,23 @@ class AgentSettings(BaseModel):
         "If you cannot complete a task with the available tools, explain why "
         "and suggest alternatives."
     )
+
+
+class SkillSettings(BaseModel):
+    enabled: bool = True
+    max_active: int = 5
+    extra_dirs: list[str] = []
+    user_dir: str = ""
+
+
+class AuthSettings(BaseModel):
+    jwt_secret: str = ""
+
+
+class BrevoSettings(BaseModel):
+    api_key: str = ""
+    sender_email: str = ""
+    sender_name: str = "MultiClaw"
 
 
 class Settings(BaseSettings):
@@ -70,6 +88,9 @@ class Settings(BaseSettings):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
+    skill: SkillSettings = Field(default_factory=SkillSettings)
+    auth: AuthSettings = Field(default_factory=AuthSettings)
+    brevo: BrevoSettings = Field(default_factory=BrevoSettings)
 
     def __init__(self, _config_file: str | None = None, **kwargs: Any):
         config_path = Path(_config_file) if _config_file else Path("multiclaw.toml")
@@ -127,4 +148,10 @@ class Settings(BaseSettings):
             result["governance"] = data["governance"]
         if "agent" in data:
             result["agent"] = data["agent"]
+        if "skills" in data:
+            result["skill"] = data["skills"]
+        if "auth" in data:
+            result["auth"] = data["auth"]
+        if "brevo" in data:
+            result["brevo"] = data["brevo"]
         return result
