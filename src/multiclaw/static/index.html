@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MultiClaw</title>
+<link rel="icon" href="/multiclaw.png" type="image/png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;1,9..40,400&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -128,6 +129,9 @@
     color: var(--text-primary);
     letter-spacing: -0.3px;
   }
+  #sidebar-brand img {
+    width: 100%; max-width: 180px; display: block; margin-bottom: 4px;
+  }
   #sidebar-brand .badge {
     font-size: 10px; color: var(--text-tertiary);
     letter-spacing: 0.8px; text-transform: uppercase;
@@ -184,10 +188,11 @@
   #main {
     flex: 1;
     min-width: 0;
-    height: 100vh;           /* FIX: explicit height */
+    height: 100vh;
     display: flex;
     flex-direction: column;
-    overflow: hidden;        /* FIX: hard contain */
+    overflow: hidden;
+    position: relative;
     position: relative;
   }
 
@@ -240,7 +245,7 @@
     min-height: 0;           /* FIX: allow flex child to scroll */
     overflow-y: auto;
     overflow-x: hidden;
-    padding: 24px;
+    padding: 24px 15%;
     display: flex;
     flex-direction: column;
     gap: 2px;
@@ -269,15 +274,15 @@
   .msg-wrap.agent { align-items: flex-start; }
 
   .msg {
-    max-width: 72%; padding: 12px 18px; border-radius: var(--radius-lg);
+    padding: 12px 18px; border-radius: var(--radius-lg);
     line-height: 1.65; font-size: 14px; position: relative;
   }
   .msg-wrap.user .msg {
-    background: var(--user-bubble); border: 1px solid var(--user-border);
+    max-width: 75%; background: var(--user-bubble); border: 1px solid var(--user-border);
     border-bottom-right-radius: 6px; color: var(--text-primary);
   }
   .msg-wrap.agent .msg {
-    background: transparent; border: none; padding: 10px 0;
+    max-width: 95%; background: transparent; border: none; padding: 10px 0;
     border-radius: 0; color: var(--text-primary);
   }
   .msg .label { display: none; }
@@ -354,11 +359,11 @@
 
   #approval-panel {
     position: absolute;
-    bottom: 100px;
-    left: 24px;
+    bottom: 90px;
+    left: 15%;
     z-index: 100;
     width: 380px;
-    max-width: calc(100% - 48px);
+    max-width: calc(100% - 30%);
     background: var(--bg-surface);
     border: 1px solid var(--border);
     border-left: 3px solid var(--accent);
@@ -512,7 +517,7 @@
 
   /* ---- input area ---- */
   #input-wrap {
-    padding: 12px 20px 18px;
+    padding: 12px 15% 18px;
     flex-shrink: 0;
     background: var(--bg-surface);
     border-top: 1px solid var(--border);
@@ -548,6 +553,11 @@
     padding: 0 0 8px; text-align: center;
   }
 
+  #disclaimer {
+    padding: 20px 15%; text-align: center;
+    font-size: 12px; color: var(--text-tertiary);
+  }
+
   /* error */
   .msg-wrap.error .msg {
     background: var(--danger-soft); border: 1px solid var(--danger);
@@ -564,14 +574,133 @@
     .msg { max-width: 90%; }
     .tool-card { max-width: 92%; }
   }
+
+/* ---- login overlay ---- */
+#login-overlay {
+  position: fixed; inset: 0; z-index: 10000;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-base);
+}
+#login-overlay.hidden { display: none; }
+#login-card {
+  width: 380px; max-width: 90vw;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 32px;
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+#login-card h2 {
+  font-family: var(--font-display);
+  font-size: 22px; font-weight: 500; margin-bottom: 4px;
+  color: var(--text-primary); letter-spacing: -0.3px;
+}
+#login-card .login-sub {
+  font-size: 11px; color: var(--text-tertiary);
+  text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 22px;
+}
+#login-card label {
+  display: block; text-align: left;
+  font-size: 12px; color: var(--text-secondary);
+  margin-bottom: 4px; font-weight: 500;
+}
+#login-card .login-input {
+  width: 100%; padding: 11px 14px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 14px; font-family: var(--font-body);
+  background: var(--bg-input); color: var(--text-primary);
+  outline: none; transition: border-color 0.2s; margin-bottom: 12px;
+  box-sizing: border-box;
+}
+#login-card .login-input:focus { border-color: var(--accent); }
+#login-card .login-btn {
+  width: 100%; padding: 11px; border: none; border-radius: var(--radius-sm);
+  font-size: 14px; font-weight: 500; font-family: var(--font-body);
+  cursor: pointer; background: var(--accent); color: #1a1a1c;
+  transition: all 0.15s ease;
+}
+#login-card .login-btn:hover { filter: brightness(1.1); box-shadow: 0 2px 10px var(--accent-glow); }
+#login-card .login-btn:disabled { opacity: 0.4; cursor: not-allowed; filter: none; box-shadow: none; }
+#login-card .login-error {
+  font-size: 12px; color: var(--danger); text-align: center;
+  margin-top: 10px; min-height: 16px;
+}
+#login-card .login-back {
+  font-size: 12px; color: var(--text-secondary); margin-top: 12px;
+  text-decoration: underline; cursor: pointer; display: inline-block;
+}
+#login-card .login-back:hover { color: var(--accent); }
+#login-card .code-row {
+  display: flex; gap: 8px; justify-content: center; margin-bottom: 16px;
+}
+#login-card .code-digit {
+  width: 44px; height: 54px; text-align: center;
+  font-size: 24px; font-family: var(--font-mono);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-input); color: var(--text-primary);
+  outline: none; transition: border-color 0.15s;
+}
+#login-card .code-digit:focus { border-color: var(--accent); }
+#login-card .resend-wrap {
+  font-size: 12px; color: var(--text-tertiary); margin-top: 12px;
+}
+#login-card .resend-wrap a {
+  color: var(--accent); cursor: pointer; text-decoration: none;
+}
+#login-card .resend-wrap a.disabled {
+  color: var(--text-tertiary); cursor: not-allowed; pointer-events: none;
+}
+#logout-btn {
+  background: none; border: none; color: var(--text-secondary);
+  cursor: pointer; font-size: 12px; font-family: var(--font-body);
+  padding: 4px 8px; border-radius: 6px; transition: all 0.15s ease;
+}
+#logout-btn:hover { background: var(--danger-soft); color: var(--danger); }
 </style>
 </head>
 <body>
 <div id="app">
+  <!-- LOGIN OVERLAY -->
+  <div id="login-overlay">
+    <div id="login-card">
+      <h2>MultiClaw</h2>
+      <div class="login-sub">Sign in to continue</div>
+
+      <div id="login-step-1">
+        <label for="login-email">Email</label>
+        <input class="login-input" id="login-email" type="email" placeholder="hello@example.com" autocomplete="email">
+        <button class="login-btn" id="login-send-btn" onclick="authSendCode()">Send Code</button>
+        <div class="login-error" id="login-error-1"></div>
+      </div>
+
+      <div id="login-step-2" style="display:none">
+        <label>Verification Code</label>
+        <p style="font-size:13px;color:var(--text-secondary);margin:4px 0 12px">
+          Sent to <strong id="login-email-display"></strong>
+        </p>
+        <div class="code-row" id="code-row">
+          <input class="code-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" data-idx="0">
+          <input class="code-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" data-idx="1">
+          <input class="code-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" data-idx="2">
+          <input class="code-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" data-idx="3">
+          <input class="code-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" data-idx="4">
+          <input class="code-digit" maxlength="1" inputmode="numeric" pattern="[0-9]" data-idx="5">
+        </div>
+        <button class="login-btn" id="login-verify-btn" onclick="authVerify()">Verify</button>
+        <div class="login-error" id="login-error-2"></div>
+        <div class="resend-wrap" id="resend-wrap">
+          <a id="resend-link" class="disabled" onclick="authResend()">Resend code (60s)</a>
+        </div>
+        <div class="login-back" onclick="authBackToEmail()">&larr; Use a different email</div>
+      </div>
+    </div>
+  </div>
+
   <!-- SIDEBAR -->
   <div id="sidebar">
     <div id="sidebar-brand">
-      <h1>MultiClaw</h1>
+      <img src="/multiclaw.png" alt="MultiClaw">
       <span class="badge">Developer Preview</span>
     </div>
     <div id="session-list"></div>
@@ -593,6 +722,7 @@
           <svg id="theme-icon-dark" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
           <svg id="theme-icon-light" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
         </button>
+        <button id="logout-btn" onclick="authLogout()" title="Sign out" style="display:none">Sign out</button>
       </div>
     </div>
 
@@ -615,6 +745,7 @@
         </button>
       </div>
     </div>
+    <div id="disclaimer">MultiClaw is AI and can make mistakes. Please double-check responses.</div>
   </div>
 </div>
 
@@ -1012,6 +1143,14 @@ async function send() {
     debugLog('chat_response', { status: res.status, ok: res.ok });
     if (!res.body) throw new Error('Response body is not readable');
 
+    if (res.status === 401) {
+      document.getElementById('login-overlay').classList.remove('hidden');
+      document.getElementById('logout-btn').style.display = 'none';
+      removeThinking();
+      addError('Session expired. Please sign in again.');
+      return;
+    }
+
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -1071,7 +1210,205 @@ input.addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
 
-loadSessions();
+// ---- auth ----
+var authEmail = '';
+var resendSeconds = 0;
+var resendTimer = null;
+
+async function checkAuth() {
+  try {
+    var res = await fetch('/auth/me');
+    var data = await res.json();
+    if (data.email) {
+      document.getElementById('login-overlay').classList.add('hidden');
+      document.getElementById('logout-btn').style.display = '';
+      loadSessions();
+    } else {
+      document.getElementById('login-overlay').classList.remove('hidden');
+      document.getElementById('logout-btn').style.display = 'none';
+    }
+  } catch(e) {
+    document.getElementById('login-overlay').classList.remove('hidden');
+    document.getElementById('logout-btn').style.display = 'none';
+  }
+}
+
+function showLoginError(step, msg) {
+  document.getElementById('login-error-' + step).textContent = msg;
+}
+
+async function authSendCode() {
+  var emailInput = document.getElementById('login-email');
+  var email = emailInput.value.trim();
+  showLoginError(1, '');
+  if (!email || email.indexOf('@') < 0) {
+    showLoginError(1, 'Please enter a valid email'); return;
+  }
+  var btn = document.getElementById('login-send-btn');
+  btn.disabled = true; btn.textContent = 'Sending...';
+  try {
+    var res = await fetch('/auth/send-code', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email: email}),
+    });
+    if (!res.ok) {
+      var err = await res.json();
+      showLoginError(1, err.detail || 'Failed to send code');
+      btn.disabled = false; btn.textContent = 'Send Code'; return;
+    }
+    authEmail = email;
+    document.getElementById('login-email-display').textContent = email;
+    document.getElementById('login-step-1').style.display = 'none';
+    document.getElementById('login-step-2').style.display = '';
+    showLoginError(2, '');
+    startResendTimer();
+    var firstDigit = document.querySelector('#code-row .code-digit');
+    if (firstDigit) firstDigit.focus();
+  } catch(e) {
+    showLoginError(1, 'Network error, please try again');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Send Code';
+  }
+}
+
+function startResendTimer() {
+  resendSeconds = 60;
+  updateResendLink();
+  if (resendTimer) clearInterval(resendTimer);
+  resendTimer = setInterval(function() {
+    resendSeconds--;
+    updateResendLink();
+    if (resendSeconds <= 0) { clearInterval(resendTimer); resendTimer = null; }
+  }, 1000);
+}
+
+function updateResendLink() {
+  var link = document.getElementById('resend-link');
+  if (resendSeconds > 0) {
+    link.textContent = 'Resend code (' + resendSeconds + 's)';
+    link.classList.add('disabled');
+  } else {
+    link.textContent = 'Resend code';
+    link.classList.remove('disabled');
+  }
+}
+
+async function authResend() {
+  if (resendSeconds > 0) return;
+  showLoginError(2, '');
+  try {
+    var res = await fetch('/auth/send-code', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email: authEmail}),
+    });
+    if (!res.ok) {
+      var err = await res.json();
+      showLoginError(2, err.detail || 'Failed to resend code'); return;
+    }
+    startResendTimer();
+    document.querySelectorAll('#code-row .code-digit').forEach(function(el) { el.value = ''; });
+    var f = document.querySelector('#code-row .code-digit');
+    if (f) f.focus();
+  } catch(e) {
+    showLoginError(2, 'Network error, please try again');
+  }
+}
+
+function authBackToEmail() {
+  document.getElementById('login-step-2').style.display = 'none';
+  document.getElementById('login-step-1').style.display = '';
+  showLoginError(2, '');
+  if (resendTimer) { clearInterval(resendTimer); resendTimer = null; }
+  document.querySelectorAll('#code-row .code-digit').forEach(function(el) { el.value = ''; });
+}
+
+async function authVerify() {
+  var code = '';
+  document.querySelectorAll('#code-row .code-digit').forEach(function(el) { code += el.value; });
+  if (code.length !== 6 || !/^\d+$/.test(code)) {
+    showLoginError(2, 'Please enter the 6-digit code'); return;
+  }
+  var btn = document.getElementById('login-verify-btn');
+  btn.disabled = true; btn.textContent = 'Verifying...';
+  showLoginError(2, '');
+  try {
+    var res = await fetch('/auth/verify', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email: authEmail, code: code}),
+    });
+    if (!res.ok) {
+      var err = await res.json();
+      showLoginError(2, err.detail || 'Verification failed');
+      btn.disabled = false; btn.textContent = 'Verify'; return;
+    }
+    document.getElementById('login-overlay').classList.add('hidden');
+    document.getElementById('logout-btn').style.display = '';
+    resetLoginForm();
+    loadSessions();
+  } catch(e) {
+    showLoginError(2, 'Network error, please try again');
+    btn.disabled = false; btn.textContent = 'Verify';
+  }
+}
+
+function resetLoginForm() {
+  authEmail = '';
+  document.getElementById('login-email').value = '';
+  document.querySelectorAll('#code-row .code-digit').forEach(function(el) { el.value = ''; });
+  document.getElementById('login-step-2').style.display = 'none';
+  document.getElementById('login-step-1').style.display = '';
+  showLoginError(1, ''); showLoginError(2, '');
+  if (resendTimer) { clearInterval(resendTimer); resendTimer = null; }
+  resendSeconds = 0; updateResendLink();
+}
+
+async function authLogout() {
+  await fetch('/auth/logout', { method: 'POST' });
+  document.getElementById('login-overlay').classList.remove('hidden');
+  document.getElementById('logout-btn').style.display = 'none';
+  resetLoginForm();
+  currentSessionId = null;
+  document.getElementById('current-session-title').textContent = 'New Chat';
+  msgs.innerHTML = '<div class="welcome" id="welcome"><div class="welcome-icon">&#x2699;&#xfe0f;</div><h3>MultiClaw Agent</h3><p>Ask me anything, run tools, or create plans.</p></div>';
+  document.getElementById('session-list').innerHTML = '';
+  sessions = [];
+}
+
+// Code digit: auto-advance, backspace, paste, enter
+document.getElementById('code-row').addEventListener('input', function(e) {
+  var el = e.target;
+  if (!el.classList.contains('code-digit')) return;
+  var val = el.value.replace(/\D/g, '');
+  el.value = val.slice(-1);
+  if (val && parseInt(el.dataset.idx) < 5) {
+    var nextId = parseInt(el.dataset.idx) + 1;
+    var next = document.querySelector('.code-digit[data-idx="' + nextId + '"]');
+    if (next) next.focus();
+  }
+});
+document.getElementById('code-row').addEventListener('keydown', function(e) {
+  var el = e.target;
+  if (!el.classList.contains('code-digit')) return;
+  if (e.key === 'Backspace' && !el.value && parseInt(el.dataset.idx) > 0) {
+    var prevId = parseInt(el.dataset.idx) - 1;
+    var prev = document.querySelector('.code-digit[data-idx="' + prevId + '"]');
+    if (prev) prev.focus();
+  }
+  if (e.key === 'Enter') { e.preventDefault(); authVerify(); }
+});
+document.getElementById('code-row').addEventListener('paste', function(e) {
+  e.preventDefault();
+  var paste = (e.clipboardData || window.clipboardData).getData('text').replace(/\D/g, '').slice(0, 6);
+  document.querySelectorAll('#code-row .code-digit').forEach(function(el, i) {
+    el.value = paste[i] || '';
+  });
+  if (paste.length === 6) authVerify();
+});
+document.getElementById('login-email').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); authSendCode(); }
+});
+
+checkAuth();
 </script>
 </body>
 </html>
