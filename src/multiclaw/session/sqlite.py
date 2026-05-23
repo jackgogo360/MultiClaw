@@ -29,6 +29,22 @@ class SqliteSessionStore:
             )
             """
         )
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_entries (
+                sort_order INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                content TEXT NOT NULL,
+                type TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT 'note',
+                turn_index INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                metadata TEXT NOT NULL
+            )
+            """
+        )
         await self._db.commit()
 
     async def create(self, title: str = "New Chat") -> ChatSession:
@@ -94,6 +110,30 @@ class SqliteSessionStore:
 
     async def restore(self, session_id: str) -> ChatSession:
         return await self._set_status(session_id, SessionStatus.ACTIVE)
+
+    async def delete(self, session_id: str) -> None:
+        db = await self._ensure_db()
+        await db.execute("BEGIN")
+        await db.execute("DELETE FROM memory_entries WHERE session_id = ?", (session_id,))
+        await db.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+        await db.commit()
+
+    async def get_messages(self, session_id: str, limit: int = 50) -> list[dict]:
+        db = await self._ensure_db()
+        cursor = await db.execute(
+            """
+            SELECT role, content, created_at FROM memory_entries
+            WHERE session_id = ? AND type = 'chat_message' AND role IN ('user', 'assistant')
+            ORDER BY sort_order DESC
+            LIMIT ?
+            """,
+            (session_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {"role": row["role"], "content": row["content"], "created_at": row["created_at"]}
+            for row in reversed(rows)
+        ]
 
     async def touch_message(self, session_id: str, content: str) -> ChatSession:
         db = await self._ensure_db()
