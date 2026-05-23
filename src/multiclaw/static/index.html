@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -9,7 +9,11 @@
 <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;1,9..40,400&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
-  :root {
+  /* ============================================================
+     THEME VARIABLES
+  ============================================================ */
+  :root,
+  [data-theme="dark"] {
     --bg-base: #1a1a1c;
     --bg-surface: #212124;
     --bg-elevated: #2a2a2e;
@@ -27,6 +31,33 @@
     --danger: #e5534b;
     --danger-soft: rgba(229, 83, 75, 0.12);
     --success: #57ab5a;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.4);
+    --shadow: 0 4px 16px rgba(0,0,0,0.5);
+  }
+
+  [data-theme="light"] {
+    --bg-base: #f5f4f1;
+    --bg-surface: #ffffff;
+    --bg-elevated: #efefeb;
+    --bg-input: #ffffff;
+    --border: #e0dfd8;
+    --border-hover: #c8c7be;
+    --text-primary: #1c1c1e;
+    --text-secondary: #5c5c66;
+    --text-tertiary: #9b9ba4;
+    --accent: #b8892e;
+    --accent-soft: rgba(184, 137, 46, 0.10);
+    --accent-glow: rgba(184, 137, 46, 0.20);
+    --user-bubble: #fdf3e0;
+    --user-border: #ead9b4;
+    --danger: #c0392b;
+    --danger-soft: rgba(192, 57, 43, 0.08);
+    --success: #2e7d32;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.08);
+    --shadow: 0 4px 16px rgba(0,0,0,0.1);
+  }
+
+  :root {
     --radius-sm: 8px;
     --radius: 12px;
     --radius-lg: 16px;
@@ -38,14 +69,18 @@
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
+  html, body {
+    height: 100%;
+    overflow: hidden;
+  }
+
   body {
     font-family: var(--font-body);
     background: var(--bg-base);
     color: var(--text-primary);
-    display: flex; justify-content: center; align-items: center;
-    height: 100vh; overflow: hidden;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    transition: background 0.25s ease, color 0.25s ease;
   }
 
   /* subtle grain overlay */
@@ -54,86 +89,204 @@
     background: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
     opacity: 0.6;
   }
-  #app { width: 100%; height: 100vh; display: flex; flex-direction: row; position: relative; z-index: 1; overflow: hidden; }
+
+  /* ============================================================
+     LAYOUT - FIX: proper flex containment so sidebar never overflows
+  ============================================================ */
+  #app {
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    flex-direction: row;
+    position: relative;
+    z-index: 1;
+    overflow: hidden; /* hard stop */
+  }
 
   /* ---- sidebar ---- */
   #sidebar {
-    width: 260px; border-right: 1px solid var(--border); display: flex; flex-direction: column;
-    background: var(--bg-surface); flex-shrink: 0;
+    width: 260px;
+    height: 100vh;           /* FIX: explicit full height */
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--border);
+    background: var(--bg-surface);
+    overflow: hidden;         /* FIX: contain children */
+    transition: background 0.25s ease, border-color 0.25s ease;
   }
-  #sidebar-brand { padding: 20px 20px 16px; }
-  #sidebar-brand h1 { font-family: var(--font-display); font-size: 22px; font-weight: 500; color: var(--text-primary); letter-spacing: -0.3px; }
-  #sidebar-brand .badge { font-size: 10px; color: var(--text-tertiary); letter-spacing: 0.8px; text-transform: uppercase; margin-top: 2px; display: block; }
-  #session-list { flex: 1; overflow-y: auto; padding: 0 10px; }
+
+  #sidebar-brand {
+    padding: 20px 20px 14px;
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  #sidebar-brand h1 {
+    font-family: var(--font-display);
+    font-size: 21px;
+    font-weight: 500;
+    color: var(--text-primary);
+    letter-spacing: -0.3px;
+  }
+  #sidebar-brand .badge {
+    font-size: 10px; color: var(--text-tertiary);
+    letter-spacing: 0.8px; text-transform: uppercase;
+    margin-top: 3px; display: block;
+  }
+
+  /* FIX: session list must flex-shrink so it doesn't push footer out */
+  #session-list {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 8px 10px;
+    min-height: 0; /* FIX: critical for flex overflow */
+  }
   #session-list::-webkit-scrollbar { width: 4px; }
   #session-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
   .session-item {
-    padding: 10px 14px; border-radius: var(--radius); margin-bottom: 2px; cursor: pointer;
+    padding: 9px 12px; border-radius: var(--radius); margin-bottom: 2px; cursor: pointer;
     font-size: 13px; color: var(--text-secondary); transition: all 0.15s ease;
     display: flex; align-items: center; gap: 10px;
   }
   .session-item:hover { background: var(--bg-elevated); color: var(--text-primary); }
   .session-item.active { background: var(--accent-soft); color: var(--accent); }
-  .session-item .icon { width: 18px; height: 18px; border-radius: 6px; background: var(--bg-elevated); flex-shrink: 0;
-    display: flex; align-items: center; justify-content: center; font-size: 10px; }
+  .session-item .icon {
+    width: 18px; height: 18px; border-radius: 6px; background: var(--bg-elevated); flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; font-size: 10px;
+  }
   .session-item.active .icon { background: var(--accent-glow); }
   .session-item .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #sidebar-footer { padding: 12px; border-top: 1px solid var(--border); }
+  .session-item .delete-btn {
+    opacity: 0; flex-shrink: 0; width: 22px; height: 22px; border-radius: 6px;
+    border: none; background: transparent; color: var(--text-tertiary); cursor: pointer;
+    font-size: 14px; line-height: 1; display: flex; align-items: center; justify-content: center;
+    transition: all 0.15s ease;
+  }
+  .session-item:hover .delete-btn { opacity: 1; }
+  .session-item .delete-btn:hover { background: var(--danger-soft); color: var(--danger); }
+
+  #sidebar-footer {
+    padding: 12px;
+    flex-shrink: 0;
+    border-top: 1px solid var(--border);
+  }
   #new-session-btn {
-    width: 100%; padding: 10px; background: transparent; color: var(--text-secondary); border: 1px dashed var(--border);
-    border-radius: var(--radius); cursor: pointer; font-size: 13px; font-family: var(--font-body);
+    width: 100%; padding: 10px; background: transparent; color: var(--text-secondary);
+    border: 1px dashed var(--border); border-radius: var(--radius); cursor: pointer;
+    font-size: 13px; font-family: var(--font-body);
     transition: all 0.15s ease; display: flex; align-items: center; justify-content: center; gap: 6px;
   }
   #new-session-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 
-  /* ---- main ---- */
-  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
-  #main-top { padding: 12px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center;
-    justify-content: space-between; min-height: 52px; }
-  #current-session-title { font-size: 13px; font-weight: 500; color: var(--text-secondary); }
-  #sidebar-toggle { display: none; background: none; border: none; color: var(--text-secondary); cursor: pointer;
-    font-size: 18px; padding: 4px 8px; border-radius: 6px; }
+  /* ---- main area ---- */
+  #main {
+    flex: 1;
+    min-width: 0;
+    height: 100vh;           /* FIX: explicit height */
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;        /* FIX: hard contain */
+    position: relative;
+  }
+
+  /* top bar */
+  #main-top {
+    padding: 0 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 52px;
+    flex-shrink: 0;
+    gap: 12px;
+    background: var(--bg-surface);
+    transition: background 0.25s ease;
+  }
+
+  #current-session-title {
+    font-size: 13px; font-weight: 500; color: var(--text-secondary);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+  }
+
+  /* top-bar controls group */
+  .topbar-controls {
+    display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+  }
+
+  /* theme toggle */
+  #theme-toggle {
+    width: 32px; height: 32px; border-radius: var(--radius-sm);
+    background: var(--bg-elevated); border: 1px solid var(--border);
+    color: var(--text-secondary); cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.15s ease; flex-shrink: 0;
+  }
+  #theme-toggle:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+  /* sidebar toggle (mobile) */
+  #sidebar-toggle {
+    display: none; background: none; border: none; color: var(--text-secondary); cursor: pointer;
+    font-size: 18px; padding: 4px 8px; border-radius: 6px;
+  }
   #sidebar-toggle:hover { background: var(--bg-elevated); }
 
-  /* ---- messages ---- */
-  #messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 4px;
-    scroll-behavior: smooth; }
+  /* ============================================================
+     MESSAGES - FIX: flex overflow chain
+  ============================================================ */
+  #messages {
+    flex: 1;
+    min-height: 0;           /* FIX: allow flex child to scroll */
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    scroll-behavior: smooth;
+  }
   #messages::-webkit-scrollbar { width: 5px; }
   #messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
   #messages::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
 
-  /* empty welcome */
-  .welcome { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 12px; color: var(--text-tertiary); text-align: center; padding: 40px; }
+  /* welcome */
+  .welcome {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; color: var(--text-tertiary); text-align: center; padding: 40px;
+  }
   .welcome-icon { font-size: 48px; margin-bottom: 8px; opacity: 0.6; }
-  .welcome h3 { font-family: var(--font-display); font-size: 22px; font-weight: 500; color: var(--text-secondary);
-    letter-spacing: -0.3px; }
+  .welcome h3 {
+    font-family: var(--font-display); font-size: 22px; font-weight: 500;
+    color: var(--text-secondary); letter-spacing: -0.3px;
+  }
   .welcome p { font-size: 13px; line-height: 1.7; max-width: 420px; }
 
   /* ---- message bubbles ---- */
-  .msg-wrap { display: flex; flex-direction: column; padding: 8px 0; animation: msgIn 0.3s ease; }
-  @keyframes msgIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  .msg-wrap { display: flex; flex-direction: column; padding: 6px 0; animation: msgIn 0.25s ease; }
+  @keyframes msgIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
   .msg-wrap.user { align-items: flex-end; }
   .msg-wrap.agent { align-items: flex-start; }
 
   .msg {
-    max-width: 72%; padding: 12px 18px; border-radius: var(--radius-lg); line-height: 1.65;
-    font-size: 14px; position: relative;
+    max-width: 72%; padding: 12px 18px; border-radius: var(--radius-lg);
+    line-height: 1.65; font-size: 14px; position: relative;
   }
   .msg-wrap.user .msg {
     background: var(--user-bubble); border: 1px solid var(--user-border);
     border-bottom-right-radius: 6px; color: var(--text-primary);
   }
   .msg-wrap.agent .msg {
-    background: transparent; border: none; padding: 12px 0;
+    background: transparent; border: none; padding: 10px 0;
     border-radius: 0; color: var(--text-primary);
   }
-  .msg-wrap.agent .msg { padding-left: 0; padding-right: 0; }
   .msg .label { display: none; }
 
-  /* markdown inside messages */
-  .msg h1, .msg h2, .msg h3 { font-family: var(--font-display); margin: 16px 0 6px; font-size: 1.15em;
-    font-weight: 500; color: var(--text-primary); letter-spacing: -0.2px; }
+  /* markdown */
+  .msg h1, .msg h2, .msg h3 {
+    font-family: var(--font-display); margin: 16px 0 6px;
+    font-size: 1.15em; font-weight: 500; color: var(--text-primary); letter-spacing: -0.2px;
+  }
   .msg h1:first-child, .msg h2:first-child, .msg h3:first-child { margin-top: 0; }
   .msg p { margin: 6px 0; }
   .msg p:first-child { margin-top: 0; }
@@ -145,10 +298,10 @@
     font-family: var(--font-mono); font-size: 12px; color: var(--accent);
   }
   .msg pre {
-    background: #111113; border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 14px 16px; margin: 10px 0; overflow-x: auto; font-size: 12px;
-    line-height: 1.55;
+    background: var(--bg-base); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 16px; margin: 10px 0; overflow-x: auto; font-size: 12px; line-height: 1.55;
   }
+  [data-theme="dark"] .msg pre { background: #111113; }
   .msg pre code { background: none; padding: 0; color: var(--text-primary); font-size: 12px; }
   .msg blockquote {
     border-left: 2px solid var(--accent); padding-left: 14px; margin: 8px 0;
@@ -162,12 +315,13 @@
 
   /* ---- tool cards ---- */
   .tool-card {
-    align-self: flex-start; max-width: 72%; margin: 4px 0; animation: msgIn 0.3s ease;
+    align-self: flex-start; max-width: 72%; margin: 4px 0; animation: msgIn 0.25s ease;
   }
   .tool-card summary {
     font-size: 12px; color: var(--text-tertiary); cursor: pointer; padding: 6px 0;
-    display: flex; align-items: center; gap: 6px; user-select: none;
+    display: flex; align-items: center; gap: 6px; user-select: none; list-style: none;
   }
+  .tool-card summary::-webkit-details-marker { display: none; }
   .tool-card summary .dot {
     width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
   }
@@ -177,175 +331,200 @@
   @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
   .tool-card .tool-body {
     background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 12px 14px; margin-top: 2px; font-size: 13px;
+    padding: 12px 14px; margin-top: 4px; font-size: 13px;
   }
   .tool-card .tool-body pre {
-    background: #111113; border-radius: var(--radius-sm); padding: 10px 12px;
-    font-family: var(--font-mono); font-size: 11px; overflow-x: auto; color: var(--text-secondary);
-    margin: 0;
+    background: var(--bg-base); border-radius: var(--radius-sm);
+    padding: 10px 12px; font-family: var(--font-mono); font-size: 11px;
+    overflow-x: auto; color: var(--text-secondary); margin: 0;
   }
+  [data-theme="dark"] .tool-card .tool-body pre { background: #111113; }
 
-  /* ---- approval ---- */
-  @keyframes approvalPulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(212, 168, 83, 0.25), 0 0 20px rgba(212, 168, 83, 0.05); }
-    50% { box-shadow: 0 0 0 6px rgba(212, 168, 83, 0.06), 0 0 36px rgba(212, 168, 83, 0.12); }
-  }
-  @keyframes approvalSlideUp {
+  /* ============================================================
+     APPROVAL PANEL — fixed floating at bottom-left
+  ============================================================ */
+  @keyframes approvalPanelSlideUp {
     from { opacity: 0; transform: translateY(16px); }
-    to { opacity: 1; transform: translateY(0); }
+    to   { opacity: 1; transform: translateY(0); }
   }
-  @keyframes shieldReveal {
-    from { opacity: 0; transform: scale(0.6); }
-    to { opacity: 1; transform: scale(1); }
+  @keyframes approvalPanelSlideDown {
+    from { opacity: 1; transform: translateY(0); }
+    to   { opacity: 0; transform: translateY(16px); }
   }
-  @keyframes resolveFlash { 0% { opacity: 1; } 40% { opacity: 0.5; } 60% { opacity: 0.5; } 100% { opacity: 1; } }
 
-  .approval-card {
-    align-self: flex-start; max-width: 72%; width: 360px; margin: 4px 0;
-    background: linear-gradient(165deg, #252528 0%, #1e1e22 100%);
-    border: 1px solid rgba(212, 168, 83, 0.28);
+  #approval-panel {
+    position: absolute;
+    bottom: 100px;
+    left: 24px;
+    z-index: 100;
+    width: 380px;
+    max-width: calc(100% - 48px);
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
     border-radius: var(--radius);
-    padding: 0; overflow: hidden;
-    animation: approvalSlideUp 0.4s cubic-bezier(0.22, 0.61, 0.36, 1), approvalPulse 3s ease-in-out infinite;
-    position: relative;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    display: none;
   }
-  /* reflective top edge */
-  .approval-card::before {
-    content: ''; display: block; height: 1px;
-    background: linear-gradient(90deg, transparent, rgba(212, 168, 83, 0.35), transparent);
-    opacity: 0.7;
+  #approval-panel.active {
+    display: block;
+    animation: approvalPanelSlideUp 0.3s cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
   }
-  /* card inner structure */
-  .approval-card-inner { padding: 10px 14px 10px; }
-
-  /* ---- header row ---- */
-  .approval-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-  .approval-shield {
-    width: 20px; height: 24px; flex-shrink: 0;
-    animation: shieldReveal 0.5s 0.15s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  #approval-panel.active.hiding {
+    animation: approvalPanelSlideDown 0.25s ease forwards;
   }
-  .approval-shield svg { width: 100%; height: 100%; }
-  .approval-header-text { display: flex; flex-direction: column; gap: 0; }
-  .approval-header-text .label {
-    font-size: 8px; text-transform: uppercase; letter-spacing: 1.2px; font-weight: 600;
-    color: var(--accent); opacity: 0.85;
-  }
-  .approval-header-text .tool-name {
-    font-size: 13px; font-weight: 500; color: var(--text-primary);
-    font-family: var(--font-body); letter-spacing: -0.2px;
+  #approval-panel.resolved {
+    border-left-color: var(--success);
+    transition: border-left-color 0.3s ease;
   }
 
-  /* ---- params block ---- */
-  .approval-card .params {
-    font-size: 11px; color: #8b8b95; font-family: var(--font-mono);
-    background: #141418; padding: 6px 8px; border-radius: var(--radius-sm);
-    margin-bottom: 8px; line-height: 1.4; max-height: 60px; overflow-y: auto;
-    border: 1px solid rgba(255, 255, 255, 0.04);
-  }
-  .approval-card .params::-webkit-scrollbar { width: 3px; }
-  .approval-card .params::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  #approval-panel .inner { padding: 14px 16px; }
 
-  /* ---- approval description ---- */
-  .approval-card .approval-desc {
-    font-size: 12px; color: var(--text-secondary); line-height: 1.4;
-    margin-bottom: 4px; word-break: break-word; max-height: 50px; overflow-y: auto;
+  #approval-panel .header {
+    display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px;
   }
-  .approval-card .approval-details {
-    margin-bottom: 6px;
+  #approval-panel .header .icon {
+    width: 32px; height: 32px; border-radius: var(--radius-sm);
+    background: var(--accent-soft); border: 1px solid var(--accent-glow);
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+    color: var(--accent);
   }
-  .approval-card .approval-details summary {
-    font-size: 10px; color: var(--text-tertiary); cursor: pointer;
-    padding: 1px 0; user-select: none;
+  #approval-panel .header .icon svg { width: 16px; height: 16px; }
+  #approval-panel .header .text { flex: 1; }
+  #approval-panel .header .label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1px; font-weight: 600;
+    color: var(--accent); opacity: 0.9; display: block; margin-bottom: 2px;
   }
-  .approval-card .approval-details pre {
-    background: #111113; border-radius: var(--radius-sm); padding: 6px 8px;
-    font-family: var(--font-mono); font-size: 10px; color: var(--text-tertiary);
-    margin: 2px 0 0; max-height: 60px; overflow-y: auto; white-space: pre-wrap;
+  #approval-panel .header .tool-name {
+    font-size: 14px; font-weight: 500; color: var(--text-primary);
+    font-family: var(--font-mono); letter-spacing: -0.2px;
   }
 
-  /* ---- actions ---- */
-  .approval-card .actions { display: flex; gap: 6px; }
-  .approval-card .actions button {
-    flex: 1; padding: 7px 12px; border-radius: var(--radius-sm); border: none;
-    font-size: 12px; font-family: var(--font-body); font-weight: 500; cursor: pointer;
-    transition: all 0.2s cubic-bezier(0.22, 0.61, 0.36, 1);
-    letter-spacing: 0.2px; position: relative; overflow: hidden;
+  #approval-panel .desc {
+    font-size: 13px; color: var(--text-secondary); line-height: 1.5;
+    margin-bottom: 10px; word-break: break-word;
   }
-  .approval-card .approve-btn {
-    background: linear-gradient(135deg, #d4a853 0%, #c4963d 100%);
-    color: #1a1a1c; box-shadow: 0 2px 12px rgba(212, 168, 83, 0.2);
-  }
-  .approval-card .approve-btn:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 20px rgba(212, 168, 83, 0.35);
-  }
-  .approval-card .approve-btn:active { transform: translateY(0); box-shadow: 0 1px 6px rgba(212, 168, 83, 0.3); }
 
-  .approval-card .reject-btn {
-    background: rgba(255, 255, 255, 0.04); color: var(--text-tertiary);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+  #approval-panel .params-details {
+    margin-bottom: 12px;
+    border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden;
   }
-  .approval-card .reject-btn:hover {
-    background: rgba(229, 83, 75, 0.1); color: var(--danger);
-    border-color: rgba(229, 83, 75, 0.3);
+  #approval-panel .params-details summary {
+    font-size: 11px; color: var(--text-tertiary); cursor: pointer;
+    padding: 6px 10px; user-select: none; list-style: none;
+    background: var(--bg-elevated); display: flex; align-items: center; gap: 5px;
   }
-  .approval-card .reject-btn:active { background: rgba(229, 83, 75, 0.18); }
+  #approval-panel .params-details summary::-webkit-details-marker { display: none; }
+  #approval-panel .params-details summary::before {
+    content: '▶'; font-size: 8px; transition: transform 0.15s;
+    color: var(--text-tertiary);
+  }
+  #approval-panel .params-details[open] summary::before { transform: rotate(90deg); }
+  #approval-panel .params-details pre {
+    background: var(--bg-base); padding: 8px 10px;
+    font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary);
+    margin: 0; white-space: pre-wrap; word-break: break-word;
+    max-height: 120px; overflow-y: auto; line-height: 1.45;
+  }
+  [data-theme="dark"] #approval-panel .params-details pre { background: #111113; }
 
-  /* ---- resolved state ---- */
-  .approval-card.resolved { animation: none; opacity: 0.85; }
-  .approval-card.resolved .approval-shield { filter: grayscale(0.5); }
-  .approval-card .resolution-badge {
-    display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: var(--radius-sm);
-    font-size: 12px; font-weight: 500; letter-spacing: 0.2px;
+  #approval-panel .actions {
+    display: flex; gap: 8px;
   }
-  .approval-card .resolution-badge.approved {
-    background: rgba(87, 171, 90, 0.1); color: #6cc070;
-    border: 1px solid rgba(87, 171, 90, 0.2);
+  #approval-panel .actions button {
+    flex: 1; padding: 8px 14px; border-radius: var(--radius-sm); border: none;
+    font-size: 13px; font-family: var(--font-body); font-weight: 500; cursor: pointer;
+    transition: all 0.15s ease; letter-spacing: 0.1px;
   }
-  .approval-card .resolution-badge.rejected {
-    background: rgba(229, 83, 75, 0.08); color: #ea6d67;
-    border: 1px solid rgba(229, 83, 75, 0.18);
+  #approval-panel .approve-btn {
+    background: var(--accent); color: #1a1a1c;
+  }
+  #approval-panel .approve-btn:hover {
+    filter: brightness(1.1);
+    box-shadow: 0 2px 10px var(--accent-glow);
+  }
+  #approval-panel .approve-btn:active { filter: brightness(0.95); }
+  #approval-panel .reject-btn {
+    background: var(--bg-elevated); color: var(--text-secondary);
+    border: 1px solid var(--border);
+  }
+  #approval-panel .reject-btn:hover {
+    background: var(--danger-soft); color: var(--danger);
+    border-color: var(--danger);
+  }
+  #approval-panel .reject-btn:active { background: var(--danger-soft); }
+
+  #approval-panel .resolution-badge {
+    display: flex; align-items: center; gap: 7px;
+    padding: 8px 12px; border-radius: var(--radius-sm);
+    font-size: 13px; font-weight: 500;
+  }
+  #approval-panel .resolution-badge.approved {
+    background: rgba(87, 171, 90, 0.1); color: var(--success);
+    border: 1px solid rgba(87, 171, 90, 0.25);
+  }
+  #approval-panel .resolution-badge.rejected {
+    background: var(--danger-soft); color: var(--danger);
+    border: 1px solid rgba(229, 83, 75, 0.25);
+  }
+
+  @media (max-width: 680px) {
+    #approval-panel { width: calc(100vw - 48px); left: 24px; right: 24px; }
   }
 
   /* ---- thinking ---- */
-  .thinking-row { display: flex; align-items: center; gap: 8px; padding: 12px 0; animation: msgIn 0.3s ease; }
-  .thinking-row span { width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary);
-    animation: think 1.4s ease-in-out infinite; }
+  .thinking-row {
+    display: flex; align-items: center; gap: 8px; padding: 12px 0; animation: msgIn 0.25s ease;
+  }
+  .thinking-row span {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--text-tertiary);
+    animation: think 1.4s ease-in-out infinite;
+  }
   .thinking-row span:nth-child(2) { animation-delay: 0.2s; }
   .thinking-row span:nth-child(3) { animation-delay: 0.4s; }
-  @keyframes think { 0%, 60%, 100% { opacity: 0.2; transform: scale(0.7); }
-    30% { opacity: 1; transform: scale(1); } }
+  @keyframes think {
+    0%, 60%, 100% { opacity: 0.2; transform: scale(0.7); }
+    30% { opacity: 1; transform: scale(1); }
+  }
 
-  /* ---- reasoning (chain-of-thought) ---- */
+  /* ---- reasoning ---- */
   .reasoning-banner {
     margin: 4px 0; border-radius: var(--radius); overflow: hidden;
-    border: 1px solid rgba(212, 168, 83, 0.15);
-    animation: msgIn 0.3s ease;
+    border: 1px solid rgba(212, 168, 83, 0.18); animation: msgIn 0.25s ease;
   }
   .reasoning-banner summary {
     font-size: 11px; color: var(--accent); cursor: pointer; padding: 8px 12px;
-    background: rgba(212, 168, 83, 0.06); user-select: none;
+    background: var(--accent-soft); user-select: none; list-style: none;
     display: flex; align-items: center; gap: 6px;
   }
+  .reasoning-banner summary::-webkit-details-marker { display: none; }
   .reasoning-banner summary::before {
     content: ''; display: inline-block; width: 5px; height: 5px; border-radius: 50%;
-    background: var(--accent); animation: pulse 1.5s ease-in-out infinite;
+    background: var(--accent); animation: pulse 1.5s ease-in-out infinite; flex-shrink: 0;
   }
   .reasoning-banner .reasoning-body {
     font-size: 12px; color: var(--text-secondary); font-family: var(--font-body);
-    padding: 10px 14px; background: rgba(0,0,0,0.15); line-height: 1.6;
+    padding: 10px 14px; background: rgba(0,0,0,0.06); line-height: 1.6;
     max-height: 180px; overflow-y: auto;
   }
+  [data-theme="dark"] .reasoning-banner .reasoning-body { background: rgba(0,0,0,0.18); }
 
-  /* ---- input ---- */
-  #input-wrap { padding: 16px 24px 20px; flex-shrink: 0; }
+  /* ---- input area ---- */
+  #input-wrap {
+    padding: 12px 20px 18px;
+    flex-shrink: 0;
+    background: var(--bg-surface);
+    border-top: 1px solid var(--border);
+    transition: background 0.25s ease;
+  }
   #input-area {
     display: flex; align-items: flex-end; gap: 8px;
     background: var(--bg-input); border: 1px solid var(--border);
     border-radius: var(--radius-xl); padding: 6px 6px 6px 18px;
     transition: border-color 0.2s ease, box-shadow 0.2s ease;
   }
-  #input-area:focus-within { border-color: var(--border-hover); box-shadow: 0 0 0 3px var(--accent-soft); }
+  #input-area:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
   #input-area textarea {
     flex: 1; background: none; border: none; color: var(--text-primary);
     font-size: 14px; font-family: var(--font-body); line-height: 1.5;
@@ -364,23 +543,32 @@
   #send-btn:disabled:hover { background: var(--accent-soft); }
   #send-btn:disabled:hover svg { color: var(--accent); }
 
-  .hint { font-size: 11px; color: var(--text-tertiary); padding: 0 24px 0; text-align: center; }
+  .hint {
+    font-size: 11px; color: var(--text-tertiary);
+    padding: 0 0 8px; text-align: center;
+  }
 
-  /* ---- error ---- */
-  .msg-wrap.error .msg { background: var(--danger-soft); border: 1px solid var(--danger); color: var(--danger);
-    border-radius: var(--radius); padding: 10px 16px; font-size: 13px; }
+  /* error */
+  .msg-wrap.error .msg {
+    background: var(--danger-soft); border: 1px solid var(--danger);
+    color: var(--danger); border-radius: var(--radius); padding: 10px 16px; font-size: 13px;
+  }
 
-  /* responsive */
+  /* ============================================================
+     RESPONSIVE
+  ============================================================ */
   @media (max-width: 680px) {
-    #sidebar { display: none; }
+    #sidebar { display: none; position: absolute; z-index: 100; }
+    #sidebar.open { display: flex; }
     #sidebar-toggle { display: block; }
     .msg { max-width: 90%; }
-    .tool-card, .approval-card { max-width: 90%; }
+    .tool-card { max-width: 92%; }
   }
 </style>
 </head>
 <body>
 <div id="app">
+  <!-- SIDEBAR -->
   <div id="sidebar">
     <div id="sidebar-brand">
       <h1>MultiClaw</h1>
@@ -394,11 +582,20 @@
       </button>
     </div>
   </div>
+
+  <!-- MAIN -->
   <div id="main">
     <div id="main-top">
-      <h2 id="current-session-title">New Chat</h2>
       <button id="sidebar-toggle" onclick="toggleSidebar()" title="Toggle sidebar">&#9776;</button>
+      <h2 id="current-session-title">New Chat</h2>
+      <div class="topbar-controls">
+        <button id="theme-toggle" onclick="toggleTheme()" title="Toggle theme">
+          <svg id="theme-icon-dark" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+          <svg id="theme-icon-light" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+      </div>
     </div>
+
     <div id="messages">
       <div class="welcome" id="welcome">
         <div class="welcome-icon">&#x2699;&#xfe0f;</div>
@@ -406,8 +603,11 @@
         <p>Ask me anything, run tools, or create plans. I can inspect files, list directories, and help you navigate the codebase.</p>
       </div>
     </div>
-    <div class="hint">Try: <code>read src/multiclaw/server.py</code> &middot; <code>plan: research and write</code> &middot; <code>grep for session_id</code></div>
+
+    <div id="approval-panel"></div>
+
     <div id="input-wrap">
+      <div class="hint">Try: <code>read src/multiclaw/server.py</code> &middot; <code>plan: research and write</code> &middot; <code>grep for session_id</code></div>
       <div id="input-area">
         <textarea id="input" rows="1" placeholder="Message MultiClaw..." autofocus></textarea>
         <button id="send-btn" onclick="send()" title="Send">
@@ -417,11 +617,11 @@
     </div>
   </div>
 </div>
+
 <script>
 const msgs = document.getElementById('messages');
 const input = document.getElementById('input');
 const btn = document.getElementById('send-btn');
-const welcome = document.getElementById('welcome');
 let streamEl = null;
 let streamContent = '';
 let thinkingEl = null;
@@ -430,18 +630,65 @@ let hasFirstToken = false;
 let currentSessionId = null;
 let sessions = [];
 
+// ---- theme ----
+function toggleTheme() {
+  const html = document.documentElement;
+  const isDark = html.getAttribute('data-theme') === 'dark';
+  html.setAttribute('data-theme', isDark ? 'light' : 'dark');
+  document.getElementById('theme-icon-dark').style.display = isDark ? 'none' : '';
+  document.getElementById('theme-icon-light').style.display = isDark ? '' : 'none';
+  try { localStorage.setItem('multiclaw:theme', isDark ? 'light' : 'dark'); } catch(e) {}
+}
+
+// Restore theme
+(function() {
+  try {
+    const saved = localStorage.getItem('multiclaw:theme');
+    if (saved && saved !== 'dark') {
+      document.documentElement.setAttribute('data-theme', saved);
+      document.getElementById('theme-icon-dark').style.display = 'none';
+      document.getElementById('theme-icon-light').style.display = '';
+    }
+  } catch(e) {}
+})();
+
+// ---- debug ----
+const DEBUG_STORAGE_KEY = 'multiclaw:debug';
+function readDebugFlag() {
+  try {
+    const params = new URLSearchParams(location.search || '');
+    if (params.get('debug') === '1') return true;
+    if (params.get('debug') === '0') return false;
+  } catch (e) {}
+  try { return localStorage.getItem(DEBUG_STORAGE_KEY) === '1'; } catch (e) {}
+  return false;
+}
+const debugEnabled = readDebugFlag();
+function debugLog(event, data) {
+  if (!debugEnabled) return;
+  const stamp = new Date().toISOString();
+  console.info('[MultiClaw debug]', stamp, event, data !== undefined ? data : '');
+}
+globalThis.multiclawDebug = {
+  enabled: debugEnabled,
+  enable: function() { try { localStorage.setItem(DEBUG_STORAGE_KEY, '1'); } catch(e) {} console.info('[MultiClaw debug] debug=1; refresh to apply'); },
+  disable: function() { try { localStorage.removeItem(DEBUG_STORAGE_KEY); } catch(e) {} console.info('[MultiClaw debug] debug=0; refresh to apply'); },
+};
+debugLog('page_loaded', {debugEnabled});
+
 // ---- textarea auto-resize ----
 input.addEventListener('input', function() {
   this.style.height = 'auto';
   this.style.height = Math.min(this.scrollHeight, 160) + 'px';
 });
 
-// ---- welcome screen ----
+// ---- welcome ----
 function hideWelcome() {
-  if (welcome) { welcome.style.display = 'none'; }
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.style.display = 'none';
 }
 
-// ---- thinking indicator ----
+// ---- thinking ----
 function showThinking() {
   if (thinkingEl) return;
   thinkingEl = document.createElement('div');
@@ -450,12 +697,11 @@ function showThinking() {
   msgs.appendChild(thinkingEl);
   scrollDown();
 }
-
 function removeThinking() {
   if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
 }
 
-// ---- reasoning (chain-of-thought) ----
+// ---- reasoning ----
 function showReasoning(text) {
   hideWelcome();
   if (!reasoningEl) {
@@ -466,16 +712,14 @@ function showReasoning(text) {
     msgs.appendChild(reasoningEl);
     scrollDown();
   }
-  const body = reasoningEl.querySelector('.reasoning-body');
-  body.textContent += text;
+  reasoningEl.querySelector('.reasoning-body').textContent += text;
   scrollDown();
 }
-
 function clearReasoning() {
   if (reasoningEl) { reasoningEl.remove(); reasoningEl = null; }
 }
 
-// ---- streaming message ----
+// ---- streaming ----
 function ensureStreamEl() {
   if (!streamEl) {
     removeThinking();
@@ -491,10 +735,8 @@ function ensureStreamEl() {
 
 function appendToken(token) {
   if (!hasFirstToken) { ensureStreamEl(); hasFirstToken = true; hideWelcome(); clearReasoning(); }
-  streamContent += token;
-  streamContent += token;
-  const body = streamEl.querySelector('.stream-body');
-  body.innerHTML = marked.parse(streamContent);
+  streamContent += token;  // FIX: was doubled (streamContent += token twice)
+  streamEl.querySelector('.stream-body').innerHTML = marked.parse(streamContent);
   scrollDown();
 }
 
@@ -502,8 +744,7 @@ function finalizeStream(content) {
   clearReasoning();
   _collapseAllTools();
   if (streamEl) {
-    const body = streamEl.querySelector('.stream-body');
-    body.innerHTML = marked.parse(content || streamContent);
+    streamEl.querySelector('.stream-body').innerHTML = marked.parse(content || streamContent);
     streamEl = null;
     streamContent = '';
     hasFirstToken = false;
@@ -524,7 +765,6 @@ function addMessage(role, content) {
   scrollDown();
   return wrap;
 }
-
 function addError(content) {
   hideWelcome();
   const wrap = document.createElement('div');
@@ -537,22 +777,13 @@ function addError(content) {
   scrollDown();
 }
 
-// ---- tool call / result ----
-function _allToolCards() {
-  return document.querySelectorAll('.tool-card');
-}
-
+// ---- tools ----
+function _allToolCards() { return document.querySelectorAll('.tool-card'); }
 function _collapseAllTools() {
-  _allToolCards().forEach(function(c) {
-    c.querySelector('details').open = false;
-  });
+  _allToolCards().forEach(function(c) { c.querySelector('details').open = false; });
 }
-
 function showToolCall(name, args) {
-  hideWelcome();
-  removeThinking();
-  clearReasoning();
-  // Collapse all existing tool cards, mark any running dots as done
+  hideWelcome(); removeThinking(); clearReasoning();
   _allToolCards().forEach(function(c) {
     c.querySelector('details').open = false;
     var dot = c.querySelector('.dot.running');
@@ -565,87 +796,109 @@ function showToolCall(name, args) {
   msgs.appendChild(card);
   scrollDown();
 }
-
 function showToolResult(name, content) {
   _allToolCards().forEach(function(card) {
     var summary = card.querySelector('summary');
     if (summary && summary.textContent.includes(name) && card.querySelector('.dot.running')) {
       summary.querySelector('.dot').className = 'dot done';
-      var body = card.querySelector('.tool-body');
-      body.innerHTML = '<pre>' + escapeHtml(content) + '</pre>';
+      card.querySelector('.tool-body').innerHTML = '<pre>' + escapeHtml(content) + '</pre>';
     }
   });
   showThinking();
   scrollDown();
 }
 
-// ---- approval ----
-const SHIELD_SVG = '<svg viewBox="0 0 34 40" fill="none" xmlns="http://www.w3.org/2000/svg">' +
-  '<path d="M17 0L1 6.5V18.5C1 29.5 8 37.5 17 40C26 37.5 33 29.5 33 18.5V6.5L17 0Z" ' +
-  'fill="rgba(212,168,83,0.12)" stroke="rgba(212,168,83,0.4)" stroke-width="1.2" stroke-linejoin="round"/>' +
-  '<path d="M17 8L17 27" stroke="rgba(212,168,83,0.35)" stroke-width="1.4" stroke-linecap="round"/>' +
-  '<circle cx="17" cy="32" r="1.8" fill="rgba(212,168,83,0.6)"/>' +
-  '<path d="M17 13L17 17" stroke="rgba(212,168,83,0.5)" stroke-width="2.2" stroke-linecap="round"/>' +
-  '</svg>';
+// ---- approval (fixed floating panel) ----
+const APPROVE_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>';
+var _currentApprovalRequestId = null;
+var _approvalHideTimer = null;
 
 function showApproval(requestId, tool, params, description) {
-  hideWelcome();
-  removeThinking();
-  clearReasoning();
-  var desc = description || escapeHtml(JSON.stringify(params));
-  var detailsOpen = !description; // only default-open if showing raw JSON
-  var div = document.createElement('div');
-  div.className = 'approval-card';
-  div.id = 'approval-' + requestId;
-  div.innerHTML =
-    '<div class="approval-card-inner">' +
-    '<div class="approval-header">' +
-    '<div class="approval-shield">' + SHIELD_SVG + '</div>' +
-    '<div class="approval-header-text">' +
-    '<span class="label">Approval Required</span>' +
-    '<span class="tool-name">' + escapeHtml(tool) + '</span>' +
-    '</div>' +
-    '</div>' +
-    '<div class="approval-desc">' + escapeHtml(desc) + '</div>' +
-    '<details class="approval-details"><summary>Raw params</summary><pre>' + escapeHtml(JSON.stringify(params, null, 2)) + '</pre></details>' +
-    '<div class="actions">' +
-    '<button class="approve-btn" id="approve-' + requestId + '">Approve</button>' +
-    '<button class="reject-btn" id="reject-' + requestId + '">Reject</button>' +
-    '</div>' +
-    '</div>';
-  msgs.appendChild(div);
-  document.getElementById('approve-' + requestId).onclick = function() { resolveApproval(requestId, true); };
-  document.getElementById('reject-' + requestId).onclick = function() { resolveApproval(requestId, false); };
-  // Ensure the Approve/Reject buttons are visible
-  requestAnimationFrame(function() {
-    requestAnimationFrame(function() {
-      var actions = div.querySelector('.actions');
-      if (actions) actions.scrollIntoView({block: 'end', behavior: 'smooth'});
-    });
-  });
+  // Always log approval events — critical for debugging
+  console.log('[MultiClaw] approval received:', { requestId, tool, hasDescription: Boolean(description) });
+  debugLog('approval_render_start', { requestId, tool, hasDescription: Boolean(description) });
+
+  try {
+    var desc = description || JSON.stringify(params);
+    var panel = document.getElementById('approval-panel');
+    if (!panel) { console.error('[MultiClaw] approval-panel element not found'); return; }
+
+    // Clear any pending hide timer
+    if (_approvalHideTimer) { clearTimeout(_approvalHideTimer); _approvalHideTimer = null; }
+    panel.classList.remove('hiding', 'resolved');
+
+    panel.innerHTML =
+      '<div class="inner">' +
+      '<div class="header">' +
+      '<div class="icon">' + APPROVE_ICON_SVG + '</div>' +
+      '<div class="text">' +
+      '<span class="label">Approval Required</span>' +
+      '<span class="tool-name">' + escapeHtml(tool) + '</span>' +
+      '</div>' +
+      '</div>' +
+      '<div class="desc">' + escapeHtml(desc) + '</div>' +
+      '<details class="params-details"><summary>Raw params</summary><pre>' + escapeHtml(JSON.stringify(params, null, 2)) + '</pre></details>' +
+      '<div class="actions">' +
+      '<button class="approve-btn" id="approve-' + requestId + '">Approve</button>' +
+      '<button class="reject-btn" id="reject-' + requestId + '">Reject</button>' +
+      '</div>' +
+      '</div>';
+
+    _currentApprovalRequestId = requestId;
+    panel.classList.add('active');
+
+    document.getElementById('approve-' + requestId).onclick = function() { resolveApproval(requestId, true); };
+    document.getElementById('reject-' + requestId).onclick = function() { resolveApproval(requestId, false); };
+
+    console.log('[MultiClaw] approval panel shown for', tool);
+  } catch(e) {
+    console.error('[MultiClaw] showApproval failed:', e);
+    addError('Failed to show approval: ' + e.message);
+  }
 }
 
 async function resolveApproval(requestId, approved) {
-  const card = document.getElementById('approval-' + requestId);
-  if (card) {
-    const actionsEl = card.querySelector('.actions');
+  console.log('[MultiClaw] approval action:', { requestId, approved });
+  debugLog('approval_submit_start', { requestId, approved });
+
+  var panel = document.getElementById('approval-panel');
+  if (panel) {
+    var actionsEl = panel.querySelector('.actions');
     if (actionsEl) {
-      const badgeClass = approved ? 'approved' : 'rejected';
-      const badgeIcon = approved ?
-        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>' :
-        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
-      const badgeText = approved ? 'Approved' : 'Rejected';
+      var badgeClass = approved ? 'approved' : 'rejected';
+      var badgeIcon = approved ?
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>' :
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+      var badgeText = approved ? 'Approved' : 'Rejected';
       actionsEl.innerHTML = '<div class="resolution-badge ' + badgeClass + '">' + badgeIcon + badgeText + '</div>';
-      card.classList.add('resolved');
+      panel.classList.add('resolved');
     }
+
+    // Hide after brief delay: show badge 800ms, then slide down 300ms
+    _approvalHideTimer = setTimeout(function() {
+      panel.classList.add('hiding');
+      setTimeout(function() {
+        panel.classList.remove('active', 'hiding', 'resolved');
+        panel.innerHTML = '';
+        _currentApprovalRequestId = null;
+        _approvalHideTimer = null;
+      }, 300);
+    }, 800);
   }
+
   try {
-    await fetch('/approve', {
+    var res = await fetch('/approve', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({request_id: requestId, approved: approved}),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_id: requestId, approved }),
     });
-  } catch (e) {
+    var payload = null;
+    try { payload = await res.json(); } catch(e) {}
+    debugLog('approval_submit_done', { requestId, approved, status: res.status, ok: res.ok, response: payload });
+    console.log('[MultiClaw] approval resolved:', { requestId, approved, ok: res.ok });
+  } catch(e) {
+    debugLog('approval_submit_failed', { requestId, approved, error: e.message });
+    console.error('[MultiClaw] approval submit failed:', e.message);
     addError('Approval failed: ' + e.message);
   }
 }
@@ -656,57 +909,91 @@ async function loadSessions() {
     const res = await fetch('/sessions');
     sessions = await res.json();
     renderSessions();
-  } catch (e) {
-    console.error('loadSessions failed', e);
-  }
+  } catch(e) { console.error('loadSessions failed', e); }
 }
-
 function renderSessions() {
   const list = document.getElementById('session-list');
   list.innerHTML = '';
   for (const s of sessions) {
     const div = document.createElement('div');
     div.className = 'session-item' + (s.id === currentSessionId ? ' active' : '');
-    div.onclick = function() { switchSession(s.id); };
-    div.innerHTML = '<span class="icon">' + (s.id === currentSessionId ? '●' : '○') + '</span><span class="title">' + escapeHtml(s.title) + '</span>';
+    div.onclick = function(e) {
+      // Don't switch if delete button was clicked
+      if (e.target.classList.contains('delete-btn')) return;
+      switchSession(s.id);
+    };
+    div.innerHTML =
+      '<span class="icon">' + (s.id === currentSessionId ? '●' : '○') + '</span>' +
+      '<span class="title">' + escapeHtml(s.title) + '</span>' +
+      '<button class="delete-btn" title="Delete">&times;</button>';
+    // Attach delete handler
+    div.querySelector('.delete-btn').onclick = async function(e) {
+      e.stopPropagation();
+      if (!confirm('Delete this conversation?')) return;
+      await deleteSession(s.id);
+    };
     list.appendChild(div);
   }
 }
-
+async function deleteSession(id) {
+  try {
+    await fetch('/sessions/' + id, { method: 'DELETE' });
+    if (currentSessionId === id) {
+      currentSessionId = null;
+      document.getElementById('current-session-title').textContent = 'New Chat';
+      msgs.innerHTML = '<div class="welcome" id="welcome"><div class="welcome-icon">&#x2699;&#xfe0f;</div><h3>MultiClaw Agent</h3><p>Ask me anything, run tools, or create plans.</p></div>';
+    }
+    await loadSessions();
+  } catch(e) { console.error('deleteSession failed', e); }
+}
 async function createSession() {
   try {
     const res = await fetch('/sessions', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({title: 'New Chat'}),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'New Chat' }),
     });
     const session = await res.json();
     currentSessionId = session.id;
     document.getElementById('current-session-title').textContent = session.title;
     msgs.innerHTML = '<div class="welcome" id="welcome"><div class="welcome-icon">&#x2699;&#xfe0f;</div><h3>MultiClaw Agent</h3><p>Ask me anything, run tools, or create plans.</p></div>';
     await loadSessions();
-  } catch (e) {
-    console.error('createSession failed', e);
-  }
+  } catch(e) { console.error('createSession failed', e); }
 }
-
-function switchSession(id) {
+async function switchSession(id) {
   currentSessionId = id;
   const s = sessions.find(function(s) { return s.id === id; });
   if (s) document.getElementById('current-session-title').textContent = s.title;
-  msgs.innerHTML = '<div class="welcome" id="welcome"><div class="welcome-icon">&#x2699;&#xfe0f;</div><h3>MultiClaw Agent</h3><p>Ask me anything, run tools, or create plans.</p></div>';
+
+  // Clear and show loading state
+  msgs.innerHTML = '';
+
+  try {
+    const res = await fetch('/sessions/' + id + '/messages?limit=50');
+    const messages = await res.json();
+    if (messages.length === 0) {
+      msgs.innerHTML = '<div class="welcome" id="welcome"><div class="welcome-icon">&#x2699;&#xfe0f;</div><h3>MultiClaw Agent</h3><p>Ask me anything, run tools, or create plans.</p></div>';
+    } else {
+      for (const msg of messages) {
+        addMessage(msg.role, msg.content);
+      }
+    }
+  } catch(e) {
+    console.error('loadMessages failed', e);
+    msgs.innerHTML = '<div class="welcome" id="welcome"><div class="welcome-icon">&#x2699;&#xfe0f;</div><h3>MultiClaw Agent</h3><p>Ask me anything, run tools, or create plans.</p></div>';
+  }
+
   renderSessions();
 }
-
 function toggleSidebar() {
   const sidebar = document.getElementById('sidebar');
-  sidebar.style.display = sidebar.style.display === 'none' ? 'flex' : 'none';
+  sidebar.classList.toggle('open');
 }
 
 // ---- send ----
 async function send() {
   const text = input.value.trim();
   if (!text || btn.disabled) return;
+  debugLog('send_start', { currentSessionId, textPreview: text.slice(0, 80) });
   addMessage('user', text);
   input.value = '';
   input.style.height = 'auto';
@@ -714,29 +1001,33 @@ async function send() {
   showThinking();
 
   try {
-    const body = {message: text};
+    const body = { message: text };
     if (currentSessionId) body.session_id = currentSessionId;
+
     const res = await fetch('/chat', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
+    debugLog('chat_response', { status: res.status, ok: res.ok });
+    if (!res.body) throw new Error('Response body is not readable');
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
 
     while (true) {
-      const {done, value} = await reader.read();
+      const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, {stream: true});
-
+      buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
-
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
-        const data = JSON.parse(line.slice(6));
+        let data = null;
+        try { data = JSON.parse(line.slice(6)); }
+        catch (e) { console.error('[MultiClaw] SSE parse failed:', e.message, line.slice(0, 200)); debugLog('sse_parse_failed', { line: line.slice(0, 200), error: e.message }); throw e; }
+        if (data.type !== 'token' && data.type !== 'reasoning') debugLog('sse_event', data);
 
         if (data.type === 'session') {
           if (!currentSessionId) {
@@ -744,25 +1035,22 @@ async function send() {
             document.getElementById('current-session-title').textContent = data.title;
             loadSessions();
           }
-        } else if (data.type === 'reasoning') {
-          showReasoning(data.content);
-        } else if (data.type === 'token') {
-          appendToken(data.content);
-        } else if (data.type === 'done') {
-          finalizeStream(data.content);
-        } else if (data.type === 'tool_call') {
-          showToolCall(data.name, data.arguments);
-        } else if (data.type === 'tool_result') {
-          showToolResult(data.name, data.content);
+        } else if (data.type === 'reasoning') { showReasoning(data.content);
+        } else if (data.type === 'token') { appendToken(data.content);
+        } else if (data.type === 'done') { finalizeStream(data.content);
+        } else if (data.type === 'tool_call') { showToolCall(data.name, data.arguments);
+        } else if (data.type === 'tool_result') { showToolResult(data.name, data.content);
         } else if (data.type === 'approval_required') {
-          showApproval(data.request_id, data.tool, data.params, data.description);
-        } else if (data.type === 'error') {
-          finalizeStream(null);
-          addError(data.content);
-        }
+          console.log('[MultiClaw] SSE approval_required event:', { requestId: data.request_id, tool: data.tool });
+          debugLog('approval_event_received', { requestId: data.request_id, tool: data.tool });
+          try { showApproval(data.request_id, data.tool, data.params, data.description); }
+          catch(e) { console.error('[MultiClaw] showApproval threw:', e); addError('Approval error: ' + e.message); }
+        } else if (data.type === 'error') { finalizeStream(null); addError(data.content); }
       }
     }
-  } catch (e) {
+  } catch(e) {
+    console.error('[MultiClaw] send failed:', e.message);
+    debugLog('send_failed', { error: e.message });
     finalizeStream(null);
     removeThinking();
     addError('Connection failed: ' + e.message);
@@ -777,14 +1065,12 @@ function escapeHtml(s) {
   el.textContent = s;
   return el.innerHTML;
 }
-
-function scrollDown() {
-  msgs.scrollTop = msgs.scrollHeight;
-}
+function scrollDown() { msgs.scrollTop = msgs.scrollHeight; }
 
 input.addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
+
 loadSessions();
 </script>
 </body>
