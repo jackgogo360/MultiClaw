@@ -36,6 +36,9 @@ data/
 *.jsonl
 .DS_Store
 
+# IDE
+.idea/
+
 # Runtime data
 .omx/
 .superpowers/
