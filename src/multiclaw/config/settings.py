@@ -74,6 +74,7 @@ class BrevoSettings(BaseModel):
     api_key: str = ""
     sender_email: str = ""
     sender_name: str = "MultiClaw"
+    mock: bool = False
 
 
 class Settings(BaseSettings):

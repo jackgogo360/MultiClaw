@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from multiclaw.memory import MemoryEntry, MemoryProtocol
 
@@ -9,6 +9,7 @@ class ContextRequest:
     user_input: str
     session_id: str
     context_window_limit: int
+    skill_prompts: list[tuple[str, str]] = field(default_factory=list)
 
 
 class ContextBuilder:
@@ -26,6 +27,10 @@ class ContextBuilder:
 
     async def build(self, request: ContextRequest) -> list[dict]:
         messages: list[dict] = [{"role": "system", "content": request.system_prompt}]
+
+        # Inject active skill prompts as independent system messages
+        for name, body in request.skill_prompts:
+            messages.append({"role": "system", "content": body})
 
         recent_entries = await self.memory.recent(
             limit=self.recent_turns * 4,

@@ -1,7 +1,10 @@
+import logging
+
 import httpx
 
 from multiclaw.config import Settings
 
+logger = logging.getLogger("multiclaw")
 BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 
@@ -11,8 +14,9 @@ async def send_verification_code(settings: Settings, to_email: str, code: str) -
         resp = await client.post(
             BREVO_API_URL,
             headers={
+                "accept": "application/json",
                 "api-key": brevo.api_key,
-                "Content-Type": "application/json",
+                "content-type": "application/json",
             },
             json={
                 "sender": {"name": brevo.sender_name, "email": brevo.sender_email},
@@ -30,4 +34,6 @@ async def send_verification_code(settings: Settings, to_email: str, code: str) -
                 ),
             },
         )
+        if resp.is_error:
+            logger.error("Brevo API error %s: %s", resp.status_code, resp.text)
         resp.raise_for_status()

@@ -17,7 +17,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             try:
                 payload = jwt.decode(token, store.jwt_secret, algorithms=["HS256"])
                 user = {"id": payload["sub"], "email": payload["email"]}
-            except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+            except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, KeyError):
                 pass
 
         request.state.user = user
