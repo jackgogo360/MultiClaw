@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from enum import Enum
 from pathlib import Path
@@ -11,6 +12,8 @@ from pydantic import BaseModel, Field
 
 from multiclaw.tools._common import WorkspaceToolBuilder, _error, _success
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
+
+logger = logging.getLogger(__name__)
 
 
 class FetchMode(str, Enum):
@@ -129,6 +132,8 @@ class WebFetchInvocation(ToolInvocation[WebFetchParams]):
         try:
             with httpx.Client(timeout=self.timeout, follow_redirects=True, headers=DEFAULT_HEADERS) as client:
                 resp = client.get(url)
+                if resp.is_error:
+                    logger.error("WebFetch light error %s for %s: %s", resp.status_code, url, resp.text[:1000])
                 resp.raise_for_status()
                 html = resp.text[:5_000_000]
                 text = trafilatura.extract(html, include_links=True, include_tables=True,
@@ -159,6 +164,8 @@ class WebFetchInvocation(ToolInvocation[WebFetchParams]):
         try:
             with httpx.Client(timeout=self.timeout, follow_redirects=True, headers=DEFAULT_HEADERS) as client:
                 resp = client.get(url)
+                if resp.is_error:
+                    logger.error("WebFetch markdown error %s for %s: %s", resp.status_code, url, resp.text[:1000])
                 resp.raise_for_status()
                 html = resp.text[:5_000_000]
                 html = re.sub(r"<nav[^>]*>.*?</nav>", "", html, flags=re.DOTALL | re.IGNORECASE)

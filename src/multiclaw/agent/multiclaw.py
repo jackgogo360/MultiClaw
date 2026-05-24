@@ -15,6 +15,7 @@ from multiclaw.llm import LLMResponse, ModelRouter
 from multiclaw.memory import MemoryEntry, MemoryProtocol
 from multiclaw.planner import Planner
 from multiclaw.tools import CoreToolScheduler, ToolRegistry
+from multiclaw.skills import SkillManager
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class MultiClawAgent(ToolCallAgent):
         memory: MemoryProtocol,
         planner: Planner,
         event_bus: EventBus,
+        skill_manager: SkillManager | None = None,
     ) -> None:
         super().__init__(
             settings=settings,
@@ -70,6 +72,7 @@ class MultiClawAgent(ToolCallAgent):
             context_history_ratio=settings.memory.context_history_ratio,
             include_legacy_memory=settings.memory.include_legacy_memory_in_retrieval,
         )
+        self.skill_manager = skill_manager or SkillManager()
 
     # ------------------------------------------------------------------
     # non-streaming path
@@ -85,15 +88,29 @@ class MultiClawAgent(ToolCallAgent):
                 content=self.planner.summary(plan),
             )
 
+        # --- Skill handling ---
+        user_msg = user_input
+
+        if user_input.startswith("/"):
+            parts = user_input[1:].split(None, 1)
+            skill_name = parts[0]
+            args = parts[1] if len(parts) > 1 else ""
+            self.skill_manager.invoke(skill_name, args)
+        else:
+            self.skill_manager.process_message(user_msg)
+
+        skill_prompts = self.skill_manager.get_active_skill_prompts()
+
         messages = await self.context_builder.build(
             ContextRequest(
                 system_prompt=self.settings.agent.system_prompt,
-                user_input=user_input,
+                user_input=user_msg,
                 session_id=session_id,
                 context_window_limit=self.settings.memory.context_window_limit,
+                skill_prompts=skill_prompts,
             )
         )
-        await self._save_chat_msg(user_input, "user", session_id)
+        await self._save_chat_msg(user_msg, "user", session_id)
         tools = self.registry.to_openai_schemas()
         max_rounds = self.settings.agent.max_tool_rounds
 
@@ -174,15 +191,34 @@ class MultiClawAgent(ToolCallAgent):
             return
 
         await self.transition(AgentState.THINKING)
+
+        # --- Skill handling ---
+        user_msg = user_input
+
+        if user_input.startswith("/"):
+            parts = user_input[1:].split(None, 1)
+            skill_name = parts[0]
+            args = parts[1] if len(parts) > 1 else ""
+            body = self.skill_manager.invoke(skill_name, args)
+            if body is not None:
+                yield {"type": "skill", "name": skill_name, "active": True}
+        else:
+            activated = self.skill_manager.process_message(user_msg)
+            for s in activated:
+                yield {"type": "skill", "name": s.name, "active": True}
+
+        skill_prompts = self.skill_manager.get_active_skill_prompts()
+
         messages = await self.context_builder.build(
             ContextRequest(
                 system_prompt=self.settings.agent.system_prompt,
-                user_input=user_input,
+                user_input=user_msg,
                 session_id=session_id,
                 context_window_limit=self.settings.memory.context_window_limit,
+                skill_prompts=skill_prompts,
             )
         )
-        await self._save_chat_msg(user_input, "user", session_id)
+        await self._save_chat_msg(user_msg, "user", session_id)
         tools = self.registry.to_openai_schemas()
         max_rounds = self.settings.agent.max_tool_rounds
 

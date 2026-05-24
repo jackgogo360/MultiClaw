@@ -22,6 +22,7 @@ class SqliteSessionStore:
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 status TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 last_message_at TEXT,
@@ -47,21 +48,22 @@ class SqliteSessionStore:
         )
         await self._db.commit()
 
-    async def create(self, title: str = "New Chat") -> ChatSession:
+    async def create(self, title: str = "New Chat", user_id: str = "") -> ChatSession:
         title = _validate_title(title)
-        session = ChatSession(title=title)
+        session = ChatSession(title=title, user_id=user_id)
         db = await self._ensure_db()
         await db.execute(
             """
             INSERT INTO chat_sessions (
-                id, title, status, created_at, updated_at, last_message_at, metadata
+                id, title, status, user_id, created_at, updated_at, last_message_at, metadata
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session.id,
                 session.title,
                 session.status.value,
+                session.user_id,
                 session.created_at.isoformat(),
                 session.updated_at.isoformat(),
                 None,
@@ -80,15 +82,18 @@ class SqliteSessionStore:
         row = await cursor.fetchone()
         return _row_to_session(row) if row else None
 
-    async def list_sessions(self, include_archived: bool = False) -> list[ChatSession]:
+    async def list_sessions(self, include_archived: bool = False, user_id: str | None = None) -> list[ChatSession]:
         db = await self._ensure_db()
-        query = "SELECT * FROM chat_sessions"
-        params: tuple[str, ...] = ()
+        query = "SELECT * FROM chat_sessions WHERE 1=1"
+        params: list[str] = []
         if not include_archived:
-            query += " WHERE status = ?"
-            params = (SessionStatus.ACTIVE.value,)
+            query += " AND status = ?"
+            params.append(SessionStatus.ACTIVE.value)
+        if user_id is not None:
+            query += " AND user_id = ?"
+            params.append(user_id)
         query += " ORDER BY COALESCE(last_message_at, created_at) DESC"
-        cursor = await db.execute(query, params)
+        cursor = await db.execute(query, tuple(params))
         rows = await cursor.fetchall()
         return [_row_to_session(row) for row in rows]
 
@@ -191,6 +196,7 @@ def _row_to_session(row: aiosqlite.Row) -> ChatSession:
         id=row["id"],
         title=row["title"],
         status=SessionStatus(row["status"]),
+        user_id=row["user_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         last_message_at=row["last_message_at"],

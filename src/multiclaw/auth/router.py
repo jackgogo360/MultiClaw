@@ -1,9 +1,11 @@
+import logging
 from datetime import datetime, timedelta, timezone
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from multiclaw.auth.brevo import send_verification_code
+from multiclaw.config import Settings
 from multiclaw.auth.models import (
     AuthResponse,
     MeResponse,
@@ -12,6 +14,7 @@ from multiclaw.auth.models import (
 )
 from multiclaw.auth.store import MAX_SENDS_PER_DAY, AuthStore
 
+logger = logging.getLogger("multiclaw")
 router = APIRouter(prefix="/auth")
 
 
@@ -19,7 +22,7 @@ def _get_store(request: Request) -> AuthStore:
     return request.app.state.auth_store
 
 
-def _get_settings(request: Request):
+def _get_settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
@@ -48,14 +51,22 @@ async def send_code(body: SendCodeRequest, request: Request):
             status_code=429, detail="Too many attempts, please try again tomorrow"
         )
 
-    code = await store.create_code(email)
     settings = _get_settings(request)
+    if settings.brevo.mock:
+        vc = store.build_code(email, code="654321")
+        await store.save_code(vc)
+        logger.info("Mock email code for %s: 654321", email)
+        return AuthResponse()
+
+    vc = store.build_code(email)
     try:
-        await send_verification_code(settings, email, code.code)
+        await send_verification_code(settings, email, vc.code)
     except Exception:
+        logger.exception("Failed to send verification email to %s", email)
         raise HTTPException(
             status_code=502, detail="Failed to send email, please try again later"
         )
+    await store.save_code(vc)
 
     return AuthResponse()
 

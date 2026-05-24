@@ -33,4 +33,10 @@ dmypy.json
 data/
 .env
 *.log
+*.jsonl
 .DS_Store
+
+# Runtime data
+.omx/
+.superpowers/
+.claude/worktrees/

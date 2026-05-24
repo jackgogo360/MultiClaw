@@ -5,8 +5,8 @@ from contextlib import asynccontextmanager
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 LOG_DIR = Path.home() / ".multiclaw" / "logs"
@@ -99,6 +99,10 @@ from multiclaw.tools.web_fetch import WebFetchToolBuilder
 from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
 
+from multiclaw.auth.store import AuthStore
+from multiclaw.auth.middleware import AuthMiddleware, require_auth
+from multiclaw.auth.router import router as auth_router
+
 
 # ---------------------------------------------------------------------------
 # Agent factory
@@ -184,10 +188,16 @@ def create_agent() -> MultiClawAgent:
 async def lifespan(app: FastAPI):
     global agent
     agent = create_agent()
+    auth_store = AuthStore(agent.settings.database.path)
+    await auth_store.initialize()
+    app.state.auth_store = auth_store
+    app.state.settings = agent.settings
     yield
 
 
 app = FastAPI(title="MultiClaw", lifespan=lifespan)
+app.add_middleware(AuthMiddleware)
+app.include_router(auth_router)
 
 
 class ChatRequest(BaseModel):
@@ -209,66 +219,83 @@ class ApproveRequest(BaseModel):
 
 
 @app.post("/approve")
-async def approve(req: ApproveRequest):
+async def approve(req: ApproveRequest, user: dict = Depends(require_auth)):
     ok = agent.scheduler.resolve_approval(req.request_id, req.approved)
     return {"ok": ok}
 
 
 @app.get("/sessions")
-async def list_sessions(include_archived: bool = False):
-    sessions = await agent.session_store.list_sessions(include_archived=include_archived)
+async def list_sessions(include_archived: bool = False, user: dict = Depends(require_auth)):
+    sessions = await agent.session_store.list_sessions(
+        include_archived=include_archived, user_id=user["id"]
+    )
     return [session.model_dump(mode="json") for session in sessions]
 
 
 @app.post("/sessions")
-async def create_session(req: SessionCreateRequest):
-    session = await agent.session_store.create(title=req.title)
+async def create_session(req: SessionCreateRequest, user: dict = Depends(require_auth)):
+    session = await agent.session_store.create(title=req.title, user_id=user["id"])
     return session.model_dump(mode="json")
 
 
 @app.patch("/sessions/{session_id}")
-async def rename_session(session_id: str, req: SessionRenameRequest):
+async def rename_session(session_id: str, req: SessionRenameRequest, user: dict = Depends(require_auth)):
+    session = await agent.session_store.get(session_id)
+    if session is None or session.user_id != user["id"]:
+        raise HTTPException(status_code=404, detail="session not found")
     session = await agent.session_store.rename(session_id, req.title)
     return session.model_dump(mode="json")
 
 
 @app.post("/sessions/{session_id}/archive")
-async def archive_session(session_id: str):
+async def archive_session(session_id: str, user: dict = Depends(require_auth)):
+    session = await agent.session_store.get(session_id)
+    if session is None or session.user_id != user["id"]:
+        raise HTTPException(status_code=404, detail="session not found")
     session = await agent.session_store.archive(session_id)
     return session.model_dump(mode="json")
 
 
 @app.post("/sessions/{session_id}/restore")
-async def restore_session(session_id: str):
+async def restore_session(session_id: str, user: dict = Depends(require_auth)):
+    session = await agent.session_store.get(session_id)
+    if session is None or session.user_id != user["id"]:
+        raise HTTPException(status_code=404, detail="session not found")
     session = await agent.session_store.restore(session_id)
     return session.model_dump(mode="json")
 
 
 @app.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
+async def delete_session(session_id: str, user: dict = Depends(require_auth)):
+    session = await agent.session_store.get(session_id)
+    if session is None or session.user_id != user["id"]:
+        raise HTTPException(status_code=404, detail="session not found")
     await agent.session_store.delete(session_id)
     return {"ok": True}
 
 
 @app.get("/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str, limit: int = 50):
+async def get_session_messages(session_id: str, limit: int = 50, user: dict = Depends(require_auth)):
+    session = await agent.session_store.get(session_id)
+    if session is None or session.user_id != user["id"]:
+        raise HTTPException(status_code=404, detail="session not found")
     return await agent.session_store.get_messages(session_id, limit)
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
     """SSE streaming — real token streaming from LLM with state events."""
 
     # Resolve or create session
     session = None
     if req.session_id:
         session = await agent.session_store.get(req.session_id)
-        if session is None:
+        if session is None or session.user_id != user["id"]:
             raise HTTPException(status_code=404, detail="session not found")
         if session.status == SessionStatus.ARCHIVED:
             raise HTTPException(status_code=409, detail="session is archived")
     else:
-        session = await agent.session_store.create()
+        session = await agent.session_store.create(user_id=user["id"])
 
     # Update session activity (title from first message)
     await agent.session_store.touch_message(session.id, req.message)
@@ -410,8 +437,14 @@ async def chat(req: ChatRequest):
 
 _HTML_PATH = Path(__file__).parent / "static" / "index.html"
 _CHAT_HTML = _HTML_PATH.read_text()
+_PNG_PATH = Path(__file__).resolve().parent.parent.parent / "multiclaw.png"
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(content=_CHAT_HTML)
+
+
+@app.get("/multiclaw.png")
+async def favicon():
+    return FileResponse(_PNG_PATH, media_type="image/png")

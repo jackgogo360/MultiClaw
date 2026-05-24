@@ -38,3 +38,13 @@ audit_enabled = true
 
 [agent]
 max_tool_rounds = 6
+
+[auth]
+# jwt_secret is auto-generated and persisted in DB — leave empty
+jwt_secret = ""
+
+[brevo]
+api_key = "REMOVED_BREVO_API_KEY"
+sender_email = "felixgogo360@gmail.com"
+sender_name = "MultiClaw"
+mock = true
