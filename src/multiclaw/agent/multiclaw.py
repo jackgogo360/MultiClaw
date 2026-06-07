@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -18,6 +19,18 @@ from multiclaw.tools import CoreToolScheduler, ToolRegistry
 from multiclaw.skills import SkillManager
 
 logger = logging.getLogger(__name__)
+DSML_TOOLCALL_PATTERN = re.compile(
+    r"<｜｜DSML｜｜tool_calls>.*?</｜｜DSML｜｜tool_calls>",
+    re.DOTALL,
+)
+DSML_TAG_PATTERN = re.compile(r"</?｜｜DSML｜｜[^>]*>")
+FINAL_SUMMARY_PLAIN_TEXT_PROMPT = (
+    "You have reached the tool limit. "
+    "Do not call any tools. "
+    "Do not output DSML, XML, HTML, or any tool-call tags. "
+    "Using only the information already gathered in the conversation, "
+    "answer directly in plain Markdown for the user."
+)
 
 
 def _build_assistant_tool_calls_msg(response: LLMResponse) -> dict:
@@ -173,6 +186,33 @@ class MultiClawAgent(ToolCallAgent):
     # streaming path
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _contains_dsml_tool_markup(text: str) -> bool:
+        return "<｜｜DSML｜｜" in text
+
+    @staticmethod
+    def _strip_dsml_tool_markup(text: str) -> str:
+        cleaned = DSML_TOOLCALL_PATTERN.sub("", text)
+        cleaned = DSML_TAG_PATTERN.sub("", cleaned)
+        return cleaned.strip()
+
+    async def _collect_plain_text_response(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        full_text = ""
+        reasoning_text = ""
+        async for event in self.router.stream_completion(
+            model=self.settings.llm.default_model,
+            messages=messages,
+            tools=None,
+        ):
+            if event["type"] == "token":
+                full_text += event["content"]
+            elif event["type"] == "reasoning":
+                reasoning_text += event["content"]
+        return full_text or reasoning_text
+
     async def handle_message_stream(
         self, user_input: str, session_id: str = ""
     ) -> AsyncIterator[dict[str, Any]]:
@@ -227,6 +267,7 @@ class MultiClawAgent(ToolCallAgent):
             for i, msg in enumerate(messages):
                 logger.info("  msg[%d] role=%s tc=%s", i, msg.get("role"), bool(msg.get("tool_calls")))
             full_text = ""
+            reasoning_text = ""
 
             try:
                 async for event in self.router.stream_completion(
@@ -239,6 +280,7 @@ class MultiClawAgent(ToolCallAgent):
                         yield event
 
                     elif event["type"] == "reasoning":
+                        reasoning_text += event["content"]
                         yield event
 
                     elif event["type"] == "tool_calls":
@@ -252,6 +294,7 @@ class MultiClawAgent(ToolCallAgent):
                         for tc in event["calls"]:
                             yield {
                                 "type": "tool_call",
+                                "call_id": tc["id"],
                                 "name": tc["name"],
                                 "arguments": tc["arguments"],
                             }
@@ -289,6 +332,7 @@ class MultiClawAgent(ToolCallAgent):
 
                             yield {
                                 "type": "tool_result",
+                                "call_id": call_id,
                                 "name": tc["name"],
                                 "content": obs.content,
                             }
@@ -301,7 +345,12 @@ class MultiClawAgent(ToolCallAgent):
                         break  # tool_calls handled, continue outer loop
 
                 else:
-                    # No tool_calls — pure text response
+                    # No tool_calls — pure text response.
+                    # DeepSeek thinking mode may emit only reasoning_content with no
+                    # content deltas; use reasoning as the visible text in that case.
+                    if not full_text and reasoning_text:
+                        full_text = reasoning_text
+                        yield {"type": "token", "content": full_text}
                     logger.info("streaming complete, text_len=%d", len(full_text))
                     await self._save_chat_msg(full_text, "assistant", session_id)
                     await self.transition(AgentState.FINISHED)
@@ -324,20 +373,25 @@ class MultiClawAgent(ToolCallAgent):
             "max tool rounds (%d) exceeded for session=%s, forcing final summary with %d messages",
             max_rounds, session_id, len(messages),
         )
-        full_text = ""
         try:
-            async for event in self.router.stream_completion(
-                model=self.settings.llm.default_model,
-                messages=messages,
-                tools=None,  # no tools — force text response
-            ):
-                if event["type"] == "token":
-                    full_text += event["content"]
-                    yield event
-                elif event["type"] == "reasoning":
-                    yield event
+            full_text = await self._collect_plain_text_response(messages)
+
+            if self._contains_dsml_tool_markup(full_text):
+                logger.warning(
+                    "DSML tool markup detected in forced final summary for session=%s, retrying with stricter plain-text prompt",
+                    session_id,
+                )
+                retry_messages = [
+                    {"role": "system", "content": FINAL_SUMMARY_PLAIN_TEXT_PROMPT},
+                    *messages,
+                ]
+                retry_text = await self._collect_plain_text_response(retry_messages)
+                full_text = retry_text or full_text
+
+            full_text = self._strip_dsml_tool_markup(full_text)
             if full_text:
                 await self._save_chat_msg(full_text, "assistant", session_id)
+                yield {"type": "token", "content": full_text}
             yield {"type": "done", "content": full_text, "data": {}}
         except Exception:
             logger.exception("final summary failed")

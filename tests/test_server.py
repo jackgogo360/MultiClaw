@@ -25,8 +25,8 @@ def test_sessions_endpoint_lists_created_sessions(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         client.cookies = _make_auth_cookie(app)
-        created = client.post("/sessions", json={"title": "Alpha"}).json()
-        listed = client.get("/sessions").json()
+        created = client.post("/api/sessions", json={"title": "Alpha"}).json()
+        listed = client.get("/api/sessions").json()
 
     assert created["title"] == "Alpha"
     assert [session["id"] for session in listed] == [created["id"]]
@@ -38,15 +38,15 @@ def test_session_lifecycle_endpoints(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         client.cookies = _make_auth_cookie(app)
-        created = client.post("/sessions", json={"title": "Alpha"}).json()
+        created = client.post("/api/sessions", json={"title": "Alpha"}).json()
         renamed = client.patch(
-            f"/sessions/{created['id']}",
+            f"/api/sessions/{created['id']}",
             json={"title": "Beta"},
         ).json()
-        archived = client.post(f"/sessions/{created['id']}/archive").json()
-        listed = client.get("/sessions").json()
-        all_sessions = client.get("/sessions?include_archived=true").json()
-        restored = client.post(f"/sessions/{created['id']}/restore").json()
+        archived = client.post(f"/api/sessions/{created['id']}/archive").json()
+        listed = client.get("/api/sessions").json()
+        all_sessions = client.get("/api/sessions?include_archived=true").json()
+        restored = client.post(f"/api/sessions/{created['id']}/restore").json()
 
     assert renamed["title"] == "Beta"
     assert archived["status"] == "archived"
@@ -61,11 +61,11 @@ def test_chat_without_session_emits_session_event(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         client.cookies = _make_auth_cookie(app)
-        response = client.post("/chat", json={"message": "hello"})
+        response = client.post("/api/chat", json={"message": "hello"})
 
     body = response.text
-    assert '"type": "session"' in body
-    assert '"session_id":' in body
+    assert '"type":"data-session"' in body
+    assert '"id":"' in body
 
 
 def test_chat_rejects_archived_session(tmp_path, monkeypatch):
@@ -74,10 +74,10 @@ def test_chat_rejects_archived_session(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         client.cookies = _make_auth_cookie(app)
-        created = client.post("/sessions", json={"title": "Alpha"}).json()
-        client.post(f"/sessions/{created['id']}/archive")
+        created = client.post("/api/sessions", json={"title": "Alpha"}).json()
+        client.post(f"/api/sessions/{created['id']}/archive")
         response = client.post(
-            "/chat",
+            "/api/chat",
             json={"message": "hello", "session_id": created["id"]},
         )
 
@@ -90,8 +90,8 @@ def test_delete_session_endpoint(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         client.cookies = _make_auth_cookie(app)
-        created = client.post("/sessions", json={"title": "Alpha"}).json()
-        response = client.delete(f"/sessions/{created['id']}")
+        created = client.post("/api/sessions", json={"title": "Alpha"}).json()
+        response = client.delete(f"/api/sessions/{created['id']}")
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
@@ -99,7 +99,7 @@ def test_delete_session_endpoint(tmp_path, monkeypatch):
     # Verify session is gone
     with TestClient(app) as client:
         client.cookies = _make_auth_cookie(app)
-        listed = client.get("/sessions").json()
+        listed = client.get("/api/sessions").json()
     assert created["id"] not in [s["id"] for s in listed]
 
 
@@ -109,10 +109,10 @@ def test_get_messages_endpoint_returns_empty_for_new_session(tmp_path, monkeypat
 
     with TestClient(app) as client:
         client.cookies = _make_auth_cookie(app)
-        created = client.post("/sessions", json={"title": "Alpha"}).json()
+        created = client.post("/api/sessions", json={"title": "Alpha"}).json()
         sid = created["id"]
 
-        response = client.get(f"/sessions/{sid}/messages")
+        response = client.get(f"/api/sessions/{sid}/messages")
         assert response.status_code == 200
         assert response.json() == []
 
@@ -123,10 +123,10 @@ def test_get_messages_endpoint_respects_limit_param(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         client.cookies = _make_auth_cookie(app)
-        created = client.post("/sessions", json={"title": "Alpha"}).json()
+        created = client.post("/api/sessions", json={"title": "Alpha"}).json()
         sid = created["id"]
 
-        response = client.get(f"/sessions/{sid}/messages?limit=10")
+        response = client.get(f"/api/sessions/{sid}/messages?limit=10")
         assert response.status_code == 200
         assert isinstance(response.json(), list)
 
@@ -136,7 +136,7 @@ def test_unauthenticated_requests_return_401(tmp_path, monkeypatch):
     from multiclaw.server import app
 
     with TestClient(app) as client:
-        response = client.get("/sessions")
+        response = client.get("/api/sessions")
         assert response.status_code == 401
 
 

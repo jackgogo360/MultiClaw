@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
 from multiclaw.memory import MemoryEntry, MemoryProtocol
@@ -27,6 +28,7 @@ class ContextBuilder:
 
     async def build(self, request: ContextRequest) -> list[dict]:
         messages: list[dict] = [{"role": "system", "content": request.system_prompt}]
+        messages.append({"role": "system", "content": self._temporal_anchor_message()})
 
         # Inject active skill prompts as independent system messages
         for name, body in request.skill_prompts:
@@ -67,6 +69,17 @@ class ContextBuilder:
 
         messages.append({"role": "user", "content": request.user_input})
         return messages
+
+    @staticmethod
+    def _temporal_anchor_message() -> str:
+        today = datetime.now(timezone.utc).date().isoformat()
+        return (
+            f"Current date: {today} (UTC). "
+            "Use this date to resolve relative time references such as today, yesterday, "
+            "last week, and last month. "
+            "For recent or latest information, do not rewrite the user's timeframe to an "
+            "older month or year unless the user explicitly asks for that older period."
+        )
 
     def _fit_relevant_memory(
         self,

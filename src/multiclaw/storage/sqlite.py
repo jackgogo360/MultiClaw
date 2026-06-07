@@ -5,6 +5,7 @@ from typing import TypeVar
 from pydantic import BaseModel
 
 from multiclaw.storage.repository import Repository
+from multiclaw.sqlite_utils import configure_sqlite_connection
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -28,6 +29,7 @@ class SqliteRepository(Repository[T]):
     async def initialize(self) -> None:
         self._db = await aiosqlite.connect(self._config.database_path)
         self._db.row_factory = aiosqlite.Row
+        await configure_sqlite_connection(self._db)
         await self._db.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {self._table_name} (

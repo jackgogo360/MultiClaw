@@ -2,6 +2,10 @@ import logging
 
 import httpx
 
+from multiclaw.auth.email_content import (
+    VERIFICATION_EMAIL_SUBJECT,
+    build_verification_email_html,
+)
 from multiclaw.config import Settings
 
 logger = logging.getLogger("multiclaw")
@@ -21,17 +25,8 @@ async def send_verification_code(settings: Settings, to_email: str, code: str) -
             json={
                 "sender": {"name": brevo.sender_name, "email": brevo.sender_email},
                 "to": [{"email": to_email}],
-                "subject": "MultiClaw Verification Code",
-                "htmlContent": (
-                    f'<div style="font-family:Arial,sans-serif;max-width:400px;margin:0 auto;padding:24px">'
-                    f'<h2 style="color:#333">Verification Code</h2>'
-                    f'<p style="font-size:16px;color:#555">Your code is:</p>'
-                    f'<div style="font-size:32px;font-weight:bold;letter-spacing:6px;'
-                    f'padding:16px 24px;background:#f5f5f5;border-radius:8px;text-align:center;margin:16px 0">'
-                    f'{code}</div>'
-                    f'<p style="font-size:13px;color:#999">Expires in 15 minutes.</p>'
-                    f'</div>'
-                ),
+                "subject": VERIFICATION_EMAIL_SUBJECT,
+                "htmlContent": build_verification_email_html(code),
             },
         )
         if resp.is_error:
