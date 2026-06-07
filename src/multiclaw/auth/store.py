@@ -6,6 +6,7 @@ from pathlib import Path
 import aiosqlite
 
 from multiclaw.auth.models import User, VerificationCode
+from multiclaw.sqlite_utils import configure_sqlite_connection
 
 CODE_EXPIRY_MINUTES = 15
 MAX_SENDS_PER_DAY = 3
@@ -21,7 +22,7 @@ class AuthStore:
         Path(self._database_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._database_path)
         self._db.row_factory = aiosqlite.Row
-        await self._db.execute("PRAGMA journal_mode=WAL")
+        await configure_sqlite_connection(self._db)
         # Auth tables
         await self._db.execute(
             """

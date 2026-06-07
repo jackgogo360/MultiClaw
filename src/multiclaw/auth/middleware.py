@@ -4,7 +4,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 
-PUBLIC_PREFIXES = ("/auth/",)
+PUBLIC_PREFIXES = ("/auth/", "/api/auth/")
 PUBLIC_EXACT = {"/multiclaw.png"}
 
 

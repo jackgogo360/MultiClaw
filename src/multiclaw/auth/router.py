@@ -4,8 +4,7 @@ from datetime import datetime, timedelta, timezone
 import jwt
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from multiclaw.auth.brevo import send_verification_code
-from multiclaw.config import Settings
+from multiclaw.auth.email_sender import is_mock_enabled, send_verification_code
 from multiclaw.auth.models import (
     AuthResponse,
     MeResponse,
@@ -13,6 +12,7 @@ from multiclaw.auth.models import (
     VerifyRequest,
 )
 from multiclaw.auth.store import MAX_SENDS_PER_DAY, AuthStore
+from multiclaw.config import Settings
 
 logger = logging.getLogger("multiclaw")
 router = APIRouter(prefix="/auth")
@@ -52,7 +52,7 @@ async def send_code(body: SendCodeRequest, request: Request):
         )
 
     settings = _get_settings(request)
-    if settings.brevo.mock:
+    if is_mock_enabled(settings):
         vc = store.build_code(email, code="654321")
         await store.save_code(vc)
         logger.info("Mock email code for %s: 654321", email)
