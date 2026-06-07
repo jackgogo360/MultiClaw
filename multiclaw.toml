@@ -37,14 +37,26 @@ sandbox_mode = "process"
 audit_enabled = true
 
 [agent]
-max_tool_rounds = 6
+max_tool_rounds = 10
 
 [auth]
 # jwt_secret is auto-generated and persisted in DB — leave empty
 jwt_secret = ""
+
+[email]
+provider = "resend"
 
 [brevo]
 api_key = "REMOVED_BREVO_API_KEY"
 sender_email = "felixgogo360@gmail.com"
 sender_name = "MultiClaw"
 mock = true
+
+[resend]
+api_key = "REMOVED_RESEND_API_KEY"
+sender_email = "multi-claw@mail.bigrouter.cc"
+sender_name = "MultiClaw"
+mock = false
+
+[mcp]
+enabled = true

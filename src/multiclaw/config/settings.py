@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 import os
 import tomllib
 
@@ -43,7 +43,7 @@ class GovernanceSettings(BaseModel):
 
 
 class AgentSettings(BaseModel):
-    max_tool_rounds: int = 6
+    max_tool_rounds: int = 10
     system_prompt: str = (
         "You are MultiClaw, an AI assistant with access to tools. "
         "You are powered by a large language model. "
@@ -66,11 +66,27 @@ class SkillSettings(BaseModel):
     user_dir: str = ""
 
 
+class McpSettings(BaseModel):
+    enabled: bool = True
+    config_path: str = ""
+
+
 class AuthSettings(BaseModel):
     jwt_secret: str = ""
 
 
+class EmailSettings(BaseModel):
+    provider: Literal["brevo", "resend"] = "brevo"
+
+
 class BrevoSettings(BaseModel):
+    api_key: str = ""
+    sender_email: str = ""
+    sender_name: str = "MultiClaw"
+    mock: bool = False
+
+
+class ResendSettings(BaseModel):
     api_key: str = ""
     sender_email: str = ""
     sender_name: str = "MultiClaw"
@@ -91,7 +107,10 @@ class Settings(BaseSettings):
     agent: AgentSettings = Field(default_factory=AgentSettings)
     skill: SkillSettings = Field(default_factory=SkillSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
+    email: EmailSettings = Field(default_factory=EmailSettings)
     brevo: BrevoSettings = Field(default_factory=BrevoSettings)
+    resend: ResendSettings = Field(default_factory=ResendSettings)
+    mcp: McpSettings = Field(default_factory=McpSettings)
 
     def __init__(self, _config_file: str | None = None, **kwargs: Any):
         config_path = Path(_config_file) if _config_file else Path("multiclaw.toml")
@@ -153,6 +172,12 @@ class Settings(BaseSettings):
             result["skill"] = data["skills"]
         if "auth" in data:
             result["auth"] = data["auth"]
+        if "email" in data:
+            result["email"] = data["email"]
         if "brevo" in data:
             result["brevo"] = data["brevo"]
+        if "resend" in data:
+            result["resend"] = data["resend"]
+        if "mcp" in data:
+            result["mcp"] = data["mcp"]
         return result

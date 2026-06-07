@@ -19,7 +19,7 @@ DEFAULT_MAX_RESULTS = 5
 
 class WebSearchParams(BaseModel):
     query: str
-    max_results: int = Field(default=DEFAULT_MAX_RESULTS, ge=1, le=5)
+    max_results: int = Field(default=DEFAULT_MAX_RESULTS, ge=1)
     engine: str | None = None
 
 
@@ -223,6 +223,8 @@ class WebSearchToolBuilder(WorkspaceToolBuilder):
         self.region = region
 
     def validate(self, params: dict) -> WebSearchParams:
+        params = dict(params)
+        params["max_results"] = min(params.get("max_results", DEFAULT_MAX_RESULTS), 5)
         return WebSearchParams(**params)
 
     def build(self, params: WebSearchParams) -> ToolInvocation[WebSearchParams]:

@@ -2,11 +2,15 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from collections.abc import Iterable
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from time import perf_counter
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 LOG_DIR = Path.home() / ".multiclaw" / "logs"
@@ -98,10 +102,14 @@ from multiclaw.tools.shell import ShellToolBuilder
 from multiclaw.tools.web_fetch import WebFetchToolBuilder
 from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
+from multiclaw.mcp import MCPClientManager, MCPToolBuilder, load_mcp_config, load_mcp_tools_config
+
+from uuid import uuid4
 
 from multiclaw.auth.store import AuthStore
 from multiclaw.auth.middleware import AuthMiddleware, require_auth
 from multiclaw.auth.router import router as auth_router
+from multiclaw.stream import DataStreamEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +158,60 @@ def create_agent() -> MultiClawAgent:
     registry.register(WebFetchToolBuilder(workspace_root))
     registry.register(WebSearchToolBuilder(workspace_root))
 
+    # Register MCP tools if enabled
+    mcp_manager = None
+    if settings.mcp.enabled:
+        mcp_manager = MCPClientManager()
+        configs = load_mcp_config(
+            settings.mcp.config_path if settings.mcp.config_path else None
+        )
+        if configs:
+            try:
+                states = mcp_manager.connect_servers(configs)
+                tools_configs = load_mcp_tools_config(
+                    settings.mcp.config_path if settings.mcp.config_path else None
+                )
+                for server_name, state in states.items():
+                    if state.status.value == "connected":
+                        tool_filter = tools_configs.get(server_name)
+                        registered = 0
+                        skipped = 0
+                        for tool in state.tools:
+                            if tool_filter:
+                                from multiclaw.mcp.config import _matches_tool_filter
+                                if not _matches_tool_filter(tool.original_name, tool_filter):
+                                    skipped += 1
+                                    continue
+                            try:
+                                adapter = MCPToolBuilder(
+                                    name=tool.name,
+                                    server_name=tool.server_name,
+                                    original_name=tool.original_name,
+                                    description=tool.description,
+                                    input_schema=tool.input_schema,
+                                    manager=mcp_manager,
+                                )
+                                registry.register(adapter)
+                                registered += 1
+                            except Exception:
+                                logger.warning(
+                                    "Failed to register MCP tool: %s", tool.name
+                                )
+                        logger.info(
+                            "Registered %d tools from MCP server '%s'%s",
+                            registered, server_name,
+                            f" ({skipped} filtered)" if skipped else "",
+                        )
+                    else:
+                        logger.warning(
+                            "MCP server '%s' failed to connect: %s",
+                            server_name, state.error,
+                        )
+            except Exception:
+                logger.exception("Failed to connect MCP servers")
+        else:
+            logger.info("No MCP servers configured (no .mcp.json found)")
+
     scheduler = CoreToolScheduler(
         permission_checker=PermissionChecker(
             guarded_tools={
@@ -176,6 +238,7 @@ def create_agent() -> MultiClawAgent:
         skill_manager=skill_manager,
     )
     runtime_agent.session_store = SqliteSessionStore(settings.database.path)
+    runtime_agent.mcp_manager = mcp_manager
     return runtime_agent
 
 
@@ -194,15 +257,50 @@ async def lifespan(app: FastAPI):
     app.state.settings = agent.settings
     yield
 
+    # Cleanup MCP connections
+    if hasattr(agent, 'mcp_manager') and agent.mcp_manager:
+        agent.mcp_manager.stop()
+
 
 app = FastAPI(title="MultiClaw", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 app.include_router(auth_router)
+app.include_router(auth_router, prefix="/api")
+
+api = APIRouter(prefix="/api")
+
+
+@app.middleware("http")
+async def log_http_requests(request, call_next):
+    started = perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (perf_counter() - started) * 1000
+        logger.exception(
+            "HTTP %s %s -> 500 (%.1fms)",
+            request.method,
+            request.url.path,
+            duration_ms,
+        )
+        raise
+
+    duration_ms = (perf_counter() - started) * 1000
+    logger.info(
+        "HTTP %s %s -> %d (%.1fms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str | None = None
     session_id: str | None = None
+    id: str | None = None
+    messages: list[dict[str, Any]] | None = None
 
 
 class SessionCreateRequest(BaseModel):
@@ -218,13 +316,13 @@ class ApproveRequest(BaseModel):
     approved: bool
 
 
-@app.post("/approve")
+@api.post("/approve")
 async def approve(req: ApproveRequest, user: dict = Depends(require_auth)):
     ok = agent.scheduler.resolve_approval(req.request_id, req.approved)
     return {"ok": ok}
 
 
-@app.get("/sessions")
+@api.get("/sessions")
 async def list_sessions(include_archived: bool = False, user: dict = Depends(require_auth)):
     sessions = await agent.session_store.list_sessions(
         include_archived=include_archived, user_id=user["id"]
@@ -232,13 +330,13 @@ async def list_sessions(include_archived: bool = False, user: dict = Depends(req
     return [session.model_dump(mode="json") for session in sessions]
 
 
-@app.post("/sessions")
+@api.post("/sessions")
 async def create_session(req: SessionCreateRequest, user: dict = Depends(require_auth)):
     session = await agent.session_store.create(title=req.title, user_id=user["id"])
     return session.model_dump(mode="json")
 
 
-@app.patch("/sessions/{session_id}")
+@api.patch("/sessions/{session_id}")
 async def rename_session(session_id: str, req: SessionRenameRequest, user: dict = Depends(require_auth)):
     session = await agent.session_store.get(session_id)
     if session is None or session.user_id != user["id"]:
@@ -247,7 +345,7 @@ async def rename_session(session_id: str, req: SessionRenameRequest, user: dict 
     return session.model_dump(mode="json")
 
 
-@app.post("/sessions/{session_id}/archive")
+@api.post("/sessions/{session_id}/archive")
 async def archive_session(session_id: str, user: dict = Depends(require_auth)):
     session = await agent.session_store.get(session_id)
     if session is None or session.user_id != user["id"]:
@@ -256,7 +354,7 @@ async def archive_session(session_id: str, user: dict = Depends(require_auth)):
     return session.model_dump(mode="json")
 
 
-@app.post("/sessions/{session_id}/restore")
+@api.post("/sessions/{session_id}/restore")
 async def restore_session(session_id: str, user: dict = Depends(require_auth)):
     session = await agent.session_store.get(session_id)
     if session is None or session.user_id != user["id"]:
@@ -265,7 +363,7 @@ async def restore_session(session_id: str, user: dict = Depends(require_auth)):
     return session.model_dump(mode="json")
 
 
-@app.delete("/sessions/{session_id}")
+@api.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, user: dict = Depends(require_auth)):
     session = await agent.session_store.get(session_id)
     if session is None or session.user_id != user["id"]:
@@ -274,7 +372,7 @@ async def delete_session(session_id: str, user: dict = Depends(require_auth)):
     return {"ok": True}
 
 
-@app.get("/sessions/{session_id}/messages")
+@api.get("/sessions/{session_id}/messages")
 async def get_session_messages(session_id: str, limit: int = 50, user: dict = Depends(require_auth)):
     session = await agent.session_store.get(session_id)
     if session is None or session.user_id != user["id"]:
@@ -282,39 +380,75 @@ async def get_session_messages(session_id: str, limit: int = 50, user: dict = De
     return await agent.session_store.get_messages(session_id, limit)
 
 
-@app.post("/chat")
+@api.post("/chat")
 async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
     """SSE streaming — real token streaming from LLM with state events."""
+    message = _resolve_chat_message(req)
+    requested_session_id = req.session_id or req.id
 
     # Resolve or create session
     session = None
-    if req.session_id:
-        session = await agent.session_store.get(req.session_id)
+    if requested_session_id:
+        session = await agent.session_store.get(requested_session_id)
         if session is None or session.user_id != user["id"]:
-            raise HTTPException(status_code=404, detail="session not found")
-        if session.status == SessionStatus.ARCHIVED:
+            session = None
+        elif session.status == SessionStatus.ARCHIVED:
             raise HTTPException(status_code=409, detail="session is archived")
-    else:
+    if session is None:
         session = await agent.session_store.create(user_id=user["id"])
 
     # Update session activity (title from first message)
-    await agent.session_store.touch_message(session.id, req.message)
+    session = await agent.session_store.touch_message(session.id, message)
 
     async def event_stream():
-        logger.info("SSE stream started, message=%r, session=%r", req.message[:80], session.id)
+        logger.info("SSE stream started, message=%r, session=%r", message[:80], session.id)
+        enc = DataStreamEncoder()
+        text_part_id: str | None = None
+        reasoning_part_id: str | None = None
+        step_open = False
+        pending_tool_results = 0
 
-        # Emit session event first
-        yield (
-            "data: "
-            + json.dumps(
-                {
-                    "type": "session",
-                    "session_id": session.id,
-                    "title": session.title,
-                }
-            )
-            + "\n\n"
+        def close_text_part() -> list[str]:
+            nonlocal text_part_id
+            if text_part_id is None:
+                return []
+            chunks = [enc.text_end(text_part_id)]
+            text_part_id = None
+            return chunks
+
+        def close_reasoning_part() -> list[str]:
+            nonlocal reasoning_part_id
+            if reasoning_part_id is None:
+                return []
+            chunks = [enc.reasoning_end(reasoning_part_id)]
+            reasoning_part_id = None
+            return chunks
+
+        def close_open_parts() -> list[str]:
+            return [*close_reasoning_part(), *close_text_part()]
+
+        def open_step() -> list[str]:
+            nonlocal step_open
+            if step_open:
+                return []
+            step_open = True
+            return [enc.start_step()]
+
+        def close_step() -> list[str]:
+            nonlocal step_open
+            if not step_open:
+                return []
+            step_open = False
+            return [enc.finish_step()]
+
+        yield enc.start()
+        yield enc.data_part(
+            "data-session",
+            session.model_dump(mode="json"),
+            transient=True,
         )
+        for chunk in open_step():
+            yield chunk
 
         token_queue: asyncio.Queue[dict] = asyncio.Queue()
         event_queue: asyncio.Queue[Event] = asyncio.Queue()
@@ -326,7 +460,7 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
 
         async def run_stream():
             try:
-                async for item in agent.handle_message_stream(req.message, session_id=session.id):
+                async for item in agent.handle_message_stream(message, session_id=session.id):
                     await token_queue.put(item)
             except Exception as exc:
                 logger.exception("stream error")
@@ -337,7 +471,6 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
 
         try:
             while True:
-                # Non-blocking drain of the token stream
                 token_count = 0
                 while True:
                     try:
@@ -347,79 +480,109 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
 
                     token_count += 1
                     if item["type"] == "token":
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                {"type": "token", "content": item["content"]},
-                                ensure_ascii=False,
-                            )
-                            + "\n\n"
-                        )
+                        for chunk in open_step():
+                            yield chunk
+                        for chunk in close_reasoning_part():
+                            yield chunk
+                        if text_part_id is None:
+                            text_part_id = uuid4().hex
+                            yield enc.text_start(text_part_id)
+                        yield enc.text_delta(text_part_id, item["content"])
                     elif item["type"] == "done":
                         logger.info("stream done, tokens=%d, content_len=%d", token_count, len(item.get("content", "")))
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                {"type": "done", "content": item["content"], "data": item.get("data", {})},
-                                ensure_ascii=False,
-                            )
-                            + "\n\n"
-                        )
+                        for chunk in close_open_parts():
+                            yield chunk
+                        for chunk in close_step():
+                            yield chunk
+                        yield enc.finish("stop")
                         return
                     elif item["type"] == "error":
                         logger.error("stream error: %s", item["content"])
-                        yield (
-                            "data: "
-                            + json.dumps({"type": "error", "content": item["content"]})
-                            + "\n\n"
-                        )
+                        for chunk in close_open_parts():
+                            yield chunk
+                        for chunk in close_step():
+                            yield chunk
+                        yield enc.error(item["content"])
                         return
-                    else:
-                        # Forward tool_call, tool_result, reasoning, and any new types
-                        yield (
-                            "data: "
-                            + json.dumps(item, ensure_ascii=False)
-                            + "\n\n"
+                    elif item["type"] == "tool_call":
+                        for chunk in open_step():
+                            yield chunk
+                        for chunk in close_open_parts():
+                            yield chunk
+                        pending_tool_results += 1
+                        tool_call_id = item.get("call_id") or uuid4().hex
+                        yield enc.tool_input_available(
+                            tool_call_id,
+                            item["name"],
+                            item.get("arguments", {}),
                         )
+                    elif item["type"] == "tool_result":
+                        for chunk in close_open_parts():
+                            yield chunk
+                        tool_call_id = item.get("call_id", "")
+                        if item.get("is_error", False):
+                            yield enc.tool_output_error(tool_call_id, item.get("content", ""))
+                        else:
+                            yield enc.tool_output_available(
+                                tool_call_id,
+                                {"content": item.get("content", "")},
+                            )
+                        if pending_tool_results > 0:
+                            pending_tool_results -= 1
+                        if pending_tool_results == 0:
+                            for chunk in close_step():
+                                yield chunk
+                    elif item["type"] == "reasoning":
+                        for chunk in open_step():
+                            yield chunk
+                        for chunk in close_text_part():
+                            yield chunk
+                        if reasoning_part_id is None:
+                            reasoning_part_id = uuid4().hex
+                            yield enc.reasoning_start(reasoning_part_id)
+                        yield enc.reasoning_delta(reasoning_part_id, item["content"])
+                    else:
+                        yield enc.data_part("data-state", {"item": item}, transient=True)
 
-                # Non-blocking drain of bus events
                 while not event_queue.empty():
                     evt = event_queue.get_nowait()
                     if evt.type == "tool.awaiting_approval":
                         logger.info(
-                            "SSE yield approval_required: request_id=%s tool=%s",
+                            "yield approval_required: request_id=%s tool=%s",
                             evt.data.get("request_id"), evt.data.get("tool"),
                         )
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                {
-                                    "type": "approval_required",
-                                    "request_id": evt.data.get("request_id", ""),
-                                    "tool": evt.data.get("tool", ""),
-                                    "params": evt.data.get("params", {}),
-                                    "description": evt.data.get("description", ""),
-                                }
-                            )
-                            + "\n\n"
+                        for chunk in open_step():
+                            yield chunk
+                        for chunk in close_open_parts():
+                            yield chunk
+                        tool_call_id = evt.data.get("call_id") or uuid4().hex
+                        yield enc.tool_input_available(
+                            tool_call_id,
+                            evt.data.get("tool", ""),
+                            evt.data.get("params", {}),
+                        )
+                        yield enc.tool_approval_request(
+                            evt.data.get("request_id", ""),
+                            tool_call_id,
                         )
                     else:
-                        yield (
-                            "data: "
-                            + json.dumps({"type": "state", "state": evt.type})
-                            + "\n\n"
-                        )
+                        yield enc.data_part("data-state", {"state": evt.type}, transient=True)
 
-                # Check if stream task crashed
                 if stream_task.done():
                     exc = stream_task.exception()
                     if exc:
                         logger.exception("stream task crashed")
-                        yield (
-                            "data: "
-                            + json.dumps({"type": "error", "content": str(exc)})
-                            + "\n\n"
-                        )
+                        for chunk in close_open_parts():
+                            yield chunk
+                        for chunk in close_step():
+                            yield chunk
+                        yield enc.error(str(exc))
+                    else:
+                        for chunk in close_open_parts():
+                            yield chunk
+                        for chunk in close_step():
+                            yield chunk
+                        yield enc.finish("stop")
                     return
 
                 await asyncio.sleep(0.02)
@@ -428,7 +591,47 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
             shared_bus.unsubscribe(sub_id)
             logger.info("SSE stream ended")
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"X-Vercel-AI-Data-Stream": "v1"},
+    )
+
+
+def _resolve_chat_message(req: ChatRequest) -> str:
+    if req.message:
+        return req.message
+
+    message = _extract_latest_user_message(req.messages or [])
+    if message:
+        return message
+
+    raise HTTPException(status_code=422, detail="No user message found in request")
+
+
+def _extract_latest_user_message(messages: list[dict[str, Any]]) -> str | None:
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        text = _extract_message_text(message)
+        if text:
+            return text
+    return None
+
+
+def _extract_message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Iterable) and not isinstance(content, (str, bytes, dict)):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "".join(parts)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +648,14 @@ async def index():
     return HTMLResponse(content=_CHAT_HTML)
 
 
+# Mount static assets built by Vite (JS, CSS bundles)
+_STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/assets", StaticFiles(directory=str(_STATIC_DIR / "assets")), name="assets")
+
+
 @app.get("/multiclaw.png")
 async def favicon():
     return FileResponse(_PNG_PATH, media_type="image/png")
+
+
+app.include_router(api)
