@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "github-search": {
+      "command": "npx",
+      "args": ["-y", "github-rest-mcp"],
+      "env": {
+        "GITHUB_TOKEN": "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"
+      },
+      "tools": {
+        "include": [
+          "github_search_",
+          "github_repos_",
+          "github_issues_",
+          "github_pulls_",
+          "github_users_",
+          "github_markdown_"
+        ],
+        "exclude": []
+      }
+    }
+  }
+}

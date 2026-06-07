@@ -46,6 +46,20 @@ class CoreToolScheduler:
             )
             params = builder.validate(raw_params)
 
+            # MCP tools are pre-approved at server-connection time
+            from multiclaw.mcp.tool_adapter import MCPToolBuilder as _MCPToolBuilder
+            if isinstance(builder, _MCPToolBuilder):
+                invocation = builder.build(params)
+                try:
+                    result = await self.sandbox.run(invocation.execute)
+                except Exception as exc:
+                    error_text = str(exc)
+                    return ToolExecutionResult(status=ToolStatus.ERROR, content=error_text)
+                await self.event_bus.publish(
+                    Event(type="tool.completed", data={"tool": builder.name})
+                )
+                return result
+
             decision = await self.permission_checker.check(
                 builder.name,
                 raw_params,
