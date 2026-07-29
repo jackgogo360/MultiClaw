@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 import jwt
 from fastapi.testclient import TestClient
 
+from multiclaw.mcp.types import ToolInfo
+
 
 def _make_auth_cookie(app) -> dict:
     """Generate a valid JWT cookie for test requests."""
@@ -149,3 +151,122 @@ def test_auth_flows_are_public(tmp_path, monkeypatch):
         assert client.get("/auth/me").status_code != 401
         assert client.get("/").status_code != 401
         assert client.get("/multiclaw.png").status_code != 401
+
+
+def test_build_mcp_adapters_respects_filter_and_sanitized_namespace():
+    from multiclaw.mcp.tool_adapter import MCPToolBuilder
+    from multiclaw.server import _build_mcp_adapters, _mcp_namespace_prefix
+
+    tools = [
+        ToolInfo(
+            name="mcp__ignored__read_file",
+            server_name="demo server/v1",
+            original_name="read file/v2",
+            description="read",
+            input_schema={},
+        ),
+        ToolInfo(
+            name="mcp__ignored__write_file",
+            server_name="demo server/v1",
+            original_name="write_file",
+            description="write",
+            input_schema={},
+        ),
+        ToolInfo(
+            name="mcp__ignored__delete_file",
+            server_name="demo server/v1",
+            original_name="delete_file",
+            description="delete",
+            input_schema={},
+        ),
+    ]
+
+    adapters = _build_mcp_adapters(
+        server_name="demo server/v1",
+        tools=tools,
+        manager=object(),
+        tool_filter={"include": ["read", "write"], "exclude": ["write"]},
+    )
+
+    assert _mcp_namespace_prefix("demo server/v1") == "mcp__demo_server_v1__"
+    assert len(adapters) == 1
+    assert isinstance(adapters[0], MCPToolBuilder)
+    assert adapters[0].name == "mcp__demo_server_v1__read_file_v2"
+
+
+def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch):
+    from multiclaw.mcp.types import ServerState, ServerStatus
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    stale_tool = ToolInfo(
+        name="mcp__ignored__read_stale",
+        server_name="demo server/v1",
+        original_name="read_stale",
+        description="stale",
+        input_schema={},
+    )
+    refreshed_tool = ToolInfo(
+        name="mcp__ignored__read_fresh",
+        server_name="demo server/v1",
+        original_name="read_fresh",
+        description="fresh",
+        input_schema={},
+    )
+
+    events: list[str] = []
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self._callback = None
+            self._latest_states = {}
+
+        def set_tools_changed_callback(self, callback) -> None:
+            events.append("set_callback")
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            events.append("connect")
+            stale_state = ServerState(
+                name="demo server/v1",
+                config=object(),
+                status=ServerStatus.CONNECTED,
+                tools=[stale_tool],
+            )
+            if self._callback is not None:
+                events.append("callback")
+                self._callback("demo server/v1", [refreshed_tool])
+            self._latest_states = {
+                "demo server/v1": ServerState(
+                    name="demo server/v1",
+                    config=object(),
+                    status=ServerStatus.CONNECTED,
+                    tools=[refreshed_tool],
+                )
+            }
+            return {"demo server/v1": stale_state}
+
+        def get_server_states(self):
+            events.append("get_server_states")
+            return dict(self._latest_states)
+
+    monkeypatch.setattr(
+        "multiclaw.server.load_mcp_config",
+        lambda path=None: {"demo server/v1": object()},
+    )
+    monkeypatch.setattr(
+        "multiclaw.server.load_mcp_tools_config",
+        lambda path=None: {"demo server/v1": {"include": ["read"], "exclude": []}},
+    )
+
+    registry = ToolRegistry()
+    _register_mcp_tools(
+        registry=registry,
+        mcp_manager=FakeManager(),
+        config_path=None,
+    )
+
+    assert events == ["set_callback", "connect", "callback", "get_server_states"]
+    assert [builder.name for builder in registry.list_all()] == [
+        "mcp__demo_server_v1__read_fresh",
+    ]

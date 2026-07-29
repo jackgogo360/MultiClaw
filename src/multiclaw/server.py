@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import threading
 from contextlib import asynccontextmanager
 from collections.abc import Iterable
 from logging.handlers import TimedRotatingFileHandler
@@ -102,7 +103,13 @@ from multiclaw.tools.shell import ShellToolBuilder
 from multiclaw.tools.web_fetch import WebFetchToolBuilder
 from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
-from multiclaw.mcp import MCPClientManager, MCPToolBuilder, load_mcp_config, load_mcp_tools_config
+from multiclaw.mcp import (
+    MCPClientManager,
+    MCPToolBuilder,
+    ToolInfo,
+    load_mcp_config,
+    load_mcp_tools_config,
+)
 
 from uuid import uuid4
 
@@ -118,6 +125,99 @@ from multiclaw.stream import DataStreamEncoder
 
 agent: MultiClawAgent
 shared_bus: EventBus
+
+
+def _sanitize_mcp_namespace(name: str) -> str:
+    return "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in name)
+
+
+def _mcp_namespace_prefix(server_name: str) -> str:
+    return f"mcp__{_sanitize_mcp_namespace(server_name)}__"
+
+
+def _build_mcp_adapters(
+    server_name: str,
+    tools: list[ToolInfo],
+    manager: MCPClientManager,
+    tool_filter: dict[str, list[str]] | None,
+) -> list[MCPToolBuilder]:
+    from multiclaw.mcp.config import _matches_tool_filter
+
+    prefix = _mcp_namespace_prefix(server_name)
+    adapters: list[MCPToolBuilder] = []
+    for tool in tools:
+        if tool_filter and not _matches_tool_filter(tool.original_name, tool_filter):
+            continue
+        adapter = MCPToolBuilder.from_tool_info(tool, manager)
+        if not adapter.name.startswith(prefix):
+            adapter.name = f"{prefix}{_sanitize_mcp_namespace(tool.original_name)}"
+        adapters.append(adapter)
+    return adapters
+
+
+def _register_mcp_tools(
+    *,
+    registry: ToolRegistry,
+    mcp_manager: MCPClientManager,
+    config_path: str | None,
+) -> None:
+    configs = load_mcp_config(config_path)
+    if not configs:
+        logger.info("No MCP servers configured (no .mcp.json found)")
+        return
+
+    tools_configs = load_mcp_tools_config(config_path)
+    registry_lock = threading.RLock()
+    refreshed_servers: set[str] = set()
+
+    def _replace_server_namespace(server_name: str, tools: list[ToolInfo]) -> list[MCPToolBuilder]:
+        adapters = _build_mcp_adapters(
+            server_name,
+            tools,
+            mcp_manager,
+            tools_configs.get(server_name),
+        )
+        registry.replace_namespace(_mcp_namespace_prefix(server_name), adapters)
+        return adapters
+
+    def _refresh_registry(server_name: str, tools: list[ToolInfo]) -> None:
+        with registry_lock:
+            _replace_server_namespace(server_name, tools)
+            refreshed_servers.add(server_name)
+
+    mcp_manager.set_tools_changed_callback(_refresh_registry)
+
+    try:
+        mcp_manager.connect_servers(configs)
+        states = mcp_manager.get_server_states()
+        for server_name, state in states.items():
+            if state.status.value == "connected":
+                tool_filter = tools_configs.get(server_name)
+                skipped = len(state.tools)
+                with registry_lock:
+                    if server_name in refreshed_servers:
+                        adapters = _build_mcp_adapters(
+                            server_name,
+                            state.tools,
+                            mcp_manager,
+                            tool_filter,
+                        )
+                    else:
+                        adapters = _replace_server_namespace(server_name, state.tools)
+                registered = len(adapters)
+                skipped -= registered
+                logger.info(
+                    "Registered %d tools from MCP server '%s'%s",
+                    registered, server_name,
+                    f" ({skipped} filtered)" if skipped else "",
+                )
+            else:
+                logger.warning(
+                    "MCP server '%s' failed to connect: %s",
+                    server_name, state.error,
+                )
+    except Exception:
+        logger.exception("Failed to connect MCP servers")
 
 
 def create_agent() -> MultiClawAgent:
@@ -162,55 +262,13 @@ def create_agent() -> MultiClawAgent:
     mcp_manager = None
     if settings.mcp.enabled:
         mcp_manager = MCPClientManager()
-        configs = load_mcp_config(
-            settings.mcp.config_path if settings.mcp.config_path else None
+        _register_mcp_tools(
+            registry=registry,
+            mcp_manager=mcp_manager,
+            config_path=(
+                settings.mcp.config_path if settings.mcp.config_path else None
+            ),
         )
-        if configs:
-            try:
-                states = mcp_manager.connect_servers(configs)
-                tools_configs = load_mcp_tools_config(
-                    settings.mcp.config_path if settings.mcp.config_path else None
-                )
-                for server_name, state in states.items():
-                    if state.status.value == "connected":
-                        tool_filter = tools_configs.get(server_name)
-                        registered = 0
-                        skipped = 0
-                        for tool in state.tools:
-                            if tool_filter:
-                                from multiclaw.mcp.config import _matches_tool_filter
-                                if not _matches_tool_filter(tool.original_name, tool_filter):
-                                    skipped += 1
-                                    continue
-                            try:
-                                adapter = MCPToolBuilder(
-                                    name=tool.name,
-                                    server_name=tool.server_name,
-                                    original_name=tool.original_name,
-                                    description=tool.description,
-                                    input_schema=tool.input_schema,
-                                    manager=mcp_manager,
-                                )
-                                registry.register(adapter)
-                                registered += 1
-                            except Exception:
-                                logger.warning(
-                                    "Failed to register MCP tool: %s", tool.name
-                                )
-                        logger.info(
-                            "Registered %d tools from MCP server '%s'%s",
-                            registered, server_name,
-                            f" ({skipped} filtered)" if skipped else "",
-                        )
-                    else:
-                        logger.warning(
-                            "MCP server '%s' failed to connect: %s",
-                            server_name, state.error,
-                        )
-            except Exception:
-                logger.exception("Failed to connect MCP servers")
-        else:
-            logger.info("No MCP servers configured (no .mcp.json found)")
 
     scheduler = CoreToolScheduler(
         permission_checker=PermissionChecker(

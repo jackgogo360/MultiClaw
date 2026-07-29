@@ -1,3 +1,5 @@
+import threading
+
 from pydantic import BaseModel
 
 from multiclaw.tools.base import ToolBuilder
@@ -6,15 +8,30 @@ from multiclaw.tools.base import ToolBuilder
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolBuilder[BaseModel]] = {}
+        self._lock = threading.RLock()
 
     def register(self, builder: ToolBuilder[BaseModel]) -> None:
-        self._tools[builder.name] = builder
+        with self._lock:
+            self._tools[builder.name] = builder
+
+    def unregister(self, name: str) -> None:
+        with self._lock:
+            self._tools.pop(name, None)
+
+    def replace_namespace(self, prefix: str, builders: list[ToolBuilder[BaseModel]]) -> None:
+        with self._lock:
+            for name in [name for name in self._tools if name.startswith(prefix)]:
+                del self._tools[name]
+            for builder in builders:
+                self._tools[builder.name] = builder
 
     def get(self, name: str) -> ToolBuilder[BaseModel] | None:
-        return self._tools.get(name)
+        with self._lock:
+            return self._tools.get(name)
 
     def list_all(self) -> list[ToolBuilder[BaseModel]]:
-        return [self._tools[name] for name in sorted(self._tools)]
+        with self._lock:
+            return [self._tools[name] for name in sorted(self._tools)]
 
     def to_openai_schemas(self) -> list[dict]:
         schemas: list[dict] = []

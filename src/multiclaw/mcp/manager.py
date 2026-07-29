@@ -47,6 +47,7 @@ class MCPClientManager:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._tools_changed_callback: Callable[[str, list[ToolInfo]], None] | None = None
         self._started = False
 
     def start(self) -> None:
@@ -108,6 +109,12 @@ class MCPClientManager:
 
     def refresh_server_tools(self, server_name: str) -> list[ToolInfo]:
         return self._run_sync(self._refresh_server(server_name))
+
+    def set_tools_changed_callback(
+        self,
+        callback: Callable[[str, list[ToolInfo]], None] | None,
+    ) -> None:
+        self._tools_changed_callback = callback
 
     # --- 内部异步方法 ---
 
@@ -200,6 +207,14 @@ class MCPClientManager:
         if server_name in self._states:
             self._states[server_name].tools = tools
         logger.info("Tools refreshed for server '%s': %d tools", server_name, len(tools))
+        if self._tools_changed_callback is not None:
+            try:
+                self._tools_changed_callback(server_name, tools)
+            except Exception:
+                logger.exception(
+                    "Tools changed callback failed for server '%s'",
+                    server_name,
+                )
 
     # --- 同步/异步桥接 ---
 
