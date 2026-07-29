@@ -9,6 +9,7 @@ import httpx
 
 from multiclaw.agent.context import ContextBuilder, ContextRequest
 from multiclaw.agent.models import Action, ActionType, Observation, ObservationType
+from multiclaw.agent.resilience import ResilienceAction, ResilienceController
 from multiclaw.agent.toolcall import ToolCallAgent
 from multiclaw.config import Settings
 from multiclaw.events import AgentState, EventBus
@@ -30,6 +31,11 @@ FINAL_SUMMARY_PLAIN_TEXT_PROMPT = (
     "Do not output DSML, XML, HTML, or any tool-call tags. "
     "Using only the information already gathered in the conversation, "
     "answer directly in plain Markdown for the user."
+)
+REFLECTION_PROMPT = (
+    "Runtime reflection required. The previous approach made no progress: {reason}. "
+    "Explain the likely root cause in at most 120 words and choose materially different "
+    "tools or parameters. Do not call tools in this reflection."
 )
 
 
@@ -87,6 +93,68 @@ class MultiClawAgent(ToolCallAgent):
         )
         self.skill_manager = skill_manager or SkillManager()
 
+    def _build_resilience_controller(self) -> ResilienceController | None:
+        if not self.settings.agent.resilience_enabled:
+            return None
+        return ResilienceController(
+            repeat_limit=self.settings.agent.no_progress_repeat_limit,
+            max_reflections=self.settings.agent.reflection_max_attempts,
+        )
+
+    async def _generate_reflection(
+        self,
+        messages: list[dict[str, Any]],
+        reason: str,
+    ) -> str:
+        prompt = REFLECTION_PROMPT.format(reason=reason)
+        response = await self.router.completion(
+            model=self.settings.llm.default_model,
+            messages=[*messages, {"role": "system", "content": prompt}],
+            tools=None,
+        )
+        reflection = response.content.strip()
+        return reflection or "Use a materially different approach."
+
+    async def _attempt_reflection(
+        self,
+        messages: list[dict[str, Any]],
+        reason: str,
+    ) -> str | None:
+        try:
+            reflection = await self._generate_reflection(messages, reason)
+        except Exception:
+            logger.exception("reflection generation failed")
+            return None
+        return reflection
+
+    @staticmethod
+    def _normalize_tool_calls(calls: list[Any]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for i, call in enumerate(calls):
+            if hasattr(call, "name") and hasattr(call, "arguments"):
+                call_id = getattr(call, "id", "") or f"call_{i}"
+                name = call.name
+                arguments = call.arguments
+            else:
+                call_id = call.get("id") or f"call_{i}"
+                name = call["name"]
+                arguments = call["arguments"]
+            normalized.append(
+                {
+                    "id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _build_reflection_feedback_msg(reflection: str) -> dict[str, str]:
+        return {
+            "role": "system",
+            "content": f"Runtime reflection feedback: {reflection}",
+        }
+
     # ------------------------------------------------------------------
     # non-streaming path
     # ------------------------------------------------------------------
@@ -126,6 +194,7 @@ class MultiClawAgent(ToolCallAgent):
         await self._save_chat_msg(user_msg, "user", session_id)
         tools = self.registry.to_openai_schemas()
         max_rounds = self.settings.agent.max_tool_rounds
+        controller = self._build_resilience_controller()
 
         for _ in range(max_rounds):
             response: LLMResponse = await self.router.completion(
@@ -141,9 +210,26 @@ class MultiClawAgent(ToolCallAgent):
                     content=response.content,
                 )
 
+            if controller is not None:
+                call_decision = controller.observe_calls(
+                    self._normalize_tool_calls(response.tool_calls)
+                )
+                if call_decision.action == ResilienceAction.REFLECT:
+                    reflection = await self._attempt_reflection(
+                        messages, call_decision.reason
+                    )
+                    if reflection is None:
+                        break
+                    controller.mark_reflection_used()
+                    messages.append(self._build_reflection_feedback_msg(reflection))
+                    continue
+                if call_decision.action == ResilienceAction.TERMINATE:
+                    break
+
             # Execute each tool call
             assistant_msg = _build_assistant_tool_calls_msg(response)
             messages.append(assistant_msg)
+            result_contents: list[str] = []
 
             for i, tc in enumerate(response.tool_calls):
                 call_id = tc.id or f"call_{i}"
@@ -154,10 +240,25 @@ class MultiClawAgent(ToolCallAgent):
                 )
                 await self.transition(AgentState.ACTING)
                 obs = await self.act(action)
+                result_contents.append(obs.content)
                 messages.append(
                     _build_tool_result_msg(call_id, obs.content)
                 )
                 await self.remember(obs.content, "tool_result")
+
+            if controller is not None:
+                result_decision = controller.observe_results(result_contents)
+                if result_decision.action == ResilienceAction.REFLECT:
+                    reflection = await self._attempt_reflection(
+                        messages, result_decision.reason
+                    )
+                    if reflection is None:
+                        break
+                    controller.mark_reflection_used()
+                    messages.append(self._build_reflection_feedback_msg(reflection))
+                    continue
+                if result_decision.action == ResilienceAction.TERMINATE:
+                    break
 
         # Max rounds exceeded — force a final summary without tools
         logger.warning(
@@ -261,6 +362,7 @@ class MultiClawAgent(ToolCallAgent):
         await self._save_chat_msg(user_msg, "user", session_id)
         tools = self.registry.to_openai_schemas()
         max_rounds = self.settings.agent.max_tool_rounds
+        controller = self._build_resilience_controller()
 
         for round_num in range(max_rounds):
             logger.info("round %d/%d, messages=%d", round_num + 1, max_rounds, len(messages))
@@ -268,6 +370,9 @@ class MultiClawAgent(ToolCallAgent):
                 logger.info("  msg[%d] role=%s tc=%s", i, msg.get("role"), bool(msg.get("tool_calls")))
             full_text = ""
             reasoning_text = ""
+            handled_tool_calls = False
+            reflect_requested = False
+            terminate_requested = False
 
             try:
                 async for event in self.router.stream_completion(
@@ -291,6 +396,31 @@ class MultiClawAgent(ToolCallAgent):
                             event.get("reasoning_content", "")[:120],
                         )
                         reasoning = event.get("reasoning_content", "")
+                        normalized_calls = self._normalize_tool_calls(event["calls"])
+                        if controller is not None:
+                            call_decision = controller.observe_calls(normalized_calls)
+                            if call_decision.action == ResilienceAction.REFLECT:
+                                reflection = await self._attempt_reflection(
+                                    messages, call_decision.reason
+                                )
+                                if reflection is None:
+                                    terminate_requested = True
+                                    break
+                                controller.mark_reflection_used()
+                                messages.append(
+                                    self._build_reflection_feedback_msg(reflection)
+                                )
+                                yield {
+                                    "type": "state",
+                                    "name": "reflection",
+                                    "content": reflection,
+                                }
+                                reflect_requested = True
+                                break
+                            if call_decision.action == ResilienceAction.TERMINATE:
+                                terminate_requested = True
+                                break
+
                         for tc in event["calls"]:
                             yield {
                                 "type": "tool_call",
@@ -319,6 +449,7 @@ class MultiClawAgent(ToolCallAgent):
                         if reasoning:
                             tool_calls_msg["reasoning_content"] = reasoning
                         messages.append(tool_calls_msg)
+                        result_contents: list[str] = []
 
                         for i, tc in enumerate(event["calls"]):
                             call_id = tc["id"] or f"call_{i}"
@@ -337,11 +468,35 @@ class MultiClawAgent(ToolCallAgent):
                                 "content": obs.content,
                             }
 
+                            result_contents.append(obs.content)
                             messages.append(
                                 _build_tool_result_msg(call_id, obs.content)
                             )
                             await self.remember(obs.content, "tool_result")
 
+                        if controller is not None:
+                            result_decision = controller.observe_results(result_contents)
+                            if result_decision.action == ResilienceAction.REFLECT:
+                                reflection = await self._attempt_reflection(
+                                    messages, result_decision.reason
+                                )
+                                if reflection is None:
+                                    terminate_requested = True
+                                else:
+                                    controller.mark_reflection_used()
+                                    messages.append(
+                                        self._build_reflection_feedback_msg(reflection)
+                                    )
+                                    yield {
+                                        "type": "state",
+                                        "name": "reflection",
+                                        "content": reflection,
+                                    }
+                                    reflect_requested = True
+                            elif result_decision.action == ResilienceAction.TERMINATE:
+                                terminate_requested = True
+
+                        handled_tool_calls = True
                         break  # tool_calls handled, continue outer loop
 
                 else:
@@ -367,6 +522,11 @@ class MultiClawAgent(ToolCallAgent):
                     "content": f"Request timed out: {exc}",
                 }
                 return
+
+            if terminate_requested:
+                break
+            if reflect_requested or handled_tool_calls:
+                continue
 
         # Max rounds exceeded — force a final summary without tools
         logger.warning(
