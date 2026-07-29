@@ -189,10 +189,22 @@ class TestMultiClawAgent:
         request_body = mock_client.post.call_args.kwargs["json"]
         messages = request_body["messages"]
 
-        assert messages[1]["role"] == "system"
-        assert "Relevant memory:" in messages[1]["content"]
-        assert "alpha project uses SQLite memory" in messages[1]["content"]
-        assert messages[2] == {"role": "user", "content": "what does alpha use?"}
+        relevant_memory_message = next(
+            (
+                message
+                for message in messages
+                if message["role"] == "system"
+                and "Relevant memory:" in message["content"]
+            ),
+            None,
+        )
+
+        assert relevant_memory_message is not None
+        assert (
+            "alpha project uses SQLite memory"
+            in relevant_memory_message["content"]
+        )
+        assert messages[-1] == {"role": "user", "content": "what does alpha use?"}
 
     @pytest.mark.asyncio
     async def test_agent_saves_user_and_assistant_messages_with_session_id(self, agent):

@@ -17,15 +17,12 @@ import { ChatView } from "@/components/chat/ChatView";
 import { API_BASE } from "@/lib/constants";
 import { SessionProvider } from "@/components/session/SessionProvider";
 import { SessionList } from "@/components/session/SessionList";
+import { shouldLogChatDebug } from "@/chat-debug";
 import { extractLatestUserText } from "@/lib/chat-request";
 import { sessionStore } from "@/lib/session-store";
 import { chatStore } from "@/lib/chat-store";
 
 type ChatRequestState = "idle" | "sending" | "streaming";
-
-function shouldLogChatDebug() {
-  return typeof window !== "undefined" && window.location.hostname === "localhost";
-}
 
 /**
  * Custom wrapper around useChat + useAISDKRuntime + useRemoteThreadListRuntime
@@ -129,7 +126,7 @@ function ChatApp() {
             );
             const sessionId = sessionStore.getSnapshot().currentId ?? undefined;
 
-            if (shouldLogChatDebug()) {
+            if (shouldLogChatDebug({ hostname: window.location.hostname })) {
               console.debug("[chat] prepare request", {
                 sessionId,
                 messageCount: messages.length,
@@ -146,7 +143,7 @@ function ChatApp() {
           } catch (error) {
             const message =
               error instanceof Error ? error.message : "Failed to prepare chat request.";
-            if (shouldLogChatDebug()) {
+            if (shouldLogChatDebug({ hostname: window.location.hostname })) {
               console.error("[chat] prepare request failed", error, messages);
             }
             setRequestState("idle");
@@ -155,11 +152,11 @@ function ChatApp() {
           }
         },
         fetch: async (input, init) => {
-          if (shouldLogChatDebug()) {
+          if (shouldLogChatDebug({ hostname: window.location.hostname })) {
             console.debug("[chat] fetch start", input, init);
           }
           const response = await fetch(input, init);
-          if (shouldLogChatDebug()) {
+          if (shouldLogChatDebug({ hostname: window.location.hostname })) {
             console.debug("[chat] fetch response", response.status, response.url);
           }
           return response;

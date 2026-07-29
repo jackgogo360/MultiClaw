@@ -133,6 +133,7 @@ class TestToolRegistry:
 
     def test_runtime_registry_matches_agent_code_tool_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+        monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
         from multiclaw.server import create_agent
 
         agent = create_agent()

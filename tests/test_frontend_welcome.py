@@ -1,64 +1,77 @@
 import json
+import re
 import subprocess
 from pathlib import Path
 
 
-def test_hide_welcome_targets_current_welcome_node():
-    html_path = Path("src/multiclaw/static/index.html").resolve()
+def _find_typescript_module() -> Path:
+    for parent in [Path.cwd().resolve(), *Path.cwd().resolve().parents]:
+        candidate = parent / "frontend" / "node_modules" / "typescript" / "lib" / "typescript.js"
+        if candidate.exists():
+            return candidate
+    raise AssertionError("typescript compiler API not found")
+
+
+def test_welcome_copy_is_rendered_in_thread_empty_state():
+    source_path = Path("frontend/src/components/assistant-ui/thread.tsx").resolve()
+    typescript_path = _find_typescript_module().resolve()
     node_script = f"""
-const fs = require('fs');
-const vm = require('vm');
+import fs from 'node:fs';
+import ts from {typescript_path.as_uri()!r};
 
-const html = fs.readFileSync({json.dumps(str(html_path))}, 'utf8');
-const start = html.indexOf("const msgs = document.getElementById('messages');");
-const end = html.indexOf("// ---- thinking ----");
-if (start === -1 || end === -1 || end <= start) {{
-  throw new Error('failed to locate welcome script snippet');
+const source = fs.readFileSync({str(source_path)!r}, 'utf8');
+const file = ts.createSourceFile(
+  {source_path.name!r},
+  source,
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TSX,
+);
+
+function isThreadPrimitiveEmpty(node) {{
+  return ts.isJsxElement(node)
+    && ts.isPropertyAccessExpression(node.openingElement.tagName)
+    && ts.isIdentifier(node.openingElement.tagName.expression)
+    && node.openingElement.tagName.expression.text === 'ThreadPrimitive'
+    && node.openingElement.tagName.name.text === 'Empty';
 }}
-const snippet = html.slice(start, end);
 
-let currentWelcome = {{ style: {{ display: '' }} }};
-const messages = {{ appendChild() {{}}, scrollTop: 0, scrollHeight: 0 }};
-const input = {{
-  style: {{}},
-  addEventListener() {{}},
-  focus() {{}},
-}};
-const btn = {{}};
-
-const document = {{
-  getElementById(id) {{
-    if (id === 'messages') return messages;
-    if (id === 'input') return input;
-    if (id === 'send-btn') return btn;
-    if (id === 'welcome') return currentWelcome;
-    return null;
-  }},
-}};
-
-    const context = {{
-      document,
-      console,
-      globalThis: {{}},
-      URLSearchParams,
-      location: {{ search: '' }},
-      localStorage: {{ getItem() {{ return null; }} }},
-      Date,
+let payload = null;
+function visit(node) {{
+  if (payload) return;
+  if (isThreadPrimitiveEmpty(node)) {{
+    payload = {{
+      childCount: node.children.filter((child) => !(ts.isJsxText(child) && child.getText(file).trim() === '')).length,
+      renderedSource: node.children.map((child) => child.getText(file)).join(' '),
     }};
-vm.createContext(context);
-vm.runInContext(snippet, context);
+    return;
+  }}
+  ts.forEachChild(node, visit);
+}}
 
-currentWelcome = {{ style: {{ display: '' }} }};
-context.hideWelcome();
-process.stdout.write(JSON.stringify({{ display: currentWelcome.style.display }}));
+visit(file);
+process.stdout.write(JSON.stringify(payload));
 """
 
     result = subprocess.run(
-        ["node", "-e", node_script],
+        ["node", "--input-type=module", "-e", node_script],
         capture_output=True,
         text=True,
         check=False,
     )
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"display": "none"}
+    payload = json.loads(result.stdout)
+    rendered_text = re.sub(
+        r"\{/\*.*?\*/\}",
+        " ",
+        payload["renderedSource"],
+        flags=re.DOTALL,
+    )
+    rendered_text = re.sub(r"<[^>]+>", " ", rendered_text)
+    rendered_text = " ".join(rendered_text.split())
+
+    assert payload is not None
+    assert payload["childCount"] > 0
+    assert "Start a conversation" in rendered_text
+    assert "Type a message below to begin" in rendered_text
