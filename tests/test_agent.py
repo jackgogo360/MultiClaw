@@ -1,12 +1,14 @@
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
+from types import SimpleNamespace
 
 from pydantic import BaseModel
 
+from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.config import Settings
 from multiclaw.events import EventBus
 from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
-from multiclaw.llm import ModelRouter
+from multiclaw.llm import LLMResponse, ModelRouter, ToolCall
 from multiclaw.memory import InMemoryMemory
 from multiclaw.planner import Planner
 from multiclaw.tools import (
@@ -260,3 +262,223 @@ class TestMultiClawAgent:
 
         assert "session one user" in contents
         assert "session two user" not in contents
+
+    @pytest.mark.asyncio
+    async def test_handle_message_reflects_on_third_repeated_tool_batch(self):
+        from multiclaw.agent.multiclaw import MultiClawAgent
+
+        agent = _build_stub_agent(
+            completion_responses=[
+                _tool_call_response("call_1", {"query": "alpha"}),
+                _tool_call_response("call_2", {"query": "alpha"}),
+                _tool_call_response("call_3", {"query": "alpha"}),
+                LLMResponse(content="Root cause analysis"),
+                LLMResponse(content="changed approach"),
+            ],
+            act_results=["first result", "second result"],
+            resilience_enabled=True,
+            repeat_limit=3,
+            max_reflections=1,
+        )
+
+        observation = await agent.handle_message("hello", session_id="s1")
+
+        assert observation.type == ObservationType.USER_RESPONSE
+        assert observation.content == "changed approach"
+        assert agent.act.await_count == 2
+
+        reflection_call = _find_reflection_call(agent.router.completion.await_args_list)
+        assert reflection_call.kwargs["tools"] is None
+        assert reflection_call.kwargs["messages"][-1]["role"] == "system"
+        assert "Runtime reflection required." in reflection_call.kwargs["messages"][-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_handle_message_reflects_then_forces_summary_on_repeated_results(self):
+        agent = _build_stub_agent(
+            completion_responses=[
+                _tool_call_response("call_1", {"query": "alpha"}),
+                _tool_call_response("call_2", {"query": "beta"}),
+                LLMResponse(content="Try a different search strategy"),
+                _tool_call_response("call_3", {"query": "gamma"}),
+                LLMResponse(content="forced summary"),
+            ],
+            act_results=["stuck", "stuck", "stuck"],
+            resilience_enabled=True,
+            repeat_limit=2,
+            max_reflections=1,
+        )
+
+        observation = await agent.handle_message("hello", session_id="s1")
+
+        assert observation.type == ObservationType.USER_RESPONSE
+        assert observation.content == "forced summary"
+        assert agent.act.await_count == 3
+
+        reflection_calls = [
+            call
+            for call in agent.router.completion.await_args_list
+            if call.kwargs["tools"] is None
+            and call.kwargs["messages"][-1]["role"] == "system"
+            and "Runtime reflection required." in call.kwargs["messages"][-1]["content"]
+        ]
+        assert len(reflection_calls) == 1
+
+        forced_summary_call = agent.router.completion.await_args_list[-1]
+        assert forced_summary_call.kwargs["tools"] is None
+        assert forced_summary_call.kwargs["messages"][-1]["role"] == "tool"
+        assert forced_summary_call.kwargs["messages"][-1]["content"] == "stuck"
+
+    @pytest.mark.asyncio
+    async def test_handle_message_keeps_legacy_behavior_when_resilience_disabled(self):
+        agent = _build_stub_agent(
+            completion_responses=[
+                _tool_call_response("call_1", {"query": "alpha"}),
+                _tool_call_response("call_2", {"query": "alpha"}),
+                _tool_call_response("call_3", {"query": "alpha"}),
+                LLMResponse(content="done"),
+            ],
+            act_results=["same", "same", "same"],
+            resilience_enabled=False,
+            repeat_limit=3,
+            max_reflections=1,
+        )
+
+        observation = await agent.handle_message("hello", session_id="s1")
+
+        assert observation.type == ObservationType.USER_RESPONSE
+        assert observation.content == "done"
+        assert agent.act.await_count == 3
+        assert all(call.kwargs["tools"] is not None for call in agent.router.completion.await_args_list[:-1])
+        assert all(
+            "Runtime reflection required." not in message["content"]
+            for call in agent.router.completion.await_args_list
+            for message in call.kwargs["messages"]
+            if message.get("role") == "system" and message.get("content")
+        )
+
+    @pytest.mark.asyncio
+    async def test_handle_message_forces_summary_when_reflection_generation_fails(self):
+        agent = _build_stub_agent(
+            completion_responses=[
+                _tool_call_response("call_1", {"query": "alpha"}),
+                _tool_call_response("call_2", {"query": "alpha"}),
+                _tool_call_response("call_3", {"query": "alpha"}),
+                RuntimeError("reflection failed"),
+                LLMResponse(content="forced summary"),
+            ],
+            act_results=["first result", "second result"],
+            resilience_enabled=True,
+            repeat_limit=3,
+            max_reflections=1,
+        )
+
+        observation = await agent.handle_message("hello", session_id="s1")
+
+        assert observation.type == ObservationType.USER_RESPONSE
+        assert observation.content == "forced summary"
+        assert agent.act.await_count == 2
+        assert agent.router.completion.await_count == 5
+
+        reflection_call = _find_reflection_call(agent.router.completion.await_args_list)
+        forced_summary_call = agent.router.completion.await_args_list[-1]
+
+        assert reflection_call.kwargs["tools"] is None
+        assert forced_summary_call.kwargs["tools"] is None
+        assert forced_summary_call.kwargs["messages"] == reflection_call.kwargs["messages"][:-1]
+        assert all(
+            message.get("content") != "Runtime reflection feedback: forced summary"
+            for message in forced_summary_call.kwargs["messages"]
+            if message.get("role") == "system"
+        )
+
+
+class _StubSkillManager:
+    def process_message(self, _message: str):
+        return []
+
+    def get_active_skill_prompts(self):
+        return []
+
+    def invoke(self, _skill_name: str, _args: str):
+        return None
+
+
+class _StubContextBuilder:
+    async def build(self, _request):
+        return [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}]
+
+
+class _StubRegistry:
+    def to_openai_schemas(self):
+        return [{"type": "function", "function": {"name": "echo"}}]
+
+
+class _StubMemory:
+    async def save(self, _entry):
+        return None
+
+
+def _build_stub_agent(
+    *,
+    completion_responses: list[LLMResponse],
+    act_results: list[str],
+    resilience_enabled: bool,
+    repeat_limit: int,
+    max_reflections: int,
+):
+    from multiclaw.agent.multiclaw import MultiClawAgent
+
+    agent = MultiClawAgent.__new__(MultiClawAgent)
+    agent.skill_manager = _StubSkillManager()
+    agent.context_builder = _StubContextBuilder()
+    agent.registry = _StubRegistry()
+    agent.memory = _StubMemory()
+    agent.router = SimpleNamespace(
+        completion=AsyncMock(side_effect=completion_responses)
+    )
+    agent.settings = _stub_settings(
+        resilience_enabled=resilience_enabled,
+        repeat_limit=repeat_limit,
+        max_reflections=max_reflections,
+    )
+    agent.transition = AsyncMock()
+    agent._save_chat_msg = AsyncMock()
+    agent.remember = AsyncMock()
+    agent.act = AsyncMock(
+        side_effect=[
+            Observation(type=ObservationType.TOOL_RESULT, content=content)
+            for content in act_results
+        ]
+    )
+    return agent
+
+
+def _stub_settings(*, resilience_enabled: bool, repeat_limit: int, max_reflections: int):
+    return SimpleNamespace(
+        agent=SimpleNamespace(
+            system_prompt="sys",
+            max_tool_rounds=6,
+            resilience_enabled=resilience_enabled,
+            no_progress_repeat_limit=repeat_limit,
+            reflection_max_attempts=max_reflections,
+        ),
+        memory=SimpleNamespace(context_window_limit=1000),
+        llm=SimpleNamespace(default_model="test-model"),
+    )
+
+
+def _tool_call_response(call_id: str, arguments: dict[str, str]) -> LLMResponse:
+    return LLMResponse(
+        content="",
+        tool_calls=[ToolCall(id=call_id, name="echo", arguments=arguments)],
+    )
+
+
+def _find_reflection_call(calls):
+    return next(
+        call
+        for call in calls
+        if call.kwargs["tools"] is None
+        and call.kwargs["messages"][-1]["role"] == "system"
+        and "Runtime reflection required." in call.kwargs["messages"][-1]["content"]
+    )
