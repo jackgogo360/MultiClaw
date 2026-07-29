@@ -35,6 +35,9 @@ class MemorySettings(BaseModel):
     recent_turns: int = 2
     context_history_ratio: float = 0.5
     include_legacy_memory_in_retrieval: bool = False
+    progressive_context_enabled: bool = False
+    context_response_reserve_tokens: int = Field(default=4096, ge=256)
+    context_l1_ratio: float = Field(default=0.6, gt=0.0, lt=1.0)
 
 
 class GovernanceSettings(BaseModel):
@@ -42,8 +45,17 @@ class GovernanceSettings(BaseModel):
     audit_enabled: bool = True
 
 
+class ToolSettings(BaseModel):
+    parallel_read_only_enabled: bool = False
+    parallel_max_concurrency: int = Field(default=4, ge=1, le=16)
+    web_fetch_allow_private_networks: bool = False
+
+
 class AgentSettings(BaseModel):
     max_tool_rounds: int = 10
+    resilience_enabled: bool = False
+    no_progress_repeat_limit: int = Field(default=3, ge=2, le=10)
+    reflection_max_attempts: int = Field(default=1, ge=0, le=3)
     system_prompt: str = (
         "You are MultiClaw, an AI assistant with access to tools. "
         "You are powered by a large language model. "
@@ -104,6 +116,7 @@ class Settings(BaseSettings):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
+    tools: ToolSettings = Field(default_factory=ToolSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
     skill: SkillSettings = Field(default_factory=SkillSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
@@ -146,6 +159,7 @@ class Settings(BaseSettings):
         except ValueError:
             pass
         return value
+
     def _build_toml_kwargs(self, path: Path) -> dict[str, Any]:
         with open(path, "rb") as f:
             data = tomllib.load(f)
@@ -166,6 +180,8 @@ class Settings(BaseSettings):
             result["memory"] = data["memory"]
         if "governance" in data:
             result["governance"] = data["governance"]
+        if "tools" in data:
+            result["tools"] = data["tools"]
         if "agent" in data:
             result["agent"] = data["agent"]
         if "skills" in data:
