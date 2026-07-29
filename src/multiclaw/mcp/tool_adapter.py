@@ -1,6 +1,7 @@
 """MCP -> ToolBuilder adapter - bridge MCP tools into MultiClaw's tool system."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, TYPE_CHECKING
@@ -160,7 +161,8 @@ class MCPToolInvocation(ToolInvocation):
 
     async def execute(self) -> ToolExecutionResult:
         try:
-            result = self._manager.call_tool(
+            result = await asyncio.to_thread(
+                self._manager.call_tool,
                 self._server_name,
                 self._tool_name,
                 self.params.model_dump(),
