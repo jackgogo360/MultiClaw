@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import jwt
+import pytest
 from fastapi.testclient import TestClient
 
 from multiclaw.mcp.types import ToolInfo
@@ -270,3 +271,37 @@ def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch
     assert [builder.name for builder in registry.list_all()] == [
         "mcp__demo_server_v1__read_fresh",
     ]
+
+
+@pytest.mark.parametrize(
+    ("allow_private_networks", "expected"),
+    [
+        (None, False),
+        ("true", True),
+    ],
+)
+def test_create_agent_wires_web_fetch_private_network_flag(
+    tmp_path,
+    monkeypatch,
+    allow_private_networks,
+    expected,
+):
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    if allow_private_networks is None:
+        monkeypatch.delenv("MULTICLAW_TOOLS__WEB_FETCH_ALLOW_PRIVATE_NETWORKS", raising=False)
+    else:
+        monkeypatch.setenv(
+            "MULTICLAW_TOOLS__WEB_FETCH_ALLOW_PRIVATE_NETWORKS",
+            allow_private_networks,
+        )
+
+    from multiclaw.server import create_agent
+    from multiclaw.tools.web_fetch import WebFetchToolBuilder
+
+    agent = create_agent()
+    web_fetch_builder = agent.registry.get("web_fetch")
+
+    assert isinstance(web_fetch_builder, WebFetchToolBuilder)
+    assert web_fetch_builder.allow_private_networks is expected

@@ -255,7 +255,12 @@ def create_agent() -> MultiClawAgent:
     registry.register(FindDirToolBuilder(workspace_root))
     registry.register(ShellToolBuilder(workspace_root))
     registry.register(CodeExecToolBuilder(workspace_root))
-    registry.register(WebFetchToolBuilder(workspace_root))
+    registry.register(
+        WebFetchToolBuilder(
+            workspace_root,
+            allow_private_networks=settings.tools.web_fetch_allow_private_networks,
+        )
+    )
     registry.register(WebSearchToolBuilder(workspace_root))
 
     # Register MCP tools if enabled
