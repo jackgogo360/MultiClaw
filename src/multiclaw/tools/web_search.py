@@ -209,6 +209,7 @@ class WebSearchToolBuilder(WorkspaceToolBuilder):
     name = "web_search"
     description = "Search the web with engine fallback. Engines: duckduckgo, bing, baidu."
     parameters_schema = WebSearchParams
+    read_only = True
 
     def __init__(self, workspace_root: str | Path | None = None, policy=None,
                  engine: str = DEFAULT_ENGINE,

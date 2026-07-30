@@ -221,6 +221,7 @@ class WebFetchToolBuilder(WorkspaceToolBuilder):
     name = "web_fetch"
     description = "Fetch a web page and extract content. Modes: light, markdown, browser, auto."
     parameters_schema = WebFetchParams
+    read_only = True
 
     def __init__(self, workspace_root: str | Path | None = None, policy=None,
                  mode: str = "auto", timeout: float = 30.0) -> None:

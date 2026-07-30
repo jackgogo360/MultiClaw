@@ -43,6 +43,7 @@ class ToolBuilder(ABC, Generic[TParams]):
     name: str
     description: str
     parameters_schema: type[TParams]
+    read_only: bool = False
 
     @abstractmethod
     def validate(self, params: dict[str, Any]) -> TParams:

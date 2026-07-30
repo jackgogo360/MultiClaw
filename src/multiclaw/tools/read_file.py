@@ -162,6 +162,7 @@ class ReadFileToolBuilder(WorkspaceToolBuilder):
     name = "read_file"
     description = "Read a file from the workspace with 1-based line ranges."
     parameters_schema = ReadFileParams
+    read_only = True
 
     def __init__(self, workspace_root: str | Path | None = None, policy: PathPolicy | None = None) -> None:
         super().__init__(workspace_root=workspace_root, policy=policy)

@@ -116,6 +116,7 @@ class ListDirToolBuilder(WorkspaceToolBuilder):
     name = "list_dir"
     description = "List a directory in flat or recursive mode."
     parameters_schema = ListDirParams
+    read_only = True
 
     def validate(self, params: dict) -> ListDirParams:
         return ListDirParams(**params)

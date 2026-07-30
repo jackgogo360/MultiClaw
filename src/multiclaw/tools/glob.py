@@ -93,6 +93,7 @@ class GlobToolBuilder(WorkspaceToolBuilder):
     name = "glob"
     description = "Find files by glob pattern within the workspace."
     parameters_schema = GlobParams
+    read_only = True
 
     def validate(self, params: dict) -> GlobParams:
         return GlobParams(**params)

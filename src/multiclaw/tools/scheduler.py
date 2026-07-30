@@ -32,6 +32,21 @@ class CoreToolScheduler:
             return True
         return False
 
+    async def can_run_concurrently(
+        self,
+        builder: ToolBuilder,
+        raw_params: dict[str, Any],
+    ) -> bool:
+        if not builder.read_only:
+            return False
+
+        decision = await self.permission_checker.check(
+            builder.name,
+            raw_params,
+            workspace_root=getattr(builder, "workspace_root", None),
+        )
+        return decision.allow and not decision.requires_approval
+
     async def run(
         self,
         builder: ToolBuilder,
