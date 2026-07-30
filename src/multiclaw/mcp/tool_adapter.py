@@ -89,6 +89,14 @@ def _extract_text(content: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _is_read_only_tool_info(tool_info: Any) -> bool:
+    return (
+        getattr(tool_info, "read_only", None) is True
+        and getattr(tool_info, "destructive", None) is False
+        and getattr(tool_info, "open_world", None) is False
+    )
+
+
 class MCPToolBuilder(ToolBuilder):
     name: str
     description: str
@@ -105,12 +113,14 @@ class MCPToolBuilder(ToolBuilder):
         description: str,
         input_schema: dict,
         manager: MCPClientManager,
+        read_only: bool = False,
     ) -> None:
         self.name = name
         self.description = description
         self._server_name = server_name
         self._original_name = original_name
         self._manager = manager
+        self.read_only = read_only
         try:
             self.parameters_schema = _json_schema_to_pydantic(input_schema)
         except Exception:
@@ -143,6 +153,7 @@ class MCPToolBuilder(ToolBuilder):
             description=tool_info.description,
             input_schema=tool_info.input_schema,
             manager=manager,
+            read_only=_is_read_only_tool_info(tool_info),
         )
 
 

@@ -78,6 +78,7 @@ class FindDirToolBuilder(WorkspaceToolBuilder):
     name = "find_dir"
     description = "Find directories by name pattern within the workspace."
     parameters_schema = FindDirParams
+    read_only = True
 
     def validate(self, params: dict) -> FindDirParams:
         return FindDirParams(**params)
