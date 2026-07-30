@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
 from types import SimpleNamespace
@@ -5,6 +6,7 @@ from types import SimpleNamespace
 from pydantic import BaseModel
 
 from multiclaw.agent.models import Observation, ObservationType
+from multiclaw.agent.tool_batch import ToolBatchExecutor
 from multiclaw.config import Settings
 from multiclaw.events import EventBus
 from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
@@ -60,6 +62,50 @@ class EchoToolBuilder(ToolBuilder[EchoParams]):
 
     def build(self, params: EchoParams) -> ToolInvocation[EchoParams]:
         return EchoInvocation(name=self.name, params=params)
+
+
+class _ScriptedParams(BaseModel):
+    query: str | None = None
+    label: str | None = None
+    delay: float = 0.0
+
+
+class _ScriptedInvocation(ToolInvocation[_ScriptedParams]):
+    def __init__(self, name: str, params: _ScriptedParams, runner) -> None:
+        super().__init__(name=name, params=params)
+        self._runner = runner
+
+    async def execute(self) -> ToolExecutionResult:
+        return await self._runner(self.params)
+
+
+class _ScriptedToolBuilder(ToolBuilder[_ScriptedParams]):
+    description = "Scripted test tool"
+    parameters_schema = _ScriptedParams
+
+    def __init__(self, name: str, runner, *, read_only: bool) -> None:
+        self.name = name
+        self._runner = runner
+        self.read_only = read_only
+
+    def validate(self, params: dict) -> _ScriptedParams:
+        return _ScriptedParams(**params)
+
+    def build(self, params: _ScriptedParams) -> ToolInvocation[_ScriptedParams]:
+        return _ScriptedInvocation(self.name, params, self._runner)
+
+
+class _BatchScheduler:
+    def __init__(self) -> None:
+        self.run_calls: list[tuple[str, dict]] = []
+
+    async def can_run_concurrently(self, builder, raw_params: dict) -> bool:
+        return builder.read_only
+
+    async def run(self, builder, raw_params: dict) -> ToolExecutionResult:
+        self.run_calls.append((builder.name, raw_params))
+        params = builder.validate(raw_params)
+        return await builder.build(params).execute()
 
 
 @pytest.fixture
@@ -285,7 +331,7 @@ class TestMultiClawAgent:
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "changed approach"
-        assert agent.act.await_count == 2
+        assert len(agent._batch_scheduler.run_calls) == 2
 
         reflection_call = _find_reflection_call(agent.router.completion.await_args_list)
         assert reflection_call.kwargs["tools"] is None
@@ -312,7 +358,7 @@ class TestMultiClawAgent:
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "forced summary"
-        assert agent.act.await_count == 3
+        assert len(agent._batch_scheduler.run_calls) == 3
 
         reflection_calls = [
             call
@@ -347,7 +393,7 @@ class TestMultiClawAgent:
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "done"
-        assert agent.act.await_count == 3
+        assert len(agent._batch_scheduler.run_calls) == 3
         assert all(call.kwargs["tools"] is not None for call in agent.router.completion.await_args_list[:-1])
         assert all(
             "Runtime reflection required." not in message["content"]
@@ -376,7 +422,7 @@ class TestMultiClawAgent:
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "forced summary"
-        assert agent.act.await_count == 2
+        assert len(agent._batch_scheduler.run_calls) == 2
         assert agent.router.completion.await_count == 5
 
         reflection_call = _find_reflection_call(agent.router.completion.await_args_list)
@@ -390,6 +436,232 @@ class TestMultiClawAgent:
             for message in forced_summary_call.kwargs["messages"]
             if message.get("role") == "system"
         )
+
+    @pytest.mark.asyncio
+    async def test_handle_message_parallel_read_only_batch_overlaps_when_enabled(self):
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        active = 0
+        max_active = 0
+        finished: list[str] = []
+
+        async def runner(params: _ScriptedParams) -> ToolExecutionResult:
+            nonlocal active, max_active
+            label = params.label or ""
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                if label == "first":
+                    first_started.set()
+                    await asyncio.wait_for(second_started.wait(), timeout=0.1)
+                    await asyncio.sleep(0.02)
+                else:
+                    second_started.set()
+                    await asyncio.sleep(0.0)
+                finished.append(label)
+                return ToolExecutionResult(
+                    status=ToolStatus.SUCCESS,
+                    content=f"done:{label}",
+                )
+            finally:
+                active -= 1
+
+        registry = ToolRegistry()
+        registry.register(_ScriptedToolBuilder("echo", runner, read_only=True))
+        scheduler = _BatchScheduler()
+        agent = _build_custom_batch_agent(
+            completion_responses=[
+                _tool_batch_response(
+                    ("call_1", "echo", {"label": "first"}),
+                    ("call_2", "echo", {"label": "second"}),
+                ),
+                LLMResponse(content="finished"),
+            ],
+            registry=registry,
+            scheduler=scheduler,
+            parallel_enabled=True,
+        )
+
+        observation = await agent.handle_message("hello", session_id="s1")
+
+        assert observation.type == ObservationType.USER_RESPONSE
+        assert observation.content == "finished"
+        assert first_started.is_set()
+        assert second_started.is_set()
+        assert max_active == 2
+        assert finished == ["second", "first"]
+        assert agent.act.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_handle_message_read_write_read_batch_preserves_serial_barriers(self):
+        active = 0
+        max_active = 0
+        execution_order: list[str] = []
+
+        async def runner(params: _ScriptedParams) -> ToolExecutionResult:
+            nonlocal active, max_active
+            label = params.label or ""
+            execution_order.append(f"start:{label}")
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.01)
+                execution_order.append(f"end:{label}")
+                return ToolExecutionResult(
+                    status=ToolStatus.SUCCESS,
+                    content=label,
+                )
+            finally:
+                active -= 1
+
+        registry = ToolRegistry()
+        registry.register(_ScriptedToolBuilder("read_probe", runner, read_only=True))
+        registry.register(_ScriptedToolBuilder("write_probe", runner, read_only=False))
+        agent = _build_custom_batch_agent(
+            completion_responses=[
+                _tool_batch_response(
+                    ("call_1", "read_probe", {"label": "read-1"}),
+                    ("call_2", "write_probe", {"label": "write"}),
+                    ("call_3", "read_probe", {"label": "read-2"}),
+                ),
+                LLMResponse(content="finished"),
+            ],
+            registry=registry,
+            scheduler=_BatchScheduler(),
+            parallel_enabled=True,
+        )
+
+        observation = await agent.handle_message("hello", session_id="s1")
+
+        assert observation.type == ObservationType.USER_RESPONSE
+        assert observation.content == "finished"
+        assert max_active == 1
+        assert execution_order == [
+            "start:read-1",
+            "end:read-1",
+            "start:write",
+            "end:write",
+            "start:read-2",
+            "end:read-2",
+        ]
+        assert [call.args[0] for call in agent.remember.await_args_list] == [
+            "read-1",
+            "write",
+            "read-2",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_handle_message_preserves_original_tool_call_ids_and_result_order(self):
+        active = 0
+        max_active = 0
+        finished: list[str] = []
+
+        async def runner(params: _ScriptedParams) -> ToolExecutionResult:
+            nonlocal active, max_active
+            label = params.label or ""
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(params.delay)
+                finished.append(label)
+                return ToolExecutionResult(
+                    status=ToolStatus.SUCCESS,
+                    content=f"result:{label}",
+                )
+            finally:
+                active -= 1
+
+        registry = ToolRegistry()
+        registry.register(_ScriptedToolBuilder("echo", runner, read_only=True))
+        agent = _build_custom_batch_agent(
+            completion_responses=[
+                _tool_batch_response(
+                    ("call_beta", "echo", {"label": "first", "delay": 0.03}),
+                    ("call_alpha", "echo", {"label": "second", "delay": 0.0}),
+                ),
+                LLMResponse(content="finished"),
+            ],
+            registry=registry,
+            scheduler=_BatchScheduler(),
+            parallel_enabled=True,
+        )
+
+        observation = await agent.handle_message("hello", session_id="s1")
+        second_call_messages = agent.router.completion.await_args_list[1].kwargs["messages"]
+        assistant_message = next(
+            message for message in second_call_messages if message.get("tool_calls")
+        )
+        tool_messages = [message for message in second_call_messages if message["role"] == "tool"]
+
+        assert observation.type == ObservationType.USER_RESPONSE
+        assert observation.content == "finished"
+        assert max_active == 2
+        assert finished == ["second", "first"]
+        assert [tool_call["id"] for tool_call in assistant_message["tool_calls"]] == [
+            "call_beta",
+            "call_alpha",
+        ]
+        assert [message["tool_call_id"] for message in tool_messages[-2:]] == [
+            "call_beta",
+            "call_alpha",
+        ]
+        assert [message["content"] for message in tool_messages[-2:]] == [
+            "result:first",
+            "result:second",
+        ]
+        assert [call.args[0] for call in agent.remember.await_args_list] == [
+            "result:first",
+            "result:second",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_handle_message_parallel_flag_disabled_keeps_read_only_batch_serial(self):
+        active = 0
+        max_active = 0
+        finished: list[str] = []
+
+        async def runner(params: _ScriptedParams) -> ToolExecutionResult:
+            nonlocal active, max_active
+            label = params.label or ""
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(params.delay)
+                finished.append(label)
+                return ToolExecutionResult(
+                    status=ToolStatus.SUCCESS,
+                    content=label,
+                )
+            finally:
+                active -= 1
+
+        registry = ToolRegistry()
+        scheduler = _BatchScheduler()
+        registry.register(_ScriptedToolBuilder("echo", runner, read_only=True))
+        agent = _build_custom_batch_agent(
+            completion_responses=[
+                _tool_batch_response(
+                    ("call_1", "echo", {"label": "first", "delay": 0.01}),
+                    ("call_2", "echo", {"label": "second", "delay": 0.0}),
+                ),
+                LLMResponse(content="finished"),
+            ],
+            registry=registry,
+            scheduler=scheduler,
+            parallel_enabled=False,
+        )
+
+        observation = await agent.handle_message("hello", session_id="s1")
+
+        assert observation.type == ObservationType.USER_RESPONSE
+        assert observation.content == "finished"
+        assert max_active == 1
+        assert finished == ["first", "second"]
+        assert scheduler.run_calls == [
+            ("echo", {"label": "first", "delay": 0.01}),
+            ("echo", {"label": "second", "delay": 0.0}),
+        ]
+        assert agent.act.await_count == 0
 
 
 class _StubSkillManager:
@@ -426,30 +698,28 @@ def _build_stub_agent(
     repeat_limit: int,
     max_reflections: int,
 ):
-    from multiclaw.agent.multiclaw import MultiClawAgent
+    tool_results = list(act_results)
 
-    agent = MultiClawAgent.__new__(MultiClawAgent)
-    agent.skill_manager = _StubSkillManager()
-    agent.context_builder = _StubContextBuilder()
-    agent.registry = _StubRegistry()
-    agent.memory = _StubMemory()
-    agent.router = SimpleNamespace(
-        completion=AsyncMock(side_effect=completion_responses)
-    )
-    agent.settings = _stub_settings(
+    async def runner(_params: _ScriptedParams) -> ToolExecutionResult:
+        return ToolExecutionResult(
+            status=ToolStatus.SUCCESS,
+            content=tool_results.pop(0),
+        )
+
+    registry = ToolRegistry()
+    registry.register(_ScriptedToolBuilder("echo", runner, read_only=True))
+    scheduler = _BatchScheduler()
+
+    agent = _build_custom_batch_agent(
+        completion_responses=completion_responses,
+        registry=registry,
+        scheduler=scheduler,
+        parallel_enabled=True,
         resilience_enabled=resilience_enabled,
         repeat_limit=repeat_limit,
         max_reflections=max_reflections,
     )
-    agent.transition = AsyncMock()
-    agent._save_chat_msg = AsyncMock()
-    agent.remember = AsyncMock()
-    agent.act = AsyncMock(
-        side_effect=[
-            Observation(type=ObservationType.TOOL_RESULT, content=content)
-            for content in act_results
-        ]
-    )
+    agent._batch_scheduler = scheduler
     return agent
 
 
@@ -464,6 +734,10 @@ def _stub_settings(*, resilience_enabled: bool, repeat_limit: int, max_reflectio
         ),
         memory=SimpleNamespace(context_window_limit=1000),
         llm=SimpleNamespace(default_model="test-model"),
+        tools=SimpleNamespace(
+            parallel_read_only_enabled=True,
+            parallel_max_concurrency=4,
+        ),
     )
 
 
@@ -472,6 +746,61 @@ def _tool_call_response(call_id: str, arguments: dict[str, str]) -> LLMResponse:
         content="",
         tool_calls=[ToolCall(id=call_id, name="echo", arguments=arguments)],
     )
+
+
+def _tool_batch_response(*calls: tuple[str, str, dict]) -> LLMResponse:
+    return LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(id=call_id, name=name, arguments=arguments)
+            for call_id, name, arguments in calls
+        ],
+    )
+
+
+def _build_custom_batch_agent(
+    *,
+    completion_responses: list[LLMResponse],
+    registry: ToolRegistry,
+    scheduler,
+    parallel_enabled: bool,
+    resilience_enabled: bool = False,
+    repeat_limit: int = 3,
+    max_reflections: int = 1,
+):
+    from multiclaw.agent.multiclaw import MultiClawAgent
+
+    agent = MultiClawAgent.__new__(MultiClawAgent)
+    agent.skill_manager = _StubSkillManager()
+    agent.context_builder = _StubContextBuilder()
+    agent.registry = registry
+    agent.scheduler = scheduler
+    agent.memory = _StubMemory()
+    agent.router = SimpleNamespace(completion=AsyncMock(side_effect=completion_responses))
+    agent.settings = SimpleNamespace(
+        **_stub_settings(
+            resilience_enabled=resilience_enabled,
+            repeat_limit=repeat_limit,
+            max_reflections=max_reflections,
+        ).__dict__
+    )
+    agent.settings.tools = SimpleNamespace(
+        parallel_read_only_enabled=parallel_enabled,
+        parallel_max_concurrency=4,
+    )
+    agent.tool_batch_executor = ToolBatchExecutor(
+        registry=registry,
+        scheduler=scheduler,
+        max_concurrency=agent.settings.tools.parallel_max_concurrency,
+        enabled=parallel_enabled,
+    )
+    agent.transition = AsyncMock()
+    agent._save_chat_msg = AsyncMock()
+    agent.remember = AsyncMock()
+    agent.act = AsyncMock(
+        side_effect=AssertionError("legacy per-call act path should not run")
+    )
+    return agent
 
 
 def _find_reflection_call(calls):
