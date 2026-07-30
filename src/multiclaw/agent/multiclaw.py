@@ -8,8 +8,9 @@ from typing import Any
 import httpx
 
 from multiclaw.agent.context import ContextBuilder, ContextRequest
-from multiclaw.agent.models import Action, ActionType, Observation, ObservationType
+from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.agent.resilience import ResilienceAction, ResilienceController
+from multiclaw.agent.tool_batch import ToolBatchExecutor, ToolCallOutcome, ToolCallSpec
 from multiclaw.agent.toolcall import ToolCallAgent
 from multiclaw.config import Settings
 from multiclaw.events import AgentState, EventBus
@@ -39,24 +40,27 @@ REFLECTION_PROMPT = (
 )
 
 
-def _build_assistant_tool_calls_msg(response: LLMResponse) -> dict:
+def _build_assistant_tool_calls_msg(
+    calls: list[dict[str, Any]],
+    reasoning_content: str = "",
+) -> dict:
     msg: dict = {
         "role": "assistant",
         "content": None,
         "tool_calls": [
             {
-                "id": tc.id or f"call_{i}",
+                "id": tc["id"] or f"call_{i}",
                 "type": "function",
                 "function": {
-                    "name": tc.name,
-                    "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                    "name": tc["name"],
+                    "arguments": json.dumps(tc["arguments"], ensure_ascii=False),
                 },
             }
-            for i, tc in enumerate(response.tool_calls)
+            for i, tc in enumerate(calls)
         ],
     }
-    if response.reasoning_content:
-        msg["reasoning_content"] = response.reasoning_content
+    if reasoning_content:
+        msg["reasoning_content"] = reasoning_content
     return msg
 
 
@@ -92,6 +96,12 @@ class MultiClawAgent(ToolCallAgent):
             include_legacy_memory=settings.memory.include_legacy_memory_in_retrieval,
         )
         self.skill_manager = skill_manager or SkillManager()
+        self.tool_batch_executor = ToolBatchExecutor(
+            registry=registry,
+            scheduler=scheduler,
+            max_concurrency=settings.tools.parallel_max_concurrency,
+            enabled=settings.tools.parallel_read_only_enabled,
+        )
 
     def _build_resilience_controller(self) -> ResilienceController | None:
         if not self.settings.agent.resilience_enabled:
@@ -155,6 +165,34 @@ class MultiClawAgent(ToolCallAgent):
             "content": f"Runtime reflection feedback: {reflection}",
         }
 
+    def _require_tool_batch_executor(self) -> ToolBatchExecutor:
+        executor = getattr(self, "tool_batch_executor", None)
+        if executor is None:
+            raise RuntimeError("tool_batch_executor is not initialized")
+        return executor
+
+    @staticmethod
+    def _build_tool_call_specs(calls: list[dict[str, Any]]) -> list[ToolCallSpec]:
+        return [
+            ToolCallSpec(
+                call_id=call["id"],
+                name=call["name"],
+                arguments=call["arguments"],
+            )
+            for call in calls
+        ]
+
+    async def _execute_tool_batch(
+        self,
+        calls: list[dict[str, Any]],
+    ) -> list[ToolCallOutcome]:
+        if not calls:
+            return []
+        await self.transition(AgentState.ACTING)
+        return await self._require_tool_batch_executor().execute(
+            self._build_tool_call_specs(calls)
+        )
+
     # ------------------------------------------------------------------
     # non-streaming path
     # ------------------------------------------------------------------
@@ -210,10 +248,9 @@ class MultiClawAgent(ToolCallAgent):
                     content=response.content,
                 )
 
+            normalized_calls = self._normalize_tool_calls(response.tool_calls)
             if controller is not None:
-                call_decision = controller.observe_calls(
-                    self._normalize_tool_calls(response.tool_calls)
-                )
+                call_decision = controller.observe_calls(normalized_calls)
                 if call_decision.action == ResilienceAction.REFLECT:
                     reflection = await self._attempt_reflection(
                         messages, call_decision.reason
@@ -226,25 +263,22 @@ class MultiClawAgent(ToolCallAgent):
                 if call_decision.action == ResilienceAction.TERMINATE:
                     break
 
-            # Execute each tool call
-            assistant_msg = _build_assistant_tool_calls_msg(response)
+            assistant_msg = _build_assistant_tool_calls_msg(
+                normalized_calls,
+                response.reasoning_content,
+            )
             messages.append(assistant_msg)
-            result_contents: list[str] = []
+            outcomes = await self._execute_tool_batch(normalized_calls)
+            result_contents = [outcome.observation.content for outcome in outcomes]
 
-            for i, tc in enumerate(response.tool_calls):
-                call_id = tc.id or f"call_{i}"
-                action = Action(
-                    type=ActionType.TOOL_CALL,
-                    tool_name=tc.name,
-                    tool_params=tc.arguments,
-                )
-                await self.transition(AgentState.ACTING)
-                obs = await self.act(action)
-                result_contents.append(obs.content)
+            for outcome in outcomes:
                 messages.append(
-                    _build_tool_result_msg(call_id, obs.content)
+                    _build_tool_result_msg(
+                        outcome.call_id,
+                        outcome.observation.content,
+                    )
                 )
-                await self.remember(obs.content, "tool_result")
+                await self.remember(outcome.observation.content, "tool_result")
 
             if controller is not None:
                 result_decision = controller.observe_results(result_contents)
@@ -421,58 +455,41 @@ class MultiClawAgent(ToolCallAgent):
                                 terminate_requested = True
                                 break
 
-                        for tc in event["calls"]:
+                        for call in normalized_calls:
                             yield {
                                 "type": "tool_call",
-                                "call_id": tc["id"],
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
+                                "call_id": call["id"],
+                                "name": call["name"],
+                                "arguments": call["arguments"],
                             }
 
-                        tool_calls_msg: dict = {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": tc["id"] or f"call_{i}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc["name"],
-                                        "arguments": json.dumps(
-                                            tc["arguments"], ensure_ascii=False
-                                        ),
-                                    },
-                                }
-                                for i, tc in enumerate(event["calls"])
-                            ],
-                        }
-                        if reasoning:
-                            tool_calls_msg["reasoning_content"] = reasoning
+                        tool_calls_msg = _build_assistant_tool_calls_msg(
+                            normalized_calls,
+                            reasoning,
+                        )
                         messages.append(tool_calls_msg)
+                        outcomes = await self._execute_tool_batch(normalized_calls)
                         result_contents: list[str] = []
 
-                        for i, tc in enumerate(event["calls"]):
-                            call_id = tc["id"] or f"call_{i}"
-                            action = Action(
-                                type=ActionType.TOOL_CALL,
-                                tool_name=tc["name"],
-                                tool_params=tc["arguments"],
-                            )
-                            await self.transition(AgentState.ACTING)
-                            obs = await self.act(action)
-
+                        for outcome in outcomes:
                             yield {
                                 "type": "tool_result",
-                                "call_id": call_id,
-                                "name": tc["name"],
-                                "content": obs.content,
+                                "call_id": outcome.call_id,
+                                "name": outcome.name,
+                                "content": outcome.observation.content,
                             }
 
-                            result_contents.append(obs.content)
+                            result_contents.append(outcome.observation.content)
                             messages.append(
-                                _build_tool_result_msg(call_id, obs.content)
+                                _build_tool_result_msg(
+                                    outcome.call_id,
+                                    outcome.observation.content,
+                                )
                             )
-                            await self.remember(obs.content, "tool_result")
+                            await self.remember(
+                                outcome.observation.content,
+                                "tool_result",
+                            )
 
                         if controller is not None:
                             result_decision = controller.observe_results(result_contents)
