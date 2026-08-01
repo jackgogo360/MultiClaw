@@ -94,6 +94,9 @@ class MultiClawAgent(ToolCallAgent):
             recent_turns=settings.memory.recent_turns,
             context_history_ratio=settings.memory.context_history_ratio,
             include_legacy_memory=settings.memory.include_legacy_memory_in_retrieval,
+            progressive_enabled=settings.memory.progressive_context_enabled,
+            response_reserve_tokens=settings.memory.context_response_reserve_tokens,
+            l1_ratio=settings.memory.context_l1_ratio,
         )
         self.skill_manager = skill_manager or SkillManager()
         self.tool_batch_executor = ToolBatchExecutor(
@@ -171,6 +174,17 @@ class MultiClawAgent(ToolCallAgent):
             raise RuntimeError("tool_batch_executor is not initialized")
         return executor
 
+    async def _build_context(self, request: ContextRequest) -> list[dict[str, Any]]:
+        result = await self.context_builder.build_with_report(request)
+        logger.info(
+            "context_budget used=%s dropped=%s limit=%d reserve=%d",
+            result.report.used_tokens_by_level,
+            result.report.dropped_by_level,
+            result.report.limit_tokens,
+            result.report.reserved_response_tokens,
+        )
+        return result.messages
+
     @staticmethod
     def _build_tool_call_specs(calls: list[dict[str, Any]]) -> list[ToolCallSpec]:
         return [
@@ -220,7 +234,7 @@ class MultiClawAgent(ToolCallAgent):
 
         skill_prompts = self.skill_manager.get_active_skill_prompts()
 
-        messages = await self.context_builder.build(
+        messages = await self._build_context(
             ContextRequest(
                 system_prompt=self.settings.agent.system_prompt,
                 user_input=user_msg,
@@ -384,7 +398,7 @@ class MultiClawAgent(ToolCallAgent):
 
         skill_prompts = self.skill_manager.get_active_skill_prompts()
 
-        messages = await self.context_builder.build(
+        messages = await self._build_context(
             ContextRequest(
                 system_prompt=self.settings.agent.system_prompt,
                 user_input=user_msg,

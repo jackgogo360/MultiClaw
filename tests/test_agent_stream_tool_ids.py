@@ -1,6 +1,6 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import BaseModel
@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from multiclaw.agent.multiclaw import MultiClawAgent
 from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.agent.tool_batch import ToolBatchExecutor
+from multiclaw.context import ContextBuildReport, ContextBuildResult
 from multiclaw.llm import LLMResponse
 from multiclaw.tools import (
     ToolBuilder,
@@ -32,6 +33,35 @@ class _DummySkillManager:
 class _DummyContextBuilder:
     async def build(self, _request):
         return [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}]
+
+    async def build_with_report(self, request):
+        return ContextBuildResult(
+            messages=await self.build(request),
+            report=ContextBuildReport(
+                limit_tokens=1000,
+                reserved_response_tokens=0,
+                used_tokens_by_level={"L0": 1, "L1": 0, "L2": 0},
+                dropped_by_level={"L0": 0, "L1": 0, "L2": 0},
+            ),
+        )
+
+
+class _ReportOnlyContextBuilder:
+    def __init__(self, messages: list[dict[str, str]]) -> None:
+        self.build_with_report = AsyncMock(
+            return_value=ContextBuildResult(
+                messages=messages,
+                report=ContextBuildReport(
+                    limit_tokens=321,
+                    reserved_response_tokens=123,
+                    used_tokens_by_level={"L0": 3, "L1": 4, "L2": 5},
+                    dropped_by_level={"L0": 0, "L1": 1, "L2": 2},
+                ),
+            )
+        )
+
+    async def build(self, _request):
+        raise AssertionError("handle_message_stream should use build_with_report")
 
 
 class _DummyMemory:
@@ -171,6 +201,60 @@ async def test_handle_message_stream_preserves_tool_call_ids(monkeypatch):
 
     assert tool_call["call_id"] == "call_123"
     assert tool_result["call_id"] == "call_123"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_uses_context_build_with_report_and_only_prompt_messages():
+    expected_messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "system", "content": "skill guidance"},
+        {"role": "user", "content": "hello"},
+    ]
+    router = _QueuedStreamRouter(
+        stream_sequences=[[{"type": "token", "content": "streamed"}]]
+    )
+    agent = _build_custom_stream_agent(
+        router=router,
+        registry=ToolRegistry(),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=1,
+    )
+    agent.context_builder = _ReportOnlyContextBuilder(expected_messages)
+
+    events = []
+    with patch("multiclaw.agent.multiclaw.logger.info") as mock_info:
+        async for event in agent.handle_message_stream("hello", session_id="s1"):
+            events.append(event)
+
+    assert events[-1] == {"type": "done", "content": "streamed", "data": {}}
+    agent.context_builder.build_with_report.assert_awaited_once()
+    request = agent.context_builder.build_with_report.await_args.args[0]
+    assert request.user_input == "hello"
+    assert request.session_id == "s1"
+    assert request.context_window_limit == 1000
+    assert request.skill_prompts == []
+    assert router.stream_calls[0]["messages"] == expected_messages
+    matching_calls = [
+        call.args
+        for call in mock_info.call_args_list
+        if call.args
+        and call.args[0] == "context_budget used=%s dropped=%s limit=%d reserve=%d"
+    ]
+    assert matching_calls == [
+        (
+            "context_budget used=%s dropped=%s limit=%d reserve=%d",
+            {"L0": 3, "L1": 4, "L2": 5},
+            {"L0": 0, "L1": 1, "L2": 2},
+            321,
+            123,
+        )
+    ]
+    assert mock_info.call_count >= 1
+    assert all(set(message.keys()) <= {"role", "content"} for message in expected_messages)
 
 
 @pytest.mark.asyncio
