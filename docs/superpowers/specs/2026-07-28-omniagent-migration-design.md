@@ -17,9 +17,9 @@
 ## 实施证据
 
 - 已按策略 C 在隔离工作树中重实现 Phase 0 + Phase 1，未复制 OmniAgent GPL 源码；新增运行时能力默认关闭，WebFetch 默认禁止访问私网。
-- 后端全量验证：`uv run pytest -q`，结果为 `292 passed, 12 warnings`。警告均为既有 aiosqlite 连接线程在事件循环关闭后的清理问题。
+- 后端全量验证：`uv run pytest -q`，结果为 `294 passed, 12 warnings`。警告均为既有 aiosqlite 连接线程在事件循环关闭后的清理问题。
 - 前端验证：`npm run lint` 和 `npm run build` 均以状态码 0 完成；构建仅报告既有的大 chunk 提示。
-- 前端基线与 Task 10 已分别通过规格和质量审查；最终分支级审查在合并前执行。
+- 前端基线与 Task 10 已分别通过规格和质量审查；最终分支级审查发现的两个 Important 已修复并复核关闭，无已确认 Critical。
 - 已知残余风险：DNS 解析与实际连接间仍存在 rebinding/TOCTOU 窗口；凭据轮换与历史清理仍需操作者在外部系统完成；Phase 2/3 不在本次交付范围。
 
 ## 审计范围与可信度

@@ -125,6 +125,15 @@ class FakePlaywrightRoute:
         self.actions.append("abort")
 
 
+class FakePlaywrightWebSocketRoute:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.actions: list[tuple[str, int, str]] = []
+
+    def close(self, *, code: int, reason: str) -> None:
+        self.actions.append(("close", code, reason))
+
+
 class FakePage:
     def __init__(
         self,
@@ -154,6 +163,12 @@ class FakePage:
             self.context.route_results.append((item["url"], list(route.actions)))
             if item.get("raise_on_abort", False) and route.actions == ["abort"]:
                 raise RuntimeError(item.get("raise_message", "navigation blocked"))
+        for socket_url in self.context.web_socket_urls:
+            socket_route = FakePlaywrightWebSocketRoute(socket_url)
+            self.context.web_socket_route_handler(socket_route)
+            self.context.web_socket_route_results.append(
+                (socket_url, list(socket_route.actions))
+            )
 
     def title(self) -> str:
         return self._title
@@ -163,17 +178,31 @@ class FakePage:
 
 
 class FakeBrowserContext:
-    def __init__(self, requests: list[dict[str, object]]) -> None:
+    def __init__(
+        self,
+        requests: list[dict[str, object]],
+        web_socket_urls: list[str],
+    ) -> None:
         self.requests = requests
+        self.web_socket_urls = web_socket_urls
         self.route_calls: list[tuple[str, object]] = []
         self.route_handler = None
         self.route_results: list[tuple[str, list[str]]] = []
+        self.web_socket_route_calls: list[tuple[str, object]] = []
+        self.web_socket_route_handler = None
+        self.web_socket_route_results: list[
+            tuple[str, list[tuple[str, int, str]]]
+        ] = []
         self.browser: FakeBrowser | None = None
         self.page = FakePage(self, requests)
 
     def route(self, pattern: str, handler) -> None:
         self.route_calls.append((pattern, handler))
         self.route_handler = handler
+
+    def route_web_socket(self, pattern: str, handler) -> None:
+        self.web_socket_route_calls.append((pattern, handler))
+        self.web_socket_route_handler = handler
 
     def new_page(self) -> FakePage:
         return self.page
@@ -218,8 +247,9 @@ def install_fake_playwright(
     monkeypatch: pytest.MonkeyPatch,
     *,
     requests: list[dict[str, object]],
+    web_socket_urls: list[str] | None = None,
 ) -> FakeBrowserContext:
-    context = FakeBrowserContext(requests)
+    context = FakeBrowserContext(requests, web_socket_urls or [])
     browser = FakeBrowser(context)
     context.browser = browser
     chromium = FakeChromium(browser)
@@ -453,6 +483,33 @@ class TestWebFetchTool:
         }
         assert context.page.goto_calls == [
             ("https://public.example/start", "networkidle", 30000.0)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_browser_fetch_disables_websocket_egress_before_goto(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        context = install_fake_playwright(
+            monkeypatch,
+            requests=[{"url": "https://public.example/start"}],
+            web_socket_urls=["wss://private.example/socket"],
+        )
+        install_fake_html2text(monkeypatch, text="Rendered body")
+        install_fake_resolver(monkeypatch, {"public.example": [PUBLIC_IPV4]})
+        builder = WebFetchToolBuilder(mode="browser")
+
+        result = await builder.build(
+            builder.validate({"url": "https://public.example/start", "mode": "browser"})
+        ).execute()
+
+        assert result.status == "success"
+        assert context.web_socket_route_calls == [("**/*", ANY)]
+        assert context.web_socket_route_results == [
+            (
+                "wss://private.example/socket",
+                [("close", 1008, "WebSocket disabled by network policy")],
+            )
         ]
 
     @pytest.mark.asyncio

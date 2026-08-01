@@ -439,6 +439,40 @@ class TestMultiClawAgent:
         )
 
     @pytest.mark.asyncio
+    async def test_handle_message_retries_when_forced_summary_contains_dsml(self):
+        registry = ToolRegistry()
+        registry.register(EchoToolBuilder())
+        agent = _build_custom_batch_agent(
+            completion_responses=[
+                _tool_batch_response(
+                    ("call_1", "echo", {"text": "search results"}),
+                ),
+                LLMResponse(
+                    content=(
+                        '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="echo">'
+                        "</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"
+                    )
+                ),
+                LLMResponse(content="Final summary"),
+            ],
+            registry=registry,
+            scheduler=_BatchScheduler(),
+            parallel_enabled=True,
+        )
+        agent.settings.agent.max_tool_rounds = 1
+
+        observation = await agent.handle_message("hello", session_id="s1")
+
+        assert observation == Observation(
+            type=ObservationType.USER_RESPONSE,
+            content="Final summary",
+        )
+        assert agent.router.completion.await_count == 3
+        retry_call = agent.router.completion.await_args_list[-1]
+        assert retry_call.kwargs["tools"] is None
+        assert "Do not output DSML" in retry_call.kwargs["messages"][0]["content"]
+
+    @pytest.mark.asyncio
     async def test_handle_message_parallel_read_only_batch_overlaps_when_enabled(self):
         first_started = asyncio.Event()
         second_started = asyncio.Event()
