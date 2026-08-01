@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -314,15 +314,14 @@ class MultiClawAgent(ToolCallAgent):
             max_rounds, session_id, len(messages),
         )
         try:
-            response = await self.router.completion(
-                model=self.settings.llm.default_model,
-                messages=messages,
-                tools=None,
+            full_text = await self._generate_final_summary(
+                messages,
+                self._collect_completion_text_response,
             )
-            await self._save_chat_msg(response.content, "assistant", session_id)
+            await self._save_chat_msg(full_text, "assistant", session_id)
             return Observation(
                 type=ObservationType.USER_RESPONSE,
-                content=response.content,
+                content=full_text,
             )
         except Exception:
             logger.exception("final summary failed")
@@ -345,6 +344,17 @@ class MultiClawAgent(ToolCallAgent):
         cleaned = DSML_TAG_PATTERN.sub("", cleaned)
         return cleaned.strip()
 
+    async def _collect_completion_text_response(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        response = await self.router.completion(
+            model=self.settings.llm.default_model,
+            messages=messages,
+            tools=None,
+        )
+        return response.content
+
     async def _collect_plain_text_response(
         self,
         messages: list[dict[str, Any]],
@@ -361,6 +371,27 @@ class MultiClawAgent(ToolCallAgent):
             elif event["type"] == "reasoning":
                 reasoning_text += event["content"]
         return full_text or reasoning_text
+
+    async def _generate_final_summary(
+        self,
+        messages: list[dict[str, Any]],
+        collect_response: Callable[
+            [list[dict[str, Any]]],
+            Awaitable[str],
+        ],
+    ) -> str:
+        full_text = await collect_response(messages)
+        if self._contains_dsml_tool_markup(full_text):
+            logger.warning(
+                "DSML tool markup detected in forced final summary, retrying with stricter plain-text prompt"
+            )
+            retry_messages = [
+                {"role": "system", "content": FINAL_SUMMARY_PLAIN_TEXT_PROMPT},
+                *messages,
+            ]
+            retry_text = await collect_response(retry_messages)
+            full_text = retry_text or full_text
+        return self._strip_dsml_tool_markup(full_text)
 
     async def handle_message_stream(
         self, user_input: str, session_id: str = ""
@@ -565,21 +596,10 @@ class MultiClawAgent(ToolCallAgent):
             max_rounds, session_id, len(messages),
         )
         try:
-            full_text = await self._collect_plain_text_response(messages)
-
-            if self._contains_dsml_tool_markup(full_text):
-                logger.warning(
-                    "DSML tool markup detected in forced final summary for session=%s, retrying with stricter plain-text prompt",
-                    session_id,
-                )
-                retry_messages = [
-                    {"role": "system", "content": FINAL_SUMMARY_PLAIN_TEXT_PROMPT},
-                    *messages,
-                ]
-                retry_text = await self._collect_plain_text_response(retry_messages)
-                full_text = retry_text or full_text
-
-            full_text = self._strip_dsml_tool_markup(full_text)
+            full_text = await self._generate_final_summary(
+                messages,
+                self._collect_plain_text_response,
+            )
             if full_text:
                 await self._save_chat_msg(full_text, "assistant", session_id)
                 yield {"type": "token", "content": full_text}

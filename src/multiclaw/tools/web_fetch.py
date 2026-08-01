@@ -220,6 +220,12 @@ class WebFetchInvocation(ToolInvocation[WebFetchParams]):
                     user_agent=DEFAULT_HEADERS["User-Agent"],
                     service_workers="block",
                 )
+                route_web_socket = getattr(context, "route_web_socket", None)
+                if not callable(route_web_socket):
+                    raise NetworkPolicyError(
+                        "browser runtime cannot enforce WebSocket policy"
+                    )
+                route_web_socket("**/*", self._block_playwright_websocket)
                 context.route("**/*", self._make_playwright_route_guard())
                 page = context.new_page()
                 page.goto(url, wait_until="networkidle", timeout=self.timeout * 1000)
@@ -258,6 +264,13 @@ class WebFetchInvocation(ToolInvocation[WebFetchParams]):
             route.continue_()
 
         return guard
+
+    @staticmethod
+    def _block_playwright_websocket(web_socket_route) -> None:
+        web_socket_route.close(
+            code=1008,
+            reason="WebSocket disabled by network policy",
+        )
 
     def _extract_playwright_request_url(self, request) -> str:
         if request is None:
