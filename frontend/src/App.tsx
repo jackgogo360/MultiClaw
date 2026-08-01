@@ -10,7 +10,8 @@ import {
 } from "@assistant-ui/core/react";
 import { useAuiState, useAui } from "@assistant-ui/store";
 import { useChat, type UIMessage } from "@ai-sdk/react";
-import { AuthProvider, useAuth } from "@/lib/auth-context";
+import { AuthProvider } from "@/lib/auth-context";
+import { useAuth } from "@/lib/auth-context-store";
 import { LoginOverlay } from "@/components/login/LoginOverlay";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { ChatView } from "@/components/chat/ChatView";
@@ -23,6 +24,31 @@ import { sessionStore } from "@/lib/session-store";
 import { chatStore } from "@/lib/chat-store";
 
 type ChatRequestState = "idle" | "sending" | "streaming";
+
+type LatestTransportController = {
+  proxy: AssistantChatTransport<UIMessage>;
+  update: (transport: AssistantChatTransport<UIMessage> | undefined) => void;
+};
+
+function createLatestTransportProxy(
+  initialTransport: AssistantChatTransport<UIMessage> | undefined,
+): LatestTransportController {
+  let currentTransport = initialTransport;
+  const proxy = new Proxy({} as AssistantChatTransport<UIMessage>, {
+    get(_, prop) {
+      const current = currentTransport;
+      const res = current?.[prop as keyof typeof current];
+      return typeof res === "function" ? res.bind(current) : res;
+    },
+  }) as unknown as AssistantChatTransport<UIMessage>;
+
+  return {
+    proxy,
+    update(transport) {
+      currentTransport = transport;
+    },
+  };
+}
 
 /**
  * Custom wrapper around useChat + useAISDKRuntime + useRemoteThreadListRuntime
@@ -51,20 +77,13 @@ function useChatThreadRuntimeWithStore(options: Record<string, unknown>) {
   const transportOptions = options.transport as
     | AssistantChatTransport<UIMessage>
     | undefined;
-
-  const transportRef = useRef(transportOptions);
+  const [transportController] = useState(() =>
+    createLatestTransportProxy(transportOptions),
+  );
   useEffect(() => {
-    transportRef.current = transportOptions;
-  });
-  const transport = useMemo(() => {
-    const ref = transportRef;
-    return new Proxy(ref, {
-      get(_, prop) {
-        const res = ref.current?.[prop as keyof typeof ref.current];
-        return typeof res === "function" ? res.bind(ref.current) : res;
-      },
-    }) as unknown as AssistantChatTransport<UIMessage>;
-  }, [transportRef]);
+    transportController.update(transportOptions);
+  }, [transportController, transportOptions]);
+  const transport = transportController.proxy;
 
   const id = useAuiState((s) => s.threadListItem.id);
   const aui = useAui();

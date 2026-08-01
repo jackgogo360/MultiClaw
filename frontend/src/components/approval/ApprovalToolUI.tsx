@@ -12,7 +12,6 @@ export interface ApprovalToolUIProps {
 
 export function ApprovalToolUI({
   approvalId,
-  toolCallId,
   toolName,
   args,
   status,

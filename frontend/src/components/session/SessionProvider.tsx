@@ -1,33 +1,10 @@
-import {
-  createContext,
-  useContext,
-  useEffect,
-  useCallback,
-  useRef,
-  useSyncExternalStore,
-  type ReactNode,
-} from "react";
+import { useEffect, useCallback, useRef, useSyncExternalStore, type ReactNode } from "react";
 import { generateId } from "ai";
 import type { UIMessage } from "@ai-sdk/react";
-import { sessionApi, type Session } from "@/lib/api";
+import { sessionApi } from "@/lib/api";
 import { sessionStore } from "@/lib/session-store";
 import { chatStore } from "@/lib/chat-store";
-
-interface SessionContextValue {
-  sessions: Session[];
-  currentId: string | null;
-  switchSession: (id: string) => Promise<void>;
-  createSession: () => Promise<void>;
-  deleteSession: (id: string) => Promise<void>;
-}
-
-const SessionContext = createContext<SessionContextValue | null>(null);
-
-export function useSessions() {
-  const ctx = useContext(SessionContext);
-  if (!ctx) throw new Error("useSessions must be used within SessionProvider");
-  return ctx;
-}
+import { SessionContext } from "./session-context";
 
 export function SessionProvider({ children }: { children: ReactNode }) {
   const state = useSyncExternalStore(
