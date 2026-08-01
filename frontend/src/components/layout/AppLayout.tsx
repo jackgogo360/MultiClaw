@@ -1,5 +1,5 @@
 import { type ReactNode } from "react";
-import { useAuth } from "@/lib/auth-context";
+import { useAuth } from "@/lib/auth-context-store";
 
 export function AppLayout({
   sidebar,

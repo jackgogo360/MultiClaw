@@ -109,7 +109,7 @@ function AssistantBubble() {
       components={{
         Text: () => <MarkdownTextPrimitive className="aui-md" smooth remarkPlugins={[remarkGfm]} />,
         tools: {
-          Override: ToolFallback as any,
+          Override: ToolFallback,
         },
         Group: ({ groupKey, indices, children }) => {
           if (groupKey === "all-tools") {

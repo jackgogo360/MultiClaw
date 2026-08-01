@@ -1,5 +1,9 @@
 import { useState, useRef, useEffect } from "react";
-import { useAuth } from "@/lib/auth-context";
+import { useAuth } from "@/lib/auth-context-store";
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
 
 export function LoginOverlay() {
   const { isAuthenticated, isLoading, sendCode, login } = useAuth();
@@ -33,8 +37,8 @@ export function LoginOverlay() {
       setStep("code");
       setResendSeconds(60);
       setTimeout(() => inputRefs.current[0]?.focus(), 100);
-    } catch (e: any) {
-      setError(e.message);
+    } catch (error: unknown) {
+      setError(getErrorMessage(error, "Failed to send code."));
     } finally {
       setSending(false);
     }
@@ -77,8 +81,8 @@ export function LoginOverlay() {
     setError("");
     try {
       await login(email, codeStr);
-    } catch (e: any) {
-      setError(e.message);
+    } catch (error: unknown) {
+      setError(getErrorMessage(error, "Failed to verify code."));
     } finally {
       setVerifying(false);
     }
@@ -92,8 +96,8 @@ export function LoginOverlay() {
       setResendSeconds(60);
       setCode(["", "", "", "", "", ""]);
       inputRefs.current[0]?.focus();
-    } catch (e: any) {
-      setError(e.message);
+    } catch (error: unknown) {
+      setError(getErrorMessage(error, "Failed to resend code."));
     }
   };
 

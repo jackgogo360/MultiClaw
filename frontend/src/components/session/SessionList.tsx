@@ -1,4 +1,4 @@
-import { useSessions } from "./SessionProvider";
+import { useSessions } from "./session-context";
 
 export function SessionList() {
   const { sessions, currentId, switchSession, deleteSession, createSession } = useSessions();
