@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.agent.tool_batch import ToolBatchExecutor
 from multiclaw.config import Settings
+from multiclaw.context import ContextBuildReport, ContextBuildResult
 from multiclaw.events import EventBus
 from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
 from multiclaw.llm import LLMResponse, ModelRouter, ToolCall
@@ -663,6 +664,76 @@ class TestMultiClawAgent:
         ]
         assert agent.act.await_count == 0
 
+    @pytest.mark.asyncio
+    async def test_handle_message_uses_context_build_with_report_and_only_prompt_messages(self):
+        expected_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "system", "content": "skill guidance"},
+            {"role": "user", "content": "hello"},
+        ]
+        agent = _build_custom_batch_agent(
+            completion_responses=[LLMResponse(content="done")],
+            registry=ToolRegistry(),
+            scheduler=_BatchScheduler(),
+            parallel_enabled=True,
+        )
+        agent.context_builder = _ReportOnlyContextBuilder(expected_messages)
+
+        with patch("multiclaw.agent.multiclaw.logger.info") as mock_info:
+            observation = await agent.handle_message("hello", session_id="s1")
+
+        assert observation == Observation(
+            type=ObservationType.USER_RESPONSE,
+            content="done",
+        )
+        agent.context_builder.build_with_report.assert_awaited_once()
+        request = agent.context_builder.build_with_report.await_args.args[0]
+        assert request.user_input == "hello"
+        assert request.session_id == "s1"
+        assert request.context_window_limit == 1000
+        assert request.skill_prompts == []
+        assert agent.router.completion.await_args_list[0].kwargs["messages"] == expected_messages
+        mock_info.assert_called_once_with(
+            "context_budget used=%s dropped=%s limit=%d reserve=%d",
+            {"L0": 3, "L1": 4, "L2": 5},
+            {"L0": 0, "L1": 1, "L2": 2},
+            321,
+            123,
+        )
+        assert all(
+            set(message.keys()) <= {"role", "content"} for message in expected_messages
+        )
+
+    def test_constructor_wires_progressive_context_settings(self, test_config_path):
+        from multiclaw.agent import MultiClawAgent
+
+        settings = Settings(_config_file=str(test_config_path))
+        settings.memory.progressive_context_enabled = True
+        settings.memory.context_response_reserve_tokens = 2048
+        settings.memory.context_l1_ratio = 0.75
+        registry = ToolRegistry()
+        registry.register(EchoToolBuilder())
+        scheduler = CoreToolScheduler(
+            permission_checker=PermissionChecker(),
+            sandbox=ProcessSandbox(),
+            audit_logger=InMemoryAuditLogger(),
+            event_bus=EventBus(),
+        )
+
+        agent = MultiClawAgent(
+            settings=settings,
+            router=ModelRouter(settings),
+            registry=registry,
+            scheduler=scheduler,
+            memory=InMemoryMemory(),
+            planner=Planner(),
+            event_bus=EventBus(),
+        )
+
+        assert agent.context_builder.progressive_enabled is True
+        assert agent.context_builder.response_reserve_tokens == 2048
+        assert agent.context_builder.l1_ratio == 0.75
+
 
 class _StubSkillManager:
     def process_message(self, _message: str):
@@ -678,6 +749,35 @@ class _StubSkillManager:
 class _StubContextBuilder:
     async def build(self, _request):
         return [{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}]
+
+    async def build_with_report(self, request):
+        return ContextBuildResult(
+            messages=await self.build(request),
+            report=ContextBuildReport(
+                limit_tokens=1000,
+                reserved_response_tokens=0,
+                used_tokens_by_level={"L0": 1, "L1": 0, "L2": 0},
+                dropped_by_level={"L0": 0, "L1": 0, "L2": 0},
+            ),
+        )
+
+
+class _ReportOnlyContextBuilder:
+    def __init__(self, messages: list[dict[str, str]]) -> None:
+        self.build_with_report = AsyncMock(
+            return_value=ContextBuildResult(
+                messages=messages,
+                report=ContextBuildReport(
+                    limit_tokens=321,
+                    reserved_response_tokens=123,
+                    used_tokens_by_level={"L0": 3, "L1": 4, "L2": 5},
+                    dropped_by_level={"L0": 0, "L1": 1, "L2": 2},
+                ),
+            )
+        )
+
+    async def build(self, _request):
+        raise AssertionError("handle_message should use build_with_report")
 
 
 class _StubRegistry:
