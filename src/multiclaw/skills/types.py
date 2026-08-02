@@ -57,7 +57,7 @@ class Skill:
 
     @property
     def keyword_triggers(self) -> list[str]:
-        keywords = []
+        keywords = [self.name]
         for t in self.triggers:
             if t.type == TriggerType.KEYWORD:
                 keywords.extend(t.keywords)

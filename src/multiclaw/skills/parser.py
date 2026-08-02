@@ -181,10 +181,8 @@ def _parse_metadata(data: dict[str, Any], dir_name: str) -> SkillMetadata:
         triggers.append(Trigger(type=TriggerType.KEYWORD, keywords=[raw_triggers]))
 
     # user-invocable: true implies keyword trigger via skill name
-    if not triggers and data.get("user-invocable", False) is True:
+    if not triggers:
         triggers.append(Trigger(type=TriggerType.KEYWORD, keywords=[name]))
-    elif not triggers:
-        triggers.append(Trigger(type=TriggerType.MANUAL))
 
     inputs = data.get("inputs", [])
     if isinstance(inputs, str):
