@@ -10,6 +10,18 @@
 
 **Tech Stack:** Python 3.12、asyncio、Pydantic 2、httpx、Playwright（可选运行时依赖）、pytest、pytest-asyncio；不增加新依赖。
 
+**Completion tracking:** Task 0–10 were implemented and reviewed in the commits below. The checkboxes retain the original TDD execution sequence and are marked complete to match the implementation status.
+
+| Task | Implementation evidence |
+|---|---|
+| 0 | `603b497`, `1bd5687` |
+| 1 | `e55f640` |
+| 2 | `e82e4a2` |
+| 3–4 | `61db1f7`, `03ecb8b` |
+| 5–6 | `afd4b40`, `ae0a589` |
+| 7–8 | `0e3ebc7`, `9b6ccac`, `6f59504` |
+| 9–10 | `dbab080`, `be9786f`, `6f59504` |
+
 ---
 
 ## File Map
@@ -49,12 +61,12 @@
 - Modify: `tests/test_frontend_welcome.py`
 - Modify: `tests/test_tools.py`
 
-- [ ] **Step 1: Preserve the reproduced baseline evidence**
+- [x] **Step 1: Preserve the reproduced baseline evidence**
 
 Run: `uv run pytest -q`
 Expected before fixes: 4 failures and 192 passes. Failures are the stale relevant-memory index assertion, two tests that search the migrated React shell for removed inline scripts, and registry pollution from an auto-discovered MCP config.
 
-- [ ] **Step 2: Make the context assertion semantic instead of positional**
+- [x] **Step 2: Make the context assertion semantic instead of positional**
 
 ```python
 relevant_message = next(
@@ -67,11 +79,11 @@ assert "alpha project uses SQLite memory" in relevant_message["content"]
 assert messages[-1] == {"role": "user", "content": "what does alpha use?"}
 ```
 
-- [ ] **Step 3: Point frontend migration tests at React sources**
+- [x] **Step 3: Point frontend migration tests at React sources**
 
 `tests/test_frontend_debug.py` reads `frontend/src/App.tsx` and asserts `shouldLogChatDebug`, the localhost hostname guard, and the three `[chat]` debug calls remain present. `tests/test_frontend_welcome.py` reads `frontend/src/components/assistant-ui/thread.tsx` and asserts the welcome copy is nested under `ThreadPrimitive.Empty`. These tests must not execute or inspect the generated static asset hash.
 
-- [ ] **Step 4: Isolate native-tool registry tests from local MCP configuration**
+- [x] **Step 4: Isolate native-tool registry tests from local MCP configuration**
 
 Add before `create_agent()`:
 
@@ -79,7 +91,7 @@ Add before `create_agent()`:
 monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
 ```
 
-- [ ] **Step 5: Verify the repaired baseline**
+- [x] **Step 5: Verify the repaired baseline**
 
 Run: `uv run pytest tests/test_agent.py tests/test_frontend_debug.py tests/test_frontend_welcome.py tests/test_tools.py -q`
 Expected: all focused tests PASS.
@@ -94,7 +106,7 @@ Expected: 196 tests PASS with zero failures; existing aiosqlite shutdown warning
 - Modify: `src/multiclaw/config/settings.py`
 - Modify: `tests/test_config.py`
 
-- [ ] **Step 1: Write failing configuration tests**
+- [x] **Step 1: Write failing configuration tests**
 
 ```python
 def test_phase_one_features_default_off():
@@ -115,12 +127,12 @@ def test_phase_one_features_load_from_environment(monkeypatch):
     assert settings.memory.progressive_context_enabled is True
 ```
 
-- [ ] **Step 2: Run tests and confirm the fields are absent**
+- [x] **Step 2: Run tests and confirm the fields are absent**
 
 Run: `uv run pytest tests/test_config.py -q`
 Expected: FAIL with missing `settings.tools` or missing new fields.
 
-- [ ] **Step 3: Add the settings models and TOML mapping**
+- [x] **Step 3: Add the settings models and TOML mapping**
 
 ```python
 class ToolSettings(BaseModel):
@@ -148,7 +160,7 @@ context_l1_ratio: float = Field(default=0.6, gt=0.0, lt=1.0)
 
 Add `tools: ToolSettings = Field(default_factory=ToolSettings)` to `Settings` and map `[tools]` in `_build_toml_kwargs`.
 
-- [ ] **Step 4: Run configuration tests**
+- [x] **Step 4: Run configuration tests**
 
 Run: `uv run pytest tests/test_config.py -q`
 Expected: PASS.
@@ -164,7 +176,7 @@ Expected: PASS.
 - Modify: `tests/test_mcp_tool_adapter.py`
 - Modify: `tests/test_mcp_integration.py`
 
-- [ ] **Step 1: Write failing MCP regression tests**
+- [x] **Step 1: Write failing MCP regression tests**
 
 ```python
 @pytest.mark.asyncio
@@ -194,12 +206,12 @@ def test_registry_replaces_mcp_server_namespace():
     assert [tool.name for tool in registry.list_all()] == ["mcp__demo__new"]
 ```
 
-- [ ] **Step 2: Run the focused tests**
+- [x] **Step 2: Run the focused tests**
 
 Run: `uv run pytest tests/test_mcp_tool_adapter.py tests/test_mcp_integration.py -q`
 Expected: FAIL because MCP execution blocks and registry replacement does not exist.
 
-- [ ] **Step 3: Implement the non-blocking bridge and registry replacement**
+- [x] **Step 3: Implement the non-blocking bridge and registry replacement**
 
 Use `await asyncio.to_thread(...)` in `MCPToolInvocation.execute()`:
 
@@ -264,7 +276,7 @@ def _mcp_namespace(server_name: str) -> str:
     return f"mcp__{safe_name}__"
 ```
 
-- [ ] **Step 4: Run focused and server tests**
+- [x] **Step 4: Run focused and server tests**
 
 Run: `uv run pytest tests/test_mcp_tool_adapter.py tests/test_mcp_integration.py tests/test_server.py -q`
 Expected: PASS.
@@ -276,7 +288,7 @@ Expected: PASS.
 - Create: `src/multiclaw/agent/resilience.py`
 - Create: `tests/test_agent_resilience.py`
 
-- [ ] **Step 1: Write failing pure unit tests**
+- [x] **Step 1: Write failing pure unit tests**
 
 ```python
 def test_repeated_tool_batch_requests_reflection_on_limit():
@@ -303,12 +315,12 @@ def test_fingerprints_ignore_tool_call_ids_and_dict_order():
     assert fingerprint_calls(left) == fingerprint_calls(right)
 ```
 
-- [ ] **Step 2: Run the new tests**
+- [x] **Step 2: Run the new tests**
 
 Run: `uv run pytest tests/test_agent_resilience.py -q`
 Expected: FAIL because the module is absent.
 
-- [ ] **Step 3: Implement deterministic decisions**
+- [x] **Step 3: Implement deterministic decisions**
 
 Define:
 
@@ -336,7 +348,7 @@ class ResilienceController:
 
 `observe_calls` and `observe_results` increment only consecutive identical fingerprints. `_decision(reason)` returns `REFLECT` while `reflections_used < max_reflections`, otherwise `TERMINATE`. Fingerprints use `json.dumps(..., sort_keys=True, separators=(",", ":"))` and SHA-256; tool-call IDs are excluded.
 
-- [ ] **Step 4: Run the unit tests**
+- [x] **Step 4: Run the unit tests**
 
 Run: `uv run pytest tests/test_agent_resilience.py -q`
 Expected: PASS.
@@ -349,7 +361,7 @@ Expected: PASS.
 - Modify: `tests/test_agent.py`
 - Modify: `tests/test_agent_stream_tool_ids.py`
 
-- [ ] **Step 1: Write failing non-stream and stream integration tests**
+- [x] **Step 1: Write failing non-stream and stream integration tests**
 
 The non-stream router returns the same tool call three times, then a reflection response, then a final answer:
 
@@ -386,12 +398,12 @@ assert reflection["name"] == "reflection"
 assert events[-1] == {"type": "done", "content": "changed approach"}
 ```
 
-- [ ] **Step 2: Run focused tests**
+- [x] **Step 2: Run focused tests**
 
 Run: `uv run pytest tests/test_agent.py tests/test_agent_stream_tool_ids.py -q`
 Expected: FAIL because repeated calls are still executed until `max_tool_rounds`.
 
-- [ ] **Step 3: Add shared helper methods to `MultiClawAgent`**
+- [x] **Step 3: Add shared helper methods to `MultiClawAgent`**
 
 ```python
 REFLECTION_PROMPT = (
@@ -415,7 +427,7 @@ Create one `ResilienceController` per request when `settings.agent.resilience_en
 yield {"type": "state", "name": "reflection", "content": reflection}
 ```
 
-- [ ] **Step 4: Run agent regression tests**
+- [x] **Step 4: Run agent regression tests**
 
 Run: `uv run pytest tests/test_agent.py tests/test_agent_stream_tool_ids.py tests/test_chat_request_compat.py -q`
 Expected: PASS with old tool IDs and final-summary behavior preserved.
@@ -431,7 +443,7 @@ Expected: PASS with old tool IDs and final-summary behavior preserved.
 - Create: `src/multiclaw/agent/tool_batch.py`
 - Create: `tests/test_tool_batch.py`
 
-- [ ] **Step 1: Write failing batch tests**
+- [x] **Step 1: Write failing batch tests**
 
 ```python
 @pytest.mark.asyncio
@@ -458,12 +470,12 @@ async def test_approval_eligible_read_is_not_parallelized():
     assert await scheduler.can_run_concurrently(external_read_builder, params) is False
 ```
 
-- [ ] **Step 2: Run the new tests**
+- [x] **Step 2: Run the new tests**
 
 Run: `uv run pytest tests/test_tool_batch.py -q`
 Expected: FAIL because metadata, preflight and executor are absent.
 
-- [ ] **Step 3: Implement metadata, preflight and stable batching**
+- [x] **Step 3: Implement metadata, preflight and stable batching**
 
 Add to `ToolBuilder`:
 
@@ -488,7 +500,7 @@ async def can_run_concurrently(self, builder: ToolBuilder, raw_params: dict) -> 
 
 `ToolBatchExecutor.execute()` partitions calls into consecutive eligible runs. Eligible runs use a semaphore and `asyncio.gather`; barriers execute one at a time. Gather results are stored by original index and returned in input order. On cancellation, cancel unfinished tasks and await them with `return_exceptions=True` before re-raising.
 
-- [ ] **Step 4: Run batch and tool tests**
+- [x] **Step 4: Run batch and tool tests**
 
 Run: `uv run pytest tests/test_tool_batch.py tests/test_tools.py tests/test_governance.py -q`
 Expected: PASS.
@@ -501,16 +513,16 @@ Expected: PASS.
 - Modify: `tests/test_agent.py`
 - Modify: `tests/test_agent_stream_tool_ids.py`
 
-- [ ] **Step 1: Write failing agent-level concurrency tests**
+- [x] **Step 1: Write failing agent-level concurrency tests**
 
 For both paths, return two read-only tool calls in one model response. Configure `parallel_read_only_enabled=True`, make each invocation wait on the other, and assert both complete. Add a mixed read/write/read case and assert the write remains a barrier. Preserve every original call ID in messages and stream events.
 
-- [ ] **Step 2: Run focused tests**
+- [x] **Step 2: Run focused tests**
 
 Run: `uv run pytest tests/test_agent.py tests/test_agent_stream_tool_ids.py -q`
 Expected: FAIL or deadlock because the current loops execute each call serially.
 
-- [ ] **Step 3: Normalize calls and use `ToolBatchExecutor`**
+- [x] **Step 3: Normalize calls and use `ToolBatchExecutor`**
 
 Create `ToolCallSpec(call_id, name, arguments)` and `ToolCallOutcome(call_id, name, observation)` in `tool_batch.py`. Initialize one executor in `MultiClawAgent.__init__`. Replace both per-call loops with:
 
@@ -523,7 +535,7 @@ for outcome in outcomes:
 
 The stream path must emit all `tool_call` events first, then emit ordered `tool_result` events after execution. If the flag is false, the executor treats every call as a barrier and exactly preserves legacy behavior.
 
-- [ ] **Step 4: Run agent and SSE tests**
+- [x] **Step 4: Run agent and SSE tests**
 
 Run: `uv run pytest tests/test_agent.py tests/test_agent_stream_tool_ids.py tests/test_chat_request_compat.py tests/test_stream.py -q`
 Expected: PASS.
@@ -537,7 +549,7 @@ Expected: PASS.
 - Create: `tests/test_network_policy.py`
 - Modify: `tests/test_web_fetch.py`
 
-- [ ] **Step 1: Write failing policy tests**
+- [x] **Step 1: Write failing policy tests**
 
 ```python
 @pytest.mark.parametrize("url", [
@@ -569,12 +581,12 @@ def test_http_fetch_revalidates_redirect_target(monkeypatch):
     assert "blocked network target" in result.content.lower()
 ```
 
-- [ ] **Step 2: Run policy and fetch tests**
+- [x] **Step 2: Run policy and fetch tests**
 
 Run: `uv run pytest tests/test_network_policy.py tests/test_web_fetch.py -q`
 Expected: FAIL because URLs are only normalized today.
 
-- [ ] **Step 3: Implement public-network validation and manual redirects**
+- [x] **Step 3: Implement public-network validation and manual redirects**
 
 `NetworkPolicy.validate_url()` must require `http` or `https`, reject credentials in URLs, require a hostname, resolve with `socket.getaddrinfo`, normalize IPv4-mapped IPv6, and require every answer to satisfy `ip.is_global`. `allow_private_networks=True` may bypass address classification only; it must not enable non-HTTP schemes or URL credentials.
 
@@ -597,7 +609,7 @@ def _request_with_policy(self, client: httpx.Client, url: str) -> httpx.Response
 
 Use it in light and markdown modes. Convert `NetworkPolicyError` to a stable tool error without including resolved internal addresses beyond the rejected host.
 
-- [ ] **Step 4: Run security tests**
+- [x] **Step 4: Run security tests**
 
 Run: `uv run pytest tests/test_network_policy.py tests/test_web_fetch.py -q`
 Expected: PASS.
@@ -610,7 +622,7 @@ Expected: PASS.
 - Modify: `src/multiclaw/server.py`
 - Modify: `tests/test_web_fetch.py`
 
-- [ ] **Step 1: Write failing browser-route tests**
+- [x] **Step 1: Write failing browser-route tests**
 
 Use fake route/request objects and capture the callback installed by `page.route("**/*", callback)`:
 
@@ -627,12 +639,12 @@ invocation = builder.build(builder.validate({"url": "http://127.0.0.1"}))
 assert invocation.network_policy.allow_private_networks is True
 ```
 
-- [ ] **Step 2: Run browser tests**
+- [x] **Step 2: Run browser tests**
 
 Run: `uv run pytest tests/test_web_fetch.py -q`
 Expected: FAIL because browser mode has no route policy.
 
-- [ ] **Step 3: Install the route guard before navigation**
+- [x] **Step 3: Install the route guard before navigation**
 
 ```python
 def guard(route) -> None:
@@ -650,7 +662,7 @@ page.goto(url, wait_until="networkidle", timeout=self.timeout * 1000)
 
 Pass `settings.tools.web_fetch_allow_private_networks` from `create_agent()` into `WebFetchToolBuilder`.
 
-- [ ] **Step 4: Run all web tool tests**
+- [x] **Step 4: Run all web tool tests**
 
 Run: `uv run pytest tests/test_web_fetch.py tests/test_web_search.py -q`
 Expected: PASS.
@@ -664,7 +676,7 @@ Expected: PASS.
 - Modify: `src/multiclaw/agent/context.py`
 - Modify: `tests/test_context.py`
 
-- [ ] **Step 1: Write failing budget and ordering tests**
+- [x] **Step 1: Write failing budget and ordering tests**
 
 ```python
 @pytest.mark.asyncio
@@ -691,12 +703,12 @@ def test_estimate_tokens_is_conservative_and_deterministic():
     assert estimate_tokens("abcde") == 2
 ```
 
-- [ ] **Step 2: Run context tests**
+- [x] **Step 2: Run context tests**
 
 Run: `uv run pytest tests/test_context.py -q`
 Expected: FAIL because progressive mode and reports do not exist.
 
-- [ ] **Step 3: Add build result, report and budget policy**
+- [x] **Step 3: Add build result, report and budget policy**
 
 Define in `src/multiclaw/context/budget.py` and export from `src/multiclaw/context/__init__.py`:
 
@@ -724,7 +736,7 @@ Keep `build()` as a compatibility wrapper returning `result.messages`. `build_wi
 - L2: relevant non-chat memory; consumes the rest in relevance order.
 - If L0 alone exceeds the available budget, retain the full system prompt and user input, drop temporal anchor first, and record the drop; never truncate the current user input.
 
-- [ ] **Step 4: Run context tests**
+- [x] **Step 4: Run context tests**
 
 Run: `uv run pytest tests/test_context.py -q`
 Expected: PASS with legacy ordering tests unchanged.
@@ -737,16 +749,16 @@ Expected: PASS with legacy ordering tests unchanged.
 - Modify: `tests/test_agent.py`
 - Modify: `docs/superpowers/specs/2026-07-28-omniagent-migration-design.md`
 
-- [ ] **Step 1: Write a failing agent wiring test**
+- [x] **Step 1: Write a failing agent wiring test**
 
 Configure progressive context on and replace `build_with_report` with an `AsyncMock`. Assert both stream and non-stream paths use `.messages` and log one structured report containing used/dropped counts, without adding the report to the model prompt.
 
-- [ ] **Step 2: Run agent wiring tests**
+- [x] **Step 2: Run agent wiring tests**
 
 Run: `uv run pytest tests/test_agent.py tests/test_agent_stream_tool_ids.py -q`
 Expected: FAIL because the agent still calls `build()`.
 
-- [ ] **Step 3: Wire `build_with_report` and log observability**
+- [x] **Step 3: Wire `build_with_report` and log observability**
 
 Use one helper:
 
@@ -765,12 +777,12 @@ async def _build_context(self, request: ContextRequest) -> list[dict[str, Any]]:
 
 Update the migration spec status to `Phase 0/1 engineering implementation complete; credential rotation pending operator action` only after the full verification below succeeds. Add a short “implementation evidence” section listing commands and results; do not claim credential rotation, Phase 2, or Phase 3.
 
-- [ ] **Step 4: Run backend verification**
+- [x] **Step 4: Run backend verification**
 
 Run: `uv run pytest -q`
 Expected: all tests PASS with zero failures.
 
-- [ ] **Step 5: Run frontend verification**
+- [x] **Step 5: Run frontend verification**
 
 Run: `npm run lint` in `frontend/`
 Expected: exit 0.
@@ -778,7 +790,7 @@ Expected: exit 0.
 Run: `npm run build` in `frontend/`
 Expected: exit 0.
 
-- [ ] **Step 6: Run static diff checks**
+- [x] **Step 6: Run static diff checks**
 
 Run: `git diff --check`
 Expected: exit 0.
