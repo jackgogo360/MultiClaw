@@ -34,6 +34,7 @@ def _environment(tmp_path: Path) -> SandboxEnvironment:
 def _policy(
     *,
     name: str = "shell_workspace",
+    profile_kind: str | None = None,
     workspace_mode: str = "rw",
     network_mode: str = "disabled",
     allow_subprocesses: bool = True,
@@ -42,8 +43,15 @@ def _policy(
     write_protected_patterns: tuple[str, ...] = (".git",),
     read_hidden_patterns: tuple[str, ...] = (".env", ".env.*"),
 ) -> SandboxProfilePolicy:
+    if profile_kind is None:
+        profile_kind = {
+            "shell_workspace": "shell",
+            "code_exec_python": "code_exec",
+            "mcp_stdio_local": "mcp_stdio",
+        }.get(name, "shell")
     return SandboxProfilePolicy(
         name=name,
+        profile_kind=profile_kind,
         workspace_mode=workspace_mode,
         network_mode=network_mode,
         allow_subprocesses=allow_subprocesses,
@@ -482,6 +490,7 @@ def test_seatbelt_treats_configured_custom_mcp_profile_as_reviewed_mcp_policy(
         request,
         _policy(
             name="custom_mcp_profile",
+            profile_kind="mcp_stdio",
             workspace_mode="ro",
             network_mode="disabled",
             allow_subprocesses=False,
@@ -494,6 +503,69 @@ def test_seatbelt_treats_configured_custom_mcp_profile_as_reviewed_mcp_policy(
     assert "(deny network*)" in profile_text
     assert "(deny process-fork)" in profile_text
     assert '(allow file-write* (subpath (param "WORKSPACE")))' not in profile_text
+
+
+def test_seatbelt_rejects_unknown_profile_even_with_mcp_server_name(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="mcp",
+        profile_name="custom_unknown_profile",
+        mode="exec_argv",
+        argv=("/usr/bin/env",),
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        mcp_server_name="demo",
+    )
+
+    with pytest.raises(SandboxLaunchError, match="unsupported seatbelt profile"):
+        SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
+            request,
+            _policy(
+                name="custom_unknown_profile",
+                profile_kind="shell",
+                entrypoints=(Path("/usr/bin/env"),),
+            ),
+            environment,
+        )
+
+
+def test_seatbelt_shell_profile_with_mcp_server_name_keeps_shell_semantics(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command=":",
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        mcp_server_name="demo",
+    )
+
+    launch = SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
+        request,
+        _policy(name="shell_workspace", profile_kind="shell"),
+        environment,
+    )
+    profile_text = launch.args[launch.args.index("-p") + 1]
+
+    assert launch.args[-3:] == ("/bin/sh", "-c", ":")
+    assert "(allow process-fork)" in profile_text
+    assert "(deny network*)" in profile_text
+    assert '(allow file-write* (subpath (param "WORKSPACE")))' in profile_text
 
 
 def test_seatbelt_rejects_network_or_capability_mismatches(tmp_path: Path) -> None:

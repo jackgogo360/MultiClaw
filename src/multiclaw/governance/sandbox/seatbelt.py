@@ -62,7 +62,7 @@ class SeatbeltBackend:
         if policy.name != request.profile_name:
             raise SandboxLaunchError("policy name must match request profile_name")
 
-        is_reviewed_mcp = self._is_reviewed_mcp_request(request)
+        is_reviewed_mcp = self._is_reviewed_mcp_policy(policy)
         template = self._template_for(policy.name, is_reviewed_mcp=is_reviewed_mcp)
         self._validate_request_overrides(request, policy)
         self._validate_policy_against_template(
@@ -414,8 +414,8 @@ class SeatbeltBackend:
             allow_subprocesses=policy.allow_subprocesses,
         )
 
-    def _is_reviewed_mcp_request(self, request: SandboxExecRequest) -> bool:
-        return request.mcp_server_name is not None
+    def _is_reviewed_mcp_policy(self, policy: SandboxProfilePolicy) -> bool:
+        return policy.profile_kind == "mcp_stdio"
 
     def _canonicalize_existing_path(self, path: Path, label: str) -> Path:
         value = str(path)

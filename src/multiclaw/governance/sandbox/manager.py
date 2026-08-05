@@ -584,6 +584,7 @@ class SandboxManager(SandboxController):
         return (
             SandboxProfilePolicy(
                 name=self._settings.profiles.shell,
+                profile_kind="shell",
                 workspace_mode="rw",
                 network_mode="disabled",
                 allow_subprocesses=True,
@@ -593,6 +594,7 @@ class SandboxManager(SandboxController):
             ),
             SandboxProfilePolicy(
                 name=self._settings.profiles.code_exec,
+                profile_kind="code_exec",
                 workspace_mode="rw",
                 network_mode="disabled",
                 allow_subprocesses=False,
@@ -603,6 +605,7 @@ class SandboxManager(SandboxController):
             ),
             SandboxProfilePolicy(
                 name=self._settings.profiles.mcp_stdio,
+                profile_kind="mcp_stdio",
                 workspace_mode="ro",
                 network_mode="disabled",
                 allow_subprocesses=False,

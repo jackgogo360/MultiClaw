@@ -40,6 +40,7 @@ def _environment(tmp_path: Path) -> SandboxEnvironment:
 def _policy(
     *,
     name: str = "shell_workspace",
+    profile_kind: str | None = None,
     workspace_mode: str = "rw",
     network_mode: str = "disabled",
     allow_subprocesses: bool = True,
@@ -48,6 +49,12 @@ def _policy(
     write_protected_patterns: tuple[str, ...] = (".git",),
     read_hidden_patterns: tuple[str, ...] = (".env", ".env.*"),
 ) -> SandboxProfilePolicy:
+    if profile_kind is None:
+        profile_kind = {
+            "shell_workspace": "shell",
+            "code_exec_python": "code_exec",
+            "mcp_stdio_local": "mcp_stdio",
+        }.get(name, "shell")
     default_entrypoints = {
         "shell_workspace": (Path("/bin/sh"),),
         "code_exec_python": (Path("/usr/bin/python3"),),
@@ -55,6 +62,7 @@ def _policy(
     }
     return SandboxProfilePolicy(
         name=name,
+        profile_kind=profile_kind,
         workspace_mode=workspace_mode,
         network_mode=network_mode,
         allow_subprocesses=allow_subprocesses,
@@ -494,6 +502,7 @@ def test_nsjail_treats_configured_custom_mcp_profile_as_reviewed_mcp_policy(
         request,
         _policy(
             name="custom_mcp_profile",
+            profile_kind="mcp_stdio",
             workspace_mode="ro",
             network_mode="disabled",
             allow_subprocesses=False,
@@ -506,6 +515,67 @@ def test_nsjail_treats_configured_custom_mcp_profile_as_reviewed_mcp_policy(
     assert "clone_newnet: true" in config_text
     assert "ERRNO(EPERM) { clone, clone3, fork, vfork, unshare }" in config_text
     assert "rlimit_nproc: 1" in config_text
+
+
+def test_nsjail_rejects_unknown_profile_even_with_mcp_server_name(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.nsjail import NsJailBackend
+
+    workspace = _workspace_tree(tmp_path)
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="mcp",
+        profile_name="custom_unknown_profile",
+        mode="exec_argv",
+        argv=("/usr/bin/env",),
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        mcp_server_name="demo",
+    )
+
+    with pytest.raises(SandboxLaunchError, match="unsupported nsjail profile"):
+        NsJailBackend(binary=Path("/usr/bin/nsjail")).build_launch_spec(
+            request,
+            _policy(
+                name="custom_unknown_profile",
+                profile_kind="shell",
+                entrypoints=(Path("/usr/bin/env"),),
+            ),
+            environment,
+        )
+
+
+def test_nsjail_shell_profile_with_mcp_server_name_keeps_shell_semantics(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.nsjail import NsJailBackend
+
+    workspace = _workspace_tree(tmp_path)
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command=":",
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        mcp_server_name="demo",
+    )
+
+    launch = NsJailBackend(binary=Path("/usr/bin/nsjail")).build_launch_spec(
+        request,
+        _policy(name="shell_workspace", profile_kind="shell"),
+        environment,
+    )
+    config_text = _config_text(launch.args)
+
+    assert launch.args[3:] == ("/bin/sh", "-c", ":")
+    assert "clone_newnet: true" in config_text
+    assert "ERRNO(EPERM) { clone, clone3, fork, vfork, unshare }" not in config_text
+    assert "rw: true" in config_text
 
 
 def test_nsjail_rejects_relative_or_nul_paths_and_too_many_runtime_roots(

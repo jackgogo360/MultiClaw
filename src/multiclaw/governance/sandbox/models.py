@@ -130,6 +130,7 @@ class SandboxProfilePolicy(_SandboxModel):
     model_config = ConfigDict(frozen=True)
 
     name: str
+    profile_kind: Literal["shell", "code_exec", "mcp_stdio"] = "shell"
     workspace_mode: Literal["ro", "rw"]
     network_mode: Literal["disabled", "inherit"]
     allow_subprocesses: bool
