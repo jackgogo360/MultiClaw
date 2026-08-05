@@ -26,6 +26,10 @@ from multiclaw.tools.grep import GrepToolBuilder
 from multiclaw.tools.list_dir import ListDirToolBuilder
 from multiclaw.tools.read_file import ReadFileToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
+from tests.sandbox_fakes import (
+    ReadyRecordingSandboxController,
+    UnavailableSandboxController,
+)
 
 
 class EchoParams(BaseModel):
@@ -134,9 +138,12 @@ class TestToolRegistry:
     def test_runtime_registry_matches_agent_code_tool_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
         monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
+        monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
         from multiclaw.server import create_agent
 
-        agent = create_agent()
+        agent = create_agent(
+            sandbox_controller=ReadyRecordingSandboxController(workspace_root=tmp_path)
+        )
 
         assert [tool.name for tool in agent.registry.list_all()] == [
             "code_exec",
@@ -152,6 +159,22 @@ class TestToolRegistry:
             "web_search",
             "write_file",
         ]
+
+    def test_runtime_registry_skips_unready_execution_tools(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+        monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
+        monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+        from multiclaw.server import create_agent
+
+        agent = create_agent(sandbox_controller=UnavailableSandboxController())
+        names = [tool.name for tool in agent.registry.list_all()]
+
+        assert "shell" not in names
+        assert "code_exec" not in names
+        assert "read_file" in names
+        assert "web_fetch" in names
+        assert agent.sandbox_readiness.ready is False
+        assert agent.sandbox_controller is not None
 
 
 class TestCoreToolScheduler:

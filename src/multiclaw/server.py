@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+import re
 import threading
+import tempfile
 from contextlib import asynccontextmanager
 from collections.abc import Iterable
 from logging.handlers import TimedRotatingFileHandler
@@ -10,7 +12,7 @@ from time import perf_counter
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -83,7 +85,15 @@ def _friendly_error(exc: Exception) -> str:
 from multiclaw.agent import MultiClawAgent
 from multiclaw.config import Settings
 from multiclaw.events import Event, EventBus
-from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
+from multiclaw.governance import (
+    ExecutionGuard,
+    InMemoryAuditLogger,
+    PermissionChecker,
+    SandboxController,
+    SandboxProcessRunner,
+    SandboxReadiness,
+)
+from multiclaw.governance.sandbox.manager import SandboxManager
 from multiclaw.llm import ModelRouter
 from multiclaw.memory import SqliteMemory
 from multiclaw.planner import Planner
@@ -110,6 +120,13 @@ from multiclaw.mcp import (
     load_mcp_config,
     load_mcp_tools_config,
 )
+from multiclaw.mcp.types import (
+    HTTPServerConfig,
+    InProcessServerConfig,
+    SSEServerConfig,
+    StdioServerConfig,
+    WebSocketServerConfig,
+)
 
 from uuid import uuid4
 
@@ -125,6 +142,11 @@ from multiclaw.stream import DataStreamEncoder
 
 agent: MultiClawAgent
 shared_bus: EventBus
+_PUBLIC_SECRET_PATTERN = re.compile(
+    r"(?:ghp_[A-Za-z0-9_]{1,255}|sk-[A-Za-z0-9_]{1,255}|Bearer\s+\S+"
+    r"|token=[^\s&,;\"']{1,255}|key=[^\s&,;\"']{1,255})",
+    re.IGNORECASE,
+)
 
 
 def _sanitize_mcp_namespace(name: str) -> str:
@@ -133,6 +155,77 @@ def _sanitize_mcp_namespace(name: str) -> str:
 
 def _mcp_namespace_prefix(server_name: str) -> str:
     return f"mcp__{_sanitize_mcp_namespace(server_name)}__"
+
+
+def _sanitize_public_reason(
+    reason: str,
+    *,
+    workspace_root: Path | None = None,
+) -> str:
+    text = _PUBLIC_SECRET_PATTERN.sub("[REDACTED]", reason.strip())
+    if not text:
+        return ""
+
+    path_markers = {tempfile.gettempdir(), str(Path.home())}
+    if workspace_root is not None:
+        resolved = workspace_root.resolve()
+        path_markers.update({str(workspace_root), str(resolved)})
+
+    if any(marker and marker in text for marker in path_markers):
+        return "details redacted"
+    if "/." in text or "\\." in text:
+        return "details redacted"
+    if "/" in text or "\\" in text:
+        return "details redacted"
+    return text
+
+
+def _sanitize_public_readiness(
+    readiness: SandboxReadiness,
+    *,
+    workspace_root: Path,
+) -> SandboxReadiness:
+    return readiness.model_copy(
+        update={
+            "probe": readiness.probe.model_copy(
+                update={
+                    "reason": _sanitize_public_reason(
+                        readiness.probe.reason,
+                        workspace_root=workspace_root,
+                    )
+                }
+            ),
+            "skipped_capabilities": {
+                _sanitize_mcp_namespace(name): _sanitize_public_reason(
+                    reason,
+                    workspace_root=workspace_root,
+                )
+                for name, reason in readiness.skipped_capabilities.items()
+            },
+        }
+    )
+
+
+def _record_blocked_capability_safely(
+    controller: SandboxController | None,
+    *,
+    name: str,
+    reason: str,
+    workspace_root: Path,
+) -> None:
+    if controller is None:
+        return
+    try:
+        controller.record_blocked_capability(
+            name,
+            _sanitize_public_reason(reason, workspace_root=workspace_root),
+        )
+    except Exception:
+        logger.debug(
+            "Sandbox controller rejected blocked capability record for %s",
+            name,
+            exc_info=True,
+        )
 
 
 def _build_mcp_adapters(
@@ -160,6 +253,8 @@ def _register_mcp_tools(
     registry: ToolRegistry,
     mcp_manager: MCPClientManager,
     config_path: str | None,
+    sandbox_controller: SandboxController | None,
+    workspace_root: Path,
 ) -> None:
     configs = load_mcp_config(config_path)
     if not configs:
@@ -185,10 +280,54 @@ def _register_mcp_tools(
             _replace_server_namespace(server_name, tools)
             refreshed_servers.add(server_name)
 
+    filtered_configs: dict[str, object] = {}
+    for server_name, config in configs.items():
+        if isinstance(config, StdioServerConfig):
+            if sandbox_controller is None or sandbox_controller.is_profile_ready("mcp_stdio_local"):
+                filtered_configs[server_name] = config
+                continue
+
+            reason = "sandbox profile 'mcp_stdio_local' is not ready"
+            _record_blocked_capability_safely(
+                sandbox_controller,
+                name=f"mcp_stdio_{_sanitize_mcp_namespace(server_name)}",
+                reason=reason,
+                workspace_root=workspace_root,
+            )
+            logger.warning("Skipping stdio MCP server '%s': %s", server_name, reason)
+            continue
+
+        if isinstance(config, InProcessServerConfig):
+            if sandbox_controller is not None and sandbox_controller.mode == "host_unsafe_dev_only":
+                filtered_configs[server_name] = config
+                logger.warning(
+                    "Keeping in-process MCP server '%s' with unsafe host execution enabled",
+                    server_name,
+                )
+                continue
+
+            reason = "in-process MCP transport requires host_unsafe_dev_only"
+            _record_blocked_capability_safely(
+                sandbox_controller,
+                name=f"mcp_in_process_{_sanitize_mcp_namespace(server_name)}",
+                reason=reason,
+                workspace_root=workspace_root,
+            )
+            logger.warning("Skipping in-process MCP server '%s': %s", server_name, reason)
+            continue
+
+        if isinstance(config, (HTTPServerConfig, SSEServerConfig, WebSocketServerConfig)):
+            logger.info(
+                "Keeping remote MCP server '%s' unsandboxed transport=%s transport_remote_unsandboxed=true",
+                server_name,
+                config.transport_type.value,
+            )
+        filtered_configs[server_name] = config
+
     mcp_manager.set_tools_changed_callback(_refresh_registry)
 
     try:
-        mcp_manager.connect_servers(configs)
+        mcp_manager.connect_servers(filtered_configs)
         states = mcp_manager.get_server_states()
         for server_name, state in states.items():
             if state.status.value == "connected":
@@ -220,7 +359,10 @@ def _register_mcp_tools(
         logger.exception("Failed to connect MCP servers")
 
 
-def create_agent() -> MultiClawAgent:
+def create_agent(
+    *,
+    sandbox_controller: SandboxController | None = None,
+) -> MultiClawAgent:
     global shared_bus
     shared_bus = EventBus()
 
@@ -242,6 +384,16 @@ def create_agent() -> MultiClawAgent:
     if settings.skill.enabled if hasattr(settings, 'skill') else True:
         skill_manager.discover()
 
+    if sandbox_controller is None:
+        sandbox_controller = SandboxManager.create(
+            settings=settings.governance.sandbox,
+            debug=settings.app.debug,
+            workspace_root=workspace_root,
+            event_bus=shared_bus,
+            runner=SandboxProcessRunner(),
+        )
+    sandbox_controller.initialize()
+
     registry = ToolRegistry()
     read_builder = ReadFileToolBuilder(workspace_root)
     edit_builder = EditFileToolBuilder(workspace_root)
@@ -253,8 +405,24 @@ def create_agent() -> MultiClawAgent:
     registry.register(ListDirToolBuilder(workspace_root))
     registry.register(GrepToolBuilder(workspace_root))
     registry.register(FindDirToolBuilder(workspace_root))
-    registry.register(ShellToolBuilder(workspace_root))
-    registry.register(CodeExecToolBuilder(workspace_root))
+    if sandbox_controller.is_profile_ready(settings.governance.sandbox.profiles.shell):
+        registry.register(ShellToolBuilder(workspace_root))
+    else:
+        _record_blocked_capability_safely(
+            sandbox_controller,
+            name="shell",
+            reason=f"sandbox profile {settings.governance.sandbox.profiles.shell!r} is not ready",
+            workspace_root=workspace_root,
+        )
+    if sandbox_controller.is_profile_ready(settings.governance.sandbox.profiles.code_exec):
+        registry.register(CodeExecToolBuilder(workspace_root))
+    else:
+        _record_blocked_capability_safely(
+            sandbox_controller,
+            name="code_exec",
+            reason=f"sandbox profile {settings.governance.sandbox.profiles.code_exec!r} is not ready",
+            workspace_root=workspace_root,
+        )
     registry.register(
         WebFetchToolBuilder(
             workspace_root,
@@ -273,7 +441,14 @@ def create_agent() -> MultiClawAgent:
             config_path=(
                 settings.mcp.config_path if settings.mcp.config_path else None
             ),
+            sandbox_controller=sandbox_controller,
+            workspace_root=workspace_root,
         )
+
+    readiness = _sanitize_public_readiness(
+        sandbox_controller.finalize_readiness(),
+        workspace_root=workspace_root,
+    )
 
     scheduler = CoreToolScheduler(
         permission_checker=PermissionChecker(
@@ -302,6 +477,8 @@ def create_agent() -> MultiClawAgent:
     )
     runtime_agent.session_store = SqliteSessionStore(settings.database.path)
     runtime_agent.mcp_manager = mcp_manager
+    runtime_agent.sandbox_controller = sandbox_controller
+    runtime_agent.sandbox_readiness = readiness
     return runtime_agent
 
 
@@ -318,11 +495,23 @@ async def lifespan(app: FastAPI):
     await auth_store.initialize()
     app.state.auth_store = auth_store
     app.state.settings = agent.settings
-    yield
-
-    # Cleanup MCP connections
-    if hasattr(agent, 'mcp_manager') and agent.mcp_manager:
-        agent.mcp_manager.stop()
+    app.state.sandbox_readiness = agent.sandbox_readiness
+    sandbox_controller = getattr(agent, "sandbox_controller", None)
+    if sandbox_controller is not None:
+        for event in sandbox_controller.drain_startup_events():
+            await shared_bus.publish(event)
+    try:
+        yield
+    finally:
+        if hasattr(agent, "mcp_manager") and agent.mcp_manager:
+            agent.mcp_manager.stop()
+        if sandbox_controller is not None:
+            try:
+                sandbox_controller.close()
+            except Exception:
+                logger.warning(
+                    "Sandbox controller reported residual startup state during shutdown; details redacted"
+                )
 
 
 app = FastAPI(title="MultiClaw", lifespan=lifespan)
@@ -377,6 +566,30 @@ class SessionRenameRequest(BaseModel):
 class ApproveRequest(BaseModel):
     request_id: str
     approved: bool
+
+
+@app.get("/health/ready")
+async def health_ready():
+    readiness = getattr(app.state, "sandbox_readiness", None)
+    if readiness is None:
+        payload = {
+            "ready": False,
+            "mode": "auto",
+            "backend_name": "unknown",
+            "probe": {
+                "backend_name": "unknown",
+                "available": False,
+                "capabilities": {},
+                "reason": "readiness unavailable",
+            },
+            "profiles": {},
+            "skipped_capabilities": {"sandbox_readiness": "readiness unavailable"},
+            "unsafe_fallback_active": False,
+        }
+        return JSONResponse(payload, status_code=503)
+
+    payload = readiness.model_dump(mode="json")
+    return JSONResponse(payload, status_code=200 if readiness.ready else 503)
 
 
 @api.post("/approve")

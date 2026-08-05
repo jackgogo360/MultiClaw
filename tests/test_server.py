@@ -1,10 +1,15 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from multiclaw.events import Event
+from multiclaw.governance.sandbox.models import SandboxProbeResult, SandboxReadiness
+from multiclaw.mcp.types import HTTPServerConfig, InProcessServerConfig, StdioServerConfig
 from multiclaw.mcp.types import ToolInfo
+from tests.sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
 
 
 def _make_auth_cookie(app) -> dict:
@@ -154,6 +159,93 @@ def test_auth_flows_are_public(tmp_path, monkeypatch):
         assert client.get("/multiclaw.png").status_code != 401
 
 
+class _LeakyUnavailableSandboxController:
+    def __init__(self, workspace_root: Path) -> None:
+        secret_value = "sk-test-should-not-leak"
+        private_root = workspace_root / "private-root"
+        hidden_path = workspace_root / ".env.secret"
+        self._events = (
+            Event(
+                type="sandbox.profile_unavailable",
+                data={
+                    "profile_name": "shell_workspace",
+                    "reason": (
+                        f"workspace={workspace_root} private_root={private_root} "
+                        f"hidden={hidden_path} token={secret_value}"
+                    ),
+                },
+            ),
+        )
+        self._readiness = SandboxReadiness(
+            ready=False,
+            mode="auto",
+            backend_name="leaky",
+            probe=SandboxProbeResult(
+                backend_name="leaky",
+                available=False,
+                capabilities={},
+                reason=(
+                    f"workspace={workspace_root} private_root={private_root} "
+                    f"hidden={hidden_path} token={secret_value}"
+                ),
+            ),
+            profiles={
+                "shell_workspace": False,
+                "code_exec_python": False,
+                "mcp_stdio_local": False,
+            },
+            skipped_capabilities={
+                "shell": (
+                    f"workspace={workspace_root} private_root={private_root} "
+                    f"hidden={hidden_path} token={secret_value}"
+                )
+            },
+            unsafe_fallback_active=False,
+        )
+
+    @property
+    def mode(self) -> str:
+        return self._readiness.mode
+
+    @property
+    def backend_name(self) -> str:
+        return self._readiness.backend_name
+
+    @property
+    def readiness(self) -> SandboxReadiness:
+        return self._readiness
+
+    def initialize(self) -> None:
+        return None
+
+    def is_profile_ready(self, profile_name: str) -> bool:
+        del profile_name
+        return False
+
+    def build_launch_spec(self, request):
+        del request
+        raise RuntimeError("unavailable")
+
+    async def run(self, request):
+        del request
+        raise RuntimeError("unavailable")
+
+    def record_blocked_capability(self, name: str, reason: str) -> None:
+        del name, reason
+        return None
+
+    def finalize_readiness(self) -> SandboxReadiness:
+        return self._readiness
+
+    def drain_startup_events(self) -> tuple[Event, ...]:
+        events = self._events
+        self._events = ()
+        return events
+
+    def close(self) -> None:
+        return None
+
+
 def test_build_mcp_adapters_respects_filter_and_sanitized_namespace():
     from multiclaw.mcp.tool_adapter import MCPToolBuilder
     from multiclaw.server import _build_mcp_adapters, _mcp_namespace_prefix
@@ -195,7 +287,59 @@ def test_build_mcp_adapters_respects_filter_and_sanitized_namespace():
     assert adapters[0].name == "mcp__demo_server_v1__read_file_v2"
 
 
-def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch):
+def test_health_ready_is_public_and_uses_app_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+
+    import multiclaw.server as server_module
+
+    real_create_agent = server_module.create_agent
+    controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
+
+    def _create_agent(*, sandbox_controller=None):
+        del sandbox_controller
+        return real_create_agent(sandbox_controller=controller)
+
+    monkeypatch.setattr(server_module, "create_agent", _create_agent)
+
+    with TestClient(server_module.app) as client:
+        response = client.get("/health/ready")
+
+        assert response.status_code == 200
+        assert response.json()["ready"] is True
+        assert server_module.app.state.sandbox_readiness.ready is True
+
+
+def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+
+    import multiclaw.server as server_module
+
+    real_create_agent = server_module.create_agent
+    controller = _LeakyUnavailableSandboxController(tmp_path)
+
+    def _create_agent(*, sandbox_controller=None):
+        del sandbox_controller
+        return real_create_agent(sandbox_controller=controller)
+
+    monkeypatch.setattr(server_module, "create_agent", _create_agent)
+
+    with TestClient(server_module.app) as client:
+        response = client.get("/health/ready")
+
+        assert response.status_code == 503
+        assert response.json()["ready"] is False
+        assert server_module.app.state.sandbox_readiness.ready is False
+        assert str(tmp_path) not in response.text
+        assert str(tmp_path / "private-root") not in response.text
+        assert str(tmp_path / ".env.secret") not in response.text
+        assert "sk-test-should-not-leak" not in response.text
+
+
+def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch, tmp_path):
     from multiclaw.mcp.types import ServerState, ServerStatus
     from multiclaw.server import _register_mcp_tools
     from multiclaw.tools.registry import ToolRegistry
@@ -253,7 +397,7 @@ def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch
 
     monkeypatch.setattr(
         "multiclaw.server.load_mcp_config",
-        lambda path=None: {"demo server/v1": object()},
+        lambda path=None: {"demo server/v1": StdioServerConfig(command="echo")},
     )
     monkeypatch.setattr(
         "multiclaw.server.load_mcp_tools_config",
@@ -265,12 +409,190 @@ def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch
         registry=registry,
         mcp_manager=FakeManager(),
         config_path=None,
+        sandbox_controller=ReadyRecordingSandboxController(workspace_root=tmp_path),
+        workspace_root=tmp_path,
     )
 
     assert events == ["set_callback", "connect", "callback", "get_server_states"]
     assert [builder.name for builder in registry.list_all()] == [
         "mcp__demo_server_v1__read_fresh",
     ]
+
+
+def test_register_mcp_tools_skips_unready_stdio_but_keeps_remote(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    from multiclaw.mcp.types import ServerState, ServerStatus
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    remote_tool = ToolInfo(
+        name="mcp__remote__search",
+        server_name="remote",
+        original_name="search",
+        description="search",
+        input_schema={},
+    )
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.connected = None
+            self._states = {}
+
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connected = dict(configs)
+            self._states = {
+                name: ServerState(
+                    name=name,
+                    config=config,
+                    status=ServerStatus.CONNECTED,
+                    tools=[remote_tool] if name == "remote" else [],
+                )
+                for name, config in configs.items()
+            }
+
+        def get_server_states(self):
+            return dict(self._states)
+
+    monkeypatch.setattr(
+        "multiclaw.server.load_mcp_config",
+        lambda path=None: {
+            "local": StdioServerConfig(command="python", args=["-m", "demo"]),
+            "remote": HTTPServerConfig(url="https://example.com/mcp"),
+        },
+    )
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    manager = FakeManager()
+    registry = ToolRegistry()
+    with caplog.at_level("INFO"):
+        _register_mcp_tools(
+            registry=registry,
+            mcp_manager=manager,
+            config_path=None,
+            sandbox_controller=UnavailableSandboxController(),
+            workspace_root=tmp_path,
+        )
+
+    assert list(manager.connected) == ["remote"]
+    assert [builder.name for builder in registry.list_all()] == ["mcp__remote__search"]
+    assert "transport_remote_unsandboxed=true" in caplog.text
+
+
+def test_register_mcp_tools_skips_in_process_in_auto_mode(tmp_path, monkeypatch):
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.connected = None
+
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connected = dict(configs)
+
+        def get_server_states(self):
+            return {}
+
+    monkeypatch.setattr(
+        "multiclaw.server.load_mcp_config",
+        lambda path=None: {
+            "local-inproc": InProcessServerConfig(server_factory=lambda: object()),
+        },
+    )
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
+    manager = FakeManager()
+    registry = ToolRegistry()
+    _register_mcp_tools(
+        registry=registry,
+        mcp_manager=manager,
+        config_path=None,
+        sandbox_controller=controller,
+        workspace_root=tmp_path,
+    )
+
+    assert manager.connected == {}
+    assert registry.list_all() == []
+    events = controller.drain_startup_events()
+    assert any(
+        event.type == "sandbox.registration_skipped"
+        and event.data["capability"] == "mcp_in_process_local-inproc"
+        for event in events
+    )
+
+
+def test_register_mcp_tools_keeps_in_process_in_unsafe_mode(tmp_path, monkeypatch, caplog):
+    from multiclaw.mcp.types import ServerState, ServerStatus
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    inproc_tool = ToolInfo(
+        name="mcp__local_inproc__stat",
+        server_name="local-inproc",
+        original_name="stat",
+        description="stat",
+        input_schema={},
+    )
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.connected = None
+            self._states = {}
+
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connected = dict(configs)
+            self._states = {
+                name: ServerState(
+                    name=name,
+                    config=config,
+                    status=ServerStatus.CONNECTED,
+                    tools=[inproc_tool],
+                )
+                for name, config in configs.items()
+            }
+
+        def get_server_states(self):
+            return dict(self._states)
+
+    monkeypatch.setattr(
+        "multiclaw.server.load_mcp_config",
+        lambda path=None: {
+            "local-inproc": InProcessServerConfig(server_factory=lambda: object()),
+        },
+    )
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    manager = FakeManager()
+    registry = ToolRegistry()
+    with caplog.at_level("WARNING"):
+        _register_mcp_tools(
+            registry=registry,
+            mcp_manager=manager,
+            config_path=None,
+            sandbox_controller=ReadyRecordingSandboxController(
+                workspace_root=tmp_path,
+                mode="host_unsafe_dev_only",
+            ),
+            workspace_root=tmp_path,
+        )
+
+    assert list(manager.connected) == ["local-inproc"]
+    assert [builder.name for builder in registry.list_all()] == [
+        "mcp__local-inproc__stat",
+    ]
+    assert "unsafe" in caplog.text
 
 
 @pytest.mark.parametrize(
