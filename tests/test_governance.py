@@ -171,6 +171,7 @@ def test_governance_package_exports():
         PermissionChecker,
         PermissionDecision,
         SandboxExecRequest,
+        SandboxProcessRunner,
     )
 
     assert governance.AuditLog is AuditLog
@@ -180,3 +181,4 @@ def test_governance_package_exports():
     assert governance.PermissionChecker is PermissionChecker
     assert governance.PermissionDecision is PermissionDecision
     assert governance.SandboxExecRequest is SandboxExecRequest
+    assert governance.SandboxProcessRunner is SandboxProcessRunner
