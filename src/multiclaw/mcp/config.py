@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -38,6 +39,12 @@ DEFAULT_CONFIG_PATHS = [
     Path.home() / ".mcp.json",
     Path(".mcp.json"),
 ]
+
+
+@dataclass(frozen=True)
+class _ConfigPathCandidate:
+    path: Path
+    source: Literal["explicit_path", "auto_home", "auto_workspace"]
 
 
 class _StdioServerConfigInput(BaseModel):
@@ -105,49 +112,76 @@ def load_mcp_config(
     path: Optional[str | Path] = None,
     *,
     search_parents: bool = True,
+    workspace_root: str | Path | None = None,
 ) -> dict[str, ServerConfig]:
+    canonical_workspace_root = _canonical_workspace_root(workspace_root)
     if path:
-        return _load_from_file(Path(path))
+        return _load_from_file(
+            Path(path),
+            workspace_root=canonical_workspace_root,
+            source="explicit_path",
+        )
 
     configs: dict[str, ServerConfig] = {}
-    for config_path in _find_config_files(search_parents):
+    for candidate in _find_config_file_candidates(search_parents):
         try:
-            file_configs = _load_from_file(config_path)
+            file_configs = _load_from_file(
+                candidate.path,
+                workspace_root=canonical_workspace_root,
+                source=candidate.source,
+            )
             for name, config in file_configs.items():
                 if name not in configs:
                     configs[name] = config
         except Exception as e:
-            logger.warning("Failed to load config from %s: %s", config_path, e)
+            logger.warning("Failed to load MCP config: %s", _sanitize_config_error(e))
     return configs
 
 
 def _find_config_files(search_parents: bool) -> list[Path]:
+    return [candidate.path for candidate in _find_config_file_candidates(search_parents)]
+
+
+def _find_config_file_candidates(search_parents: bool) -> list[_ConfigPathCandidate]:
     found = []
     for p in DEFAULT_CONFIG_PATHS:
         if p.exists():
-            found.append(p)
+            source: Literal["auto_home", "auto_workspace"] = (
+                "auto_home" if p == DEFAULT_CONFIG_PATHS[0] else "auto_workspace"
+            )
+            found.append(_ConfigPathCandidate(path=p, source=source))
 
     if search_parents:
         cwd = Path.cwd()
         for parent in [cwd, *cwd.parents]:
             candidate = parent / ".mcp.json"
-            if candidate.exists() and candidate not in found:
-                found.append(candidate)
+            if candidate.exists() and all(existing.path != candidate for existing in found):
+                found.append(_ConfigPathCandidate(path=candidate, source="auto_workspace"))
             if (parent / ".git").exists():
                 break
     return found
 
 
-def _load_from_file(path: Path) -> dict[str, ServerConfig]:
+def _load_from_file(
+    path: Path,
+    *,
+    workspace_root: Path | None = None,
+    source: Literal["explicit_path", "auto_home", "auto_workspace"] = "explicit_path",
+) -> dict[str, ServerConfig]:
     raw = json.loads(path.read_text())
     servers = raw.get("mcpServers", raw.get("servers", {}))
     configs: dict[str, ServerConfig] = {}
+    trust = _classify_config_trust(path, workspace_root=workspace_root)
 
     for name, server_data in servers.items():
         try:
+            if trust == "workspace_untrusted":
+                _reject_untrusted_templates(server_data)
             _validate_raw_stdio_env_expansions(server_data)
             server_data = _expand_env_vars(server_data)
             config = _parse_server_config(server_data)
+            config.config_source = source
+            config.config_trust = trust
             configs[name] = config
         except Exception as e:
             logger.warning("Failed to parse server '%s': %s", name, _sanitize_config_error(e))
@@ -269,6 +303,41 @@ def _expand_env_vars(data: Any) -> Any:
     elif isinstance(data, list):
         return [_expand_env_vars(item) for item in data]
     return data
+
+
+def _canonical_workspace_root(workspace_root: str | Path | None) -> Path:
+    candidate = Path.cwd() if workspace_root is None else Path(workspace_root)
+    return candidate.resolve(strict=True)
+
+
+def _classify_config_trust(
+    path: Path,
+    *,
+    workspace_root: Path | None,
+) -> Literal["trusted_operator", "workspace_untrusted"]:
+    if workspace_root is None:
+        return "trusted_operator"
+
+    lexical = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    canonical = lexical.resolve(strict=True)
+    if lexical.is_relative_to(workspace_root) or canonical.is_relative_to(workspace_root):
+        return "workspace_untrusted"
+    return "trusted_operator"
+
+
+def _reject_untrusted_templates(server_data: Any) -> None:
+    if _contains_env_template(server_data):
+        raise ValueError("workspace_untrusted config cannot use ${...} expansion")
+
+
+def _contains_env_template(data: Any) -> bool:
+    if isinstance(data, str):
+        return _ENV_VAR_PATTERN.search(data) is not None
+    if isinstance(data, dict):
+        return any(_contains_env_template(key) or _contains_env_template(value) for key, value in data.items())
+    if isinstance(data, list):
+        return any(_contains_env_template(item) for item in data)
+    return False
 
 
 def _validate_raw_stdio_env_expansions(server_data: Any) -> None:

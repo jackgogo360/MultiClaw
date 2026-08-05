@@ -53,6 +53,16 @@ nsjail_config_dir = ""
 
 Grant extra stdio MCP access explicitly and minimally. Never embed literal credentials in config files.
 
+- High-privilege local MCP settings must come from a trusted operator-managed config outside the workspace.
+- Workspace `.mcp.json` files are conservative-only:
+  - `sandbox_network = "disabled"`
+  - `sandbox_workspace = "ro"`
+  - `sandbox_allow_subprocesses = false`
+  - `sandbox_env_allowlist = []`
+  - `sandbox_read_only_paths = []`
+- Workspace configs cannot use `${...}` expansion anywhere, including remote MCP URLs, headers, or OAuth fields.
+- Secret env expansion is allowed only as an exact same-key reference with an exact allowlist entry, for example `API_TOKEN = "${API_TOKEN}"` together with `sandbox_env_allowlist = ["API_TOKEN"]`.
+
 ```toml
 [mcp.servers.example_stdio]
 transport = "stdio"
@@ -145,6 +155,7 @@ Status as of August 5, 2026:
 - Non-native verification remains required before release.
 - macOS native verification remains a release gate and must pass on a supported macOS host outside any interfering parent sandbox.
 - Linux native verification remains a release gate and has not been validated in this environment because `nsjail` is not available here.
+- Both native gates remain pending until they pass in real host environments with the reviewed MCP restrictions enabled.
 - The Linux native gate is designed to fail if it cannot inspect `/proc/net/route` or enumerate interfaces from inside the jail; it must not silently pass on parent-loopback denial alone.
 - The current nested-macOS characterization failed at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'` and all native profile readiness values false.
 - A prior nested-macOS characterization had reached Seatbelt profile execution and returned `-6`; treat both outcomes as environment constraints, not as evidence to loosen the sandbox policy.
