@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from multiclaw.config.settings import SandboxSettings
+from multiclaw.config.settings import SandboxProfileNames, SandboxSettings
 from multiclaw.governance import (
     SandboxExecRequest,
     SandboxExecResult,
@@ -149,10 +149,12 @@ def _settings(
     *,
     mode: str = "auto",
     backend_probe_on_startup: bool = True,
+    profiles: SandboxProfileNames | None = None,
 ) -> SandboxSettings:
     return SandboxSettings(
         mode=mode,
         backend_probe_on_startup=backend_probe_on_startup,
+        profiles=profiles or SandboxProfileNames(),
     )
 
 
@@ -338,6 +340,52 @@ def test_auto_initialize_probes_once_and_marks_only_proven_profiles_ready(
         "mcp_stdio_local": True,
     }
     assert finalized is manager.finalize_readiness()
+
+
+def test_auto_initialize_uses_configured_profile_names_for_readiness_and_events(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    profiles = SandboxProfileNames(
+        shell="custom_shell",
+        code_exec="custom_code",
+        mcp_stdio="custom_mcp",
+    )
+    backend = RecordingBackend(
+        name="recording",
+        probe_result=SandboxProbeResult(
+            backend_name="recording",
+            available=True,
+            capabilities={**_PROBE_CAPABILITIES, "child_creation_denied": False},
+            reason="missing subprocess proof",
+        ),
+    )
+    manager = SandboxManager.create(
+        settings=_settings(profiles=profiles),
+        debug=False,
+        workspace_root=tmp_path,
+        backend_override=backend,
+    )
+
+    manager.initialize()
+    readiness = manager.finalize_readiness()
+    startup_events = manager.drain_startup_events()
+
+    assert readiness.profiles == {
+        "custom_shell": False,
+        "custom_code": False,
+        "custom_mcp": False,
+    }
+    assert "shell_workspace" not in readiness.profiles
+    assert "code_exec_python" not in readiness.profiles
+    assert "mcp_stdio_local" not in readiness.profiles
+    unavailable_profiles = {
+        event.data["profile_name"]
+        for event in startup_events
+        if event.type == "sandbox.profile_unavailable"
+    }
+    assert unavailable_profiles == {"custom_shell", "custom_code", "custom_mcp"}
 
 
 def test_initialize_after_early_finalize_raises_before_mutating_frozen_state(
