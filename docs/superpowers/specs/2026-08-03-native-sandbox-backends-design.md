@@ -252,6 +252,8 @@ MCP tool call 仍经过现有 scheduler。stdio 沙箱事件发生在服务器�
 
 完整实施任务与文件分工记录在 `docs/superpowers/plans/2026-08-03-native-sandbox-backends.md`；PRD 与测试规格分别保存在 `docs/superpowers/specs/2026-08-03-native-sandbox-backends-prd.md` 和 `docs/superpowers/specs/2026-08-03-native-sandbox-backends-test-spec.md`，`.omx/plans/` 下保留执行门禁镜像。
 
+部署、迁移、原生验证命令与回滚说明见 `docs/sandbox-deployment.md`。
+
 ## 验证与验收
 
 单元测试覆盖 OS 选择、请求互斥校验、profile 渲染、env scrub、路径规则、旧值迁移、unsafe fallback 门禁。
