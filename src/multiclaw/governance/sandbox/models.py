@@ -1,4 +1,5 @@
 from pathlib import Path
+from copy import deepcopy
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
@@ -46,7 +47,20 @@ def _redact_env_mapping(mapping: dict[str, str]) -> dict[str, str]:
     }
 
 
-class SandboxExecRequest(BaseModel):
+class _SandboxModel(BaseModel):
+    def model_copy(self, *, update: dict | None = None, deep: bool = False):
+        data = {
+            field_name: getattr(self, field_name)
+            for field_name in type(self).model_fields
+        }
+        if deep:
+            data = deepcopy(data)
+        if update:
+            data.update(update)
+        return type(self).model_validate(data)
+
+
+class SandboxExecRequest(_SandboxModel):
     model_config = ConfigDict(frozen=True)
 
     tool_name: str
@@ -86,7 +100,7 @@ class SandboxExecRequest(BaseModel):
         return _redact_env_mapping(value)
 
 
-class SandboxEnvironment(BaseModel):
+class SandboxEnvironment(_SandboxModel):
     model_config = ConfigDict(frozen=True)
 
     env: dict[str, str] = Field(repr=False)
@@ -104,7 +118,7 @@ class SandboxEnvironment(BaseModel):
         return _redact_env_mapping(value)
 
 
-class SandboxProfilePolicy(BaseModel):
+class SandboxProfilePolicy(_SandboxModel):
     model_config = ConfigDict(frozen=True)
 
     name: str
@@ -117,7 +131,7 @@ class SandboxProfilePolicy(BaseModel):
     read_hidden_patterns: tuple[str, ...] = (".env", ".env.*")
 
 
-class SandboxedLaunchSpec(BaseModel):
+class SandboxedLaunchSpec(_SandboxModel):
     model_config = ConfigDict(frozen=True)
 
     executable: str
@@ -141,7 +155,7 @@ class SandboxedLaunchSpec(BaseModel):
         return _redact_env_mapping(value)
 
 
-class SandboxExecResult(BaseModel):
+class SandboxExecResult(_SandboxModel):
     model_config = ConfigDict(frozen=True)
 
     exit_code: int | None
@@ -154,7 +168,7 @@ class SandboxExecResult(BaseModel):
     unsafe_fallback_used: bool = False
 
 
-class SandboxProbeResult(BaseModel):
+class SandboxProbeResult(_SandboxModel):
     model_config = ConfigDict(frozen=True)
 
     backend_name: str
@@ -168,7 +182,7 @@ class SandboxProbeResult(BaseModel):
         return self
 
 
-class SandboxReadiness(BaseModel):
+class SandboxReadiness(_SandboxModel):
     model_config = ConfigDict(frozen=True)
 
     ready: bool

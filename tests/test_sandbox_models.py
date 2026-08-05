@@ -276,3 +276,180 @@ def test_sandbox_env_contracts_redact_secret_values_in_repr_and_model_dump() -> 
     assert secret_value not in str(request_dump)
     assert secret_value not in str(environment_dump)
     assert secret_value not in str(launch_dump)
+
+
+def test_model_copy_update_preserves_immutable_wrapped_mappings() -> None:
+    from multiclaw.governance import (
+        SandboxEnvironment,
+        SandboxExecRequest,
+        SandboxProbeResult,
+        SandboxReadiness,
+        SandboxedLaunchSpec,
+    )
+
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command="echo hello",
+        workspace_root=Path("/workspace"),
+        cwd=Path("/workspace"),
+        timeout_seconds=5.0,
+        env_overrides={"CUSTOM_FLAG": "1"},
+    )
+    copied_request = request.model_copy(
+        update={"env_overrides": {"CUSTOM_FLAG": "2", "SECOND_FLAG": "3"}}
+    )
+    assert copied_request.env_overrides == {"CUSTOM_FLAG": "2", "SECOND_FLAG": "3"}
+    with pytest.raises(TypeError):
+        copied_request.env_overrides["THIRD_FLAG"] = "4"
+
+    environment = SandboxEnvironment(
+        env={"PATH": "/usr/bin:/bin"},
+        private_root=Path("/tmp/private"),
+        home=Path("/tmp/private/home"),
+        tmp=Path("/tmp/private/tmp"),
+    )
+    copied_environment = environment.model_copy(
+        update={"env": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}}
+    )
+    assert copied_environment.env == {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+    }
+    with pytest.raises(TypeError):
+        copied_environment.env["TERM"] = "xterm-256color"
+
+    launch = SandboxedLaunchSpec(
+        executable="/bin/sh",
+        args=("-c", "echo hello"),
+        cwd=Path("/workspace"),
+        env={"PATH": "/usr/bin:/bin"},
+        stdin_bytes=None,
+        private_root=Path("/tmp/private"),
+        backend_name="host_unsafe",
+        profile_name="shell_workspace",
+        correlation_id="corr-1",
+    )
+    copied_launch = launch.model_copy(
+        update={"env": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}}
+    )
+    assert copied_launch.env == {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+    }
+    with pytest.raises(TypeError):
+        copied_launch.env["TERM"] = "xterm-256color"
+
+    probe = SandboxProbeResult(
+        backend_name="host_unsafe",
+        available=True,
+        capabilities={"exec": True},
+    )
+    copied_probe = probe.model_copy(
+        update={"capabilities": {"exec": True, "network": False}}
+    )
+    assert copied_probe.capabilities == {"exec": True, "network": False}
+    with pytest.raises(TypeError):
+        copied_probe.capabilities["filesystem"] = False
+
+    readiness = SandboxReadiness(
+        ready=True,
+        mode="auto",
+        backend_name="host_unsafe",
+        probe=probe,
+        profiles={"shell_workspace": True},
+        skipped_capabilities={"network": "disabled"},
+    )
+    copied_readiness = readiness.model_copy(
+        update={
+            "profiles": {"shell_workspace": True, "code_exec": False},
+            "skipped_capabilities": {
+                "network": "disabled",
+                "filesystem": "blocked",
+            },
+        }
+    )
+    assert copied_readiness.profiles == {
+        "shell_workspace": True,
+        "code_exec": False,
+    }
+    assert copied_readiness.skipped_capabilities == {
+        "network": "disabled",
+        "filesystem": "blocked",
+    }
+    with pytest.raises(TypeError):
+        copied_readiness.profiles["mcp_stdio"] = False
+    with pytest.raises(TypeError):
+        copied_readiness.skipped_capabilities["mcp_stdio"] = "blocked"
+
+
+def test_model_copy_update_preserves_raw_secret_env_values_while_redacting_repr_and_dump() -> None:
+    from multiclaw.governance import (
+        SandboxEnvironment,
+        SandboxExecRequest,
+        SandboxedLaunchSpec,
+    )
+
+    secret_value = "dummy-secret-value"
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command="echo hello",
+        workspace_root=Path("/workspace"),
+        cwd=Path("/workspace"),
+        timeout_seconds=5.0,
+    )
+    copied_request = request.model_copy(
+        update={
+            "env_overrides": {
+                "OPENAI_API_KEY": secret_value,
+                "CUSTOM_FLAG": "1",
+            }
+        }
+    )
+    assert copied_request.env_overrides["OPENAI_API_KEY"] == secret_value
+    assert secret_value not in repr(copied_request)
+    assert copied_request.model_dump()["env_overrides"]["OPENAI_API_KEY"] == "[REDACTED]"
+
+    environment = SandboxEnvironment(
+        env={"PATH": "/usr/bin:/bin"},
+        private_root=Path("/tmp/private"),
+        home=Path("/tmp/private/home"),
+        tmp=Path("/tmp/private/tmp"),
+    )
+    copied_environment = environment.model_copy(
+        update={
+            "env": {
+                "OPENAI_API_KEY": secret_value,
+                "CUSTOM_FLAG": "1",
+            }
+        }
+    )
+    assert copied_environment.env["OPENAI_API_KEY"] == secret_value
+    assert secret_value not in repr(copied_environment)
+    assert copied_environment.model_dump()["env"]["OPENAI_API_KEY"] == "[REDACTED]"
+
+    launch = SandboxedLaunchSpec(
+        executable="/bin/sh",
+        args=("-c", "echo hello"),
+        cwd=Path("/workspace"),
+        env={"PATH": "/usr/bin:/bin"},
+        stdin_bytes=None,
+        private_root=Path("/tmp/private"),
+        backend_name="host_unsafe",
+        profile_name="shell_workspace",
+        correlation_id="corr-1",
+    )
+    copied_launch = launch.model_copy(
+        update={
+            "env": {
+                "OPENAI_API_KEY": secret_value,
+                "CUSTOM_FLAG": "1",
+            }
+        }
+    )
+    assert copied_launch.env["OPENAI_API_KEY"] == secret_value
+    assert secret_value not in repr(copied_launch)
+    assert copied_launch.model_dump()["env"]["OPENAI_API_KEY"] == "[REDACTED]"
