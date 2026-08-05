@@ -225,6 +225,29 @@ class TestCoreToolScheduler:
         assert entries[0].status == "success"
 
     @pytest.mark.asyncio
+    async def test_safe_tool_emits_expected_event_order_and_audit_before_return(self, scheduler):
+        events = []
+
+        async def handler(event):
+            if event.type.startswith("tool."):
+                events.append(event.type.removeprefix("tool."))
+
+        scheduler.event_bus.subscribe("*", handler)
+
+        result = await scheduler.run(EchoToolBuilder(), {"text": "ordered"})
+
+        assert result.status == ToolStatus.SUCCESS
+        assert events == ["scheduled", "validating", "executing", "completed"]
+
+        entries = await scheduler.audit_logger.list_entries()
+        assert any(
+            entry.tool_name == "echo"
+            and entry.status == ToolStatus.SUCCESS.value
+            and entry.detail == "ordered"
+            for entry in entries
+        )
+
+    @pytest.mark.asyncio
     async def test_external_read_allowed_after_approval(self, tmp_path):
         workspace = tmp_path / "workspace"
         workspace.mkdir()

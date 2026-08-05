@@ -47,3 +47,32 @@ class TestCodeExecTool:
             builder.validate({"code": "while True: pass", "timeout": 1.0})
         ).execute()
         assert "timed out" in result.content.lower()
+
+    @pytest.mark.asyncio
+    async def test_code_exec_success_result_data_matches_current_contract(self, tmp_path):
+        builder = CodeExecToolBuilder(str(tmp_path))
+        result = await builder.build(
+            builder.validate({"code": "print('ok')"})
+        ).execute()
+        assert result.status == "success"
+        assert result.data == {"success": True}
+
+    @pytest.mark.asyncio
+    async def test_code_exec_exception_result_data_matches_current_contract(self, tmp_path):
+        builder = CodeExecToolBuilder(str(tmp_path))
+        result = await builder.build(
+            builder.validate({"code": "raise ValueError('bad')"})
+        ).execute()
+        assert result.status == "success"
+        assert result.data["success"] is False
+        assert "ValueError: bad" in result.data["error"]
+
+    @pytest.mark.asyncio
+    async def test_code_exec_timeout_result_data_matches_current_contract(self, tmp_path):
+        builder = CodeExecToolBuilder(str(tmp_path))
+        result = await builder.build(
+            builder.validate({"code": "while True: pass", "timeout": 0.2})
+        ).execute()
+        assert result.status == "success"
+        assert result.data == {}
+        assert "timed out" in result.content.lower()
