@@ -545,6 +545,198 @@ def test_register_mcp_tools_skips_unready_stdio_but_keeps_remote(
     assert "transport_remote_unsandboxed=true" in caplog.text
 
 
+def test_register_mcp_tools_allows_conservative_untrusted_stdio(
+    tmp_path,
+    monkeypatch,
+):
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.connected = None
+
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connected = dict(configs)
+
+        def get_server_states(self):
+            return {}
+
+    config = StdioServerConfig(command="/usr/bin/env")
+    config.config_trust = "workspace_untrusted"
+    config.config_source = "auto_workspace"
+
+    monkeypatch.setattr("multiclaw.server.load_mcp_config", lambda path=None, **kwargs: {"local": config})
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
+    manager = FakeManager()
+    _register_mcp_tools(
+        registry=ToolRegistry(),
+        mcp_manager=manager,
+        config_path=None,
+        sandbox_controller=controller,
+        workspace_root=tmp_path,
+        mcp_profile_name="mcp_stdio_local",
+    )
+
+    assert list(manager.connected) == ["local"]
+    assert controller.requests == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("sandbox_network", "inherit"),
+        ("sandbox_workspace", "rw"),
+        ("sandbox_allow_subprocesses", True),
+        ("sandbox_env_allowlist", ["API_TOKEN"]),
+        ("sandbox_read_only_paths", [Path("/opt/example")]),
+    ],
+)
+def test_register_mcp_tools_rejects_untrusted_stdio_privilege_knobs_before_connect(
+    tmp_path,
+    monkeypatch,
+    caplog,
+    field_name,
+    field_value,
+):
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.connected = None
+            self.connect_calls = 0
+
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connect_calls += 1
+            self.connected = dict(configs)
+
+        def get_server_states(self):
+            return {}
+
+    config = StdioServerConfig(command="/usr/bin/env")
+    config.config_trust = "workspace_untrusted"
+    config.config_source = "auto_workspace"
+    setattr(config, field_name, field_value)
+
+    monkeypatch.setattr("multiclaw.server.load_mcp_config", lambda path=None, **kwargs: {"local": config})
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
+    manager = FakeManager()
+    with caplog.at_level("WARNING"):
+        _register_mcp_tools(
+            registry=ToolRegistry(),
+            mcp_manager=manager,
+            config_path=None,
+            sandbox_controller=controller,
+            workspace_root=tmp_path,
+            mcp_profile_name="mcp_stdio_local",
+        )
+
+    assert manager.connect_calls == 1
+    assert manager.connected == {}
+    assert controller.requests == []
+    events = controller.drain_startup_events()
+    assert any(event.type == "sandbox.registration_skipped" for event in events)
+    assert str(tmp_path) not in caplog.text
+
+
+def test_register_mcp_tools_rejects_untrusted_in_process_even_in_unsafe_mode(
+    tmp_path,
+    monkeypatch,
+):
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.connected = None
+
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connected = dict(configs)
+
+        def get_server_states(self):
+            return {}
+
+    config = InProcessServerConfig(server_factory=lambda: object())
+    config.config_trust = "workspace_untrusted"
+    config.config_source = "auto_workspace"
+
+    monkeypatch.setattr("multiclaw.server.load_mcp_config", lambda path=None, **kwargs: {"local-inproc": config})
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    controller = ReadyRecordingSandboxController(
+        workspace_root=tmp_path,
+        mode="host_unsafe_dev_only",
+    )
+    manager = FakeManager()
+    _register_mcp_tools(
+        registry=ToolRegistry(),
+        mcp_manager=manager,
+        config_path=None,
+        sandbox_controller=controller,
+        workspace_root=tmp_path,
+        mcp_profile_name="mcp_stdio_local",
+    )
+
+    assert manager.connected == {}
+    events = controller.drain_startup_events()
+    assert any(event.type == "sandbox.registration_skipped" for event in events)
+    assert all(event.type != "sandbox.unsafe_fallback_used" for event in events)
+
+
+def test_register_mcp_tools_keeps_untrusted_remote_literal_configs(
+    tmp_path,
+    monkeypatch,
+):
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.connected = None
+
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connected = dict(configs)
+
+        def get_server_states(self):
+            return {}
+
+    config = HTTPServerConfig(url="https://example.com/mcp")
+    config.config_trust = "workspace_untrusted"
+    config.config_source = "auto_workspace"
+
+    monkeypatch.setattr("multiclaw.server.load_mcp_config", lambda path=None, **kwargs: {"remote": config})
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    manager = FakeManager()
+    _register_mcp_tools(
+        registry=ToolRegistry(),
+        mcp_manager=manager,
+        config_path=None,
+        sandbox_controller=ReadyRecordingSandboxController(workspace_root=tmp_path),
+        workspace_root=tmp_path,
+        mcp_profile_name="mcp_stdio_local",
+    )
+
+    assert list(manager.connected) == ["remote"]
+
+
 def test_register_mcp_tools_skips_in_process_in_auto_mode(tmp_path, monkeypatch):
     from multiclaw.server import _register_mcp_tools
     from multiclaw.tools.registry import ToolRegistry

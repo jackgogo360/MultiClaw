@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -269,7 +270,10 @@ def _register_mcp_tools(
     if sandbox_controller is None:
         raise RuntimeError("sandbox controller is required for MCP transport gating")
 
-    configs = load_mcp_config(config_path)
+    configs = _load_mcp_config_for_workspace(
+        config_path,
+        workspace_root=workspace_root,
+    )
     if not configs:
         logger.info("No MCP servers configured (no .mcp.json found)")
         return
@@ -296,6 +300,22 @@ def _register_mcp_tools(
     filtered_configs: dict[str, object] = {}
     for server_name, config in configs.items():
         if isinstance(config, StdioServerConfig):
+            if _is_workspace_untrusted_config(config):
+                violation = _workspace_untrusted_stdio_violation(config)
+                if violation is not None:
+                    reason = f"workspace_untrusted stdio config requested forbidden {violation}"
+                    _record_blocked_capability_safely(
+                        sandbox_controller,
+                        name=_mcp_capability_id("mcp_stdio", server_name),
+                        reason=reason,
+                        workspace_root=workspace_root,
+                    )
+                    logger.warning(
+                        "Skipping workspace stdio MCP server '%s': %s",
+                        server_name,
+                        reason,
+                    )
+                    continue
             if sandbox_controller.is_profile_ready(mcp_profile_name):
                 filtered_configs[server_name] = config
                 continue
@@ -311,6 +331,16 @@ def _register_mcp_tools(
             continue
 
         if isinstance(config, InProcessServerConfig):
+            if _is_workspace_untrusted_config(config):
+                reason = "workspace_untrusted config cannot use in-process MCP transport"
+                _record_blocked_capability_safely(
+                    sandbox_controller,
+                    name=_mcp_capability_id("mcp_in_process", server_name),
+                    reason=reason,
+                    workspace_root=workspace_root,
+                )
+                logger.warning("Skipping in-process MCP server '%s': %s", server_name, reason)
+                continue
             if sandbox_controller.mode == "host_unsafe_dev_only":
                 sandbox_controller.record_unsafe_capability(
                     _mcp_capability_id("mcp_in_process", server_name),
@@ -374,6 +404,34 @@ def _register_mcp_tools(
                 )
     except Exception:
         logger.exception("Failed to connect MCP servers")
+
+
+def _load_mcp_config_for_workspace(
+    config_path: str | None,
+    *,
+    workspace_root: Path,
+) -> dict[str, object]:
+    if "workspace_root" in inspect.signature(load_mcp_config).parameters:
+        return load_mcp_config(config_path, workspace_root=workspace_root)
+    return load_mcp_config(config_path)
+
+
+def _is_workspace_untrusted_config(config: object) -> bool:
+    return getattr(config, "config_trust", "trusted_operator") == "workspace_untrusted"
+
+
+def _workspace_untrusted_stdio_violation(config: StdioServerConfig) -> str | None:
+    if config.sandbox_network != "disabled":
+        return "network grant"
+    if config.sandbox_workspace != "ro":
+        return "workspace write grant"
+    if config.sandbox_allow_subprocesses:
+        return "subprocess grant"
+    if config.sandbox_env_allowlist:
+        return "env allowlist grant"
+    if config.sandbox_read_only_paths:
+        return "read-only path grant"
+    return None
 
 
 def create_agent(

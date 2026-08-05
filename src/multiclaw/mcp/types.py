@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 
 class TransportType(enum.Enum):
@@ -35,6 +35,14 @@ class StdioServerConfig:
     sandbox_allow_subprocesses: bool = False
     sandbox_env_allowlist: list[str] = field(default_factory=list)
     sandbox_read_only_paths: list[Path] = field(default_factory=list)
+    config_source: Literal["programmatic", "explicit_path", "auto_home", "auto_workspace"] = field(
+        default="programmatic",
+        repr=False,
+    )
+    config_trust: Literal["trusted_operator", "workspace_untrusted"] = field(
+        default="trusted_operator",
+        repr=False,
+    )
     transport_type: TransportType = field(default=TransportType.STDIO, init=False)
 
 
@@ -42,6 +50,14 @@ class StdioServerConfig:
 class SSEServerConfig:
     url: str
     headers: dict[str, str] = field(default_factory=dict)
+    config_source: Literal["programmatic", "explicit_path", "auto_home", "auto_workspace"] = field(
+        default="programmatic",
+        repr=False,
+    )
+    config_trust: Literal["trusted_operator", "workspace_untrusted"] = field(
+        default="trusted_operator",
+        repr=False,
+    )
     transport_type: TransportType = field(default=TransportType.SSE, init=False)
 
 
@@ -50,6 +66,14 @@ class HTTPServerConfig:
     url: str
     headers: dict[str, str] = field(default_factory=dict)
     oauth: Optional[OAuthConfig] = None
+    config_source: Literal["programmatic", "explicit_path", "auto_home", "auto_workspace"] = field(
+        default="programmatic",
+        repr=False,
+    )
+    config_trust: Literal["trusted_operator", "workspace_untrusted"] = field(
+        default="trusted_operator",
+        repr=False,
+    )
     transport_type: TransportType = field(default=TransportType.HTTP, init=False)
 
 
@@ -57,12 +81,28 @@ class HTTPServerConfig:
 class WebSocketServerConfig:
     url: str
     headers: dict[str, str] = field(default_factory=dict)
+    config_source: Literal["programmatic", "explicit_path", "auto_home", "auto_workspace"] = field(
+        default="programmatic",
+        repr=False,
+    )
+    config_trust: Literal["trusted_operator", "workspace_untrusted"] = field(
+        default="trusted_operator",
+        repr=False,
+    )
     transport_type: TransportType = field(default=TransportType.WS, init=False)
 
 
 @dataclass
 class InProcessServerConfig:
     server_factory: Callable
+    config_source: Literal["programmatic", "explicit_path", "auto_home", "auto_workspace"] = field(
+        default="programmatic",
+        repr=False,
+    )
+    config_trust: Literal["trusted_operator", "workspace_untrusted"] = field(
+        default="trusted_operator",
+        repr=False,
+    )
     transport_type: TransportType = field(default=TransportType.IN_PROCESS, init=False)
 
 

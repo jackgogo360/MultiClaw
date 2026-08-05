@@ -5,8 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from multiclaw.mcp.config import _load_from_file, _parse_server_config
-from multiclaw.mcp.types import StdioServerConfig
+import multiclaw.mcp.config as mcp_config_module
+from multiclaw.mcp.config import _load_from_file, _parse_server_config, load_mcp_config
+from multiclaw.mcp.types import HTTPServerConfig, StdioServerConfig
+
+
+def _write_mcp_config(path: Path, servers: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
 
 
 def test_parse_stdio_server_config_supports_aliases_and_conservative_defaults() -> None:
@@ -228,3 +234,153 @@ def test_stdio_server_config_repr_redacts_env_values() -> None:
 
     assert "dummy-secret-token" not in rendered
     assert "literal-value" not in rendered
+
+
+def test_load_mcp_config_marks_auto_workspace_config_untrusted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_path = workspace / ".mcp.json"
+    _write_mcp_config(config_path, {"demo": {"command": "/usr/bin/env"}})
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [tmp_path / "home" / ".mcp.json", Path(".mcp.json")],
+    )
+
+    loaded = load_mcp_config(search_parents=False, workspace_root=workspace)
+
+    assert isinstance(loaded["demo"], StdioServerConfig)
+    assert loaded["demo"].config_source == "auto_workspace"
+    assert loaded["demo"].config_trust == "workspace_untrusted"
+
+
+def test_load_mcp_config_marks_explicit_outside_path_trusted(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "operator" / "outside.json"
+    _write_mcp_config(outside, {"demo": {"command": "/usr/bin/env"}})
+
+    loaded = load_mcp_config(path=outside, workspace_root=workspace)
+
+    assert isinstance(loaded["demo"], StdioServerConfig)
+    assert loaded["demo"].config_source == "explicit_path"
+    assert loaded["demo"].config_trust == "trusted_operator"
+
+
+def test_load_mcp_config_marks_explicit_workspace_path_untrusted(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    inside = workspace / "inside.json"
+    _write_mcp_config(inside, {"demo": {"command": "/usr/bin/env"}})
+
+    loaded = load_mcp_config(path=inside, workspace_root=workspace)
+
+    assert isinstance(loaded["demo"], StdioServerConfig)
+    assert loaded["demo"].config_trust == "workspace_untrusted"
+
+
+def test_load_mcp_config_marks_both_symlink_directions_untrusted(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside_root = tmp_path / "operator"
+    outside_root.mkdir()
+
+    outside_target = outside_root / "outside.json"
+    _write_mcp_config(outside_target, {"outside": {"command": "/usr/bin/env"}})
+    workspace_link = workspace / "workspace-link.json"
+    workspace_link.symlink_to(outside_target)
+
+    inside_target = workspace / "inside.json"
+    _write_mcp_config(inside_target, {"inside": {"command": "/usr/bin/env"}})
+    outside_link = outside_root / "outside-link.json"
+    outside_link.symlink_to(inside_target)
+
+    workspace_loaded = load_mcp_config(path=workspace_link, workspace_root=workspace)
+    outside_loaded = load_mcp_config(path=outside_link, workspace_root=workspace)
+
+    assert workspace_loaded["outside"].config_trust == "workspace_untrusted"
+    assert outside_loaded["inside"].config_trust == "workspace_untrusted"
+
+
+def test_load_mcp_config_preserves_home_first_winner_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home_config = tmp_path / "home" / ".mcp.json"
+    workspace_config = workspace / ".mcp.json"
+    _write_mcp_config(home_config, {"demo": {"command": "/usr/bin/env"}})
+    _write_mcp_config(workspace_config, {"demo": {"command": "/bin/echo"}})
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [home_config, Path(".mcp.json")],
+    )
+
+    loaded = load_mcp_config(search_parents=False, workspace_root=workspace)
+
+    assert isinstance(loaded["demo"], StdioServerConfig)
+    assert loaded["demo"].command == "/usr/bin/env"
+    assert loaded["demo"].config_source == "auto_home"
+    assert loaded["demo"].config_trust == "trusted_operator"
+
+
+def test_load_mcp_config_rejects_any_template_in_untrusted_remote_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_path = workspace / ".mcp.json"
+    monkeypatch.setenv("API_TOKEN", "dummy-secret-token")
+    _write_mcp_config(
+        config_path,
+        {
+            "demo": {
+                "url": "https://example.com/${API_TOKEN}",
+                "headers": {"Authorization": "Bearer ${API_TOKEN}"},
+            }
+        },
+    )
+
+    with caplog.at_level("WARNING"):
+        loaded = load_mcp_config(path=config_path, workspace_root=workspace)
+
+    assert loaded == {}
+    assert "workspace_untrusted" in caplog.text
+    assert "dummy-secret-token" not in caplog.text
+
+
+def test_load_mcp_config_keeps_untrusted_remote_literal_config_allowed(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_path = workspace / ".mcp.json"
+    _write_mcp_config(
+        config_path,
+        {
+            "demo": {
+                "url": "https://example.com/mcp",
+                "headers": {"Authorization": "Bearer literal-token"},
+            }
+        },
+    )
+
+    loaded = load_mcp_config(path=config_path, workspace_root=workspace)
+
+    assert isinstance(loaded["demo"], HTTPServerConfig)
+    assert loaded["demo"].config_trust == "workspace_untrusted"
