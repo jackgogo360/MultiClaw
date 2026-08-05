@@ -1,5 +1,6 @@
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from enum import Enum
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -31,7 +32,10 @@ class ToolInvocation(ABC, Generic[TParams]):
         self.params = params
         self.approved_roots: list[Path] = []
 
-    def configure_permission(self, approved_roots: list[str] | None = None) -> None:
+    def configure_permission(
+        self,
+        approved_roots: Sequence[str | Path] | None = None,
+    ) -> None:
         self.approved_roots = [Path(root).resolve() for root in (approved_roots or [])]
 
     @abstractmethod

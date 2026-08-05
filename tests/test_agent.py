@@ -10,7 +10,7 @@ from multiclaw.agent.tool_batch import ToolBatchExecutor
 from multiclaw.config import Settings
 from multiclaw.context import ContextBuildReport, ContextBuildResult
 from multiclaw.events import EventBus
-from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
+from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.llm import LLMResponse, ModelRouter, ToolCall
 from multiclaw.memory import InMemoryMemory
 from multiclaw.planner import Planner
@@ -118,7 +118,7 @@ def agent(test_config_path):
     registry.register(EchoToolBuilder())
     scheduler = CoreToolScheduler(
         permission_checker=PermissionChecker(),
-        sandbox=ProcessSandbox(),
+        execution_guard=ExecutionGuard(),
         audit_logger=InMemoryAuditLogger(),
         event_bus=EventBus(),
     )
@@ -749,7 +749,7 @@ class TestMultiClawAgent:
         registry.register(EchoToolBuilder())
         scheduler = CoreToolScheduler(
             permission_checker=PermissionChecker(),
-            sandbox=ProcessSandbox(),
+            execution_guard=ExecutionGuard(),
             audit_logger=InMemoryAuditLogger(),
             event_bus=EventBus(),
         )
