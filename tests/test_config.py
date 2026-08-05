@@ -157,6 +157,40 @@ code_exec = "toml_code_exec"
         assert settings.governance.sandbox.profiles.code_exec == "toml_code_exec"
         assert settings.governance.sandbox.profiles.mcp_stdio == "env_mcp"
 
+    def test_nested_env_override_decodes_write_protected_workspace_paths_json_array(self, tmp_path, monkeypatch):
+        config_file = write_config(
+            tmp_path,
+            """
+[governance.sandbox]
+write_protected_workspace_paths = [".git"]
+""",
+        )
+        monkeypatch.setenv(
+            "MULTICLAW_GOVERNANCE__SANDBOX__WRITE_PROTECTED_WORKSPACE_PATHS",
+            '[".git", ".venv"]',
+        )
+
+        settings = Settings(_config_file=str(config_file))
+
+        assert settings.governance.sandbox.write_protected_workspace_paths == [".git", ".venv"]
+
+    def test_nested_env_override_decodes_read_hidden_workspace_paths_json_array(self, tmp_path, monkeypatch):
+        config_file = write_config(
+            tmp_path,
+            """
+[governance.sandbox]
+read_hidden_workspace_paths = [".env", ".env.*"]
+""",
+        )
+        monkeypatch.setenv(
+            "MULTICLAW_GOVERNANCE__SANDBOX__READ_HIDDEN_WORKSPACE_PATHS",
+            '[".env", ".env.local"]',
+        )
+
+        settings = Settings(_config_file=str(config_file))
+
+        assert settings.governance.sandbox.read_hidden_workspace_paths == [".env", ".env.local"]
+
     def test_auto_mode_allows_backend_probe_to_be_disabled(self, tmp_path):
         config_file = write_config(
             tmp_path,
