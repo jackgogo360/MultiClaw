@@ -438,7 +438,13 @@ def create_agent(
             workspace_root=workspace_root,
         )
     if sandbox_controller.is_profile_ready(settings.governance.sandbox.profiles.code_exec):
-        registry.register(CodeExecToolBuilder(workspace_root))
+        registry.register(
+            CodeExecToolBuilder(
+                workspace_root,
+                sandbox_controller=sandbox_controller,
+                profile_name=settings.governance.sandbox.profiles.code_exec,
+            )
+        )
     else:
         _record_blocked_capability_safely(
             sandbox_controller,
