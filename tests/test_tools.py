@@ -45,6 +45,20 @@ class EchoInvocation(ToolInvocation[EchoParams]):
         )
 
 
+class AuditedEchoInvocation(EchoInvocation):
+    async def execute(self) -> ToolExecutionResult:
+        result = await super().execute()
+        result.audit.update(
+            {
+                "sandbox_profile": "shell_workspace",
+                "sandbox_backend": "recording",
+                "unsafe_fallback_used": False,
+                "command": "echo $OPENAI_API_KEY",
+            }
+        )
+        return result
+
+
 class EchoToolBuilder(ToolBuilder[EchoParams]):
     name = "echo"
     description = "Echoes the supplied text"
@@ -59,6 +73,16 @@ class EchoToolBuilder(ToolBuilder[EchoParams]):
 
 class DeleteToolBuilder(EchoToolBuilder):
     name = "delete_file"
+
+
+class AuditedEchoToolBuilder(EchoToolBuilder):
+    def build(self, params: EchoParams) -> ToolInvocation[EchoParams]:
+        return AuditedEchoInvocation(name=self.name, params=params)
+
+
+class GuardedAuditedToolBuilder(DeleteToolBuilder):
+    def build(self, params: EchoParams) -> ToolInvocation[EchoParams]:
+        return AuditedEchoInvocation(name=self.name, params=params)
 
 
 @pytest.fixture
@@ -95,11 +119,18 @@ class TestToolBaseTypes:
             status=ToolStatus.SUCCESS,
             content="hello",
             data={"echoed": "hello"},
+            audit={"sandbox_backend": "recording", "secret": "hidden"},
         )
 
         assert result.status == ToolStatus.SUCCESS
         assert result.content == "hello"
         assert result.data == {"echoed": "hello"}
+        assert result.audit == {"sandbox_backend": "recording", "secret": "hidden"}
+        assert result.model_dump() == {
+            "status": ToolStatus.SUCCESS,
+            "content": "hello",
+            "data": {"echoed": "hello"},
+        }
 
     def test_tool_invocation_and_builder_are_abstract_bases(self):
         with pytest.raises(TypeError):
@@ -246,6 +277,92 @@ class TestCoreToolScheduler:
         assert len(entries) == 1
         assert entries[0].tool_name == "echo"
         assert entries[0].status == "success"
+
+    @pytest.mark.asyncio
+    async def test_records_allowlisted_audit_prefix_for_normal_tools(self, scheduler):
+        await scheduler.run(AuditedEchoToolBuilder(), {"text": "audit"})
+
+        entries = await scheduler.audit_logger.list_entries()
+        assert entries[-1].detail == (
+            "[audit] sandbox_backend=recording sandbox_profile=shell_workspace "
+            "unsafe_fallback_used=False\n"
+            "audit"
+        )
+        assert "OPENAI_API_KEY" not in entries[-1].detail
+
+    @pytest.mark.asyncio
+    async def test_records_allowlisted_audit_prefix_after_approval(self, scheduler):
+        import asyncio
+        import uuid
+
+        async def run():
+            return await scheduler.run(GuardedAuditedToolBuilder(), {"text": "danger"})
+
+        orig = uuid.uuid4
+        uuid.uuid4 = lambda: type("FakeUUID", (), {"hex": "req-4"})()
+
+        try:
+            run_task = asyncio.create_task(run())
+            await asyncio.sleep(0.02)
+            scheduler.resolve_approval("req-4", True)
+            result = await run_task
+        finally:
+            uuid.uuid4 = orig
+
+        assert result.status == ToolStatus.SUCCESS
+        entries = await scheduler.audit_logger.list_entries()
+        assert entries[-1].detail == (
+            "[audit] sandbox_backend=recording sandbox_profile=shell_workspace "
+            "unsafe_fallback_used=False\n"
+            "danger"
+        )
+
+    @pytest.mark.asyncio
+    async def test_records_allowlisted_audit_prefix_for_mcp_results(self, scheduler):
+        from multiclaw.mcp.tool_adapter import MCPToolBuilder
+
+        class MCPParams(BaseModel):
+            pass
+
+        class AuditedMCPToolBuilder(MCPToolBuilder):
+            def build(self, params):
+                del params
+
+                class _Invocation(ToolInvocation[MCPParams]):
+                    async def execute(self_inner) -> ToolExecutionResult:
+                        return ToolExecutionResult(
+                            status=ToolStatus.SUCCESS,
+                            content="mcp audit",
+                            audit={
+                                "sandbox_profile": "mcp_stdio_local",
+                                "sandbox_backend": "recording",
+                                "unsafe_fallback_used": True,
+                                "env": {"OPENAI_API_KEY": "secret"},
+                            },
+                        )
+
+                return _Invocation(name=self.name, params=MCPParams())
+
+        result = await scheduler.run(
+            AuditedMCPToolBuilder(
+                name="mcp__demo__tool",
+                server_name="demo",
+                original_name="tool",
+                description="demo",
+                input_schema={},
+                manager=object(),
+            ),
+            {},
+        )
+
+        assert result.status == ToolStatus.SUCCESS
+        entries = await scheduler.audit_logger.list_entries()
+        assert entries[-1].detail == (
+            "[audit] sandbox_backend=recording sandbox_profile=mcp_stdio_local "
+            "unsafe_fallback_used=True\n"
+            "mcp audit"
+        )
+        assert "OPENAI_API_KEY" not in entries[-1].detail
 
     @pytest.mark.asyncio
     async def test_safe_tool_emits_expected_event_order_and_audit_before_return(self, scheduler):

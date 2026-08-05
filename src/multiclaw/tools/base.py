@@ -24,6 +24,7 @@ class ToolExecutionResult(BaseModel):
     status: ToolStatus
     content: str
     data: dict[str, Any] = Field(default_factory=dict)
+    audit: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
 class ToolInvocation(ABC, Generic[TParams]):

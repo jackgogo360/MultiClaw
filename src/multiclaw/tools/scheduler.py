@@ -11,6 +11,12 @@ logger = logging.getLogger(__name__)
 
 
 class CoreToolScheduler:
+    _AUDIT_ALLOWLIST = (
+        "sandbox_backend",
+        "sandbox_profile",
+        "unsafe_fallback_used",
+    )
+
     def __init__(
         self,
         permission_checker: PermissionChecker,
@@ -70,6 +76,11 @@ class CoreToolScheduler:
                 except Exception as exc:
                     error_text = str(exc)
                     return ToolExecutionResult(status=ToolStatus.ERROR, content=error_text)
+                await self.audit_logger.record(
+                    tool_name=builder.name,
+                    status=ToolStatus.SUCCESS.value,
+                    detail=self._audit_detail(result),
+                )
                 await self.event_bus.publish(
                     Event(type="tool.completed", data={"tool": builder.name})
                 )
@@ -171,9 +182,23 @@ class CoreToolScheduler:
         await self.audit_logger.record(
             tool_name=builder.name,
             status=ToolStatus.SUCCESS.value,
-            detail=result.content,
+            detail=self._audit_detail(result),
         )
         await self.event_bus.publish(
             Event(type="tool.completed", data={"tool": builder.name})
         )
         return result
+
+    def _audit_detail(self, result: ToolExecutionResult) -> str:
+        allowlisted = {
+            key: result.audit[key]
+            for key in sorted(self._AUDIT_ALLOWLIST)
+            if key in result.audit
+        }
+        if not allowlisted:
+            return result.content
+
+        prefix = " ".join(f"{key}={allowlisted[key]}" for key in allowlisted)
+        if not result.content:
+            return f"[audit] {prefix}"
+        return f"[audit] {prefix}\n{result.content}"
