@@ -193,3 +193,44 @@ async def test_stdio_transport_cleans_up_on_connect_failure_and_cannot_reconnect
     assert spec.private_root.exists() is False
     with pytest.raises(RuntimeError, match="private root"):
         await transport.connect()
+
+
+@pytest.mark.asyncio
+async def test_stdio_transport_debug_log_redacts_command_args_and_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret_path = tmp_path / "private" / "token.txt"
+    spec = _launch_spec(tmp_path).model_copy(
+        update={
+            "executable": "/usr/bin/secret-mcp",
+            "args": ("--token", "super-secret-token", str(secret_path)),
+            "correlation_id": "corr-456",
+        }
+    )
+
+    class FakeContext:
+        async def __aenter__(self):
+            return ("read", "write")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            return None
+
+    monkeypatch.setattr(
+        "multiclaw.mcp.transport.stdio.get_default_environment",
+        lambda: {"PATH": "/host"},
+    )
+    monkeypatch.setattr("multiclaw.mcp.transport.stdio.stdio_client", lambda params: FakeContext())
+
+    transport = StdioTransport(server_name="demo", launch_spec=spec)
+    with caplog.at_level("DEBUG"):
+        await transport.connect()
+        await transport.disconnect()
+
+    assert "/usr/bin/secret-mcp" not in caplog.text
+    assert "super-secret-token" not in caplog.text
+    assert str(secret_path) not in caplog.text
+    assert "--token" not in caplog.text
+    assert "demo" in caplog.text

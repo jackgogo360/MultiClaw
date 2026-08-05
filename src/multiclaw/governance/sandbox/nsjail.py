@@ -74,10 +74,19 @@ class NsJailBackend:
         if policy.name != request.profile_name:
             raise SandboxLaunchError("policy name must match request profile_name")
 
-        template = self._template_for(policy.name)
+        is_reviewed_mcp = self._is_reviewed_mcp_request(request)
+        template = self._template_for(policy.name, is_reviewed_mcp=is_reviewed_mcp)
         self._validate_request_overrides(request, policy)
-        self._validate_policy_against_template(policy, template)
-        template = self._render_template(policy, template)
+        self._validate_policy_against_template(
+            policy,
+            template,
+            is_reviewed_mcp=is_reviewed_mcp,
+        )
+        template = self._render_template(
+            policy,
+            template,
+            is_reviewed_mcp=is_reviewed_mcp,
+        )
         target_argv = self._target_argv_for(request, policy)
 
         binary = self._canonicalize_path(self.binary, "binary")
@@ -367,8 +376,15 @@ class NsJailBackend:
             env=dict(env),
         )
 
-    def _template_for(self, profile_name: str) -> NsJailProfileTemplate:
+    def _template_for(
+        self,
+        profile_name: str,
+        *,
+        is_reviewed_mcp: bool,
+    ) -> NsJailProfileTemplate:
         template = NSJAIL_PROFILES.get(profile_name)
+        if template is None and is_reviewed_mcp:
+            template = NSJAIL_PROFILES["mcp_stdio_local"]
         if template is None:
             raise SandboxLaunchError(f"unsupported nsjail profile {profile_name!r}")
         return template
@@ -392,10 +408,12 @@ class NsJailBackend:
         self,
         policy: SandboxProfilePolicy,
         template: NsJailProfileTemplate,
+        *,
+        is_reviewed_mcp: bool,
     ) -> None:
         if policy.network_mode not in _SUPPORTED_NETWORK_MODES:
             raise SandboxLaunchError("unsupported network mode for nsjail profile")
-        if policy.name != "mcp_stdio_local":
+        if not is_reviewed_mcp:
             if policy.network_mode != template.network_mode:
                 raise SandboxLaunchError("network mode is not represented by the reviewed template")
             if policy.workspace_mode != template.workspace_mode:
@@ -415,14 +433,19 @@ class NsJailBackend:
         self,
         policy: SandboxProfilePolicy,
         template: NsJailProfileTemplate,
+        *,
+        is_reviewed_mcp: bool,
     ) -> NsJailProfileTemplate:
-        if policy.name != "mcp_stdio_local":
+        if not is_reviewed_mcp:
             return template
         return render_mcp_stdio_template(
             workspace_mode=policy.workspace_mode,
             network_mode=policy.network_mode,
             allow_subprocesses=policy.allow_subprocesses,
         )
+
+    def _is_reviewed_mcp_request(self, request: SandboxExecRequest) -> bool:
+        return request.mcp_server_name is not None
 
     def _canonicalize_existing_file(self, path: Path, label: str) -> Path:
         self._reject_nul(str(path), label)

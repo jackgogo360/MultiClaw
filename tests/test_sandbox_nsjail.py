@@ -435,6 +435,7 @@ def test_nsjail_renders_dynamic_mcp_policy_combinations(
         network_mode=network_mode,
         workspace_mode=workspace_mode,
         allow_subprocesses=allow_subprocesses,
+        mcp_server_name="demo",
     )
 
     launch = NsJailBackend(binary=Path("/usr/bin/nsjail")).build_launch_spec(
@@ -466,6 +467,45 @@ def test_nsjail_renders_dynamic_mcp_policy_combinations(
     else:
         assert "ERRNO(EPERM) { clone, clone3, fork, vfork, unshare }" in config_text
         assert "rlimit_nproc: 1" in config_text
+
+
+def test_nsjail_treats_configured_custom_mcp_profile_as_reviewed_mcp_policy(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.nsjail import NsJailBackend
+
+    workspace = _workspace_tree(tmp_path)
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="mcp",
+        profile_name="custom_mcp_profile",
+        mode="exec_argv",
+        argv=("/usr/bin/env",),
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        network_mode="disabled",
+        workspace_mode="ro",
+        allow_subprocesses=False,
+        mcp_server_name="demo",
+    )
+
+    launch = NsJailBackend(binary=Path("/usr/bin/nsjail")).build_launch_spec(
+        request,
+        _policy(
+            name="custom_mcp_profile",
+            workspace_mode="ro",
+            network_mode="disabled",
+            allow_subprocesses=False,
+            entrypoints=(Path("/usr/bin/env"),),
+        ),
+        environment,
+    )
+    config_text = _config_text(launch.args)
+
+    assert "clone_newnet: true" in config_text
+    assert "ERRNO(EPERM) { clone, clone3, fork, vfork, unshare }" in config_text
+    assert "rlimit_nproc: 1" in config_text
 
 
 def test_nsjail_rejects_relative_or_nul_paths_and_too_many_runtime_roots(
