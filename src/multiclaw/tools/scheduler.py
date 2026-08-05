@@ -4,7 +4,7 @@ import uuid
 from typing import Any
 
 from multiclaw.events import Event, EventBus
-from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
+from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.tools.base import ToolBuilder, ToolExecutionResult, ToolStatus
 
 logger = logging.getLogger(__name__)
@@ -14,12 +14,12 @@ class CoreToolScheduler:
     def __init__(
         self,
         permission_checker: PermissionChecker,
-        sandbox: ProcessSandbox,
+        execution_guard: ExecutionGuard,
         audit_logger: InMemoryAuditLogger,
         event_bus: EventBus,
     ) -> None:
         self.permission_checker = permission_checker
-        self.sandbox = sandbox
+        self.execution_guard = execution_guard
         self.audit_logger = audit_logger
         self.event_bus = event_bus
         self._pending: dict[str, asyncio.Event] = {}
@@ -66,7 +66,7 @@ class CoreToolScheduler:
             if isinstance(builder, _MCPToolBuilder):
                 invocation = builder.build(params)
                 try:
-                    result = await self.sandbox.run(invocation.execute)
+                    result = await self.execution_guard.run(invocation.execute)
                 except Exception as exc:
                     error_text = str(exc)
                     return ToolExecutionResult(status=ToolStatus.ERROR, content=error_text)
@@ -155,7 +155,7 @@ class CoreToolScheduler:
             await self.event_bus.publish(
                 Event(type="tool.executing", data={"tool": builder.name})
             )
-            result = await self.sandbox.run(invocation.execute)
+            result = await self.execution_guard.run(invocation.execute)
         except Exception as exc:
             error_text = str(exc)
             await self.audit_logger.record(

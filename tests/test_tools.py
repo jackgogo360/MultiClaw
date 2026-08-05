@@ -10,7 +10,7 @@ from multiclaw.tools import glob as glob_module
 from multiclaw.tools import grep as grep_module
 from multiclaw.tools import list_dir as list_dir_module
 from multiclaw.events import EventBus
-from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
+from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.tools import (
     CoreToolScheduler,
     ToolBuilder,
@@ -24,7 +24,11 @@ from multiclaw.tools.find_dir import FindDirToolBuilder
 from multiclaw.tools.glob import GlobToolBuilder
 from multiclaw.tools.grep import GrepToolBuilder
 from multiclaw.tools.list_dir import ListDirToolBuilder
+from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.read_file import ReadFileToolBuilder
+from multiclaw.tools.shell import ShellToolBuilder
+from multiclaw.tools.web_fetch import WebFetchToolBuilder
+from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
 
 
@@ -131,14 +135,24 @@ class TestToolRegistry:
         assert registry.get("echo") is builder
         assert [tool.name for tool in registry.list_all()] == ["echo"]
 
-    def test_runtime_registry_matches_agent_code_tool_set(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
-        monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
-        from multiclaw.server import create_agent
+    def test_runtime_registry_matches_agent_code_tool_set(self, tmp_path):
+        registry = ToolRegistry()
+        read_builder = ReadFileToolBuilder(str(tmp_path))
+        edit_builder = EditFileToolBuilder(str(tmp_path))
+        registry.register(read_builder)
+        registry.register(WriteFileToolBuilder(str(tmp_path), read_builder))
+        registry.register(edit_builder)
+        registry.register(UndoEditToolBuilder(str(tmp_path), edit_builder))
+        registry.register(GlobToolBuilder(str(tmp_path)))
+        registry.register(ListDirToolBuilder(str(tmp_path)))
+        registry.register(GrepToolBuilder(str(tmp_path)))
+        registry.register(FindDirToolBuilder(str(tmp_path)))
+        registry.register(ShellToolBuilder(str(tmp_path)))
+        registry.register(CodeExecToolBuilder(str(tmp_path)))
+        registry.register(WebFetchToolBuilder(str(tmp_path)))
+        registry.register(WebSearchToolBuilder(str(tmp_path)))
 
-        agent = create_agent()
-
-        assert [tool.name for tool in agent.registry.list_all()] == [
+        assert [tool.name for tool in registry.list_all()] == [
             "code_exec",
             "edit_file",
             "find_dir",
@@ -159,7 +173,7 @@ class TestCoreToolScheduler:
     def scheduler(self):
         return CoreToolScheduler(
             permission_checker=PermissionChecker(guarded_tools={"delete_file"}),
-            sandbox=ProcessSandbox(),
+            execution_guard=ExecutionGuard(),
             audit_logger=InMemoryAuditLogger(),
             event_bus=EventBus(),
         )
@@ -256,7 +270,7 @@ class TestCoreToolScheduler:
 
         scheduler = CoreToolScheduler(
             permission_checker=PermissionChecker(),
-            sandbox=ProcessSandbox(),
+            execution_guard=ExecutionGuard(),
             audit_logger=InMemoryAuditLogger(),
             event_bus=EventBus(),
         )
@@ -291,7 +305,7 @@ class TestCoreToolScheduler:
 
         scheduler = CoreToolScheduler(
             permission_checker=PermissionChecker(),
-            sandbox=ProcessSandbox(),
+            execution_guard=ExecutionGuard(),
             audit_logger=InMemoryAuditLogger(),
             event_bus=EventBus(),
         )

@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from multiclaw.agent.models import ObservationType
 from multiclaw.agent.tool_batch import ToolBatchExecutor, ToolCallSpec
 from multiclaw.events import EventBus
-from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
+from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.mcp.tool_adapter import MCPToolBuilder
 from multiclaw.mcp.types import ToolInfo
 from multiclaw.tools import (
@@ -72,7 +72,7 @@ class ScriptedToolBuilder(ToolBuilder[ScriptedParams]):
 def scheduler() -> CoreToolScheduler:
     return CoreToolScheduler(
         permission_checker=PermissionChecker(),
-        sandbox=ProcessSandbox(timeout=1.0),
+        execution_guard=ExecutionGuard(timeout=1.0),
         audit_logger=InMemoryAuditLogger(),
         event_bus=EventBus(),
     )
