@@ -1093,3 +1093,21 @@ def test_unsafe_capability_event_does_not_block_unsafe_mode_readiness(tmp_path: 
     assert [event.type for event in events] == ["sandbox.unsafe_fallback_used"]
     assert events[0].data["scope"] == "capability"
     assert events[0].data["capability"] == "mcp_in_process_demo"
+
+
+def test_record_unsafe_capability_rejects_auto_mode(tmp_path: Path) -> None:
+    from multiclaw.governance import SandboxPolicyError
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    manager = SandboxManager.create(
+        settings=_settings(mode="auto"),
+        debug=False,
+        workspace_root=tmp_path,
+        platform_name="Darwin",
+    )
+
+    with pytest.raises(SandboxPolicyError, match="host_unsafe_dev_only"):
+        manager.record_unsafe_capability(
+            "mcp_in_process_demo",
+            "unsafe transport kept for development",
+        )
