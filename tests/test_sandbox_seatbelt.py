@@ -54,6 +54,14 @@ def _policy(
     )
 
 
+def _definition_pairs(args: tuple[str, ...], prefix: str) -> list[tuple[int, str]]:
+    pairs: list[tuple[int, str]] = []
+    for index, arg in enumerate(args):
+        if arg == "-D" and index + 1 < len(args) and args[index + 1].startswith(prefix):
+            pairs.append((index, args[index + 1]))
+    return pairs
+
+
 def test_seatbelt_backend_exposes_expected_name_and_binary() -> None:
     from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
 
@@ -185,6 +193,161 @@ def test_seatbelt_launch_spec_uses_stable_parameter_pairs_for_canonical_paths(
     assert str(workspace.resolve()) not in profile_text
     assert str(policy_runtime.resolve()) not in profile_text
     assert str(request_runtime.resolve()) not in profile_text
+
+
+def test_zero_runtime_roots_still_define_all_runtime_slots_before_profile(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command=":",
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+    )
+
+    launch = SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
+        request,
+        _policy(),
+        environment,
+    )
+
+    runtime_pairs = _definition_pairs(launch.args, "RUNTIME_ROOT_")
+
+    assert len(runtime_pairs) == 16
+    assert [value for _, value in runtime_pairs] == [
+        f"RUNTIME_ROOT_{index}={environment.home.resolve()}"
+        for index in range(16)
+    ]
+    assert max(index for index, _ in runtime_pairs) < launch.args.index("-p")
+
+
+def test_one_runtime_root_uses_leading_slot_and_fills_remaining_slots_with_private_home(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    only_root = tmp_path / "one-runtime"
+    only_root.mkdir()
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command=":",
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        read_only_paths=(only_root,),
+    )
+
+    launch = SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
+        request,
+        _policy(),
+        environment,
+    )
+
+    runtime_pairs = _definition_pairs(launch.args, "RUNTIME_ROOT_")
+
+    assert len(runtime_pairs) == 16
+    assert runtime_pairs[0][1] == "RUNTIME_ROOT_0=" + str(only_root.resolve())
+    assert [value for _, value in runtime_pairs[1:]] == [
+        f"RUNTIME_ROOT_{index}={environment.home.resolve()}"
+        for index in range(1, 16)
+    ]
+    assert max(index for index, _ in runtime_pairs) < launch.args.index("-p")
+
+
+def test_fewer_than_sixteen_runtime_roots_use_deterministic_slots_and_safe_fillers(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    roots = [tmp_path / name for name in ("z-root", "a-root", "m-root")]
+    for root in roots:
+        root.mkdir()
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command=":",
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        read_only_paths=tuple(root / "." for root in roots),
+    )
+
+    launch = SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
+        request,
+        _policy(),
+        environment,
+    )
+
+    runtime_pairs = _definition_pairs(launch.args, "RUNTIME_ROOT_")
+    sorted_roots = sorted((root.resolve() for root in roots), key=str)
+
+    assert len(runtime_pairs) == 16
+    assert [value for _, value in runtime_pairs[:3]] == [
+        f"RUNTIME_ROOT_{index}={path}"
+        for index, path in enumerate(sorted_roots)
+    ]
+    assert [value for _, value in runtime_pairs[3:]] == [
+        f"RUNTIME_ROOT_{index}={environment.home.resolve()}"
+        for index in range(3, 16)
+    ]
+    assert [index for index, _ in runtime_pairs] == sorted(index for index, _ in runtime_pairs)
+    assert max(index for index, _ in runtime_pairs) < launch.args.index("-p")
+
+
+def test_sixteen_runtime_roots_preserve_all_exact_values(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    roots = [tmp_path / f"root-{index:02d}" for index in range(16)]
+    for root in roots:
+        root.mkdir()
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command=":",
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        read_only_paths=tuple(root for root in reversed(roots)),
+    )
+
+    launch = SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
+        request,
+        _policy(),
+        environment,
+    )
+
+    runtime_pairs = _definition_pairs(launch.args, "RUNTIME_ROOT_")
+    sorted_roots = sorted((root.resolve() for root in roots), key=str)
+
+    assert len(runtime_pairs) == 16
+    assert [value for _, value in runtime_pairs] == [
+        f"RUNTIME_ROOT_{index}={path}"
+        for index, path in enumerate(sorted_roots)
+    ]
+    assert max(index for index, _ in runtime_pairs) < launch.args.index("-p")
 
 
 def test_static_seatbelt_profiles_are_reviewable_and_semantically_distinct() -> None:
