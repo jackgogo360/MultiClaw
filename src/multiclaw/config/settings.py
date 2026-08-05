@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any, Literal
 import os
@@ -211,6 +212,7 @@ class Settings(BaseSettings):
 
     @staticmethod
     def _coerce_env_value(value: str) -> Any:
+        stripped = value.strip()
         lower = value.lower()
         if lower in ("true", "false"):
             return lower == "true"
@@ -218,6 +220,11 @@ class Settings(BaseSettings):
             return int(value)
         except ValueError:
             pass
+        if stripped.startswith("[") or stripped.startswith("{"):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                pass
         return value
 
     def _build_toml_kwargs(self, path: Path) -> dict[str, Any]:
