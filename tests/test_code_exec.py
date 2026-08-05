@@ -351,6 +351,31 @@ class TestCodeExecTool:
         assert result.content == "sandbox execution failed"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            b'{"success":true,"stdout":"","stderr":"","error":"","error":"dup"}',
+            b'{"success":true,"success":false,"stdout":"","stderr":"","error":""}',
+            b'{"success":true,"success":"nope","stdout":"","stderr":"","error":""}',
+        ],
+    )
+    async def test_code_exec_rejects_duplicate_runner_protocol_keys(self, tmp_path, stdout):
+        builder, _, _ = _build_tool(
+            tmp_path,
+            result=_sandbox_result(stdout=stdout),
+        )
+
+        result = await builder.build(
+            builder.validate({"code": "print('ok')"})
+        ).execute()
+
+        assert result.status == "error"
+        assert result.content == "sandbox execution failed"
+        assert "dup" not in result.content
+        assert "print('ok')" not in result.content
+        assert str(tmp_path) not in result.content
+
+    @pytest.mark.asyncio
     async def test_code_exec_rejects_non_zero_child_exit_even_with_json_output(self, tmp_path):
         builder, _, _ = _build_tool(
             tmp_path,
