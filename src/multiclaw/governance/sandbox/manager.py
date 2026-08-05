@@ -96,7 +96,12 @@ class SandboxManager(SandboxController):
     ) -> None:
         self._settings = settings
         self._debug = debug
+        self._workspace_root_lexical = self._absolute_lexical_path(workspace_root)
         self._workspace_root = self._canonical_workspace_root(workspace_root)
+        self._workspace_root_aliases = self._build_path_aliases(
+            self._workspace_root_lexical,
+            self._workspace_root,
+        )
         self._backend = backend
         self._event_bus = event_bus
         self._runner = runner or SandboxProcessRunner()
@@ -104,7 +109,13 @@ class SandboxManager(SandboxController):
         self._backend_name = backend_name
         self._policies = self._build_policies()
         self._policies_by_name = {policy.name: policy for policy in self._policies}
-        self._manager_root = Path(tempfile.mkdtemp(prefix="multiclaw-sandbox-")).resolve()
+        manager_root_raw = Path(tempfile.mkdtemp(prefix="multiclaw-sandbox-"))
+        self._manager_root_lexical = self._absolute_lexical_path(manager_root_raw)
+        self._manager_root = manager_root_raw.resolve()
+        self._manager_root_aliases = self._build_path_aliases(
+            self._manager_root_lexical,
+            self._manager_root,
+        )
         self._manager_root.chmod(0o700)
         self._probe = self._initial_probe()
         self._profile_readiness = {policy.name: False for policy in self._policies}
@@ -508,8 +519,16 @@ class SandboxManager(SandboxController):
 
     def _sanitize_text(self, value: str) -> str:
         sanitized = " ".join(value.split())
-        sanitized = sanitized.replace(str(self._manager_root), "[PRIVATE_ROOT]")
-        sanitized = sanitized.replace(str(self._workspace_root), "[WORKSPACE_ROOT]")
+        sanitized = self._replace_path_aliases(
+            sanitized,
+            self._manager_root_aliases,
+            "[PRIVATE_ROOT]",
+        )
+        sanitized = self._replace_path_aliases(
+            sanitized,
+            self._workspace_root_aliases,
+            "[WORKSPACE_ROOT]",
+        )
         sanitized = re.sub(
             r"\b([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)",
             self._redact_assignment_match,
@@ -528,4 +547,28 @@ class SandboxManager(SandboxController):
         return f"{key}={value}"
 
     def _looks_like_sensitive_value(self, value: str) -> bool:
-        return value in {str(self._manager_root), str(self._workspace_root)}
+        return value in self._manager_root_aliases | self._workspace_root_aliases
+
+    def _absolute_lexical_path(self, path: Path) -> Path:
+        return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+    def _build_path_aliases(self, *paths: Path) -> set[str]:
+        return {str(path) for path in paths if str(path)}
+
+    def _replace_path_aliases(
+        self,
+        text: str,
+        aliases: set[str],
+        placeholder: str,
+    ) -> str:
+        if not aliases:
+            return text
+        pattern = "|".join(
+            re.escape(alias)
+            for alias in sorted(aliases, key=len, reverse=True)
+        )
+        return re.sub(
+            rf"(?<![A-Za-z0-9._~/-])(?:{pattern})(?![A-Za-z0-9._~/-])",
+            placeholder,
+            text,
+        )

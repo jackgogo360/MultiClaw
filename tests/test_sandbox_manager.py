@@ -854,6 +854,66 @@ def test_manager_sanitizes_blocked_and_profile_reasons_in_readiness_and_events(
     )
 
 
+def test_manager_sanitizes_lexical_and_canonical_path_aliases(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    backend = RecordingBackend(name="recording")
+    manager = SandboxManager.create(
+        settings=_settings(),
+        debug=False,
+        workspace_root=tmp_path,
+        backend_override=backend,
+    )
+
+    workspace_lexical = "/var/folders/fake/workspace"
+    workspace_canonical = "/private/var/folders/fake/workspace"
+    manager_lexical = "/var/folders/fake/manager"
+    manager_canonical = "/private/var/folders/fake/manager"
+    manager._workspace_root_aliases = {workspace_lexical, workspace_canonical}
+    manager._manager_root_aliases = {manager_lexical, manager_canonical}
+
+    manager.record_blocked_capability(
+        f"skip {workspace_lexical} {workspace_canonical}",
+        f"reason {manager_lexical} {manager_canonical}",
+    )
+    backend.probe_result = backend.probe_result.model_copy(
+        update={
+            "available": False,
+            "reason": (
+                f"probe saw {workspace_lexical} {workspace_canonical} "
+                f"and {manager_lexical} {manager_canonical}"
+            ),
+        }
+    )
+
+    manager.initialize()
+    readiness = manager.finalize_readiness()
+    events = manager.drain_startup_events()
+
+    readiness_text = str(readiness.model_dump())
+    events_text = str([event.model_dump() for event in events])
+    _assert_sanitized_payload(
+        readiness_text,
+        workspace_lexical,
+        workspace_canonical,
+        manager_lexical,
+        manager_canonical,
+    )
+    _assert_sanitized_payload(
+        events_text,
+        workspace_lexical,
+        workspace_canonical,
+        manager_lexical,
+        manager_canonical,
+    )
+    assert "[WORKSPACE_ROOT]" in readiness_text
+    assert "[PRIVATE_ROOT]" in readiness_text
+    assert "[WORKSPACE_ROOT]" in events_text
+    assert "[PRIVATE_ROOT]" in events_text
+
+
 def test_unsafe_mode_emits_startup_and_launch_events_once_without_run_duplication(
     tmp_path: Path,
 ) -> None:
