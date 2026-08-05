@@ -90,3 +90,141 @@ def test_load_mcp_config_logs_server_and_key_without_secret_values(
     assert "demo" in caplog.text
     assert "sandbox_env_allowlist" in caplog.text
     assert secret_value not in caplog.text
+
+
+def test_load_mcp_config_allows_exact_same_key_secret_expansion_with_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / ".mcp.json"
+    monkeypatch.setenv("API_TOKEN", "dummy-secret-token")
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "demo": {
+                        "command": "/usr/bin/env",
+                        "env": {"API_TOKEN": "${API_TOKEN}"},
+                        "sandboxEnvAllowlist": ["API_TOKEN"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = _load_from_file(config_path)
+
+    assert isinstance(loaded["demo"], StdioServerConfig)
+    assert loaded["demo"].env == {"API_TOKEN": "dummy-secret-token"}
+
+
+def test_load_mcp_config_rejects_secret_expansion_without_allowlist_and_sanitizes_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config_path = tmp_path / ".mcp.json"
+    monkeypatch.setenv("API_TOKEN", "dummy-secret-token")
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "demo": {
+                        "command": "/usr/bin/env",
+                        "env": {"API_TOKEN": "${API_TOKEN}"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        loaded = _load_from_file(config_path)
+
+    assert loaded == {}
+    assert "demo" in caplog.text
+    assert "API_TOKEN" in caplog.text
+    assert "dummy-secret-token" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "env_mapping",
+    [
+        {"VISIBLE_FLAG": "${API_TOKEN}", "API_TOKEN": "placeholder"},
+        {"API_TOKEN": "prefix-${API_TOKEN}"},
+        {"API_TOKEN": "${A}${B}"},
+    ],
+)
+def test_load_mcp_config_rejects_laundered_or_composite_secret_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    env_mapping: dict[str, str],
+) -> None:
+    config_path = tmp_path / ".mcp.json"
+    monkeypatch.setenv("API_TOKEN", "dummy-secret-token")
+    monkeypatch.setenv("A", "dummy-a")
+    monkeypatch.setenv("B", "dummy-b")
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "demo": {
+                        "command": "/usr/bin/env",
+                        "env": env_mapping,
+                        "sandboxEnvAllowlist": ["API_TOKEN", "VISIBLE_FLAG", "A", "B"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        loaded = _load_from_file(config_path)
+
+    assert loaded == {}
+    assert "demo" in caplog.text
+    assert "dummy-secret-token" not in caplog.text
+    assert "dummy-a" not in caplog.text
+    assert "dummy-b" not in caplog.text
+
+
+def test_load_mcp_config_keeps_literal_env_values_without_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / ".mcp.json"
+    monkeypatch.setenv("API_TOKEN", "dummy-secret-token")
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "demo": {
+                        "command": "/usr/bin/env",
+                        "env": {"VISIBLE_FLAG": "literal-value"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = _load_from_file(config_path)
+
+    assert isinstance(loaded["demo"], StdioServerConfig)
+    assert loaded["demo"].env == {"VISIBLE_FLAG": "literal-value"}
+
+
+def test_stdio_server_config_repr_redacts_env_values() -> None:
+    config = StdioServerConfig(
+        command="/usr/bin/env",
+        env={"API_TOKEN": "dummy-secret-token", "VISIBLE_FLAG": "literal-value"},
+    )
+
+    rendered = repr(config)
+
+    assert "dummy-secret-token" not in rendered
+    assert "literal-value" not in rendered
