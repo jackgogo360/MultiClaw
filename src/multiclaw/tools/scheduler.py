@@ -75,10 +75,10 @@ class CoreToolScheduler:
                 try:
                     result = await self.execution_guard.run(invocation.execute)
                 except Exception as exc:
-                    error_text = str(exc)
+                    del exc
                     result = ToolExecutionResult(
                         status=ToolStatus.ERROR,
-                        content=error_text,
+                        content="tool execution failed",
                     )
                     await self._finalize_terminal_result(
                         builder.name,
@@ -179,10 +179,10 @@ class CoreToolScheduler:
             )
             result = await self.execution_guard.run(invocation.execute)
         except Exception as exc:
-            error_text = str(exc)
+            del exc
             result = ToolExecutionResult(
                 status=ToolStatus.ERROR,
-                content=error_text,
+                content="tool execution failed",
             )
             await self._finalize_terminal_result(
                 builder.name,
