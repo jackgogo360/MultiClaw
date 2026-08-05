@@ -304,6 +304,16 @@ def test_create_transport_rejects_in_process_in_auto_mode_but_allows_remote(
     assert isinstance(remote, StreamableHTTPTransport)
 
 
+def test_create_transport_requires_sandbox_context_for_in_process_transport() -> None:
+    with pytest.raises(RuntimeError, match="sandbox controller context"):
+        create_transport(
+            InProcessServerConfig(server_factory=lambda: object()),
+            sandbox_controller=None,
+            workspace_root=None,
+            server_name="local-inproc",
+        )
+
+
 def test_manager_marks_bad_stdio_failed_without_blocking_remote(monkeypatch) -> None:
     connected: list[str] = []
 
@@ -352,3 +362,48 @@ def test_manager_marks_bad_stdio_failed_without_blocking_remote(monkeypatch) -> 
     assert states["remote"].status is ServerStatus.CONNECTED
     assert connected == ["remote"]
     assert "/tmp/secret" not in (states["local"].error or "")
+
+
+def test_manager_without_sandbox_context_fails_closed_for_local_transports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connected: list[str] = []
+
+    class FakeClient:
+        def __init__(self, name, transport):
+            self.name = name
+            self.transport = transport
+
+        def set_on_tools_changed(self, callback) -> None:
+            self.callback = callback
+
+        async def connect(self) -> None:
+            connected.append(self.name)
+
+        async def discover_tools(self) -> list[ToolInfo]:
+            return []
+
+        async def disconnect(self) -> None:
+            return None
+
+        @property
+        def connected(self) -> bool:
+            return True
+
+    monkeypatch.setattr("multiclaw.mcp.manager.MCPClient", FakeClient)
+
+    manager = MCPClientManager()
+    states = manager.connect_servers(
+        {
+            "local-stdio": StdioServerConfig(command="/usr/bin/env"),
+            "local-inproc": InProcessServerConfig(server_factory=lambda: object()),
+            "remote": HTTPServerConfig(url="https://example.com/mcp"),
+        }
+    )
+
+    assert states["local-stdio"].status is ServerStatus.FAILED
+    assert states["local-inproc"].status is ServerStatus.FAILED
+    assert states["remote"].status is ServerStatus.CONNECTED
+    assert connected == ["remote"]
+    assert "sandbox controller context" in (states["local-stdio"].error or "")
+    assert "sandbox controller context" in (states["local-inproc"].error or "")
