@@ -672,6 +672,32 @@ def test_mcp_launch_spec_uses_conservative_defaults_and_dynamic_policy_overrides
     assert registry_policy.runtime_read_only_paths == ()
 
 
+def test_configured_mcp_profile_name_keeps_explicit_mcp_policy_identity(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.config.settings import SandboxProfileNames
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    manager = SandboxManager.create(
+        settings=_settings(
+            profiles=SandboxProfileNames(
+                shell="shell_workspace",
+                code_exec="code_exec_python",
+                mcp_stdio="custom_mcp_profile",
+            )
+        ),
+        debug=False,
+        workspace_root=tmp_path,
+        backend_override=RecordingBackend(name="recording"),
+    )
+
+    policies = {policy.name: policy for policy in manager._policies}
+
+    assert policies["shell_workspace"].profile_kind == "shell"
+    assert policies["code_exec_python"].profile_kind == "code_exec"
+    assert policies["custom_mcp_profile"].profile_kind == "mcp_stdio"
+
+
 @pytest.mark.parametrize(
     "request_kwargs",
     [
