@@ -1,5 +1,13 @@
+import os
 import pytest
 from pathlib import Path
+
+
+@pytest.fixture(autouse=True)
+def clear_multiclaw_env(monkeypatch):
+    for key in list(os.environ):
+        if key.startswith("MULTICLAW_"):
+            monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture
@@ -30,7 +38,13 @@ short_term_limit = 50
 context_window_limit = 64000
 
 [governance]
-sandbox_mode = "process"
 audit_enabled = false
+
+[governance.sandbox]
+mode = "auto"
+backend_probe_on_startup = true
+unsafe_fallback_requires_debug = true
+write_protected_workspace_paths = [".git"]
+read_hidden_workspace_paths = [".env", ".env.*"]
 """)
     return config_file

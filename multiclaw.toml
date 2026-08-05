@@ -33,8 +33,14 @@ short_term_limit = 100
 context_window_limit = 128000
 
 [governance]
-sandbox_mode = "process"
 audit_enabled = true
+
+[governance.sandbox]
+mode = "auto"
+backend_probe_on_startup = true
+unsafe_fallback_requires_debug = true
+write_protected_workspace_paths = [".git"]
+read_hidden_workspace_paths = [".env", ".env.*"]
 
 [agent]
 max_tool_rounds = 10
