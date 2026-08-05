@@ -208,6 +208,19 @@ def test_static_seatbelt_profiles_are_reviewable_and_semantically_distinct() -> 
     assert "(deny process-fork)" in code_profile
 
 
+def test_mcp_profile_keeps_workspace_read_only_but_private_runtime_writeable() -> None:
+    from multiclaw.governance.sandbox.seatbelt_profiles import SEATBELT_PROFILES
+
+    profile_text = SEATBELT_PROFILES["mcp_stdio_local"].profile_text
+
+    assert '(allow file-read* (subpath (param "WORKSPACE")))' in profile_text
+    assert '(allow file-write* (subpath (param "PRIVATE_HOME")))' in profile_text
+    assert '(allow file-write* (subpath (param "PRIVATE_TMP")))' in profile_text
+    assert '(allow file-write* (subpath (param "WORKSPACE")))' not in profile_text
+    assert '(deny file-read* (regex #".*/\\.env(\\..*)?$"))' in profile_text
+    assert '(deny file-write* (regex #".*/\\.git($|/.*)"))' in profile_text
+
+
 def test_seatbelt_rejects_network_or_capability_mismatches(tmp_path: Path) -> None:
     from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
 
@@ -304,6 +317,33 @@ def test_probe_short_circuits_when_binary_missing_or_not_executable(
     assert result.available is False
     assert result.backend_name == "seatbelt"
     assert result.reason
+    assert calls == []
+
+
+def test_probe_short_circuits_when_binary_is_not_executable(tmp_path: Path) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    calls: list[object] = []
+    binary = tmp_path / "sandbox-exec"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o600)
+
+    def unexpected_runner(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("runner should not be called")
+
+    backend = SeatbeltBackend(
+        binary=binary,
+        subprocess_run=unexpected_runner,
+    )
+
+    result = backend.probe(tmp_path / "workspace", (_policy(),))
+
+    assert result.available is False
+    assert result.backend_name == "seatbelt"
+    assert result.reason
+    assert "sandbox-exec" in result.reason
+    assert str(binary) not in result.reason
     assert calls == []
 
 
