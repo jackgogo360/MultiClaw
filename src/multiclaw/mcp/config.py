@@ -145,6 +145,7 @@ def _load_from_file(path: Path) -> dict[str, ServerConfig]:
 
     for name, server_data in servers.items():
         try:
+            _validate_raw_stdio_env_expansions(server_data)
             server_data = _expand_env_vars(server_data)
             config = _parse_server_config(server_data)
             configs[name] = config
@@ -268,3 +269,44 @@ def _expand_env_vars(data: Any) -> Any:
     elif isinstance(data, list):
         return [_expand_env_vars(item) for item in data]
     return data
+
+
+def _validate_raw_stdio_env_expansions(server_data: Any) -> None:
+    if not isinstance(server_data, dict) or "command" not in server_data:
+        return
+
+    raw_env = server_data.get("env")
+    if not isinstance(raw_env, dict):
+        return
+
+    raw_allowlist = (
+        server_data.get("sandbox_env_allowlist")
+        if "sandbox_env_allowlist" in server_data
+        else server_data.get("sandboxEnvAllowlist")
+    )
+    allowlist = (
+        {entry for entry in raw_allowlist if isinstance(entry, str)}
+        if isinstance(raw_allowlist, list)
+        else None
+    )
+
+    for dest_key, raw_value in raw_env.items():
+        if not isinstance(dest_key, str) or not isinstance(raw_value, str):
+            continue
+        matches = list(_ENV_VAR_PATTERN.finditer(raw_value))
+        if not matches:
+            continue
+
+        full_match = _ENV_VAR_PATTERN.fullmatch(raw_value)
+        if full_match is None or len(matches) != 1:
+            raise ValueError(f"invalid secret env expansion for {dest_key}: exact whole-value reference required")
+
+        source_key = full_match.group(1)
+        if dest_key != source_key:
+            raise ValueError(
+                f"invalid secret env expansion for {dest_key}: destination must match source {source_key}"
+            )
+        if allowlist is None or source_key not in allowlist:
+            raise ValueError(
+                f"invalid secret env expansion for {source_key}: sandbox_env_allowlist entry required"
+            )

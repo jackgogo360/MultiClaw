@@ -28,7 +28,7 @@ class ServerStatus(enum.Enum):
 class StdioServerConfig:
     command: str
     args: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict, repr=False)
     cwd: Path | None = None
     sandbox_network: str = "disabled"
     sandbox_workspace: str = "ro"
