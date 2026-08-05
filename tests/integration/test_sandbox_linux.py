@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import shlex
 import socket
@@ -125,27 +126,30 @@ def _assert_denied_marker(
     result: SandboxExecResult,
     *,
     prefix: str,
+    expected_classes: set[str],
     expected_errnos: set[int] | None = None,
-) -> int:
+) -> tuple[str, int]:
     assert _python_exit_code(result) == 0
     stdout = _python_stdout_text(result)
-    match = re.fullmatch(rf"{re.escape(prefix)}:(\d+)", stdout)
+    match = re.fullmatch(rf"{re.escape(prefix)}:([A-Za-z_][A-Za-z0-9_]*):(\d+)", stdout)
     assert match is not None, stdout
-    denied_errno = int(match.group(1))
+    denied_class = match.group(1)
+    denied_errno = int(match.group(2))
+    assert denied_class in expected_classes
     if expected_errnos is not None:
         assert denied_errno in expected_errnos
     assert result.stderr == b""
-    return denied_errno
+    return denied_class, denied_errno
 
 
-def _wait_for_pid_record(path: Path, *, timeout_seconds: float = 2.0) -> tuple[int, int]:
+def _wait_for_pid_record(path: Path, *, expected_count: int, timeout_seconds: float = 2.0) -> tuple[int, ...]:
     deadline = time.monotonic() + timeout_seconds
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
             lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-            if len(lines) == 2:
-                return int(lines[0]), int(lines[1])
+            if len(lines) == expected_count:
+                return tuple(int(line) for line in lines)
             last_error = AssertionError(f"unexpected pid record contents: {lines!r}")
         except Exception as exc:  # pragma: no cover - exercised in polling loop
             last_error = exc
@@ -212,6 +216,29 @@ async def _assert_direct_python_probe_control(
     assert _python_exit_code(result) == 0
     assert _python_stdout_text(result) == "PYTHON_VISIBLE"
     assert result.stderr == b""
+
+
+def _assert_linux_network_state(stdout: str) -> None:
+    match = re.fullmatch(
+        r"NETWORK_STATE:ifaces=([A-Za-z0-9_,.-]*);default_routes=([A-Za-z0-9_,.-]*)\n"
+        r"NETWORK_DENIED:([A-Za-z_][A-Za-z0-9_]*):(\d+)",
+        stdout,
+    )
+    assert match is not None, stdout
+    ifaces_field, routes_field, denied_class, denied_errno_text = match.groups()
+    if ifaces_field:
+        raise AssertionError(f"unexpected non-loopback interfaces visible: {ifaces_field}")
+    if routes_field:
+        raise AssertionError(f"unexpected default routes visible: {routes_field}")
+    assert denied_class in {"OSError", "PermissionError", "ConnectionRefusedError"}
+    assert int(denied_errno_text) in {
+        errno.EPERM,
+        errno.EACCES,
+        errno.ENETUNREACH,
+        errno.EHOSTUNREACH,
+        errno.ENETDOWN,
+        errno.ECONNREFUSED,
+    }
 
 
 @pytest.fixture(scope="module")
@@ -377,18 +404,44 @@ async def test_linux_sandbox_blocks_parent_listener_network(
         "except Exception:\n"
         "    raise SystemExit(41)\n"
         "try:\n"
+        "    interfaces = sorted(name for _, name in socket.if_nameindex() if name != 'lo')\n"
+        "except Exception:\n"
+        "    raise SystemExit(44)\n"
+        "try:\n"
+        "    with open('/proc/net/route', 'r', encoding='utf-8') as handle:\n"
+        "        route_lines = handle.read().splitlines()\n"
+        "except OSError:\n"
+        "    raise SystemExit(45)\n"
+        "if not route_lines:\n"
+        "    raise SystemExit(46)\n"
+        "default_routes = []\n"
+        "for line in route_lines[1:]:\n"
+        "    if not line.strip():\n"
+        "        continue\n"
+        "    fields = line.split()\n"
+        "    if len(fields) < 2:\n"
+        "        raise SystemExit(47)\n"
+        "    if fields[1] == '00000000':\n"
+        "        default_routes.append(fields[0])\n"
+        "sys.stdout.write(\n"
+        "    'NETWORK_STATE:ifaces=' + ','.join(interfaces)\n"
+        "    + ';default_routes=' + ','.join(default_routes) + '\\n'\n"
+        ")\n"
+        "try:\n"
         f"    sock = socket.create_connection(('127.0.0.1', {parent_tcp_listener.port}), timeout=1.0)\n"
         "except OSError as exc:\n"
         "    if exc.errno is None:\n"
         "        raise SystemExit(43)\n"
-        "    sys.stdout.write(f'NETWORK_DENIED:{exc.errno}')\n"
+        "    sys.stdout.write(f'NETWORK_DENIED:{exc.__class__.__name__}:{exc.errno}')\n"
         "    raise SystemExit(0)\n"
         "else:\n"
         "    sock.close()\n"
         "    raise SystemExit(42)\n",
     )
 
-    _assert_denied_marker(result, prefix="NETWORK_DENIED")
+    assert _python_exit_code(result) == 0
+    _assert_linux_network_state(_python_stdout_text(result))
+    assert result.stderr == b""
     assert parent_tcp_listener.accepted_connection() is False
 
 
@@ -411,7 +464,7 @@ async def test_linux_code_exec_blocks_child_process_creation(
         "    subprocess.run([sys.executable, '-I', '-S', '-c', 'raise SystemExit(0)'], check=True)\n"
         "except OSError as exc:\n"
         "    if exc.errno in (errno.EPERM, errno.EACCES):\n"
-        "        sys.stdout.write(f'CHILD_DENIED:{exc.errno}')\n"
+        "        sys.stdout.write(f'CHILD_DENIED:{exc.__class__.__name__}:{exc.errno}')\n"
         "        raise SystemExit(0)\n"
         "    raise SystemExit(53)\n"
         "except subprocess.CalledProcessError:\n"
@@ -422,6 +475,7 @@ async def test_linux_code_exec_blocks_child_process_creation(
     _assert_denied_marker(
         result,
         prefix="CHILD_DENIED",
+        expected_classes={"OSError", "PermissionError"},
         expected_errnos={1, 13},
     )
 
@@ -457,18 +511,35 @@ async def test_linux_timed_out_shell_leaves_no_descendants(
     result = await _run_shell(
         shell_builder,
         "trap '' TERM; "
-        "/bin/sh -c 'trap \"\" TERM; sleep 60' & "
+        ": > " + shlex.quote(str(sandbox_tree.timeout_pids)) + "; "
+        "/bin/sh -c '"
+        "trap \"\" TERM; "
+        "sleep 60 & "
+        "leaf=$!; "
+        "printf \"%s\\n%s\\n\" \"$$\" \"$leaf\" >> \"$1\"; "
+        "wait \"$leaf\""
+        "' sh "
+        + shlex.quote(str(sandbox_tree.timeout_pids))
+        + " & "
         "child=$!; "
-        "printf '%s\\n%s\\n' \"$$\" \"$child\" > "
+        "printf '%s\\n%s\\n' \"$$\" \"$child\" >> "
         + shlex.quote(str(sandbox_tree.timeout_pids))
         + "; "
+        "while [ \"$(wc -l < "
+        + shlex.quote(str(sandbox_tree.timeout_pids))
+        + ")\" -lt 4 ]; do sleep 0.01; done; "
         "wait \"$child\"",
         timeout=0.2,
     )
-    shell_pid, child_pid = _wait_for_pid_record(sandbox_tree.timeout_pids)
+    shell_pid, child_pid, wrapper_pid, leaf_pid = _wait_for_pid_record(
+        sandbox_tree.timeout_pids,
+        expected_count=4,
+    )
 
     assert result.status == "success"
     assert "[Command timed out after 0s]" in result.content
     assert result.data == {"exit_code": -1}
     _assert_pid_gone(shell_pid)
     _assert_pid_gone(child_pid)
+    _assert_pid_gone(wrapper_pid)
+    _assert_pid_gone(leaf_pid)
