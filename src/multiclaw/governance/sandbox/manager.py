@@ -20,6 +20,7 @@ from multiclaw.governance.sandbox.environment import build_sandbox_environment
 from multiclaw.governance.sandbox.errors import (
     SandboxConfigurationError,
     SandboxLaunchError,
+    SandboxPolicyError,
     SandboxUnavailableError,
 )
 from multiclaw.governance.sandbox.models import (
@@ -340,6 +341,10 @@ class SandboxManager(SandboxController):
         with self._lifecycle_lock:
             if self._readiness_snapshot is not None:
                 raise RuntimeError("sandbox readiness has already been finalized")
+            if self.mode != "host_unsafe_dev_only":
+                raise SandboxPolicyError(
+                    "unsafe capability evidence requires mode='host_unsafe_dev_only'"
+                )
 
             self._startup_events.append(
                 Event(

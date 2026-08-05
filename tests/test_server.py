@@ -162,7 +162,9 @@ def test_auth_flows_are_public(tmp_path, monkeypatch):
 
 class _LeakyUnavailableSandboxController:
     def __init__(self, workspace_root: Path) -> None:
-        secret_value = "sk-test-should-not-leak"
+        secret_value = "secret-dummy-value"
+        password_value = "password-dummy-value"
+        bearer_value = "bearer-dummy-value"
         private_root = workspace_root / "private-root"
         hidden_path = workspace_root / ".env.secret"
         self._events = (
@@ -172,7 +174,8 @@ class _LeakyUnavailableSandboxController:
                     "profile_name": "shell_workspace",
                     "reason": (
                         f"workspace={workspace_root} private_root={private_root} "
-                        f"hidden={hidden_path} token={secret_value}"
+                        f"hidden={hidden_path} client_secret={secret_value} "
+                        f"PASSWORD = {password_value} Authorization: Bearer {bearer_value}"
                     ),
                 },
             ),
@@ -187,7 +190,8 @@ class _LeakyUnavailableSandboxController:
                 capabilities={},
                 reason=(
                     f"workspace={workspace_root} private_root={private_root} "
-                    f"hidden={hidden_path} token={secret_value}"
+                    f"hidden={hidden_path} client_secret={secret_value} "
+                    f"PASSWORD = {password_value} Authorization: Bearer {bearer_value}"
                 ),
             ),
             profiles={
@@ -198,7 +202,8 @@ class _LeakyUnavailableSandboxController:
             skipped_capabilities={
                 "shell": (
                     f"workspace={workspace_root} private_root={private_root} "
-                    f"hidden={hidden_path} token={secret_value}"
+                    f"hidden={hidden_path} client_secret={secret_value} "
+                    f"PASSWORD = {password_value} Authorization: Bearer {bearer_value}"
                 )
             },
             unsafe_fallback_active=False,
@@ -313,7 +318,7 @@ def test_health_ready_is_public_and_uses_app_state(tmp_path, monkeypatch):
         assert server_module.app.state.sandbox_readiness is controller.finalize_readiness()
 
 
-def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch):
+def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
@@ -329,8 +334,9 @@ def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch)
 
     monkeypatch.setattr(server_module, "create_agent", _create_agent)
 
-    with TestClient(server_module.app) as client:
-        response = client.get("/health/ready")
+    with caplog.at_level("INFO"):
+        with TestClient(server_module.app) as client:
+            response = client.get("/health/ready")
 
         assert response.status_code == 503
         assert response.json()["ready"] is False
@@ -338,7 +344,12 @@ def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch)
         assert str(tmp_path) not in response.text
         assert str(tmp_path / "private-root") not in response.text
         assert str(tmp_path / ".env.secret") not in response.text
-        assert "sk-test-should-not-leak" not in response.text
+        assert "secret-dummy-value" not in response.text
+        assert "password-dummy-value" not in response.text
+        assert "bearer-dummy-value" not in response.text
+        assert "secret-dummy-value" not in caplog.text
+        assert "password-dummy-value" not in caplog.text
+        assert "bearer-dummy-value" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -357,8 +368,32 @@ async def test_health_ready_reads_request_app_state_and_sanitizes_response(tmp_p
     assert response.status_code == 503
     body = response.body.decode()
     assert str(tmp_path) not in body
-    assert "sk-test-should-not-leak" not in body
+    assert "secret-dummy-value" not in body
+    assert "password-dummy-value" not in body
+    assert "bearer-dummy-value" not in body
     assert app.state.sandbox_readiness is controller.finalize_readiness()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "client_secret=secret-dummy-value",
+        "PASSWORD = password-dummy-value",
+        "OPENAI_API_KEY=api-dummy-value",
+        "Authorization: Bearer bearer-dummy-value",
+        "Bearer bearer-dummy-value",
+    ],
+)
+def test_sanitize_public_reason_redacts_assignments_and_auth_values(reason, tmp_path):
+    from multiclaw.server import _sanitize_public_reason
+
+    sanitized = _sanitize_public_reason(reason, workspace_root=tmp_path)
+
+    assert "secret-dummy-value" not in sanitized
+    assert "password-dummy-value" not in sanitized
+    assert "api-dummy-value" not in sanitized
+    assert "bearer-dummy-value" not in sanitized
+    assert "[REDACTED]" in sanitized
 
 
 def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch, tmp_path):
@@ -433,6 +468,7 @@ def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch
         config_path=None,
         sandbox_controller=ReadyRecordingSandboxController(workspace_root=tmp_path),
         workspace_root=tmp_path,
+        mcp_profile_name="mcp_stdio_local",
     )
 
     assert events == ["set_callback", "connect", "callback", "get_server_states"]
@@ -499,6 +535,7 @@ def test_register_mcp_tools_skips_unready_stdio_but_keeps_remote(
             config_path=None,
             sandbox_controller=UnavailableSandboxController(),
             workspace_root=tmp_path,
+            mcp_profile_name="mcp_stdio_local",
         )
 
     assert list(manager.connected) == ["remote"]
@@ -540,6 +577,7 @@ def test_register_mcp_tools_skips_in_process_in_auto_mode(tmp_path, monkeypatch)
         config_path=None,
         sandbox_controller=controller,
         workspace_root=tmp_path,
+        mcp_profile_name="mcp_stdio_local",
     )
 
     assert manager.connected == {}
@@ -547,7 +585,7 @@ def test_register_mcp_tools_skips_in_process_in_auto_mode(tmp_path, monkeypatch)
     events = controller.drain_startup_events()
     assert any(
         event.type == "sandbox.registration_skipped"
-        and event.data["capability"] == "mcp_in_process_local-inproc"
+        and event.data["capability"].startswith("mcp_in_process_local-inproc_")
         for event in events
     )
 
@@ -609,6 +647,7 @@ def test_register_mcp_tools_keeps_in_process_in_unsafe_mode(tmp_path, monkeypatc
             config_path=None,
             sandbox_controller=controller,
             workspace_root=tmp_path,
+            mcp_profile_name="mcp_stdio_local",
         )
 
     assert list(manager.connected) == ["local-inproc"]
@@ -620,7 +659,7 @@ def test_register_mcp_tools_keeps_in_process_in_unsafe_mode(tmp_path, monkeypatc
     events = controller.drain_startup_events()
     assert [event.type for event in events] == ["sandbox.unsafe_fallback_used"]
     assert events[0].data["scope"] == "capability"
-    assert events[0].data["capability"] == "mcp_in_process_local-inproc"
+    assert events[0].data["capability"].startswith("mcp_in_process_local-inproc_")
     assert "unsafe" in events[0].data["reason"]
 
 
@@ -662,7 +701,150 @@ def test_register_mcp_tools_propagates_blocked_capability_record_errors(tmp_path
             config_path=None,
             sandbox_controller=RaisingController(workspace_root=tmp_path),
             workspace_root=tmp_path,
+            mcp_profile_name="mcp_stdio_local",
         )
+
+
+def test_register_mcp_tools_requires_sandbox_controller_for_local_transports(tmp_path, monkeypatch):
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.connect_calls = 0
+
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connect_calls += 1
+            self.connected = dict(configs)
+
+        def get_server_states(self):
+            return {}
+
+    monkeypatch.setattr(
+        "multiclaw.server.load_mcp_config",
+        lambda path=None: {
+            "local": StdioServerConfig(command="python", args=["-m", "demo"]),
+        },
+    )
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    manager = FakeManager()
+    with pytest.raises(RuntimeError, match="sandbox controller is required"):
+        _register_mcp_tools(
+            registry=ToolRegistry(),
+            mcp_manager=manager,
+            config_path=None,
+            sandbox_controller=None,
+            workspace_root=tmp_path,
+            mcp_profile_name="mcp_stdio_local",
+        )
+
+    assert manager.connect_calls == 0
+
+
+def test_register_mcp_tools_uses_configured_mcp_profile_name(tmp_path, monkeypatch):
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    class ProfileController(ReadyRecordingSandboxController):
+        def is_profile_ready(self, profile_name: str) -> bool:
+            return profile_name == "custom_mcp_profile"
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.connected = None
+            self._states = {}
+
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connected = dict(configs)
+
+        def get_server_states(self):
+            return {}
+
+    monkeypatch.setattr(
+        "multiclaw.server.load_mcp_config",
+        lambda path=None: {
+            "local": StdioServerConfig(command="python", args=["-m", "demo"]),
+        },
+    )
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    manager = FakeManager()
+    _register_mcp_tools(
+        registry=ToolRegistry(),
+        mcp_manager=manager,
+        config_path=None,
+        sandbox_controller=ProfileController(workspace_root=tmp_path),
+        workspace_root=tmp_path,
+        mcp_profile_name="custom_mcp_profile",
+    )
+
+    assert list(manager.connected) == ["local"]
+
+
+def test_register_mcp_tools_keeps_distinct_blocked_capabilities_for_colliding_server_names(
+    tmp_path,
+    monkeypatch,
+):
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    class CollisionController(ReadyRecordingSandboxController):
+        def __init__(self) -> None:
+            super().__init__(workspace_root=tmp_path)
+            self._blocked: dict[str, str] = {}
+
+        def is_profile_ready(self, profile_name: str) -> bool:
+            del profile_name
+            return False
+
+        def record_blocked_capability(self, name: str, reason: str) -> None:
+            self._blocked[name] = reason
+            super().record_blocked_capability(name, reason)
+
+        def finalize_readiness(self) -> SandboxReadiness:
+            return self.readiness.model_copy(update={"skipped_capabilities": dict(self._blocked)})
+
+    class FakeManager:
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connected = dict(configs)
+
+        def get_server_states(self):
+            return {}
+
+    monkeypatch.setattr(
+        "multiclaw.server.load_mcp_config",
+        lambda path=None: {
+            "a b": StdioServerConfig(command="python", args=["-m", "demo"]),
+            "a/b": StdioServerConfig(command="python", args=["-m", "demo"]),
+        },
+    )
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    controller = CollisionController()
+    _register_mcp_tools(
+        registry=ToolRegistry(),
+        mcp_manager=FakeManager(),
+        config_path=None,
+        sandbox_controller=controller,
+        workspace_root=tmp_path,
+        mcp_profile_name="mcp_stdio_local",
+    )
+
+    skipped = controller.finalize_readiness().skipped_capabilities
+    assert len(skipped) == 2
+    assert len(set(skipped)) == 2
+    assert all(name.startswith("mcp_stdio_a_") for name in skipped)
+    assert all(len(name) > len("mcp_stdio_a_") for name in skipped)
 
 
 def test_lifespan_still_closes_controller_when_mcp_stop_fails(tmp_path, monkeypatch, caplog):
@@ -703,6 +885,35 @@ def test_lifespan_still_closes_controller_when_mcp_stop_fails(tmp_path, monkeypa
     assert manager.stop_calls == 1
     assert controller.close_calls == 1
     assert str(tmp_path) not in caplog.text
+
+
+def test_create_agent_passes_configured_mcp_profile_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "true")
+    monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    monkeypatch.setenv(
+        "MULTICLAW_GOVERNANCE__SANDBOX__PROFILES__MCP_STDIO",
+        "custom_mcp_profile",
+    )
+
+    import multiclaw.server as server_module
+
+    captured: dict[str, str] = {}
+    real_register = server_module._register_mcp_tools
+
+    def _register_stub(*, registry, mcp_manager, config_path, sandbox_controller, workspace_root, mcp_profile_name):
+        del registry, mcp_manager, config_path, sandbox_controller, workspace_root
+        captured["mcp_profile_name"] = mcp_profile_name
+
+    monkeypatch.setattr(server_module, "_register_mcp_tools", _register_stub)
+    try:
+        server_module.create_agent(
+            sandbox_controller=ReadyRecordingSandboxController(workspace_root=tmp_path)
+        )
+    finally:
+        monkeypatch.setattr(server_module, "_register_mcp_tools", real_register)
+
+    assert captured["mcp_profile_name"] == "custom_mcp_profile"
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -147,6 +148,13 @@ _PUBLIC_SECRET_PATTERN = re.compile(
     r"|token=[^\s&,;\"']{1,255}|key=[^\s&,;\"']{1,255})",
     re.IGNORECASE,
 )
+_PUBLIC_ASSIGNMENT_PATTERN = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_.-]*)\b\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_PUBLIC_AUTHORIZATION_PATTERN = re.compile(
+    r"(?i)\bAuthorization\s*:\s*Bearer\s+[^\s,;]+"
+)
+_PUBLIC_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
 
 
 def _sanitize_mcp_namespace(name: str) -> str:
@@ -162,7 +170,11 @@ def _sanitize_public_reason(
     *,
     workspace_root: Path | None = None,
 ) -> str:
-    text = _PUBLIC_SECRET_PATTERN.sub("[REDACTED]", reason.strip())
+    text = reason.strip()
+    text = _PUBLIC_AUTHORIZATION_PATTERN.sub("Authorization: [REDACTED]", text)
+    text = _PUBLIC_BEARER_PATTERN.sub("Bearer [REDACTED]", text)
+    text = _PUBLIC_ASSIGNMENT_PATTERN.sub(r"\1=[REDACTED]", text)
+    text = _PUBLIC_SECRET_PATTERN.sub("[REDACTED]", text)
     if not text:
         return ""
 
@@ -183,7 +195,7 @@ def _sanitize_public_reason(
 def _sanitize_public_readiness(
     readiness: SandboxReadiness,
     *,
-    workspace_root: Path,
+    workspace_root: Path | None,
 ) -> SandboxReadiness:
     return readiness.model_copy(
         update={
@@ -207,18 +219,22 @@ def _sanitize_public_readiness(
 
 
 def _record_blocked_capability_safely(
-    controller: SandboxController | None,
+    controller: SandboxController,
     *,
     name: str,
     reason: str,
     workspace_root: Path,
 ) -> None:
-    if controller is None:
-        return
     controller.record_blocked_capability(
         name,
         _sanitize_public_reason(reason, workspace_root=workspace_root),
     )
+
+
+def _mcp_capability_id(prefix: str, server_name: str) -> str:
+    readable = _sanitize_mcp_namespace(server_name).strip("_") or "server"
+    digest = hashlib.sha256(server_name.encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}_{readable}_{digest}"
 
 
 def _build_mcp_adapters(
@@ -248,7 +264,11 @@ def _register_mcp_tools(
     config_path: str | None,
     sandbox_controller: SandboxController | None,
     workspace_root: Path,
+    mcp_profile_name: str,
 ) -> None:
+    if sandbox_controller is None:
+        raise RuntimeError("sandbox controller is required for MCP transport gating")
+
     configs = load_mcp_config(config_path)
     if not configs:
         logger.info("No MCP servers configured (no .mcp.json found)")
@@ -276,14 +296,14 @@ def _register_mcp_tools(
     filtered_configs: dict[str, object] = {}
     for server_name, config in configs.items():
         if isinstance(config, StdioServerConfig):
-            if sandbox_controller is None or sandbox_controller.is_profile_ready("mcp_stdio_local"):
+            if sandbox_controller.is_profile_ready(mcp_profile_name):
                 filtered_configs[server_name] = config
                 continue
 
-            reason = "sandbox profile 'mcp_stdio_local' is not ready"
+            reason = f"sandbox profile {mcp_profile_name!r} is not ready"
             _record_blocked_capability_safely(
                 sandbox_controller,
-                name=f"mcp_stdio_{_sanitize_mcp_namespace(server_name)}",
+                name=_mcp_capability_id("mcp_stdio", server_name),
                 reason=reason,
                 workspace_root=workspace_root,
             )
@@ -291,9 +311,9 @@ def _register_mcp_tools(
             continue
 
         if isinstance(config, InProcessServerConfig):
-            if sandbox_controller is not None and sandbox_controller.mode == "host_unsafe_dev_only":
+            if sandbox_controller.mode == "host_unsafe_dev_only":
                 sandbox_controller.record_unsafe_capability(
-                    f"mcp_in_process_{_sanitize_mcp_namespace(server_name)}",
+                    _mcp_capability_id("mcp_in_process", server_name),
                     "unsafe transport kept for development",
                 )
                 filtered_configs[server_name] = config
@@ -306,7 +326,7 @@ def _register_mcp_tools(
             reason = "in-process MCP transport requires host_unsafe_dev_only"
             _record_blocked_capability_safely(
                 sandbox_controller,
-                name=f"mcp_in_process_{_sanitize_mcp_namespace(server_name)}",
+                name=_mcp_capability_id("mcp_in_process", server_name),
                 reason=reason,
                 workspace_root=workspace_root,
             )
@@ -440,6 +460,7 @@ def create_agent(
             ),
             sandbox_controller=sandbox_controller,
             workspace_root=workspace_root,
+            mcp_profile_name=settings.governance.sandbox.profiles.mcp_stdio,
         )
 
     readiness = sandbox_controller.finalize_readiness()
