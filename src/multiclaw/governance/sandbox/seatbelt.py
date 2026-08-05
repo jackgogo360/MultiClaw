@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -63,23 +64,23 @@ class SeatbeltBackend:
         template = self._template_for(policy.name)
         self._validate_request_overrides(request, policy)
         self._validate_policy_against_template(policy, template)
+        target_argv = self._target_argv_for(request, policy)
 
         workspace_root = self._canonicalize_path(request.workspace_root, "workspace_root")
         cwd = self._canonicalize_path(request.cwd, "cwd")
         private_home = self._canonicalize_path(environment.home, "private_home")
         private_tmp = self._canonicalize_path(environment.tmp, "private_tmp")
         runtime_roots = self._collect_runtime_roots(policy, request)
-        target_argv = self._target_argv_for(request)
 
         args = (
-            "-p",
-            template.profile_text,
             *self._profile_parameter_args(
                 workspace_root=workspace_root,
                 private_home=private_home,
                 private_tmp=private_tmp,
                 runtime_roots=runtime_roots,
             ),
+            "-p",
+            template.profile_text,
             "--",
             *target_argv,
         )
@@ -123,16 +124,17 @@ class SeatbeltBackend:
 
         probe_root = Path(tempfile.mkdtemp(prefix="seatbelt-probe-"))
         try:
-            canonical_workspace = self._canonicalize_path(
+            self._canonicalize_path(
                 workspace_root, "workspace_root"
             )
+            probe_workspace = probe_root / "workspace"
             private_root = probe_root / "private"
             private_home = private_root / "home"
             private_tmp = private_root / "tmp"
             outside_root = probe_root / "outside"
-            git_dir = canonical_workspace / ".git"
+            git_dir = probe_workspace / ".git"
             hidden_env = private_home / ".env"
-            for path in (private_home, private_tmp, outside_root, git_dir):
+            for path in (probe_workspace, private_home, private_tmp, outside_root, git_dir):
                 path.mkdir(parents=True, exist_ok=True)
             hidden_env.write_text("SEATBELT_SECRET=probe-secret\n", encoding="utf-8")
 
@@ -147,148 +149,148 @@ class SeatbeltBackend:
                 tmp=private_tmp,
             )
             capabilities = self._default_capabilities()
-            results = [
-                self._probe_definition(
-                    capability="allowed_execution",
-                    request=self._probe_request(
-                        profile_name="shell_workspace",
-                        workspace_root=canonical_workspace,
-                        cwd=canonical_workspace,
-                        argv=("/usr/bin/true",),
-                    ),
-                    policy=shell_policy,
-                    expected_returncode=0,
-                ),
-                self._probe_definition(
-                    capability="outside_workspace_write_denied",
-                    request=self._probe_request(
-                        profile_name="shell_workspace",
-                        workspace_root=canonical_workspace,
-                        cwd=canonical_workspace,
-                        argv=(
-                            "/usr/bin/python3",
-                            "-c",
-                            (
-                                "from pathlib import Path; "
-                                "Path(" + repr(str(outside_root / "blocked.txt")) + ").write_text('x')"
+            code_entrypoint = self._preferred_code_entrypoint(code_policy)
+            capability_groups = [
+                (
+                    "allowed_execution",
+                    (
+                        self._probe_definition(
+                            request=self._probe_shell_request(
+                                profile_name="shell_workspace",
+                                workspace_root=probe_workspace,
+                                cwd=probe_workspace,
+                                command=":",
                             ),
+                            policy=shell_policy,
+                            expected_returncode=0,
+                        ),
+                        self._probe_definition(
+                            request=self._probe_exec_request(
+                                profile_name="code_exec_python",
+                                workspace_root=probe_workspace,
+                                cwd=probe_workspace,
+                                argv=(str(code_entrypoint), "-c", "pass"),
+                            ),
+                            policy=code_policy,
+                            expected_returncode=0,
                         ),
                     ),
-                    policy=shell_policy,
-                    expected_returncode="nonzero",
                 ),
-                self._probe_definition(
-                    capability="network_denied",
-                    request=self._probe_request(
-                        profile_name="shell_workspace",
-                        workspace_root=canonical_workspace,
-                        cwd=canonical_workspace,
-                        argv=(
-                            "/usr/bin/python3",
-                            "-c",
-                            (
-                                "import socket; "
-                                "socket.create_connection(('1.1.1.1', 53), 0.25)"
+                (
+                    "outside_workspace_write_denied",
+                    (
+                        self._probe_definition(
+                            request=self._probe_shell_request(
+                                profile_name="shell_workspace",
+                                workspace_root=probe_workspace,
+                                cwd=probe_workspace,
+                                command=self._shell_redirection_command(outside_root / "blocked.txt"),
                             ),
+                            policy=shell_policy,
+                            expected_returncode="nonzero",
                         ),
                     ),
-                    policy=shell_policy,
-                    expected_returncode="nonzero",
                 ),
-                self._probe_definition(
-                    capability="hidden_env_read_denied",
-                    request=self._probe_request(
-                        profile_name="shell_workspace",
-                        workspace_root=canonical_workspace,
-                        cwd=canonical_workspace,
-                        argv=(
-                            "/usr/bin/python3",
-                            "-c",
-                            (
-                                "from pathlib import Path; "
-                                "Path(" + repr(str(hidden_env)) + ").read_text(encoding='utf-8')"
+                (
+                    "network_denied",
+                    (
+                        self._probe_definition(
+                            request=self._probe_shell_request(
+                                profile_name="shell_workspace",
+                                workspace_root=probe_workspace,
+                                cwd=probe_workspace,
+                                command="nc -G 1 -z 1.1.1.1 53",
                             ),
+                            policy=shell_policy,
+                            expected_returncode="nonzero",
                         ),
                     ),
-                    policy=shell_policy,
-                    expected_returncode="nonzero",
                 ),
-                self._probe_definition(
-                    capability="protected_git_write_denied",
-                    request=self._probe_request(
-                        profile_name="shell_workspace",
-                        workspace_root=canonical_workspace,
-                        cwd=canonical_workspace,
-                        argv=(
-                            "/usr/bin/python3",
-                            "-c",
-                            (
-                                "from pathlib import Path; "
-                                "Path(" + repr(str(git_dir / "config")) + ").write_text('x')"
+                (
+                    "hidden_env_read_denied",
+                    (
+                        self._probe_definition(
+                            request=self._probe_shell_request(
+                                profile_name="shell_workspace",
+                                workspace_root=probe_workspace,
+                                cwd=probe_workspace,
+                                command="cat " + shlex.quote(str(hidden_env)) + " >/dev/null",
                             ),
+                            policy=shell_policy,
+                            expected_returncode="nonzero",
                         ),
                     ),
-                    policy=shell_policy,
-                    expected_returncode="nonzero",
                 ),
-                self._probe_definition(
-                    capability="child_creation_denied",
-                    request=self._probe_request(
-                        profile_name="code_exec_python",
-                        workspace_root=canonical_workspace,
-                        cwd=canonical_workspace,
-                        argv=(
-                            "/usr/bin/python3",
-                            "-c",
-                            (
-                                "import subprocess; "
-                                "subprocess.run(['/usr/bin/true'], check=True)"
+                (
+                    "protected_git_write_denied",
+                    (
+                        self._probe_definition(
+                            request=self._probe_shell_request(
+                                profile_name="shell_workspace",
+                                workspace_root=probe_workspace,
+                                cwd=probe_workspace,
+                                command=self._shell_redirection_command(git_dir / "config"),
                             ),
+                            policy=shell_policy,
+                            expected_returncode="nonzero",
                         ),
                     ),
-                    policy=code_policy,
-                    expected_returncode="nonzero",
+                ),
+                (
+                    "child_creation_denied",
+                    (
+                        self._probe_definition(
+                            request=self._probe_exec_request(
+                                profile_name="code_exec_python",
+                                workspace_root=probe_workspace,
+                                cwd=probe_workspace,
+                                argv=(
+                                    str(code_entrypoint),
+                                    "-c",
+                                    "import subprocess; subprocess.run(['/usr/bin/true'], check=True)",
+                                ),
+                            ),
+                            policy=code_policy,
+                            expected_returncode="nonzero",
+                        ),
+                    ),
                 ),
             ]
 
-            for definition in results:
-                try:
-                    spec = self.build_launch_spec(
-                        definition["request"],
-                        definition["policy"],
-                        environment,
-                    )
-                    completed = self._run_probe_command(
-                        args=[spec.executable, *spec.args],
-                        env=environment.env,
-                    )
-                except subprocess.TimeoutExpired:
-                    capabilities[definition["capability"]] = False
-                    return SandboxProbeResult(
-                        backend_name=self.name,
-                        available=False,
-                        capabilities=capabilities,
-                        reason=self._failed_probe_reason(definition["capability"]),
-                    )
-                except Exception:
-                    capabilities[definition["capability"]] = False
-                    return SandboxProbeResult(
-                        backend_name=self.name,
-                        available=False,
-                        capabilities=capabilities,
-                        reason=self._failed_probe_reason(definition["capability"]),
-                    )
+            for capability, definitions in capability_groups:
+                capability_passed = True
+                for definition in definitions:
+                    try:
+                        spec = self.build_launch_spec(
+                            definition["request"],
+                            definition["policy"],
+                            environment,
+                        )
+                        completed = self._run_probe_command(
+                            args=[spec.executable, *spec.args],
+                            env=environment.env,
+                        )
+                    except subprocess.TimeoutExpired:
+                        capability_passed = False
+                        break
+                    except Exception:
+                        capability_passed = False
+                        break
 
-                expected = definition["expected_returncode"]
-                observed = completed.returncode
-                success = observed == 0 if expected == 0 else observed != 0
-                capabilities[definition["capability"]] = success
-                if not success:
+                    expected = definition["expected_returncode"]
+                    observed = completed.returncode
+                    success = observed == 0 if expected == 0 else observed != 0
+                    if not success:
+                        capability_passed = False
+                        break
+
+                capabilities[capability] = capability_passed
+                if not capability_passed:
                     return SandboxProbeResult(
                         backend_name=self.name,
                         available=False,
                         capabilities=capabilities,
-                        reason=self._failed_probe_reason(definition["capability"]),
+                        reason=self._failed_probe_reason(capability),
                     )
 
             return SandboxProbeResult(
@@ -376,6 +378,20 @@ class SeatbeltBackend:
                 "protected path policy must match the reviewed seatbelt rules"
             )
 
+    def _canonicalize_existing_path(self, path: Path, label: str) -> Path:
+        value = str(path)
+        if "\x00" in value:
+            raise SandboxLaunchError(f"{label} is invalid")
+        if not path.is_absolute():
+            raise SandboxLaunchError(f"{label} is invalid")
+        try:
+            canonical = path.resolve(strict=True)
+        except OSError as exc:
+            raise SandboxLaunchError(f"{label} is invalid") from exc
+        if not canonical.is_file():
+            raise SandboxLaunchError(f"{label} is invalid")
+        return canonical
+
     def _canonicalize_path(self, path: Path, label: str) -> Path:
         value = str(path)
         if "\x00" in value:
@@ -421,18 +437,48 @@ class SeatbeltBackend:
             args.extend(["-D", "RUNTIME_ROOT_" + str(index) + "=" + str(path)])
         return tuple(args)
 
-    def _target_argv_for(self, request: SandboxExecRequest) -> tuple[str, ...]:
+    def _target_argv_for(
+        self,
+        request: SandboxExecRequest,
+        policy: SandboxProfilePolicy,
+    ) -> tuple[str, ...]:
+        allowed_entrypoints = self._canonical_allowed_entrypoints(policy)
         if request.mode == "shell_string":
             if request.command is None or request.argv is not None:
                 raise SandboxLaunchError("command is required for shell_string mode")
+            shell_entrypoint = self._canonicalize_existing_path(Path("/bin/sh"), "entrypoint")
+            if shell_entrypoint not in allowed_entrypoints:
+                raise SandboxLaunchError("entrypoint is not allowed by the seatbelt policy")
             return ("/bin/sh", "-c", request.command)
         if request.mode == "exec_argv":
             if request.command is not None or not request.argv:
                 raise SandboxLaunchError("argv must include executable for exec_argv mode")
+            executable = Path(request.argv[0])
+            target_entrypoint = self._canonicalize_existing_path(executable, "entrypoint")
+            if target_entrypoint not in allowed_entrypoints:
+                raise SandboxLaunchError("entrypoint is not allowed by the seatbelt policy")
             return request.argv
         raise SandboxLaunchError("unsupported request mode")
 
-    def _probe_request(
+    def _probe_shell_request(
+        self,
+        *,
+        profile_name: str,
+        workspace_root: Path,
+        cwd: Path,
+        command: str,
+    ) -> SandboxExecRequest:
+        return SandboxExecRequest(
+            tool_name="probe",
+            profile_name=profile_name,
+            mode="shell_string",
+            command=command,
+            workspace_root=workspace_root,
+            cwd=cwd,
+            timeout_seconds=self.probe_timeout_seconds,
+        )
+
+    def _probe_exec_request(
         self,
         *,
         profile_name: str,
@@ -453,13 +499,11 @@ class SeatbeltBackend:
     def _probe_definition(
         self,
         *,
-        capability: str,
         request: SandboxExecRequest,
         policy: SandboxProfilePolicy,
         expected_returncode: int | str,
     ) -> dict[str, Any]:
         return {
-            "capability": capability,
             "request": request,
             "policy": policy,
             "expected_returncode": expected_returncode,
@@ -480,3 +524,21 @@ class SeatbeltBackend:
 
     def _failed_probe_reason(self, capability: str) -> str:
         return "seatbelt capability check failed: " + capability
+
+    def _canonical_allowed_entrypoints(
+        self,
+        policy: SandboxProfilePolicy,
+    ) -> tuple[Path, ...]:
+        if not policy.entrypoints:
+            raise SandboxLaunchError("entrypoint policy is invalid")
+        return tuple(
+            self._canonicalize_existing_path(entrypoint, "entrypoint")
+            for entrypoint in policy.entrypoints
+        )
+
+    def _preferred_code_entrypoint(self, policy: SandboxProfilePolicy) -> Path:
+        entrypoints = self._canonical_allowed_entrypoints(policy)
+        return entrypoints[0]
+
+    def _shell_redirection_command(self, target_path: Path) -> str:
+        return ": > " + shlex.quote(str(target_path))
