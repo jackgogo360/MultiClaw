@@ -24,11 +24,7 @@ from multiclaw.tools.find_dir import FindDirToolBuilder
 from multiclaw.tools.glob import GlobToolBuilder
 from multiclaw.tools.grep import GrepToolBuilder
 from multiclaw.tools.list_dir import ListDirToolBuilder
-from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.read_file import ReadFileToolBuilder
-from multiclaw.tools.shell import ShellToolBuilder
-from multiclaw.tools.web_fetch import WebFetchToolBuilder
-from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
 
 
@@ -135,24 +131,14 @@ class TestToolRegistry:
         assert registry.get("echo") is builder
         assert [tool.name for tool in registry.list_all()] == ["echo"]
 
-    def test_runtime_registry_matches_agent_code_tool_set(self, tmp_path):
-        registry = ToolRegistry()
-        read_builder = ReadFileToolBuilder(str(tmp_path))
-        edit_builder = EditFileToolBuilder(str(tmp_path))
-        registry.register(read_builder)
-        registry.register(WriteFileToolBuilder(str(tmp_path), read_builder))
-        registry.register(edit_builder)
-        registry.register(UndoEditToolBuilder(str(tmp_path), edit_builder))
-        registry.register(GlobToolBuilder(str(tmp_path)))
-        registry.register(ListDirToolBuilder(str(tmp_path)))
-        registry.register(GrepToolBuilder(str(tmp_path)))
-        registry.register(FindDirToolBuilder(str(tmp_path)))
-        registry.register(ShellToolBuilder(str(tmp_path)))
-        registry.register(CodeExecToolBuilder(str(tmp_path)))
-        registry.register(WebFetchToolBuilder(str(tmp_path)))
-        registry.register(WebSearchToolBuilder(str(tmp_path)))
+    def test_runtime_registry_matches_agent_code_tool_set(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+        monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
+        from multiclaw.server import create_agent
 
-        assert [tool.name for tool in registry.list_all()] == [
+        agent = create_agent()
+
+        assert [tool.name for tool in agent.registry.list_all()] == [
             "code_exec",
             "edit_file",
             "find_dir",

@@ -83,7 +83,7 @@ def _friendly_error(exc: Exception) -> str:
 from multiclaw.agent import MultiClawAgent
 from multiclaw.config import Settings
 from multiclaw.events import Event, EventBus
-from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
+from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.llm import ModelRouter
 from multiclaw.memory import SqliteMemory
 from multiclaw.planner import Planner
@@ -285,7 +285,7 @@ def create_agent() -> MultiClawAgent:
                 "code_exec",
             }
         ),
-        sandbox=ProcessSandbox(),
+        execution_guard=ExecutionGuard(),
         audit_logger=InMemoryAuditLogger(),
         event_bus=shared_bus,
     )
