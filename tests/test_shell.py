@@ -63,3 +63,26 @@ class TestShellTool:
         ).execute()
         assert result.status == "success"
         assert "err msg" in result.content
+
+    @pytest.mark.asyncio
+    async def test_shell_preserves_pipeline_redirect_quote_glob_and_env(self, workspace):
+        builder = ShellToolBuilder(str(workspace))
+        command = (
+            "VALUE='a b'; export VALUE; "
+            "touch one.py two.py; "
+            "printf '%s\\n' *.py > files.txt; "
+            "printf '%s|' \"$VALUE\"; tail -n 1 files.txt"
+        )
+        result = await builder.build(builder.validate({"command": command})).execute()
+        assert result.status == "success"
+        assert "a b|two.py" in result.content
+
+    @pytest.mark.asyncio
+    async def test_shell_preserves_nonzero_exit_code_and_stderr(self, workspace):
+        builder = ShellToolBuilder(str(workspace))
+        result = await builder.build(
+            builder.validate({"command": "printf problem >&2; exit 7"})
+        ).execute()
+        assert "[stderr]" in result.content
+        assert "problem" in result.content
+        assert result.data == {"exit_code": 7}
