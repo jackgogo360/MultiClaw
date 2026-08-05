@@ -216,7 +216,9 @@ class UnavailableSandboxController:
         return self._readiness
 
     def drain_startup_events(self) -> tuple[Event, ...]:
-        return self._events
+        events = self._events
+        self._events = ()
+        return events
 
     def close(self) -> None:
         return None
