@@ -329,6 +329,33 @@ def test_auto_initialize_probes_once_and_marks_only_proven_profiles_ready(
     assert finalized is manager.finalize_readiness()
 
 
+@pytest.mark.parametrize("backend_name", ["seatbelt", "nsjail"])
+def test_backend_proven_mcp_profile_stays_ready_for_current_native_backend_shape(
+    tmp_path: Path,
+    backend_name: str,
+) -> None:
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    backend = RecordingBackend(name=backend_name)
+    manager = SandboxManager.create(
+        settings=_settings(),
+        debug=False,
+        workspace_root=tmp_path,
+        backend_override=backend,
+    )
+
+    manager.initialize()
+    readiness = manager.finalize_readiness()
+
+    assert readiness.ready is True
+    assert readiness.profiles == {
+        "shell_workspace": True,
+        "code_exec_python": True,
+        "mcp_stdio_local": True,
+    }
+    assert readiness.skipped_capabilities == {}
+
+
 def test_auto_initialize_fails_closed_on_failed_or_incomplete_probe_and_never_falls_back_to_host(
     tmp_path: Path,
 ) -> None:
@@ -437,8 +464,9 @@ def test_fixed_profile_registry_matches_expected_policies_and_runtime_roots(
 
     mcp_policy = policies["mcp_stdio_local"]
     assert mcp_policy.workspace_mode == "ro"
-    assert mcp_policy.network_mode == "disabled"
-    assert mcp_policy.allow_subprocesses is False
+    assert mcp_policy.network_mode == "inherit"
+    assert mcp_policy.allow_subprocesses is True
+    assert mcp_policy.entrypoints == (Path("/usr/bin/env").resolve(),)
     assert mcp_policy.write_protected_patterns == (".git",)
     assert mcp_policy.read_hidden_patterns == (".env", ".env.*")
 
