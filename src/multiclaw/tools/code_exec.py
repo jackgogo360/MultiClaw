@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import sys
 import uuid
-from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+from multiclaw.tools import _code_runner
 from multiclaw.governance import (
     SandboxConfigurationError,
     SandboxController,
@@ -25,11 +24,7 @@ from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
 DEFAULT_TIMEOUT = 30.0
 MAX_TIMEOUT = 300.0
 MAX_OUTPUT_CHARS = 30_000
-MAX_ENVELOPE_BYTES = 1_048_576
 TRUNCATION_MARKER = "\n... [output truncated: {removed} characters removed] ...\n"
-RUNNER_MODULE = "multiclaw.tools._code_runner"
-RUNNER_FLAG = "--restrict-builtins"
-RUNNER_KEYS = ("success", "stdout", "stderr", "error")
 
 
 class CodeExecParams(BaseModel):
@@ -82,15 +77,15 @@ class CodeExecInvocation(ToolInvocation[CodeExecParams]):
         try:
             exec_result = await self.sandbox_controller.run(request)
         except SandboxUnavailableError:
-            return _error("sandbox profile unavailable")
+            return self._with_request_audit(_error("sandbox profile unavailable"))
         except SandboxConfigurationError:
-            return _error("sandbox configuration unavailable")
+            return self._with_request_audit(_error("sandbox configuration unavailable"))
         except SandboxPolicyError:
-            return _error("sandbox policy blocked execution")
+            return self._with_request_audit(_error("sandbox policy blocked execution"))
         except SandboxLaunchError:
-            return _error("sandbox failed to launch command")
+            return self._with_request_audit(_error("sandbox failed to launch command"))
         except Exception:
-            return _error("sandbox execution failed")
+            return self._with_request_audit(_error("sandbox execution failed"))
 
         if exec_result.timed_out:
             return self._with_audit(
@@ -98,88 +93,65 @@ class CodeExecInvocation(ToolInvocation[CodeExecParams]):
                 exec_result,
             )
 
-        if exec_result.exit_code != 0 or exec_result.stderr:
-            return self._with_audit(_error("sandbox execution failed"), exec_result)
+        stdout = self._truncate(
+            exec_result.stdout.decode("utf-8", errors="replace")
+            if exec_result.stdout
+            else ""
+        )
+        stderr = self._truncate(
+            exec_result.stderr.decode("utf-8", errors="replace")
+            if exec_result.stderr
+            else ""
+        )
 
-        try:
-            payload = self._parse_envelope(exec_result.stdout)
-        except ValueError:
-            return self._with_audit(_error("sandbox execution failed"), exec_result)
+        if exec_result.exit_code == 0:
+            parts = []
+            if stdout:
+                parts.append(stdout)
+            if stderr:
+                parts.append(f"[stderr]\n{stderr}")
+            if not parts:
+                parts.append("[No output]")
+            return self._with_audit(
+                _success("\n".join(parts), data={"success": True}),
+                exec_result,
+            )
 
-        stdout = self._truncate(payload["stdout"])
-        stderr = self._truncate(payload["stderr"])
-        error = self._truncate(payload["error"])
+        error = self._failure_error_text(exec_result, stderr)
 
         parts = []
         if stdout:
             parts.append(stdout)
-        if stderr:
-            parts.append(f"[stderr]\n{stderr}")
         if error:
             parts.append(f"[error]\n{error}")
         if not parts:
             parts.append("[No output]")
 
-        if not payload["success"]:
-            return self._with_audit(
-                _success(
-                    "\n".join(parts),
-                    data={"success": False, "error": error},
-                ),
-                exec_result,
-            )
-
-        return self._with_audit(_success("\n".join(parts), data={"success": True}), exec_result)
+        return self._with_audit(
+            _success(
+                "\n".join(parts),
+                data={"success": False, "error": error},
+            ),
+            exec_result,
+        )
 
     def _build_argv(self) -> tuple[str, ...]:
-        argv = [
+        return (
             str(Path(sys.executable).resolve()),
-            "-m",
-            RUNNER_MODULE,
-        ]
-        if self.restrict_builtins:
-            argv.append(RUNNER_FLAG)
-        return tuple(argv)
+            "-I",
+            "-S",
+            "-c",
+            _code_runner.build_bootstrap(self.restrict_builtins),
+        )
 
-    def _parse_envelope(self, raw_stdout: bytes) -> dict[str, bool | str]:
-        if len(raw_stdout) > MAX_ENVELOPE_BYTES:
-            raise ValueError("runner output too large")
-
-        try:
-            envelope_text = raw_stdout.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError("runner output must be utf-8") from exc
-
-        decoder = json.JSONDecoder(object_pairs_hook=self._reject_duplicate_keys)
-        try:
-            payload, end_index = decoder.raw_decode(envelope_text)
-        except JSONDecodeError as exc:
-            raise ValueError("runner output was not valid json") from exc
-
-        if end_index != len(envelope_text):
-            raise ValueError("runner output contained extra bytes")
-        if not isinstance(payload, dict):
-            raise ValueError("runner payload must be an object")
-        if tuple(payload.keys()) != RUNNER_KEYS:
-            raise ValueError("runner payload keys did not match protocol")
-        if not isinstance(payload["success"], bool):
-            raise ValueError("runner success must be a bool")
-
-        for key in ("stdout", "stderr", "error"):
-            if not isinstance(payload[key], str):
-                raise ValueError(f"runner {key} must be a string")
-        return payload
-
-    def _reject_duplicate_keys(
-        self,
-        pairs: list[tuple[str, object]],
-    ) -> dict[str, object]:
-        payload: dict[str, object] = {}
-        for key, value in pairs:
-            if key in payload:
-                raise ValueError("runner payload contained duplicate keys")
-            payload[key] = value
-        return payload
+    def _failure_error_text(self, exec_result, stderr: str) -> str:
+        if stderr:
+            return stderr
+        if exec_result.exit_code is not None:
+            return f"Python exited with code {exec_result.exit_code}"
+        if exec_result.signal:
+            return f"Python exited due to {exec_result.signal}"
+        return "Python exited unexpectedly"
 
     def _with_audit(
         self,
@@ -191,6 +163,17 @@ class CodeExecInvocation(ToolInvocation[CodeExecParams]):
                 "sandbox_backend": exec_result.backend_name,
                 "sandbox_profile": exec_result.profile_name,
                 "unsafe_fallback_used": exec_result.unsafe_fallback_used,
+            }
+        )
+        return result
+
+    def _with_request_audit(self, result: ToolExecutionResult) -> ToolExecutionResult:
+        result.audit.update(
+            {
+                "sandbox_backend": self.sandbox_controller.backend_name,
+                "sandbox_profile": self.profile_name,
+                "unsafe_fallback_used": self.sandbox_controller.mode
+                == "host_unsafe_dev_only",
             }
         )
         return result

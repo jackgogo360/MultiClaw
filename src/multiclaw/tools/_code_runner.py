@@ -1,17 +1,11 @@
-"""Sandboxed Python code runner used by the code_exec tool."""
+"""Static bootstrap source for sandboxed Python execution."""
 
 from __future__ import annotations
 
-import argparse
 import builtins
-import json
-import sys
-import traceback
-from contextlib import redirect_stderr, redirect_stdout
-from io import StringIO
-from typing import Any, Sequence
+from typing import Any
 
-SAFE_BUILTINS = {
+SAFE_BUILTINS = (
     "abs",
     "all",
     "any",
@@ -100,21 +94,21 @@ SAFE_BUILTINS = {
     "AssertionError",
     "EOFError",
     "LookupError",
-}
+)
 
-BLOCKED_MODULES = {"subprocess", "shutil", "ctypes", "signal"}
+BLOCKED_MODULES = ("subprocess", "shutil", "ctypes", "signal")
 
 
 def _restricted_import(name: str, *args: Any, **kwargs: Any) -> Any:
     root_name = name.split(".", 1)[0]
     if root_name in BLOCKED_MODULES:
         raise ImportError(f"Import of '{root_name}' is not allowed in sandbox mode")
-    return __import__(name, *args, **kwargs)
+    return builtins.__import__(name, *args, **kwargs)
 
 
 def build_globals(restrict_builtins: bool) -> dict[str, Any]:
     if not restrict_builtins:
-        return {"__builtins__": __builtins__}
+        return {"__builtins__": __builtins__, "__name__": "__main__"}
 
     safe_builtins = {
         name: getattr(builtins, name)
@@ -122,41 +116,40 @@ def build_globals(restrict_builtins: bool) -> dict[str, Any]:
         if hasattr(builtins, name)
     }
     safe_builtins["__import__"] = _restricted_import
-    return {"__builtins__": safe_builtins}
+    return {"__builtins__": safe_builtins, "__name__": "__main__"}
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--restrict-builtins", action="store_true")
-    args = parser.parse_args(list(argv) if argv is not None else None)
-
-    code = sys.stdin.read()
-    captured_stdout = StringIO()
-    captured_stderr = StringIO()
-    success = True
-    error = ""
-
-    try:
-        with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
-            exec(code, build_globals(args.restrict_builtins))
-    except BaseException:
-        success = False
-        error = traceback.format_exc()
-
-    sys.__stdout__.write(
-        json.dumps(
-            {
-                "success": success,
-                "stdout": captured_stdout.getvalue(),
-                "stderr": captured_stderr.getvalue(),
-                "error": error,
-            },
-            ensure_ascii=False,
+def build_bootstrap(restrict_builtins: bool) -> str:
+    if restrict_builtins:
+        bootstrap_lines = [
+            "import builtins",
+            "import sys",
+            f"SAFE_BUILTINS = {SAFE_BUILTINS!r}",
+            f"BLOCKED_MODULES = frozenset({BLOCKED_MODULES!r})",
+            "_original_import = builtins.__import__",
+            "",
+            "def _restricted_import(name, *args, **kwargs):",
+            '    root_name = name.split(".", 1)[0]',
+            "    if root_name in BLOCKED_MODULES:",
+            '        raise ImportError(f"Import of \'{root_name}\' is not allowed in sandbox mode")',
+            "    return _original_import(name, *args, **kwargs)",
+            "",
+            "builtins.__import__ = _restricted_import",
+            "_safe_builtins = {",
+            "    name: getattr(builtins, name)",
+            "    for name in SAFE_BUILTINS",
+            "    if hasattr(builtins, name)",
+            "}",
+            '_safe_builtins["__import__"] = _restricted_import',
+            'globals_dict = {"__builtins__": _safe_builtins, "__name__": "__main__"}',
+            'exec(compile(sys.stdin.read(), "<stdin>", "exec"), globals_dict)',
+        ]
+        return "\n".join(bootstrap_lines)
+    else:
+        return "\n".join(
+            [
+                "import sys",
+                'globals_dict = {"__builtins__": __builtins__, "__name__": "__main__"}',
+                'exec(compile(sys.stdin.read(), "<stdin>", "exec"), globals_dict)',
+            ]
         )
-    )
-    sys.__stdout__.flush()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
