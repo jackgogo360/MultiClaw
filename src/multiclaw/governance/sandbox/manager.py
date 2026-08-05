@@ -241,19 +241,23 @@ class SandboxManager(SandboxController):
                 for profile_name in self._profile_readiness:
                     self._profile_readiness[profile_name] = False
 
-            if not self._profile_readiness["shell_workspace"]:
+            shell_profile = self._settings.profiles.shell
+            code_exec_profile = self._settings.profiles.code_exec
+            mcp_stdio_profile = self._settings.profiles.mcp_stdio
+
+            if not self._profile_readiness[shell_profile]:
                 self._buffer_profile_unavailable(
-                    "shell_workspace",
+                    shell_profile,
                     self._probe.reason or "probe did not prove shell isolation",
                 )
-            if not self._profile_readiness["code_exec_python"]:
+            if not self._profile_readiness[code_exec_profile]:
                 self._buffer_profile_unavailable(
-                    "code_exec_python",
+                    code_exec_profile,
                     self._probe.reason or "probe did not prove code execution isolation",
                 )
-            if not self._profile_readiness["mcp_stdio_local"]:
+            if not self._profile_readiness[mcp_stdio_profile]:
                 self._buffer_profile_unavailable(
-                    "mcp_stdio_local",
+                    mcp_stdio_profile,
                     self._probe.reason or "probe did not prove MCP stdio isolation",
                 )
 
@@ -420,9 +424,9 @@ class SandboxManager(SandboxController):
             return result
 
         required = {
-            "shell_workspace": _SHELL_CAPABILITIES,
-            "code_exec_python": _CODE_CAPABILITIES,
-            "mcp_stdio_local": _MCP_CAPABILITIES,
+            self._settings.profiles.shell: _SHELL_CAPABILITIES,
+            self._settings.profiles.code_exec: _CODE_CAPABILITIES,
+            self._settings.profiles.mcp_stdio: _MCP_CAPABILITIES,
         }
         for profile_name, capability_names in required.items():
             if all(probe.capabilities.get(name, False) for name in capability_names):
