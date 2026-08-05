@@ -2,15 +2,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+
+@dataclass(frozen=True)
+class NsJailSystemMount:
+    path: str
+    is_dir: bool
+    mandatory: bool = False
+
+
 _SYSTEM_READ_ONLY_ROOTS = (
-    "/bin",
-    "/usr",
-    "/lib",
-    "/lib64",
-    "/sbin",
-    "/etc",
-    "/dev/null",
-    "/dev/urandom",
+    NsJailSystemMount("/bin", True),
+    NsJailSystemMount("/usr", True),
+    NsJailSystemMount("/lib", True),
+    NsJailSystemMount("/lib64", True),
+    NsJailSystemMount("/sbin", True),
+    NsJailSystemMount("/etc", True),
+    NsJailSystemMount("/dev/null", False),
+    NsJailSystemMount("/dev/urandom", False),
 )
 
 _COMMON_SECCOMP_RULES = (
@@ -40,7 +48,7 @@ class NsJailProfileTemplate:
     allow_subprocesses: bool
     write_protected_patterns: tuple[str, ...]
     read_hidden_patterns: tuple[str, ...]
-    system_read_only_roots: tuple[str, ...]
+    system_read_only_roots: tuple[NsJailSystemMount, ...]
     seccomp_policy: str
     rlimit_as_mb: int
     rlimit_cpu_seconds: int

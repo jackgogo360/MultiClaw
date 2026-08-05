@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 from pathlib import Path
@@ -18,6 +20,7 @@ from multiclaw.governance.sandbox.models import (
 from multiclaw.governance.sandbox.nsjail_profiles import (
     NSJAIL_PROFILES,
     NsJailProfileTemplate,
+    NsJailSystemMount,
 )
 
 _PRODUCTION_BINARY = Path("/usr/bin/nsjail")
@@ -33,6 +36,7 @@ _PROBE_CAPABILITIES = (
     "protected_git_write_denied",
     "child_creation_denied",
 )
+_PROBE_DENIED_MARKER = "MULTICLAW_NSJAIL_DENIED\n"
 
 
 def protobuf_quote(value: str) -> str:
@@ -150,6 +154,7 @@ class NsJailBackend:
 
         self._canonicalize_existing_dir(workspace_root, "workspace_root")
         probe_root = Path(tempfile.mkdtemp(prefix="nsjail-probe-"))
+        network_listener: socket.socket | None = None
         try:
             probe_workspace = probe_root / "workspace"
             private_root = probe_root / "private"
@@ -173,9 +178,17 @@ class NsJailBackend:
             )
             capabilities = self._default_capabilities()
             code_entrypoint = self._preferred_code_entrypoint(code_policy)
-            capability_groups: tuple[tuple[str, tuple[SandboxExecRequest, ...], SandboxProfilePolicy], ...] = (
+            network_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            network_listener.bind(("127.0.0.1", 0))
+            network_listener.listen(1)
+            network_port = network_listener.getsockname()[1]
+            capability_groups: tuple[
+                tuple[str, bool, tuple[SandboxExecRequest, ...], SandboxProfilePolicy],
+                ...,
+            ] = (
                 (
                     "allowed_execution",
+                    False,
                     (
                         self._probe_shell_request(
                             profile_name="shell_workspace",
@@ -198,60 +211,67 @@ class NsJailBackend:
                 ),
                 (
                     "outside_workspace_write_denied",
+                    True,
                     (
-                        self._probe_shell_request(
+                        self._probe_shell_python_request(
                             profile_name="shell_workspace",
                             workspace_root=probe_workspace,
                             cwd=probe_workspace,
-                            command=": > "
-                            + str(outside_root / "blocked.txt")
-                            + " # probe-deny-outside-write",
+                            python_entrypoint=code_entrypoint,
+                            script=self._denied_write_probe_script(outside_root / "blocked.txt"),
+                            marker_name="probe-deny-outside-write",
                         ),
                     ),
                     shell_policy,
                 ),
                 (
                     "network_denied",
+                    True,
                     (
-                        self._probe_shell_request(
+                        self._probe_shell_python_request(
                             profile_name="shell_workspace",
                             workspace_root=probe_workspace,
                             cwd=probe_workspace,
-                            command="nc -G 1 -z 1.1.1.1 53 # probe-deny-network",
+                            python_entrypoint=code_entrypoint,
+                            script=self._denied_network_probe_script(network_port),
+                            marker_name="probe-deny-network",
                         ),
                     ),
                     shell_policy,
                 ),
                 (
                     "hidden_env_read_denied",
+                    True,
                     (
-                        self._probe_shell_request(
+                        self._probe_shell_python_request(
                             profile_name="shell_workspace",
                             workspace_root=probe_workspace,
                             cwd=probe_workspace,
-                            command="cat "
-                            + str(probe_workspace / ".env")
-                            + " >/dev/null # probe-deny-hidden-read",
+                            python_entrypoint=code_entrypoint,
+                            script=self._denied_read_probe_script(probe_workspace / ".env"),
+                            marker_name="probe-deny-hidden-read",
                         ),
                     ),
                     shell_policy,
                 ),
                 (
                     "protected_git_write_denied",
+                    True,
                     (
-                        self._probe_shell_request(
+                        self._probe_shell_python_request(
                             profile_name="shell_workspace",
                             workspace_root=probe_workspace,
                             cwd=probe_workspace,
-                            command=": > "
-                            + str(git_dir / "config")
-                            + " # probe-deny-protected-write",
+                            python_entrypoint=code_entrypoint,
+                            script=self._denied_write_probe_script(git_dir / "config"),
+                            marker_name="probe-deny-protected-write",
                         ),
                     ),
                     shell_policy,
                 ),
                 (
                     "child_creation_denied",
+                    True,
                     (
                         self._probe_exec_request(
                             profile_name="code_exec_python",
@@ -260,8 +280,7 @@ class NsJailBackend:
                             argv=(
                                 str(code_entrypoint),
                                 "-c",
-                                "import subprocess; subprocess.run(['/usr/bin/true'], check=True) "
-                                "# probe-deny-child-process",
+                                self._denied_child_process_probe_script(),
                             ),
                         ),
                     ),
@@ -269,7 +288,7 @@ class NsJailBackend:
                 ),
             )
 
-            for capability, requests, default_policy in capability_groups:
+            for capability, expect_denied_marker, requests, default_policy in capability_groups:
                 capability_passed = True
                 for probe_request in requests:
                     policy = code_policy if probe_request.profile_name == "code_exec_python" else default_policy
@@ -286,9 +305,10 @@ class NsJailBackend:
                         capability_passed = False
                         break
 
-                    marker = spec.args[-1]
-                    expected_zero = "probe-allow" in marker
-                    success = completed.returncode == 0 if expected_zero else completed.returncode != 0
+                    success = self._probe_result_matches(
+                        completed=completed,
+                        expect_denied_marker=expect_denied_marker,
+                    )
                     if not success:
                         capability_passed = False
                         break
@@ -309,6 +329,11 @@ class NsJailBackend:
                 reason="",
             )
         finally:
+            try:
+                if network_listener is not None:
+                    network_listener.close()
+            except Exception:
+                pass
             shutil.rmtree(probe_root, ignore_errors=True)
 
     def _probe_binary_ready(self) -> tuple[bool, Path | None, str]:
@@ -445,12 +470,17 @@ class NsJailBackend:
         *,
         workspace_root: Path,
         patterns: tuple[str, ...],
-    ) -> tuple[Path, ...]:
-        matches: set[Path] = set()
+    ) -> tuple[tuple[Path, Path], ...]:
+        matches: dict[Path, Path] = {}
+        canonical_workspace = workspace_root.resolve(strict=True)
         for pattern in patterns:
             for path in workspace_root.glob(pattern):
-                matches.add(path.resolve(strict=True))
-        return tuple(sorted(matches, key=str))
+                if path.is_symlink():
+                    raise SandboxLaunchError("workspace path match is invalid")
+                canonical = path.resolve(strict=True)
+                self._ensure_relative_to(canonical, canonical_workspace, "workspace path match")
+                matches[path] = canonical
+        return tuple(sorted(matches.items(), key=lambda item: str(item[0])))
 
     def _prepare_hidden_mount_sources(
         self,
@@ -462,7 +492,7 @@ class NsJailBackend:
         hidden_root = private_root / ".nsjail-hidden"
         hidden_root.mkdir(mode=0o700, exist_ok=True)
         mounts: list[tuple[Path, Path]] = []
-        for index, hidden_path in enumerate(
+        for index, (lexical_path, canonical_path) in enumerate(
             self._existing_workspace_matches(workspace_root=workspace_root, patterns=patterns)
         ):
             target = hidden_root / f"hidden-{index}"
@@ -471,14 +501,14 @@ class NsJailBackend:
                     shutil.rmtree(target)
                 else:
                     target.unlink()
-            if hidden_path.is_dir():
+            if canonical_path.is_dir():
                 target.mkdir(mode=0o000, exist_ok=True)
                 os.chmod(target, 0o000)
             else:
                 fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
                 os.close(fd)
                 os.chmod(target, 0o000)
-            mounts.append((hidden_path, target.resolve(strict=True)))
+            mounts.append((lexical_path, target.resolve(strict=True)))
         return tuple(mounts)
 
     def _render_config_text(
@@ -562,15 +592,15 @@ class NsJailBackend:
             )
         )
         for root in template.system_read_only_roots:
-            src = self._canonicalize_path(Path(root), "system_root")
-            is_dir = src.suffix == ""
+            src = self._canonicalize_path(Path(root.path), "system_root")
+            is_dir = self._mount_type_for_system_root(src, root)
             lines.extend(
                 self._mount_block(
                     src=src,
                     dst=src,
                     rw=False,
                     is_dir=is_dir,
-                    mandatory=False,
+                    mandatory=root.mandatory,
                 )
             )
         for root in runtime_roots:
@@ -583,13 +613,13 @@ class NsJailBackend:
                     mandatory=True,
                 )
             )
-        for protected in protected_mounts:
+        for protected, canonical_protected in protected_mounts:
             lines.extend(
                 self._mount_block(
-                    src=protected,
+                    src=canonical_protected,
                     dst=protected,
                     rw=False,
-                    is_dir=protected.is_dir(),
+                    is_dir=canonical_protected.is_dir(),
                     mandatory=True,
                 )
             )
@@ -719,6 +749,30 @@ class NsJailBackend:
             timeout_seconds=self.probe_timeout_seconds,
         )
 
+    def _probe_shell_python_request(
+        self,
+        *,
+        profile_name: str,
+        workspace_root: Path,
+        cwd: Path,
+        python_entrypoint: Path,
+        script: str,
+        marker_name: str,
+    ) -> SandboxExecRequest:
+        command = (
+            shlex.quote(str(python_entrypoint))
+            + " -c "
+            + shlex.quote(script)
+            + " # "
+            + marker_name
+        )
+        return self._probe_shell_request(
+            profile_name=profile_name,
+            workspace_root=workspace_root,
+            cwd=cwd,
+            command=command,
+        )
+
     def _probe_exec_request(
         self,
         *,
@@ -752,3 +806,81 @@ class NsJailBackend:
 
     def _failed_probe_reason(self, capability: str) -> str:
         return "nsjail capability check failed: " + capability
+
+    def _probe_result_matches(
+        self,
+        *,
+        completed: subprocess.CompletedProcess[bytes],
+        expect_denied_marker: bool,
+    ) -> bool:
+        if expect_denied_marker:
+            return (
+                completed.returncode == 0
+                and completed.stdout == _PROBE_DENIED_MARKER.encode("utf-8")
+            )
+        return (
+            completed.returncode == 0
+            and completed.stdout != _PROBE_DENIED_MARKER.encode("utf-8")
+        )
+
+    def _mount_type_for_system_root(
+        self,
+        path: Path,
+        system_root: NsJailSystemMount,
+    ) -> bool:
+        if path.exists():
+            return path.is_dir()
+        return system_root.is_dir
+
+    def _denied_read_probe_script(self, target_path: Path) -> str:
+        return (
+            "import sys\n"
+            f"target = {str(target_path)!r}\n"
+            "try:\n"
+            "    with open(target, 'rb') as handle:\n"
+            "        handle.read(1)\n"
+            "except (OSError, PermissionError):\n"
+            f"    sys.stdout.write({_PROBE_DENIED_MARKER!r})\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(23)\n"
+        )
+
+    def _denied_write_probe_script(self, target_path: Path) -> str:
+        return (
+            "import sys\n"
+            f"target = {str(target_path)!r}\n"
+            "try:\n"
+            "    with open(target, 'wb') as handle:\n"
+            "        handle.write(b'x')\n"
+            "except (OSError, PermissionError):\n"
+            f"    sys.stdout.write({_PROBE_DENIED_MARKER!r})\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(23)\n"
+        )
+
+    def _denied_network_probe_script(self, port: int) -> str:
+        return (
+            "import socket\n"
+            "import sys\n"
+            "try:\n"
+            f"    sock = socket.create_connection(('127.0.0.1', {port}), timeout=1.0)\n"
+            "except OSError:\n"
+            f"    sys.stdout.write({_PROBE_DENIED_MARKER!r})\n"
+            "    raise SystemExit(0)\n"
+            "else:\n"
+            "    sock.close()\n"
+            "raise SystemExit(23)\n"
+        )
+
+    def _denied_child_process_probe_script(self) -> str:
+        return (
+            "import subprocess\n"
+            "import sys\n"
+            "# probe-deny-child-process\n"
+            "try:\n"
+            "    subprocess.run(['/usr/bin/true'], check=True)\n"
+            "except (OSError, PermissionError):\n"
+            f"    sys.stdout.write({_PROBE_DENIED_MARKER!r})\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(23)\n"
+        )

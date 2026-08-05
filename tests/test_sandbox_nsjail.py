@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import stat
 import subprocess
 from pathlib import Path
@@ -234,6 +235,36 @@ def test_nsjail_config_contains_reviewed_namespace_mount_and_rlimit_fragments(
     assert config_text.count(f'src: "{protobuf_quote(str(runtime_root.resolve()))}"') == 1
 
 
+def test_nsjail_mount_type_semantics_use_real_filesystem_types(tmp_path: Path) -> None:
+    from multiclaw.governance.sandbox.nsjail import NsJailBackend
+
+    workspace = _workspace_tree(tmp_path)
+    environment = _environment(tmp_path)
+    runtime_file = tmp_path / "runtime-file.txt"
+    runtime_file.write_text("runtime\n", encoding="utf-8")
+
+    launch = NsJailBackend(binary=Path("/usr/bin/nsjail")).build_launch_spec(
+        SandboxExecRequest(
+            tool_name="shell",
+            profile_name="shell_workspace",
+            mode="shell_string",
+            command=":",
+            workspace_root=workspace,
+            cwd=workspace,
+            timeout_seconds=5.0,
+            read_only_paths=(runtime_file,),
+        ),
+        _policy(),
+        environment,
+    )
+    config_text = _config_text(launch.args)
+
+    assert 'src: "/dev/null"\n  dst: "/dev/null"\n  is_bind: true\n  rw: false\n  is_dir: false' in config_text
+    assert 'src: "/dev/urandom"\n  dst: "/dev/urandom"\n  is_bind: true\n  rw: false\n  is_dir: false' in config_text
+    assert f'src: "{workspace.resolve()}"\n  dst: "{workspace.resolve()}"\n  is_bind: true\n  rw: true\n  is_dir: true' in config_text
+    assert f'src: "{runtime_file.resolve()}"\n  dst: "{runtime_file.resolve()}"\n  is_bind: true\n  rw: false\n  is_dir: false' in config_text
+
+
 @pytest.mark.parametrize(
     ("profile_name", "workspace_mode", "network_mode", "allow_subprocesses", "entrypoint"),
     [
@@ -453,6 +484,45 @@ def test_nsjail_shell_wrapper_requires_bin_sh_policy_and_exec_entrypoint_is_allo
         )
 
 
+@pytest.mark.parametrize("path_name", [".git", ".env", ".env.local"])
+def test_nsjail_rejects_workspace_symlink_matches_for_protected_and_hidden_paths(
+    tmp_path: Path,
+    path_name: str,
+) -> None:
+    from multiclaw.governance.sandbox.nsjail import NsJailBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir()
+    outside_file = outside_root / "secret.txt"
+    outside_file.write_text("secret\n", encoding="utf-8")
+    if path_name == ".git":
+        target = outside_root / "git-dir"
+        target.mkdir()
+    else:
+        target = outside_file
+    (workspace / path_name).symlink_to(target)
+
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command=":",
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+    )
+
+    with pytest.raises(SandboxLaunchError, match="workspace path match is invalid"):
+        NsJailBackend(binary=Path("/usr/bin/nsjail")).build_launch_spec(
+            request,
+            _policy(),
+            environment,
+        )
+
+
 def test_nsjail_probe_rejects_missing_nonfile_nonexecutable_and_noncanonical_binary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -520,6 +590,7 @@ def test_nsjail_probe_reports_capabilities_only_after_behavioral_proofs(
     monkeypatch.setattr("multiclaw.governance.sandbox.nsjail._PRODUCTION_BINARY", real_binary.resolve())
 
     calls: list[dict[str, object]] = []
+    deny_marker = b"MULTICLAW_NSJAIL_DENIED\n"
 
     def fake_run(args, *, shell, capture_output, timeout, check, env):
         assert shell is False
@@ -543,7 +614,7 @@ def test_nsjail_probe_reports_capabilities_only_after_behavioral_proofs(
                 "probe-deny-child-process",
             )
         ):
-            return subprocess.CompletedProcess(args, 111, b"", b"expected deny")
+            return subprocess.CompletedProcess(args, 0, deny_marker, b"")
         raise AssertionError(f"unexpected marker {marker!r}")
 
     policies = (
@@ -575,6 +646,13 @@ def test_nsjail_probe_reports_capabilities_only_after_behavioral_proofs(
     assert all("--config" in call["args"] for call in calls)
     assert all("super-secret-token" not in call["config"] for call in calls)
     assert all("probe-secret" not in call["config"] for call in calls)
+    assert all("1.1.1.1" not in " ".join(call["args"]) for call in calls)
+    assert all(" nc " not in f" {' '.join(call['args'])} " for call in calls)
+    network_calls = [
+        call for call in calls if "probe-deny-network" in call["args"][-1]
+    ]
+    assert len(network_calls) == 1
+    assert "127.0.0.1" in " ".join(network_calls[0]["args"])
 
 
 def test_nsjail_probe_fails_closed_on_timeout_and_sanitizes_reason(
@@ -618,6 +696,42 @@ def test_nsjail_probe_fails_closed_on_timeout_and_sanitizes_reason(
     assert not probe_root.exists()
 
 
+def test_nsjail_probe_rejects_generic_nonzero_without_denial_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiclaw.governance.sandbox.nsjail import NsJailBackend
+
+    workspace = _workspace_tree(tmp_path)
+    real_binary = tmp_path / "nsjail"
+    real_binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_binary.chmod(0o755)
+    monkeypatch.setattr("multiclaw.governance.sandbox.nsjail._PRODUCTION_BINARY", real_binary.resolve())
+
+    def fake_run(args, *, shell, capture_output, timeout, check, env):
+        del shell, capture_output, timeout, check, env
+        marker = args[-1]
+        if "probe-allow" in marker:
+            return subprocess.CompletedProcess(args, 0, b"ok", b"")
+        return subprocess.CompletedProcess(args, 1, b"", b"generic failure")
+
+    policies = (
+        _policy(),
+        _policy(
+            name="code_exec_python",
+            allow_subprocesses=False,
+            entrypoints=(Path("/usr/bin/python3"),),
+        ),
+    )
+
+    result = NsJailBackend(binary=real_binary, subprocess_run=fake_run).probe(workspace, policies)
+
+    assert result.available is False
+    assert result.reason == "nsjail capability check failed: outside_workspace_write_denied"
+    assert result.capabilities["allowed_execution"] is True
+    assert result.capabilities["outside_workspace_write_denied"] is False
+
+
 def test_nsjail_probe_rejects_missing_required_profiles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -636,6 +750,51 @@ def test_nsjail_probe_rejects_missing_required_profiles(
 
     assert result.available is False
     assert "required nsjail profiles" in result.reason
+
+
+def test_nsjail_probe_closes_loopback_listener_on_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiclaw.governance.sandbox.nsjail import NsJailBackend
+
+    workspace = _workspace_tree(tmp_path)
+    real_binary = tmp_path / "nsjail"
+    real_binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_binary.chmod(0o755)
+    monkeypatch.setattr("multiclaw.governance.sandbox.nsjail._PRODUCTION_BINARY", real_binary.resolve())
+
+    closed: list[bool] = []
+    original_socket = socket.socket
+
+    class TrackingSocket(socket.socket):
+        def close(self):
+            closed.append(True)
+            return super().close()
+
+    monkeypatch.setattr("multiclaw.governance.sandbox.nsjail.socket.socket", TrackingSocket)
+
+    def fake_run(args, *, shell, capture_output, timeout, check, env):
+        del shell, capture_output, timeout, check, env
+        marker = args[-1]
+        if "probe-allow" in marker:
+            return subprocess.CompletedProcess(args, 0, b"ok", b"")
+        return subprocess.CompletedProcess(args, 0, b"MULTICLAW_NSJAIL_DENIED\n", b"")
+
+    policies = (
+        _policy(),
+        _policy(
+            name="code_exec_python",
+            allow_subprocesses=False,
+            entrypoints=(Path("/usr/bin/python3"),),
+        ),
+    )
+
+    result = NsJailBackend(binary=real_binary, subprocess_run=fake_run).probe(workspace, policies)
+
+    assert result.available is True
+    assert closed
+    assert original_socket is not None
 
 
 def test_nsjail_config_creation_failure_cleans_partial_private_file(
