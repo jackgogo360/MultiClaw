@@ -32,3 +32,8 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "native_sandbox: opt-in integration tests that exercise real native sandbox backends",
+    "macos_sandbox: macOS seatbelt native sandbox integration tests",
+    "linux_sandbox: Linux nsjail native sandbox integration tests",
+]
