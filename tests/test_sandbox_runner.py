@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -74,17 +75,56 @@ def _best_effort_kill_pid(pid: int | None) -> None:
         return
 
 
-def _read_pid_record(record_path: Path) -> dict[str, int]:
-    return json.loads(record_path.read_text(encoding="utf-8"))
+def _is_pid_record(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("parent_pid"), int)
+        and isinstance(value.get("child_pid"), int)
+    )
 
 
-async def _wait_for_file(path: Path, *, timeout_seconds: float = 2.0) -> None:
+async def _wait_for_pid_record(
+    path: Path,
+    *,
+    timeout_seconds: float = 2.0,
+) -> dict[str, int]:
     deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
     while time.monotonic() < deadline:
-        if path.exists():
-            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            last_error = exc
+        else:
+            if _is_pid_record(payload):
+                return payload
+            last_error = AssertionError(
+                f"{path} contained unexpected payload: {payload!r}"
+            )
         await asyncio.sleep(0.01)
-    raise AssertionError(f"timed out waiting for {path}")
+    detail = f"; last error: {last_error}" if last_error is not None else ""
+    raise AssertionError(f"timed out waiting for complete PID record at {path}{detail}")
+
+
+@pytest.mark.asyncio
+async def test_wait_for_pid_record_waits_for_complete_json(tmp_path: Path) -> None:
+    record_path = tmp_path / "partial.json"
+
+    async def writer() -> None:
+        record_path.write_text("{", encoding="utf-8")
+        await asyncio.sleep(0.05)
+        record_path.write_text(
+            json.dumps({"parent_pid": 111, "child_pid": 222}),
+            encoding="utf-8",
+        )
+
+    writer_task = asyncio.create_task(writer())
+    try:
+        record = await _wait_for_pid_record(record_path, timeout_seconds=1.0)
+    finally:
+        await writer_task
+
+    assert record == {"parent_pid": 111, "child_pid": 222}
 
 
 @pytest.mark.asyncio
@@ -225,15 +265,16 @@ async def test_sandbox_runner_kills_descendants_on_timeout(tmp_path: Path) -> No
     )
     spec = _make_spec(tmp_path, code=script, correlation_id="descendant-timeout")
 
+    task: asyncio.Task | None = None
+    record: dict[str, int] | None = None
     child_pid: int | None = None
     parent_pid: int | None = None
     try:
         task = asyncio.create_task(
             SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 0.2)
         )
-        await _wait_for_file(record_path)
+        record = await _wait_for_pid_record(record_path)
         result = await task
-        record = _read_pid_record(record_path)
         parent_pid = record["parent_pid"]
         child_pid = record["child_pid"]
 
@@ -242,6 +283,13 @@ async def test_sandbox_runner_kills_descendants_on_timeout(tmp_path: Path) -> No
         _assert_pid_gone(parent_pid)
         _assert_pid_gone(child_pid)
     finally:
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if record is not None:
+            parent_pid = record["parent_pid"]
+            child_pid = record["child_pid"]
         _best_effort_kill_pid(parent_pid)
         _best_effort_kill_pid(child_pid)
 
@@ -270,18 +318,27 @@ async def test_sandbox_runner_cleans_up_on_cancellation(tmp_path: Path) -> None:
     spec = _make_spec(tmp_path, code=script, correlation_id="cancel")
 
     task = asyncio.create_task(SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 60.0))
-    await _wait_for_file(record_path)
-    record = _read_pid_record(record_path)
-    parent_pid = record["parent_pid"]
-    child_pid = record["child_pid"]
+    record: dict[str, int] | None = None
+    parent_pid: int | None = None
+    child_pid: int | None = None
 
     try:
+        record = await _wait_for_pid_record(record_path)
+        parent_pid = record["parent_pid"]
+        child_pid = record["child_pid"]
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         _assert_pid_gone(parent_pid)
         _assert_pid_gone(child_pid)
     finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if record is not None:
+            parent_pid = record["parent_pid"]
+            child_pid = record["child_pid"]
         _best_effort_kill_pid(parent_pid)
         _best_effort_kill_pid(child_pid)
 
