@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import sys
 import sysconfig
@@ -211,7 +212,10 @@ def _manager_root(manager) -> Path:
 
 def _assert_sanitized_payload(text: str, *sensitive_values: str) -> None:
     for sensitive_value in sensitive_values:
-        if sensitive_value and sensitive_value in text:
+        if not sensitive_value:
+            continue
+        pattern = rf"(?<![A-Za-z0-9._~/-])[\"']?{re.escape(sensitive_value)}[\"']?(?=[\s,.;:!?)]|$)"
+        if re.search(pattern, text):
             raise AssertionError("sanitized payload leaked sensitive text")
 
 
@@ -912,6 +916,87 @@ def test_manager_sanitizes_lexical_and_canonical_path_aliases(
     assert "[PRIVATE_ROOT]" in readiness_text
     assert "[WORKSPACE_ROOT]" in events_text
     assert "[PRIVATE_ROOT]" in events_text
+
+
+def test_manager_sanitizes_descendant_path_aliases_without_touching_similar_prefixes(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    backend = RecordingBackend(name="recording")
+    manager = SandboxManager.create(
+        settings=_settings(),
+        debug=False,
+        workspace_root=tmp_path,
+        backend_override=backend,
+    )
+
+    workspace_lexical = "/var/folders/fake/workspace"
+    workspace_canonical = "/private/var/folders/fake/workspace"
+    manager_lexical = "/var/folders/fake/manager"
+    manager_canonical = "/private/var/folders/fake/manager"
+    workspace_descendants = (
+        f"{workspace_lexical}/nested/secret.txt",
+        f"{workspace_canonical}/nested/secret.txt",
+    )
+    manager_descendants = (
+        f"{manager_lexical}/launch-x/home/token.json",
+        f"{manager_canonical}/launch-x/home/token.json",
+    )
+    safe_similar_prefixes = (
+        f"{workspace_lexical}-other/keep.txt",
+        f"{manager_canonical}_other/keep.txt",
+    )
+    manager._workspace_root_aliases = {workspace_lexical, workspace_canonical}
+    manager._manager_root_aliases = {manager_lexical, manager_canonical}
+
+    manager.record_blocked_capability(
+        f"blocked '{workspace_descendants[0]}' and {workspace_descendants[1]}. "
+        f"OPENAI_API_KEY={manager_descendants[0]}",
+        f"reason \"{manager_descendants[0]}\" plus {manager_descendants[1]}! "
+        f"TOKEN={workspace_descendants[1]}",
+    )
+    backend.probe_result = backend.probe_result.model_copy(
+        update={
+            "available": False,
+            "reason": (
+                f"probe saw '{workspace_descendants[0]}' and \"{workspace_descendants[1]}\"; "
+                f"then {manager_descendants[0]}. "
+                f"Safe refs: {safe_similar_prefixes[0]} and {safe_similar_prefixes[1]}"
+            ),
+        }
+    )
+
+    manager.initialize()
+    readiness = manager.finalize_readiness()
+    events = manager.drain_startup_events()
+
+    readiness_text = str(readiness.model_dump())
+    events_text = str([event.model_dump() for event in events])
+    _assert_sanitized_payload(
+        readiness_text,
+        workspace_lexical,
+        workspace_canonical,
+        manager_lexical,
+        manager_canonical,
+        *workspace_descendants,
+        *manager_descendants,
+    )
+    _assert_sanitized_payload(
+        events_text,
+        workspace_lexical,
+        workspace_canonical,
+        manager_lexical,
+        manager_canonical,
+        *workspace_descendants,
+        *manager_descendants,
+    )
+    assert safe_similar_prefixes[0] in readiness_text
+    assert safe_similar_prefixes[1] in readiness_text
+    assert safe_similar_prefixes[0] in events_text
+    assert safe_similar_prefixes[1] in events_text
+    assert "[WORKSPACE_ROOT]" in readiness_text
+    assert "[PRIVATE_ROOT]" in readiness_text
 
 
 def test_unsafe_mode_emits_startup_and_launch_events_once_without_run_duplication(

@@ -547,7 +547,10 @@ class SandboxManager(SandboxController):
         return f"{key}={value}"
 
     def _looks_like_sensitive_value(self, value: str) -> bool:
-        return value in self._manager_root_aliases | self._workspace_root_aliases
+        return self._path_token_matches_alias(
+            value,
+            self._manager_root_aliases | self._workspace_root_aliases,
+        )
 
     def _absolute_lexical_path(self, path: Path) -> Path:
         return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
@@ -563,12 +566,37 @@ class SandboxManager(SandboxController):
     ) -> str:
         if not aliases:
             return text
-        pattern = "|".join(
-            re.escape(alias)
-            for alias in sorted(aliases, key=len, reverse=True)
-        )
         return re.sub(
-            rf"(?<![A-Za-z0-9._~/-])(?:{pattern})(?![A-Za-z0-9._~/-])",
-            placeholder,
+            r"(?<![A-Za-z0-9._~/-])([\"']?/[A-Za-z0-9._~/-]+[\"']?)(?=[\s,.;:!?)]|$)",
+            lambda match: self._replace_path_token_match(match, aliases, placeholder),
             text,
         )
+
+    def _replace_path_token_match(
+        self,
+        match: re.Match[str],
+        aliases: set[str],
+        placeholder: str,
+    ) -> str:
+        token = match.group(1)
+        leading = token[:1] if token[:1] in {'"', "'"} else ""
+        trailing = token[-1:] if token[-1:] in {'"', "'"} else ""
+        raw_token = token[len(leading): len(token) - len(trailing) if trailing else len(token)]
+        if self._path_token_matches_alias(raw_token, aliases):
+            return f"{leading}{placeholder}{trailing}"
+        return token
+
+    def _path_token_matches_alias(self, token: str, aliases: set[str]) -> bool:
+        normalized = Path(token)
+        normalized_resolved = normalized.resolve(strict=False)
+        for alias in aliases:
+            alias_path = Path(alias)
+            alias_resolved = alias_path.resolve(strict=False)
+            if self._same_or_descendant(normalized, alias_path):
+                return True
+            if self._same_or_descendant(normalized_resolved, alias_resolved):
+                return True
+        return False
+
+    def _same_or_descendant(self, candidate: Path, root: Path) -> bool:
+        return candidate == root or candidate.is_relative_to(root)
