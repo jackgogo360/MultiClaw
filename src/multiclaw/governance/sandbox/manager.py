@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 import sysconfig
@@ -28,6 +29,7 @@ from multiclaw.governance.sandbox.models import (
     SandboxProfilePolicy,
     SandboxReadiness,
     SandboxedLaunchSpec,
+    _is_secret_env_key,
 )
 from multiclaw.governance.sandbox.nsjail import NsJailBackend
 from multiclaw.governance.sandbox.runner import SandboxProcessRunner
@@ -108,7 +110,7 @@ class SandboxManager(SandboxController):
         self._profile_readiness = {policy.name: False for policy in self._policies}
         self._blocked_capabilities: dict[str, str] = {}
         self._startup_events: list[Event] = []
-        self._startup_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._readiness_snapshot: SandboxReadiness | None = None
         self._initialized = False
         self._probed = False
@@ -189,39 +191,59 @@ class SandboxManager(SandboxController):
 
     @property
     def readiness(self) -> SandboxReadiness:
-        return self._readiness_snapshot or self._build_readiness()
+        with self._lifecycle_lock:
+            return self._readiness_snapshot or self._build_readiness()
 
     def initialize(self) -> None:
-        if self._initialized:
-            return
+        with self._lifecycle_lock:
+            if self._initialized:
+                return
+            if self._readiness_snapshot is not None:
+                raise RuntimeError("sandbox readiness has already been finalized before initialize")
 
-        self._initialized = True
-        if self.mode != "auto":
-            return
+            self._initialized = True
+            if self.mode != "auto":
+                return
 
-        if not self._settings.backend_probe_on_startup:
-            self._probe = SandboxProbeResult(
-                backend_name=self._backend_name,
-                available=False,
-                capabilities={capability: False for capability in _PROBE_CAPABILITIES},
-                reason="backend probe disabled at startup",
+            if not self._settings.backend_probe_on_startup:
+                self._probe = SandboxProbeResult(
+                    backend_name=self._backend_name,
+                    available=False,
+                    capabilities={capability: False for capability in _PROBE_CAPABILITIES},
+                    reason="backend probe disabled at startup",
+                )
+                self.record_blocked_capability(
+                    "sandbox_probe",
+                    "backend probe disabled at startup",
+                )
+                return
+
+            self._probed = True
+            self._probe = self._sanitize_probe_result(
+                self._backend.probe(self._workspace_root, self._policies)
             )
-            self.record_blocked_capability("sandbox_probe", "backend probe disabled at startup")
-            return
+            self._profile_readiness = self._profiles_from_probe(self._probe)
+            if not self._probe.available or not all(
+                self._probe.capabilities.get(name, False) for name in _CODE_CAPABILITIES
+            ):
+                for profile_name in self._profile_readiness:
+                    self._profile_readiness[profile_name] = False
 
-        self._probed = True
-        self._probe = self._backend.probe(self._workspace_root, self._policies)
-        self._profile_readiness = self._profiles_from_probe(self._probe)
-        if not self._probe.available or not all(self._probe.capabilities.get(name, False) for name in _CODE_CAPABILITIES):
-            for profile_name in self._profile_readiness:
-                self._profile_readiness[profile_name] = False
-
-        if not self._profile_readiness["shell_workspace"]:
-            self._buffer_profile_unavailable("shell_workspace", self._probe.reason or "probe did not prove shell isolation")
-        if not self._profile_readiness["code_exec_python"]:
-            self._buffer_profile_unavailable("code_exec_python", self._probe.reason or "probe did not prove code execution isolation")
-        if not self._profile_readiness["mcp_stdio_local"]:
-            self._buffer_profile_unavailable("mcp_stdio_local", self._probe.reason or "probe did not prove MCP stdio isolation")
+            if not self._profile_readiness["shell_workspace"]:
+                self._buffer_profile_unavailable(
+                    "shell_workspace",
+                    self._probe.reason or "probe did not prove shell isolation",
+                )
+            if not self._profile_readiness["code_exec_python"]:
+                self._buffer_profile_unavailable(
+                    "code_exec_python",
+                    self._probe.reason or "probe did not prove code execution isolation",
+                )
+            if not self._profile_readiness["mcp_stdio_local"]:
+                self._buffer_profile_unavailable(
+                    "mcp_stdio_local",
+                    self._probe.reason or "probe did not prove MCP stdio isolation",
+                )
 
     def is_profile_ready(self, profile_name: str) -> bool:
         return bool(self.readiness.profiles.get(profile_name, False))
@@ -289,12 +311,12 @@ class SandboxManager(SandboxController):
             shutil.rmtree(spec.private_root, ignore_errors=True)
 
     def record_blocked_capability(self, name: str, reason: str) -> None:
-        if self._readiness_snapshot is not None:
-            raise RuntimeError("sandbox readiness has already been finalized")
+        with self._lifecycle_lock:
+            if self._readiness_snapshot is not None:
+                raise RuntimeError("sandbox readiness has already been finalized")
 
-        safe_name = self._sanitize_text(name)
-        safe_reason = self._sanitize_text(reason)
-        with self._startup_lock:
+            safe_name = self._sanitize_text(name)
+            safe_reason = self._sanitize_text(reason)
             self._blocked_capabilities[safe_name] = safe_reason
             self._startup_events.append(
                 Event(
@@ -304,12 +326,13 @@ class SandboxManager(SandboxController):
             )
 
     def finalize_readiness(self) -> SandboxReadiness:
-        if self._readiness_snapshot is None:
-            self._readiness_snapshot = self._build_readiness()
-        return self._readiness_snapshot
+        with self._lifecycle_lock:
+            if self._readiness_snapshot is None:
+                self._readiness_snapshot = self._build_readiness()
+            return self._readiness_snapshot
 
     def drain_startup_events(self) -> tuple[Event, ...]:
-        with self._startup_lock:
+        with self._lifecycle_lock:
             events = tuple(self._startup_events)
             self._startup_events.clear()
             return events
@@ -386,7 +409,7 @@ class SandboxManager(SandboxController):
         )
 
     def _buffer_event(self, event: Event) -> None:
-        with self._startup_lock:
+        with self._lifecycle_lock:
             self._startup_events.append(event)
 
     def _build_policies(self) -> tuple[SandboxProfilePolicy, ...]:
@@ -484,4 +507,25 @@ class SandboxManager(SandboxController):
         return resolved
 
     def _sanitize_text(self, value: str) -> str:
-        return " ".join(value.split())
+        sanitized = " ".join(value.split())
+        sanitized = sanitized.replace(str(self._manager_root), "[PRIVATE_ROOT]")
+        sanitized = sanitized.replace(str(self._workspace_root), "[WORKSPACE_ROOT]")
+        sanitized = re.sub(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)",
+            self._redact_assignment_match,
+            sanitized,
+        )
+        return sanitized
+
+    def _sanitize_probe_result(self, probe: SandboxProbeResult) -> SandboxProbeResult:
+        return probe.model_copy(update={"reason": self._sanitize_text(probe.reason)})
+
+    def _redact_assignment_match(self, match: re.Match[str]) -> str:
+        key = match.group(1)
+        value = match.group(2)
+        if _is_secret_env_key(key) or self._looks_like_sensitive_value(value):
+            return f"{key}=[REDACTED]"
+        return f"{key}={value}"
+
+    def _looks_like_sensitive_value(self, value: str) -> bool:
+        return value in {str(self._manager_root), str(self._workspace_root)}

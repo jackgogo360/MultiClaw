@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import sys
 import sysconfig
+import threading
 from pathlib import Path
 
 import pytest
@@ -208,6 +209,12 @@ def _manager_root(manager) -> Path:
     return manager._manager_root
 
 
+def _assert_sanitized_payload(text: str, *sensitive_values: str) -> None:
+    for sensitive_value in sensitive_values:
+        if sensitive_value and sensitive_value in text:
+            raise AssertionError("sanitized payload leaked sensitive text")
+
+
 @pytest.mark.parametrize(
     ("platform_name", "expected_type_name", "expected_backend_name"),
     [
@@ -327,6 +334,87 @@ def test_auto_initialize_probes_once_and_marks_only_proven_profiles_ready(
         "mcp_stdio_local": True,
     }
     assert finalized is manager.finalize_readiness()
+
+
+def test_initialize_after_early_finalize_raises_before_mutating_frozen_state(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    backend = RecordingBackend(name="recording")
+    manager = SandboxManager.create(
+        settings=_settings(),
+        debug=False,
+        workspace_root=tmp_path,
+        backend_override=backend,
+    )
+
+    frozen = manager.finalize_readiness()
+
+    assert frozen.ready is False
+    with pytest.raises(RuntimeError, match="finalized"):
+        manager.initialize()
+    assert backend.probe_calls == []
+    assert manager.finalize_readiness() is frozen
+    assert frozen.profiles == {
+        "shell_workspace": False,
+        "code_exec_python": False,
+        "mcp_stdio_local": False,
+    }
+
+
+def test_record_blocked_capability_cannot_race_past_finalization(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    manager = SandboxManager.create(
+        settings=_settings(),
+        debug=False,
+        workspace_root=tmp_path,
+        backend_override=RecordingBackend(name="recording"),
+    )
+
+    class CoordinatedRLock:
+        def __init__(self, inner: threading.RLock) -> None:
+            self._inner = inner
+            self.record_entered = threading.Event()
+            self.allow_record_to_continue = threading.Event()
+            self._blocked_once = False
+
+        def __enter__(self):
+            if threading.current_thread() is not threading.main_thread() and not self._blocked_once:
+                self._blocked_once = True
+                self.record_entered.set()
+                assert self.allow_record_to_continue.wait(timeout=2.0)
+            self._inner.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            del exc_type, exc, tb
+            self._inner.release()
+
+    coordinated_lock = CoordinatedRLock(manager._lifecycle_lock)
+    manager._lifecycle_lock = coordinated_lock
+    exceptions: list[Exception] = []
+
+    def record() -> None:
+        try:
+            manager.record_blocked_capability("late capability", "late reason")
+        except Exception as exc:  # pragma: no branch - deterministic single path
+            exceptions.append(exc)
+
+    worker = threading.Thread(target=record)
+    worker.start()
+    assert coordinated_lock.record_entered.wait(timeout=2.0)
+    frozen = manager.finalize_readiness()
+    coordinated_lock.allow_record_to_continue.set()
+    worker.join(timeout=2.0)
+
+    assert len(exceptions) == 1
+    assert isinstance(exceptions[0], RuntimeError)
+    assert frozen.skipped_capabilities == {}
+    assert manager.drain_startup_events() == ()
 
 
 @pytest.mark.parametrize("backend_name", ["seatbelt", "nsjail"])
@@ -715,6 +803,57 @@ def test_readiness_lifecycle_buffers_events_until_finalization_and_blocks_late_m
         manager.record_blocked_capability("late", "too late")
 
 
+def test_manager_sanitizes_blocked_and_profile_reasons_in_readiness_and_events(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    backend = RecordingBackend(name="recording")
+    manager = SandboxManager.create(
+        settings=_settings(),
+        debug=False,
+        workspace_root=tmp_path,
+        backend_override=backend,
+    )
+
+    explicit_secret = "task7-sensitive-value"
+    blocked_name = (
+        f"capability {_manager_root(manager)} {tmp_path} OPENAI_API_KEY={explicit_secret}"
+    )
+    blocked_reason = (
+        f"blocked because {_manager_root(manager)} {tmp_path} OPENAI_API_KEY={explicit_secret}"
+    )
+    manager.record_blocked_capability(blocked_name, blocked_reason)
+    backend.probe_result = backend.probe_result.model_copy(
+        update={
+            "available": False,
+            "reason": (
+                f"probe failed at {_manager_root(manager)} {tmp_path} "
+                f"OPENAI_API_KEY={explicit_secret}"
+            ),
+        }
+    )
+
+    manager.initialize()
+    readiness = manager.finalize_readiness()
+    events = manager.drain_startup_events()
+
+    readiness_text = str(readiness.model_dump())
+    events_text = str([event.model_dump() for event in events])
+    _assert_sanitized_payload(
+        readiness_text,
+        str(_manager_root(manager)),
+        str(tmp_path.resolve()),
+        explicit_secret,
+    )
+    _assert_sanitized_payload(
+        events_text,
+        str(_manager_root(manager)),
+        str(tmp_path.resolve()),
+        explicit_secret,
+    )
+
+
 def test_unsafe_mode_emits_startup_and_launch_events_once_without_run_duplication(
     tmp_path: Path,
 ) -> None:
@@ -771,3 +910,15 @@ def test_host_unsafe_backend_still_uses_common_environment_and_validates_workspa
         manager.build_launch_spec(_request(tmp_path / "other", cwd=tmp_path / "other"))
     with pytest.raises(SandboxLaunchError, match="cwd"):
         manager.build_launch_spec(_request(tmp_path, cwd=tmp_path.parent))
+
+
+def test_unavailable_sandbox_controller_drains_startup_events_once() -> None:
+    from tests.sandbox_fakes import UnavailableSandboxController
+
+    controller = UnavailableSandboxController()
+
+    first = controller.drain_startup_events()
+    second = controller.drain_startup_events()
+
+    assert len(first) == 1
+    assert second == ()
