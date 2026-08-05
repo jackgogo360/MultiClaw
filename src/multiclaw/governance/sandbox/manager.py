@@ -48,7 +48,6 @@ _CODE_CAPABILITIES = frozenset(_PROBE_CAPABILITIES)
 _MCP_CAPABILITIES = _SHELL_CAPABILITIES
 _DARWIN_DEFAULT_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 _LINUX_DEFAULT_PATH = "/usr/bin:/bin"
-_SUPPORTED_PLATFORMS = {"Darwin", "Linux"}
 
 
 class _UnavailableBackend:
@@ -373,20 +372,7 @@ class SandboxManager(SandboxController):
             if all(probe.capabilities.get(name, False) for name in capability_names):
                 result[profile_name] = True
 
-        if not self._backend_supports_policy(self._policies_by_name["mcp_stdio_local"]):
-            result["mcp_stdio_local"] = False
-            self.record_blocked_capability(
-                "mcp_stdio_local",
-                "current backend templates do not yet render the conservative MCP stdio policy",
-            )
         return result
-
-    def _backend_supports_policy(self, policy: SandboxProfilePolicy) -> bool:
-        if self._backend_name not in {"seatbelt", "nsjail"}:
-            return True
-        if policy.name != "mcp_stdio_local":
-            return True
-        return policy.network_mode == "inherit" and policy.allow_subprocesses is True
 
     def _buffer_profile_unavailable(self, profile_name: str, reason: str) -> None:
         self._buffer_event(
@@ -429,8 +415,11 @@ class SandboxManager(SandboxController):
             SandboxProfilePolicy(
                 name=self._settings.profiles.mcp_stdio,
                 workspace_mode="ro",
-                network_mode="disabled",
-                allow_subprocesses=False,
+                # Task 7 keeps the backend-compatible MCP base profile. Task 11
+                # will layer server-specific request overrides and conservative
+                # per-server defaults on top of this profile.
+                network_mode="inherit",
+                allow_subprocesses=True,
                 entrypoints=(Path("/usr/bin/env").resolve(),),
                 write_protected_patterns=protected,
                 read_hidden_patterns=hidden,
