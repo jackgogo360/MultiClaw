@@ -1,22 +1,13 @@
 import shutil
 import tempfile
 from collections.abc import Mapping
-from fnmatch import fnmatch
 from pathlib import Path
 
 from multiclaw.governance.sandbox.errors import SandboxPolicyError
-from multiclaw.governance.sandbox.models import SandboxEnvironment
+from multiclaw.governance.sandbox.models import SandboxEnvironment, _is_secret_env_key
 
 _PASSTHROUGH_KEYS = ("LANG", "LC_ALL", "TERM")
 _RUNTIME_OWNED_KEYS = {"HOME", "TMPDIR", "PATH", "USER", "LOGNAME", "SHELL"}
-_SECRET_PATTERNS = (
-    "*TOKEN*",
-    "*SECRET*",
-    "*PASSWORD*",
-    "*API_KEY*",
-    "*ACCESS_KEY*",
-    "*PRIVATE_KEY*",
-)
 
 
 def build_sandbox_environment(
@@ -29,7 +20,6 @@ def build_sandbox_environment(
 ) -> SandboxEnvironment:
     temp_root.mkdir(parents=True, exist_ok=True)
     private_root = Path(tempfile.mkdtemp(prefix="launch-", dir=temp_root))
-    private_root.chmod(0o700)
 
     try:
         home = private_root / "home"
@@ -41,8 +31,19 @@ def build_sandbox_environment(
         xdg_state = xdg_root / "state"
         xdg_runtime = xdg_root / "runtime"
 
-        for path in (home, tmp, xdg_config, xdg_cache, xdg_data, xdg_state, xdg_runtime):
+        for path in (
+            private_root,
+            home,
+            tmp,
+            xdg_root,
+            xdg_config,
+            xdg_cache,
+            xdg_data,
+            xdg_state,
+            xdg_runtime,
+        ):
             path.mkdir(parents=True, exist_ok=True)
+            path.chmod(0o700)
 
         env: dict[str, str] = {}
         for key in _PASSTHROUGH_KEYS:
@@ -89,4 +90,4 @@ def build_sandbox_environment(
 
 
 def _is_secret_key(key: str) -> bool:
-    return any(fnmatch(key, pattern) for pattern in _SECRET_PATTERNS)
+    return _is_secret_env_key(key)

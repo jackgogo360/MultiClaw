@@ -34,6 +34,18 @@ def test_build_sandbox_environment_scrubs_host_values_and_creates_private_root(
     assert environment.tmp == environment.private_root / "tmp"
     assert environment.home.is_dir()
     assert environment.tmp.is_dir()
+    assert oct(environment.home.stat().st_mode & 0o777) == "0o700"
+    assert oct(environment.tmp.stat().st_mode & 0o777) == "0o700"
+    xdg_root = environment.private_root / "xdg"
+    assert oct(xdg_root.stat().st_mode & 0o777) == "0o700"
+    for key in (
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+    ):
+        assert oct(Path(env[key]).stat().st_mode & 0o777) == "0o700"
     assert env["LANG"] == "en_US.UTF-8"
     assert env["LC_ALL"] == "en_US.UTF-8"
     assert env["TERM"] == "xterm-256color"
@@ -53,6 +65,31 @@ def test_build_sandbox_environment_scrubs_host_values_and_creates_private_root(
     assert "COLORTERM" not in env
     assert "SSH_AUTH_SOCK" not in env
     assert "OPENAI_API_KEY" not in env
+
+
+def test_build_sandbox_environment_redacts_secret_values_in_repr_and_model_dump(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance import build_sandbox_environment
+
+    secret_value = "dummy-secret-value"
+    environment = build_sandbox_environment(
+        base_env={},
+        overrides={
+            "OPENAI_API_KEY": secret_value,
+            "CUSTOM_FLAG": "1",
+        },
+        allowed_secret_keys=frozenset({"OPENAI_API_KEY"}),
+        temp_root=tmp_path,
+        default_path="/usr/bin:/bin",
+    )
+
+    assert environment.env["OPENAI_API_KEY"] == secret_value
+    assert secret_value not in repr(environment)
+    dumped = environment.model_dump()
+    assert dumped["env"]["OPENAI_API_KEY"] == "[REDACTED]"
+    assert dumped["env"]["CUSTOM_FLAG"] == "1"
+    assert secret_value not in str(dumped)
 
 
 def test_build_sandbox_environment_rejects_secret_override_without_allowlist(

@@ -1,7 +1,49 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+
+_SECRET_PATTERNS = (
+    "*TOKEN*",
+    "*SECRET*",
+    "*PASSWORD*",
+    "*API_KEY*",
+    "*ACCESS_KEY*",
+    "*PRIVATE_KEY*",
+)
+_REDACTED = "[REDACTED]"
+
+
+class _ImmutableDict(dict):
+    def _blocked(self, *args, **kwargs):
+        del args, kwargs
+        raise TypeError("mapping is immutable")
+
+    __setitem__ = _blocked
+    __delitem__ = _blocked
+    clear = _blocked
+    pop = _blocked
+    popitem = _blocked
+    setdefault = _blocked
+    update = _blocked
+    __ior__ = _blocked
+
+
+def _freeze_mapping(mapping: dict) -> _ImmutableDict:
+    return _ImmutableDict(dict(mapping))
+
+
+def _is_secret_env_key(key: str) -> bool:
+    from fnmatch import fnmatch
+
+    return any(fnmatch(key.upper(), pattern) for pattern in _SECRET_PATTERNS)
+
+
+def _redact_env_mapping(mapping: dict[str, str]) -> dict[str, str]:
+    return {
+        key: (_REDACTED if _is_secret_env_key(key) else value)
+        for key, value in mapping.items()
+    }
 
 
 class SandboxExecRequest(BaseModel):
@@ -16,7 +58,7 @@ class SandboxExecRequest(BaseModel):
     cwd: Path
     stdin_bytes: bytes | None = None
     timeout_seconds: float = Field(gt=0)
-    env_overrides: dict[str, str] = Field(default_factory=dict)
+    env_overrides: dict[str, str] = Field(default_factory=dict, repr=False)
     allowed_secret_env: frozenset[str] = frozenset()
     network_mode: Literal["disabled", "inherit"] | None = None
     workspace_mode: Literal["ro", "rw"] | None = None
@@ -36,16 +78,30 @@ class SandboxExecRequest(BaseModel):
             raise ValueError("exactly one launch payload must match mode")
         if len(self.read_only_paths) > 16:
             raise ValueError("read_only_paths cannot exceed 16 entries")
+        object.__setattr__(self, "env_overrides", _freeze_mapping(self.env_overrides))
         return self
+
+    @field_serializer("env_overrides", when_used="always")
+    def serialize_env_overrides(self, value: dict[str, str]) -> dict[str, str]:
+        return _redact_env_mapping(value)
 
 
 class SandboxEnvironment(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    env: dict[str, str]
+    env: dict[str, str] = Field(repr=False)
     private_root: Path
     home: Path
     tmp: Path
+
+    @model_validator(mode="after")
+    def freeze_env(self) -> "SandboxEnvironment":
+        object.__setattr__(self, "env", _freeze_mapping(self.env))
+        return self
+
+    @field_serializer("env", when_used="always")
+    def serialize_env(self, value: dict[str, str]) -> dict[str, str]:
+        return _redact_env_mapping(value)
 
 
 class SandboxProfilePolicy(BaseModel):
@@ -67,13 +123,22 @@ class SandboxedLaunchSpec(BaseModel):
     executable: str
     args: tuple[str, ...]
     cwd: Path
-    env: dict[str, str]
+    env: dict[str, str] = Field(repr=False)
     stdin_bytes: bytes | None
     private_root: Path
     backend_name: str
     profile_name: str
     correlation_id: str
     unsafe_fallback_used: bool = False
+
+    @model_validator(mode="after")
+    def freeze_env(self) -> "SandboxedLaunchSpec":
+        object.__setattr__(self, "env", _freeze_mapping(self.env))
+        return self
+
+    @field_serializer("env", when_used="always")
+    def serialize_env(self, value: dict[str, str]) -> dict[str, str]:
+        return _redact_env_mapping(value)
 
 
 class SandboxExecResult(BaseModel):
@@ -97,6 +162,11 @@ class SandboxProbeResult(BaseModel):
     capabilities: dict[str, bool]
     reason: str = ""
 
+    @model_validator(mode="after")
+    def freeze_capabilities(self) -> "SandboxProbeResult":
+        object.__setattr__(self, "capabilities", _freeze_mapping(self.capabilities))
+        return self
+
 
 class SandboxReadiness(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -108,3 +178,13 @@ class SandboxReadiness(BaseModel):
     profiles: dict[str, bool]
     skipped_capabilities: dict[str, str]
     unsafe_fallback_active: bool = False
+
+    @model_validator(mode="after")
+    def freeze_mappings(self) -> "SandboxReadiness":
+        object.__setattr__(self, "profiles", _freeze_mapping(self.profiles))
+        object.__setattr__(
+            self,
+            "skipped_capabilities",
+            _freeze_mapping(self.skipped_capabilities),
+        )
+        return self
