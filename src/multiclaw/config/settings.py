@@ -2,8 +2,9 @@ from pathlib import Path
 from typing import Any, Literal
 import os
 import tomllib
+import warnings
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,9 +41,62 @@ class MemorySettings(BaseModel):
     context_l1_ratio: float = Field(default=0.6, gt=0.0, lt=1.0)
 
 
+class SandboxProfileNames(BaseModel):
+    shell: str = "shell_workspace"
+    code_exec: str = "code_exec_python"
+    mcp_stdio: str = "mcp_stdio_local"
+
+
+class MacOSSandboxSettings(BaseModel):
+    seatbelt_profile_dir: str = ""
+
+
+class LinuxSandboxSettings(BaseModel):
+    nsjail_path: str = "/usr/bin/nsjail"
+    nsjail_config_dir: str = ""
+
+
+class SandboxSettings(BaseModel):
+    mode: Literal["auto", "host_unsafe_dev_only"] = "auto"
+    backend_probe_on_startup: bool = True
+    unsafe_fallback_requires_debug: Literal[True] = True
+    write_protected_workspace_paths: list[str] = Field(default_factory=lambda: [".git"])
+    read_hidden_workspace_paths: list[str] = Field(default_factory=lambda: [".env", ".env.*"])
+    profiles: SandboxProfileNames = Field(default_factory=SandboxProfileNames)
+    macos: MacOSSandboxSettings = Field(default_factory=MacOSSandboxSettings)
+    linux: LinuxSandboxSettings = Field(default_factory=LinuxSandboxSettings)
+
+
 class GovernanceSettings(BaseModel):
-    sandbox_mode: str = "process"
+    sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     audit_enabled: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_sandbox_mode(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        migrated = dict(data)
+        legacy_mode = migrated.pop("sandbox_mode", None)
+        if legacy_mode is None:
+            return migrated
+
+        if "sandbox" in migrated:
+            raise ValueError("governance.sandbox_mode cannot be combined with governance.sandbox")
+
+        if legacy_mode == "process":
+            warnings.warn(
+                "governance.sandbox_mode='process' is deprecated; using governance.sandbox.mode='auto'",
+                DeprecationWarning,
+                stacklevel=5,
+            )
+            migrated["sandbox"] = {"mode": "auto"}
+            return migrated
+
+        raise ValueError(
+            f"Unsupported governance.sandbox_mode {legacy_mode!r}; use governance.sandbox.mode instead"
+        )
 
 
 class ToolSettings(BaseModel):
@@ -131,6 +185,12 @@ class Settings(BaseSettings):
             toml_kwargs = self._build_toml_kwargs(config_path)
             kwargs = self._apply_env_overrides(toml_kwargs) | kwargs
         super().__init__(**kwargs)
+
+    @model_validator(mode="after")
+    def validate_unsafe_sandbox_mode_requires_debug(self) -> "Settings":
+        if self.governance.sandbox.mode == "host_unsafe_dev_only" and not self.app.debug:
+            raise ValueError("governance.sandbox.mode='host_unsafe_dev_only' requires app.debug=true")
+        return self
 
     @staticmethod
     def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
