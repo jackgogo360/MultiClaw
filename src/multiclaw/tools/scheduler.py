@@ -78,12 +78,10 @@ class CoreToolScheduler:
                     return ToolExecutionResult(status=ToolStatus.ERROR, content=error_text)
                 await self.audit_logger.record(
                     tool_name=builder.name,
-                    status=ToolStatus.SUCCESS.value,
+                    status=result.status.value,
                     detail=self._audit_detail(result),
                 )
-                await self.event_bus.publish(
-                    Event(type="tool.completed", data={"tool": builder.name})
-                )
+                await self._publish_result_event(builder.name, result)
                 return result
 
             decision = await self.permission_checker.check(
@@ -181,12 +179,10 @@ class CoreToolScheduler:
 
         await self.audit_logger.record(
             tool_name=builder.name,
-            status=ToolStatus.SUCCESS.value,
+            status=result.status.value,
             detail=self._audit_detail(result),
         )
-        await self.event_bus.publish(
-            Event(type="tool.completed", data={"tool": builder.name})
-        )
+        await self._publish_result_event(builder.name, result)
         return result
 
     def _audit_detail(self, result: ToolExecutionResult) -> str:
@@ -202,3 +198,23 @@ class CoreToolScheduler:
         if not result.content:
             return f"[audit] {prefix}"
         return f"[audit] {prefix}\n{result.content}"
+
+    async def _publish_result_event(
+        self,
+        tool_name: str,
+        result: ToolExecutionResult,
+    ) -> None:
+        if result.status == ToolStatus.SUCCESS:
+            await self.event_bus.publish(
+                Event(type="tool.completed", data={"tool": tool_name})
+            )
+            return
+
+        error_label = (
+            "tool returned error"
+            if result.status == ToolStatus.ERROR
+            else f"tool returned {result.status.value}"
+        )
+        await self.event_bus.publish(
+            Event(type="tool.error", data={"tool": tool_name, "error": error_label})
+        )

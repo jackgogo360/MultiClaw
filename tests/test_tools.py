@@ -59,6 +59,23 @@ class AuditedEchoInvocation(EchoInvocation):
         return result
 
 
+class AuditedErrorInvocation(EchoInvocation):
+    async def execute(self) -> ToolExecutionResult:
+        result = ToolExecutionResult(
+            status=ToolStatus.ERROR,
+            content="boom",
+        )
+        result.audit.update(
+            {
+                "sandbox_profile": "shell_workspace",
+                "sandbox_backend": "recording",
+                "unsafe_fallback_used": False,
+                "env": {"OPENAI_API_KEY": "secret"},
+            }
+        )
+        return result
+
+
 class EchoToolBuilder(ToolBuilder[EchoParams]):
     name = "echo"
     description = "Echoes the supplied text"
@@ -83,6 +100,11 @@ class AuditedEchoToolBuilder(EchoToolBuilder):
 class GuardedAuditedToolBuilder(DeleteToolBuilder):
     def build(self, params: EchoParams) -> ToolInvocation[EchoParams]:
         return AuditedEchoInvocation(name=self.name, params=params)
+
+
+class AuditedErrorToolBuilder(EchoToolBuilder):
+    def build(self, params: EchoParams) -> ToolInvocation[EchoParams]:
+        return AuditedErrorInvocation(name=self.name, params=params)
 
 
 @pytest.fixture
@@ -361,6 +383,95 @@ class TestCoreToolScheduler:
             "[audit] sandbox_backend=recording sandbox_profile=mcp_stdio_local "
             "unsafe_fallback_used=True\n"
             "mcp audit"
+        )
+        assert "OPENAI_API_KEY" not in entries[-1].detail
+
+    @pytest.mark.asyncio
+    async def test_returned_error_uses_error_audit_status_and_error_event(self, scheduler):
+        events = []
+
+        async def handler(event):
+            if event.type.startswith("tool."):
+                events.append((event.type.removeprefix("tool."), event.data))
+
+        scheduler.event_bus.subscribe("*", handler)
+
+        result = await scheduler.run(AuditedErrorToolBuilder(), {"text": "ignored"})
+
+        assert result.status == ToolStatus.ERROR
+        assert events == [
+            ("scheduled", {"tool": "echo"}),
+            ("validating", {"tool": "echo"}),
+            ("executing", {"tool": "echo"}),
+            ("error", {"tool": "echo", "error": "tool returned error"}),
+        ]
+        entries = await scheduler.audit_logger.list_entries()
+        assert entries[-1].status == ToolStatus.ERROR.value
+        assert entries[-1].detail == (
+            "[audit] sandbox_backend=recording sandbox_profile=shell_workspace "
+            "unsafe_fallback_used=False\n"
+            "boom"
+        )
+        assert "OPENAI_API_KEY" not in entries[-1].detail
+
+    @pytest.mark.asyncio
+    async def test_mcp_returned_error_uses_error_audit_status_and_error_event(self, scheduler):
+        from multiclaw.mcp.tool_adapter import MCPToolBuilder
+
+        events = []
+
+        async def handler(event):
+            if event.type.startswith("tool."):
+                events.append((event.type.removeprefix("tool."), event.data))
+
+        scheduler.event_bus.subscribe("*", handler)
+
+        class MCPParams(BaseModel):
+            pass
+
+        class AuditedErrorMCPToolBuilder(MCPToolBuilder):
+            def build(self, params):
+                del params
+
+                class _Invocation(ToolInvocation[MCPParams]):
+                    async def execute(self_inner) -> ToolExecutionResult:
+                        return ToolExecutionResult(
+                            status=ToolStatus.ERROR,
+                            content="mcp boom",
+                            audit={
+                                "sandbox_profile": "mcp_stdio_local",
+                                "sandbox_backend": "recording",
+                                "unsafe_fallback_used": True,
+                                "env": {"OPENAI_API_KEY": "secret"},
+                            },
+                        )
+
+                return _Invocation(name=self.name, params=MCPParams())
+
+        result = await scheduler.run(
+            AuditedErrorMCPToolBuilder(
+                name="mcp__demo__tool",
+                server_name="demo",
+                original_name="tool",
+                description="demo",
+                input_schema={},
+                manager=object(),
+            ),
+            {},
+        )
+
+        assert result.status == ToolStatus.ERROR
+        assert events == [
+            ("scheduled", {"tool": "mcp__demo__tool"}),
+            ("validating", {"tool": "mcp__demo__tool"}),
+            ("error", {"tool": "mcp__demo__tool", "error": "tool returned error"}),
+        ]
+        entries = await scheduler.audit_logger.list_entries()
+        assert entries[-1].status == ToolStatus.ERROR.value
+        assert entries[-1].detail == (
+            "[audit] sandbox_backend=recording sandbox_profile=mcp_stdio_local "
+            "unsafe_fallback_used=True\n"
+            "mcp boom"
         )
         assert "OPENAI_API_KEY" not in entries[-1].detail
 
