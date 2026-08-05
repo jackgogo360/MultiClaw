@@ -64,6 +64,8 @@ _WORKSPACE_RW_BLOCK = """
 
 _WORKSPACE_RO_BLOCK = """
 ; MCP stdio remains read-only against the workspace
+(allow file-write* (subpath (param "PRIVATE_HOME")))
+(allow file-write* (subpath (param "PRIVATE_TMP")))
 """.strip()
 
 _SHELL_PROCESS_BLOCK = """
@@ -128,4 +130,3 @@ SEATBELT_PROFILES = {
     CODE_EXEC_PYTHON_PROFILE.name: CODE_EXEC_PYTHON_PROFILE,
     MCP_STDIO_LOCAL_PROFILE.name: MCP_STDIO_LOCAL_PROFILE,
 }
-
