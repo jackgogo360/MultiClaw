@@ -435,6 +435,10 @@ class SeatbeltBackend:
         ]
         for index, path in enumerate(runtime_roots):
             args.extend(["-D", "RUNTIME_ROOT_" + str(index) + "=" + str(path)])
+        # The static SBPL templates always reference RUNTIME_ROOT_0..15. Unused slots
+        # are bound to PRIVATE_HOME so every param is defined without broadening access.
+        for index in range(len(runtime_roots), _MAX_RUNTIME_ROOTS):
+            args.extend(["-D", "RUNTIME_ROOT_" + str(index) + "=" + str(private_home)])
         return tuple(args)
 
     def _target_argv_for(
