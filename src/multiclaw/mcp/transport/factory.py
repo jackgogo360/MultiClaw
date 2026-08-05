@@ -56,7 +56,12 @@ def create_transport(
                 headers=config.headers,
             )
         case InProcessServerConfig():
-            if sandbox_controller is not None and sandbox_controller.mode != "host_unsafe_dev_only":
+            _require_sandbox_context(
+                sandbox_controller=sandbox_controller,
+                workspace_root=workspace_root,
+                server_name=server_name,
+            )
+            if sandbox_controller.mode != "host_unsafe_dev_only":
                 raise RuntimeError(
                     f"MCP server '{server_name}' in-process transport requires host_unsafe_dev_only"
                 )
@@ -72,8 +77,11 @@ def _create_stdio_transport(
     workspace_root: Path | None,
     server_name: str,
 ) -> StdioTransport:
-    if sandbox_controller is None or workspace_root is None:
-        raise RuntimeError(f"MCP server '{server_name}' requires sandbox controller context")
+    _require_sandbox_context(
+        sandbox_controller=sandbox_controller,
+        workspace_root=workspace_root,
+        server_name=server_name,
+    )
 
     workspace = workspace_root.resolve(strict=True)
     explicit_roots = tuple(
@@ -125,6 +133,16 @@ def _create_stdio_transport(
     except Exception:
         shutil.rmtree(spec.private_root, ignore_errors=True)
         raise
+
+
+def _require_sandbox_context(
+    *,
+    sandbox_controller: SandboxController | None,
+    workspace_root: Path | None,
+    server_name: str,
+) -> None:
+    if sandbox_controller is None or workspace_root is None:
+        raise RuntimeError(f"MCP server '{server_name}' requires sandbox controller context")
 
 
 def _controller_default_path(sandbox_controller: SandboxController) -> str:
