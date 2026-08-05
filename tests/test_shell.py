@@ -71,7 +71,7 @@ class TestShellTool:
             "VALUE='a b'; export VALUE; "
             "touch one.py two.py; "
             "printf '%s\\n' *.py > files.txt; "
-            "printf '%s|' \"$VALUE\"; tail -n 1 files.txt"
+            "printf '%s|' \"$VALUE\"; tail -n 1 files.txt | cat"
         )
         result = await builder.build(builder.validate({"command": command})).execute()
         assert result.status == "success"
@@ -83,6 +83,7 @@ class TestShellTool:
         result = await builder.build(
             builder.validate({"command": "printf problem >&2; exit 7"})
         ).execute()
+        assert result.status == "success"
         assert "[stderr]" in result.content
         assert "problem" in result.content
         assert result.data == {"exit_code": 7}
