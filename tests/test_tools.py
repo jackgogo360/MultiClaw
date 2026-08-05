@@ -26,7 +26,7 @@ from multiclaw.tools.grep import GrepToolBuilder
 from multiclaw.tools.list_dir import ListDirToolBuilder
 from multiclaw.tools.read_file import ReadFileToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
-from tests.sandbox_fakes import (
+from sandbox_fakes import (
     ReadyRecordingSandboxController,
     UnavailableSandboxController,
 )

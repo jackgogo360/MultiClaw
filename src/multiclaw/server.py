@@ -11,7 +11,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -215,17 +215,10 @@ def _record_blocked_capability_safely(
 ) -> None:
     if controller is None:
         return
-    try:
-        controller.record_blocked_capability(
-            name,
-            _sanitize_public_reason(reason, workspace_root=workspace_root),
-        )
-    except Exception:
-        logger.debug(
-            "Sandbox controller rejected blocked capability record for %s",
-            name,
-            exc_info=True,
-        )
+    controller.record_blocked_capability(
+        name,
+        _sanitize_public_reason(reason, workspace_root=workspace_root),
+    )
 
 
 def _build_mcp_adapters(
@@ -299,6 +292,10 @@ def _register_mcp_tools(
 
         if isinstance(config, InProcessServerConfig):
             if sandbox_controller is not None and sandbox_controller.mode == "host_unsafe_dev_only":
+                sandbox_controller.record_unsafe_capability(
+                    f"mcp_in_process_{_sanitize_mcp_namespace(server_name)}",
+                    "unsafe transport kept for development",
+                )
                 filtered_configs[server_name] = config
                 logger.warning(
                     "Keeping in-process MCP server '%s' with unsafe host execution enabled",
@@ -445,10 +442,7 @@ def create_agent(
             workspace_root=workspace_root,
         )
 
-    readiness = _sanitize_public_readiness(
-        sandbox_controller.finalize_readiness(),
-        workspace_root=workspace_root,
-    )
+    readiness = sandbox_controller.finalize_readiness()
 
     scheduler = CoreToolScheduler(
         permission_checker=PermissionChecker(
@@ -479,6 +473,7 @@ def create_agent(
     runtime_agent.mcp_manager = mcp_manager
     runtime_agent.sandbox_controller = sandbox_controller
     runtime_agent.sandbox_readiness = readiness
+    runtime_agent.workspace_root = workspace_root
     return runtime_agent
 
 
@@ -496,6 +491,7 @@ async def lifespan(app: FastAPI):
     app.state.auth_store = auth_store
     app.state.settings = agent.settings
     app.state.sandbox_readiness = agent.sandbox_readiness
+    app.state.workspace_root = getattr(agent, "workspace_root", None)
     sandbox_controller = getattr(agent, "sandbox_controller", None)
     if sandbox_controller is not None:
         for event in sandbox_controller.drain_startup_events():
@@ -503,15 +499,20 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        if hasattr(agent, "mcp_manager") and agent.mcp_manager:
-            agent.mcp_manager.stop()
-        if sandbox_controller is not None:
-            try:
-                sandbox_controller.close()
-            except Exception:
-                logger.warning(
-                    "Sandbox controller reported residual startup state during shutdown; details redacted"
-                )
+        try:
+            if hasattr(agent, "mcp_manager") and agent.mcp_manager:
+                try:
+                    agent.mcp_manager.stop()
+                except Exception:
+                    logger.warning("MCP manager shutdown failed; details redacted")
+        finally:
+            if sandbox_controller is not None:
+                try:
+                    sandbox_controller.close()
+                except Exception:
+                    logger.warning(
+                        "Sandbox controller reported residual startup state during shutdown; details redacted"
+                    )
 
 
 app = FastAPI(title="MultiClaw", lifespan=lifespan)
@@ -569,8 +570,8 @@ class ApproveRequest(BaseModel):
 
 
 @app.get("/health/ready")
-async def health_ready():
-    readiness = getattr(app.state, "sandbox_readiness", None)
+async def health_ready(request: Request):
+    readiness = getattr(request.app.state, "sandbox_readiness", None)
     if readiness is None:
         payload = {
             "ready": False,
@@ -588,7 +589,12 @@ async def health_ready():
         }
         return JSONResponse(payload, status_code=503)
 
-    payload = readiness.model_dump(mode="json")
+    workspace_root = getattr(request.app.state, "workspace_root", None)
+    public_readiness = _sanitize_public_readiness(
+        readiness,
+        workspace_root=workspace_root.resolve() if isinstance(workspace_root, Path) else workspace_root,
+    )
+    payload = public_readiness.model_dump(mode="json")
     return JSONResponse(payload, status_code=200 if readiness.ready else 503)
 
 

@@ -1058,7 +1058,7 @@ def test_host_unsafe_backend_still_uses_common_environment_and_validates_workspa
 
 
 def test_unavailable_sandbox_controller_drains_startup_events_once() -> None:
-    from tests.sandbox_fakes import UnavailableSandboxController
+    from sandbox_fakes import UnavailableSandboxController
 
     controller = UnavailableSandboxController()
 
@@ -1067,3 +1067,29 @@ def test_unavailable_sandbox_controller_drains_startup_events_once() -> None:
 
     assert len(first) == 1
     assert second == ()
+
+
+def test_unsafe_capability_event_does_not_block_unsafe_mode_readiness(tmp_path: Path) -> None:
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    manager = SandboxManager.create(
+        settings=_settings(mode="host_unsafe_dev_only"),
+        debug=True,
+        workspace_root=tmp_path,
+        platform_name="Darwin",
+    )
+
+    manager.drain_startup_events()
+    manager.record_unsafe_capability(
+        "mcp_in_process_demo",
+        "unsafe transport kept for development",
+    )
+    readiness = manager.finalize_readiness()
+    events = manager.drain_startup_events()
+
+    assert readiness.ready is True
+    assert readiness.unsafe_fallback_active is True
+    assert readiness.skipped_capabilities == {}
+    assert [event.type for event in events] == ["sandbox.unsafe_fallback_used"]
+    assert events[0].data["scope"] == "capability"
+    assert events[0].data["capability"] == "mcp_in_process_demo"
