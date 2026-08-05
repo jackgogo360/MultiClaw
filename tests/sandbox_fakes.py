@@ -130,6 +130,19 @@ class ReadyRecordingSandboxController:
             )
         )
 
+    def record_unsafe_capability(self, name: str, reason: str) -> None:
+        self._events.append(
+            Event(
+                type="sandbox.unsafe_fallback_used",
+                data={
+                    "backend_name": self._backend_name,
+                    "scope": "capability",
+                    "capability": name,
+                    "reason": reason,
+                },
+            )
+        )
+
     def finalize_readiness(self) -> SandboxReadiness:
         return self._readiness
 
@@ -174,12 +187,12 @@ class UnavailableSandboxController:
             skipped_capabilities={"sandbox": "backend unavailable"},
             unsafe_fallback_active=False,
         )
-        self._events = (
+        self._events = [
             Event(
                 type="sandbox.profile_unavailable",
                 data={"profile_name": "shell_workspace", "reason": "backend unavailable"},
             ),
-        )
+        ]
 
     @property
     def mode(self) -> str:
@@ -209,6 +222,14 @@ class UnavailableSandboxController:
         raise SandboxUnavailableError("sandbox backend unavailable")
 
     def record_blocked_capability(self, name: str, reason: str) -> None:
+        self._events.append(
+            Event(
+                type="sandbox.registration_skipped",
+                data={"capability": name, "reason": reason},
+            )
+        )
+
+    def record_unsafe_capability(self, name: str, reason: str) -> None:
         del name, reason
         raise RuntimeError("sandbox readiness is already blocked")
 
@@ -216,8 +237,8 @@ class UnavailableSandboxController:
         return self._readiness
 
     def drain_startup_events(self) -> tuple[Event, ...]:
-        events = self._events
-        self._events = ()
+        events = tuple(self._events)
+        self._events = []
         return events
 
     def close(self) -> None:

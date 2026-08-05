@@ -336,6 +336,23 @@ class SandboxManager(SandboxController):
                 )
             )
 
+    def record_unsafe_capability(self, name: str, reason: str) -> None:
+        with self._lifecycle_lock:
+            if self._readiness_snapshot is not None:
+                raise RuntimeError("sandbox readiness has already been finalized")
+
+            self._startup_events.append(
+                Event(
+                    type="sandbox.unsafe_fallback_used",
+                    data={
+                        "backend_name": self._backend_name,
+                        "scope": "capability",
+                        "capability": self._sanitize_text(name),
+                        "reason": self._sanitize_text(reason),
+                    },
+                )
+            )
+
     def finalize_readiness(self) -> SandboxReadiness:
         with self._lifecycle_lock:
             if self._readiness_snapshot is None:

@@ -4,12 +4,13 @@ from pathlib import Path
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from multiclaw.events import Event
 from multiclaw.governance.sandbox.models import SandboxProbeResult, SandboxReadiness
 from multiclaw.mcp.types import HTTPServerConfig, InProcessServerConfig, StdioServerConfig
 from multiclaw.mcp.types import ToolInfo
-from tests.sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
+from sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
 
 
 def _make_auth_cookie(app) -> dict:
@@ -309,6 +310,7 @@ def test_health_ready_is_public_and_uses_app_state(tmp_path, monkeypatch):
         assert response.status_code == 200
         assert response.json()["ready"] is True
         assert server_module.app.state.sandbox_readiness.ready is True
+        assert server_module.app.state.sandbox_readiness is controller.finalize_readiness()
 
 
 def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch):
@@ -337,6 +339,26 @@ def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch)
         assert str(tmp_path / "private-root") not in response.text
         assert str(tmp_path / ".env.secret") not in response.text
         assert "sk-test-should-not-leak" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_health_ready_reads_request_app_state_and_sanitizes_response(tmp_path):
+    import multiclaw.server as server_module
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    controller = _LeakyUnavailableSandboxController(tmp_path)
+    app.state.sandbox_readiness = controller.finalize_readiness()
+    app.state.workspace_root = tmp_path
+    request = Request({"type": "http", "app": app, "method": "GET", "path": "/health/ready", "headers": []})
+
+    response = await server_module.health_ready(request)
+
+    assert response.status_code == 503
+    body = response.body.decode()
+    assert str(tmp_path) not in body
+    assert "sk-test-should-not-leak" not in body
+    assert app.state.sandbox_readiness is controller.finalize_readiness()
 
 
 def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch, tmp_path):
@@ -574,6 +596,10 @@ def test_register_mcp_tools_keeps_in_process_in_unsafe_mode(tmp_path, monkeypatc
     )
     monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
 
+    controller = ReadyRecordingSandboxController(
+        workspace_root=tmp_path,
+        mode="host_unsafe_dev_only",
+    )
     manager = FakeManager()
     registry = ToolRegistry()
     with caplog.at_level("WARNING"):
@@ -581,10 +607,7 @@ def test_register_mcp_tools_keeps_in_process_in_unsafe_mode(tmp_path, monkeypatc
             registry=registry,
             mcp_manager=manager,
             config_path=None,
-            sandbox_controller=ReadyRecordingSandboxController(
-                workspace_root=tmp_path,
-                mode="host_unsafe_dev_only",
-            ),
+            sandbox_controller=controller,
             workspace_root=tmp_path,
         )
 
@@ -593,6 +616,93 @@ def test_register_mcp_tools_keeps_in_process_in_unsafe_mode(tmp_path, monkeypatc
         "mcp__local-inproc__stat",
     ]
     assert "unsafe" in caplog.text
+    assert controller.readiness.ready is True
+    events = controller.drain_startup_events()
+    assert [event.type for event in events] == ["sandbox.unsafe_fallback_used"]
+    assert events[0].data["scope"] == "capability"
+    assert events[0].data["capability"] == "mcp_in_process_local-inproc"
+    assert "unsafe" in events[0].data["reason"]
+
+
+def test_register_mcp_tools_propagates_blocked_capability_record_errors(tmp_path, monkeypatch):
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    class RaisingController(ReadyRecordingSandboxController):
+        def is_profile_ready(self, profile_name: str) -> bool:
+            if profile_name == "mcp_stdio_local":
+                return False
+            return super().is_profile_ready(profile_name)
+
+        def record_blocked_capability(self, name: str, reason: str) -> None:
+            raise RuntimeError(f"record failed for {name}: {reason}")
+
+    class FakeManager:
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connected = dict(configs)
+
+        def get_server_states(self):
+            return {}
+
+    monkeypatch.setattr(
+        "multiclaw.server.load_mcp_config",
+        lambda path=None: {
+            "local": StdioServerConfig(command="python", args=["-m", "demo"]),
+        },
+    )
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
+
+    with pytest.raises(RuntimeError, match="record failed"):
+        _register_mcp_tools(
+            registry=ToolRegistry(),
+            mcp_manager=FakeManager(),
+            config_path=None,
+            sandbox_controller=RaisingController(workspace_root=tmp_path),
+            workspace_root=tmp_path,
+        )
+
+
+def test_lifespan_still_closes_controller_when_mcp_stop_fails(tmp_path, monkeypatch, caplog):
+    import multiclaw.server as server_module
+
+    class FakeController(ReadyRecordingSandboxController):
+        def __init__(self) -> None:
+            super().__init__(workspace_root=tmp_path)
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            raise RuntimeError(f"stop leaked path {tmp_path}")
+
+    controller = FakeController()
+    manager = FakeManager()
+    real_create_agent = server_module.create_agent
+
+    def _create_agent(*, sandbox_controller=None):
+        del sandbox_controller
+        runtime_agent = real_create_agent(sandbox_controller=controller)
+        runtime_agent.mcp_manager = manager
+        return runtime_agent
+
+    monkeypatch.setattr(server_module, "create_agent", _create_agent)
+
+    with caplog.at_level("WARNING"):
+        with TestClient(server_module.app):
+            pass
+
+    assert manager.stop_calls == 1
+    assert controller.close_calls == 1
+    assert str(tmp_path) not in caplog.text
 
 
 @pytest.mark.parametrize(
