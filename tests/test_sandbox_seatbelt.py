@@ -424,6 +424,7 @@ def test_seatbelt_renders_dynamic_mcp_policy_combinations(
         network_mode=network_mode,
         workspace_mode=workspace_mode,
         allow_subprocesses=allow_subprocesses,
+        mcp_server_name="demo",
     )
 
     launch = SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
@@ -453,6 +454,46 @@ def test_seatbelt_renders_dynamic_mcp_policy_combinations(
         assert "(deny process-fork)" not in profile_text
     else:
         assert "(deny process-fork)" in profile_text
+
+
+def test_seatbelt_treats_configured_custom_mcp_profile_as_reviewed_mcp_policy(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="mcp",
+        profile_name="custom_mcp_profile",
+        mode="exec_argv",
+        argv=("/usr/bin/env",),
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        network_mode="disabled",
+        workspace_mode="ro",
+        allow_subprocesses=False,
+        mcp_server_name="demo",
+    )
+
+    launch = SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
+        request,
+        _policy(
+            name="custom_mcp_profile",
+            workspace_mode="ro",
+            network_mode="disabled",
+            allow_subprocesses=False,
+            entrypoints=(Path("/usr/bin/env"),),
+        ),
+        environment,
+    )
+    profile_text = launch.args[launch.args.index("-p") + 1]
+
+    assert "(deny network*)" in profile_text
+    assert "(deny process-fork)" in profile_text
+    assert '(allow file-write* (subpath (param "WORKSPACE")))' not in profile_text
 
 
 def test_seatbelt_rejects_network_or_capability_mismatches(tmp_path: Path) -> None:

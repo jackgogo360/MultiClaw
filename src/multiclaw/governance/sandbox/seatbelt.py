@@ -62,9 +62,14 @@ class SeatbeltBackend:
         if policy.name != request.profile_name:
             raise SandboxLaunchError("policy name must match request profile_name")
 
-        template = self._template_for(policy.name)
+        is_reviewed_mcp = self._is_reviewed_mcp_request(request)
+        template = self._template_for(policy.name, is_reviewed_mcp=is_reviewed_mcp)
         self._validate_request_overrides(request, policy)
-        self._validate_policy_against_template(policy, template)
+        self._validate_policy_against_template(
+            policy,
+            template,
+            is_reviewed_mcp=is_reviewed_mcp,
+        )
         target_argv = self._target_argv_for(request, policy)
 
         workspace_root = self._canonicalize_path(request.workspace_root, "workspace_root")
@@ -72,7 +77,11 @@ class SeatbeltBackend:
         private_home = self._canonicalize_path(environment.home, "private_home")
         private_tmp = self._canonicalize_path(environment.tmp, "private_tmp")
         runtime_roots = self._collect_runtime_roots(policy, request)
-        profile_text = self._render_profile_text(policy, template)
+        profile_text = self._render_profile_text(
+            policy,
+            template,
+            is_reviewed_mcp=is_reviewed_mcp,
+        )
 
         args = (
             *self._profile_parameter_args(
@@ -333,8 +342,15 @@ class SeatbeltBackend:
             env=dict(env),
         )
 
-    def _template_for(self, profile_name: str) -> SeatbeltProfileTemplate:
+    def _template_for(
+        self,
+        profile_name: str,
+        *,
+        is_reviewed_mcp: bool,
+    ) -> SeatbeltProfileTemplate:
         template = SEATBELT_PROFILES.get(profile_name)
+        if template is None and is_reviewed_mcp:
+            template = SEATBELT_PROFILES["mcp_stdio_local"]
         if template is None:
             raise SandboxLaunchError(f"unsupported seatbelt profile {profile_name!r}")
         return template
@@ -358,10 +374,12 @@ class SeatbeltBackend:
         self,
         policy: SandboxProfilePolicy,
         template: SeatbeltProfileTemplate,
+        *,
+        is_reviewed_mcp: bool,
     ) -> None:
         if policy.network_mode not in _SUPPORTED_NETWORK_MODES:
             raise SandboxLaunchError("unsupported network mode for seatbelt profile")
-        if policy.name != "mcp_stdio_local":
+        if not is_reviewed_mcp:
             if policy.network_mode != template.network_mode:
                 raise SandboxLaunchError("network mode is not represented by the static template")
             if policy.workspace_mode != template.workspace_mode:
@@ -385,14 +403,19 @@ class SeatbeltBackend:
         self,
         policy: SandboxProfilePolicy,
         template: SeatbeltProfileTemplate,
+        *,
+        is_reviewed_mcp: bool,
     ) -> str:
-        if policy.name != "mcp_stdio_local":
+        if not is_reviewed_mcp:
             return template.profile_text
         return render_mcp_stdio_profile(
             workspace_mode=policy.workspace_mode,
             network_mode=policy.network_mode,
             allow_subprocesses=policy.allow_subprocesses,
         )
+
+    def _is_reviewed_mcp_request(self, request: SandboxExecRequest) -> bool:
+        return request.mcp_server_name is not None
 
     def _canonicalize_existing_path(self, path: Path, label: str) -> Path:
         value = str(path)

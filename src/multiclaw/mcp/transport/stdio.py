@@ -48,9 +48,10 @@ class StdioTransport(BaseTransport):
             raise
         self._set_streams(streams[0], streams[1])
         logger.debug(
-            "Stdio transport connected: %s %s",
-            self._launch_spec.executable,
-            self._launch_spec.args,
+            "Stdio transport connected: server=%s correlation_id=%s arg_count=%d",
+            self._server_name,
+            self._launch_spec.correlation_id,
+            len(self._launch_spec.args),
         )
         return self
 
