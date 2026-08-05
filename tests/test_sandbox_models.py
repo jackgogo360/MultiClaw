@@ -145,3 +145,134 @@ def test_sandbox_models_are_frozen_and_expose_expected_defaults() -> None:
     assert request.mcp_server_name is None
     assert request.stdin_bytes is None
 
+
+def test_sandbox_mapping_fields_are_immutably_wrapped_after_validation() -> None:
+    from multiclaw.governance import (
+        SandboxEnvironment,
+        SandboxExecRequest,
+        SandboxProbeResult,
+        SandboxReadiness,
+        SandboxedLaunchSpec,
+    )
+
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command="echo hello",
+        workspace_root=Path("/workspace"),
+        cwd=Path("/workspace"),
+        timeout_seconds=5.0,
+        env_overrides={"CUSTOM_FLAG": "1"},
+    )
+    environment = SandboxEnvironment(
+        env={"PATH": "/usr/bin:/bin"},
+        private_root=Path("/tmp/private"),
+        home=Path("/tmp/private/home"),
+        tmp=Path("/tmp/private/tmp"),
+    )
+    launch = SandboxedLaunchSpec(
+        executable="/bin/sh",
+        args=("-c", "echo hello"),
+        cwd=Path("/workspace"),
+        env={"PATH": "/usr/bin:/bin"},
+        stdin_bytes=None,
+        private_root=Path("/tmp/private"),
+        backend_name="host_unsafe",
+        profile_name="shell_workspace",
+        correlation_id="corr-1",
+    )
+    probe = SandboxProbeResult(
+        backend_name="host_unsafe",
+        available=True,
+        capabilities={"exec": True},
+    )
+    readiness = SandboxReadiness(
+        ready=True,
+        mode="auto",
+        backend_name="host_unsafe",
+        probe=probe,
+        profiles={"shell_workspace": True},
+        skipped_capabilities={"network": "disabled"},
+    )
+
+    with pytest.raises(TypeError):
+        request.env_overrides["OTHER"] = "2"
+    with pytest.raises(TypeError):
+        environment.env["OTHER"] = "2"
+    with pytest.raises(TypeError):
+        launch.env["OTHER"] = "2"
+    with pytest.raises(TypeError):
+        probe.capabilities["network"] = False
+    with pytest.raises(TypeError):
+        readiness.profiles["code_exec"] = False
+    with pytest.raises(TypeError):
+        readiness.skipped_capabilities["filesystem"] = "blocked"
+
+
+def test_sandbox_env_contracts_redact_secret_values_in_repr_and_model_dump() -> None:
+    from multiclaw.governance import (
+        SandboxEnvironment,
+        SandboxExecRequest,
+        SandboxedLaunchSpec,
+    )
+
+    secret_value = "dummy-secret-value"
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command="echo hello",
+        workspace_root=Path("/workspace"),
+        cwd=Path("/workspace"),
+        timeout_seconds=5.0,
+        env_overrides={
+            "OPENAI_API_KEY": secret_value,
+            "CUSTOM_FLAG": "1",
+        },
+    )
+    environment = SandboxEnvironment(
+        env={
+            "OPENAI_API_KEY": secret_value,
+            "CUSTOM_FLAG": "1",
+        },
+        private_root=Path("/tmp/private"),
+        home=Path("/tmp/private/home"),
+        tmp=Path("/tmp/private/tmp"),
+    )
+    launch = SandboxedLaunchSpec(
+        executable="/bin/sh",
+        args=("-c", "echo hello"),
+        cwd=Path("/workspace"),
+        env={
+            "OPENAI_API_KEY": secret_value,
+            "CUSTOM_FLAG": "1",
+        },
+        stdin_bytes=None,
+        private_root=Path("/tmp/private"),
+        backend_name="host_unsafe",
+        profile_name="shell_workspace",
+        correlation_id="corr-1",
+    )
+
+    assert secret_value == request.env_overrides["OPENAI_API_KEY"]
+    assert secret_value == environment.env["OPENAI_API_KEY"]
+    assert secret_value == launch.env["OPENAI_API_KEY"]
+
+    assert secret_value not in repr(request)
+    assert secret_value not in repr(environment)
+    assert secret_value not in repr(launch)
+
+    request_dump = request.model_dump()
+    environment_dump = environment.model_dump()
+    launch_dump = launch.model_dump()
+
+    assert request_dump["env_overrides"]["OPENAI_API_KEY"] == "[REDACTED]"
+    assert request_dump["env_overrides"]["CUSTOM_FLAG"] == "1"
+    assert environment_dump["env"]["OPENAI_API_KEY"] == "[REDACTED]"
+    assert environment_dump["env"]["CUSTOM_FLAG"] == "1"
+    assert launch_dump["env"]["OPENAI_API_KEY"] == "[REDACTED]"
+    assert launch_dump["env"]["CUSTOM_FLAG"] == "1"
+    assert secret_value not in str(request_dump)
+    assert secret_value not in str(environment_dump)
+    assert secret_value not in str(launch_dump)
