@@ -129,6 +129,16 @@ class WeirdAuditToolBuilder(EchoToolBuilder):
         return WeirdAuditInvocation(name=self.name, params=params)
 
 
+class RaisingInvocation(ToolInvocation[EchoParams]):
+    async def execute(self) -> ToolExecutionResult:
+        raise RuntimeError("dummy-secret-token path=/tmp/private-root")
+
+
+class RaisingToolBuilder(EchoToolBuilder):
+    def build(self, params: EchoParams) -> ToolInvocation[EchoParams]:
+        return RaisingInvocation(name=self.name, params=params)
+
+
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
     (tmp_path / "src" / "sub").mkdir(parents=True)
@@ -649,7 +659,7 @@ class TestCoreToolScheduler:
 
                 class _Invocation(ToolInvocation[MCPParams]):
                     async def execute(self_inner) -> ToolExecutionResult:
-                        raise RuntimeError("secret-token-123")
+                        raise RuntimeError("dummy-secret-token path=/tmp/private-root")
 
                 return _Invocation(name=self.name, params=MCPParams())
 
@@ -666,15 +676,54 @@ class TestCoreToolScheduler:
         )
 
         assert result.status == ToolStatus.ERROR
+        assert result.content == "tool execution failed"
         entries = await scheduler.audit_logger.list_entries()
         assert entries[-1].status == ToolStatus.ERROR.value
         assert entries[-1].detail == "tool execution failed"
-        assert "secret-token-123" not in entries[-1].detail
+        assert "dummy-secret-token" not in result.content
+        assert "/tmp/private-root" not in result.content
+        assert "dummy-secret-token" not in entries[-1].detail
+        assert "/tmp/private-root" not in entries[-1].detail
         assert events == [
             ("scheduled", {"tool": "mcp__demo__tool"}),
             ("validating", {"tool": "mcp__demo__tool"}),
             ("error", {"tool": "mcp__demo__tool", "error": "tool execution failed"}),
         ]
+        assert "dummy-secret-token" not in str(events)
+        assert "/tmp/private-root" not in str(events)
+
+    @pytest.mark.asyncio
+    async def test_ordinary_execute_exception_returns_generic_error_without_secret_leak(
+        self,
+        scheduler,
+    ):
+        events = []
+
+        async def handler(event):
+            if event.type.startswith("tool."):
+                events.append((event.type.removeprefix("tool."), event.data))
+
+        scheduler.event_bus.subscribe("*", handler)
+
+        result = await scheduler.run(RaisingToolBuilder(), {"text": "ignored"})
+
+        assert result.status == ToolStatus.ERROR
+        assert result.content == "tool execution failed"
+        entries = await scheduler.audit_logger.list_entries()
+        assert entries[-1].status == ToolStatus.ERROR.value
+        assert entries[-1].detail == "tool execution failed"
+        assert "dummy-secret-token" not in result.content
+        assert "/tmp/private-root" not in result.content
+        assert "dummy-secret-token" not in entries[-1].detail
+        assert "/tmp/private-root" not in entries[-1].detail
+        assert events == [
+            ("scheduled", {"tool": "echo"}),
+            ("validating", {"tool": "echo"}),
+            ("executing", {"tool": "echo"}),
+            ("error", {"tool": "echo", "error": "tool execution failed"}),
+        ]
+        assert "dummy-secret-token" not in str(events)
+        assert "/tmp/private-root" not in str(events)
 
     @pytest.mark.asyncio
     async def test_safe_tool_emits_expected_event_order_and_audit_before_return(self, scheduler):
