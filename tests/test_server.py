@@ -10,6 +10,7 @@ from multiclaw.events import Event
 from multiclaw.governance.sandbox.models import SandboxProbeResult, SandboxReadiness
 from multiclaw.mcp.types import HTTPServerConfig, InProcessServerConfig, StdioServerConfig
 from multiclaw.mcp.types import ToolInfo
+from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.shell import ShellToolBuilder
 from sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
 
@@ -939,6 +940,30 @@ def test_create_agent_passes_configured_shell_profile_and_controller(tmp_path, m
     assert isinstance(shell_builder, ShellToolBuilder)
     assert shell_builder.sandbox_controller is controller
     assert shell_builder.profile_name == "custom_shell_profile"
+
+
+def test_create_agent_passes_configured_code_exec_profile_and_controller(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    monkeypatch.setenv(
+        "MULTICLAW_GOVERNANCE__SANDBOX__PROFILES__CODE_EXEC",
+        "custom_code_profile",
+    )
+
+    import multiclaw.server as server_module
+
+    class ProfileController(ReadyRecordingSandboxController):
+        def is_profile_ready(self, profile_name: str) -> bool:
+            return profile_name in {"shell_workspace", "custom_code_profile"}
+
+    controller = ProfileController(workspace_root=tmp_path)
+    agent = server_module.create_agent(sandbox_controller=controller)
+    code_exec_builder = agent.registry.get("code_exec")
+
+    assert isinstance(code_exec_builder, CodeExecToolBuilder)
+    assert code_exec_builder.sandbox_controller is controller
+    assert code_exec_builder.profile_name == "custom_code_profile"
 
 
 @pytest.mark.parametrize(
