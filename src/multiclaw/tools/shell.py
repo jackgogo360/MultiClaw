@@ -148,6 +148,8 @@ class ShellInvocation(ToolInvocation[ShellParams]):
             output_parts.append(f"[exit code: {exit_code}]")
 
         output = "\n".join(output_parts)
+        # Compatibility: timed out shell runs stay "success" so callers keep
+        # using content/data rather than treating timeouts as scheduler errors.
         result = _success(output, data={"exit_code": exit_code})
         result.audit.update(
             {
@@ -174,13 +176,16 @@ class ShellInvocation(ToolInvocation[ShellParams]):
         for pattern in DANGEROUS_PATTERNS:
             if pattern in cmd_lower:
                 return f"Blocked dangerous command pattern: {pattern}"
+        try:
+            first_token = shlex.split(command)[0]
+        except ValueError:
+            first_token = command.split()[0] if command.split() else ""
         if self.blocked_commands:
-            try:
-                first_token = shlex.split(command)[0]
-            except ValueError:
-                first_token = command.split()[0] if command.split() else ""
             if first_token in self.blocked_commands:
                 return f"Command '{first_token}' is blocked by policy"
+        if self.allowed_commands:
+            if first_token not in self.allowed_commands:
+                return f"Command '{first_token}' is not allowed by policy"
         return None
 
 class ShellToolBuilder(WorkspaceToolBuilder):

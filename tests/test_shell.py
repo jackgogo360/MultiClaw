@@ -62,6 +62,21 @@ class TestShellTool:
         assert "blocked" in result.content.lower() or "dangerous" in result.content.lower()
 
     @pytest.mark.asyncio
+    async def test_shell_dangerous_command_takes_priority_over_allowlist(self, workspace):
+        builder = ShellToolBuilder(
+            str(workspace),
+            sandbox_controller=ReadyRecordingSandboxController(workspace_root=workspace),
+            allowed_commands=["rm"],
+        )
+
+        result = await builder.build(
+            builder.validate({"command": "rm -rf /"})
+        ).execute()
+
+        assert result.status == "error"
+        assert "dangerous" in result.content.lower() or "blocked" in result.content.lower()
+
+    @pytest.mark.asyncio
     async def test_shell_respects_cwd(self, workspace):
         controller = ReadyRecordingSandboxController(workspace_root=workspace)
         builder = ShellToolBuilder(
@@ -85,6 +100,7 @@ class TestShellTool:
         result = await builder.build(
             builder.validate({"command": "sleep 10", "timeout": 0.5})
         ).execute()
+        assert result.status == "success"
         assert "timed out" in result.content.lower()
 
     @pytest.mark.asyncio
@@ -149,3 +165,20 @@ class TestShellTool:
         assert result.content == "sandbox profile unavailable"
         assert "printf" not in result.content
         assert "OPENAI_API_KEY" not in result.content
+
+    @pytest.mark.asyncio
+    async def test_shell_rejects_commands_outside_allowed_commands_without_execution(self, workspace):
+        controller = ReadyRecordingSandboxController(workspace_root=workspace)
+        builder = ShellToolBuilder(
+            str(workspace),
+            sandbox_controller=controller,
+            allowed_commands=["echo"],
+        )
+
+        result = await builder.build(
+            builder.validate({"command": "python3 -c 'print(1)'"} )
+        ).execute()
+
+        assert result.status == "error"
+        assert "allow" in result.content.lower()
+        assert controller.requests == []

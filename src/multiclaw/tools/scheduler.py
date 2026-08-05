@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -75,13 +76,18 @@ class CoreToolScheduler:
                     result = await self.execution_guard.run(invocation.execute)
                 except Exception as exc:
                     error_text = str(exc)
-                    return ToolExecutionResult(status=ToolStatus.ERROR, content=error_text)
-                await self.audit_logger.record(
-                    tool_name=builder.name,
-                    status=result.status.value,
-                    detail=self._audit_detail(result),
-                )
-                await self._publish_result_event(builder.name, result)
+                    result = ToolExecutionResult(
+                        status=ToolStatus.ERROR,
+                        content=error_text,
+                    )
+                    await self._finalize_terminal_result(
+                        builder.name,
+                        result,
+                        audit_detail="tool execution failed",
+                        error_label="tool execution failed",
+                    )
+                    return result
+                await self._finalize_terminal_result(builder.name, result)
                 return result
 
             decision = await self.permission_checker.check(
@@ -124,23 +130,30 @@ class CoreToolScheduler:
                     )
                     self._pending.pop(request_id, None)
                     self._pending_results.pop(request_id, None)
-                    return ToolExecutionResult(
+                    result = ToolExecutionResult(
                         status=ToolStatus.CANCELLED,
                         content="Approval timed out after 120s.",
                     )
+                    await self._finalize_terminal_result(
+                        builder.name,
+                        result,
+                        audit_detail=result.content,
+                    )
+                    return result
                 approved = self._pending_results.pop(request_id, False)
                 self._pending.pop(request_id, None)
 
                 if not approved:
-                    await self.audit_logger.record(
-                        tool_name=builder.name,
-                        status=ToolStatus.CANCELLED.value,
-                        detail="rejected by user",
-                    )
-                    return ToolExecutionResult(
+                    result = ToolExecutionResult(
                         status=ToolStatus.CANCELLED,
                         content="rejected by user",
                     )
+                    await self._finalize_terminal_result(
+                        builder.name,
+                        result,
+                        audit_detail=result.content,
+                    )
+                    return result
 
             if not decision.allow:
                 await self.event_bus.publish(
@@ -167,30 +180,23 @@ class CoreToolScheduler:
             result = await self.execution_guard.run(invocation.execute)
         except Exception as exc:
             error_text = str(exc)
-            await self.audit_logger.record(
-                tool_name=builder.name,
-                status=ToolStatus.ERROR.value,
-                detail=error_text,
+            result = ToolExecutionResult(
+                status=ToolStatus.ERROR,
+                content=error_text,
             )
-            await self.event_bus.publish(
-                Event(type="tool.error", data={"tool": builder.name, "error": error_text})
+            await self._finalize_terminal_result(
+                builder.name,
+                result,
+                audit_detail="tool execution failed",
+                error_label="tool execution failed",
             )
-            return ToolExecutionResult(status=ToolStatus.ERROR, content=error_text)
+            return result
 
-        await self.audit_logger.record(
-            tool_name=builder.name,
-            status=result.status.value,
-            detail=self._audit_detail(result),
-        )
-        await self._publish_result_event(builder.name, result)
+        await self._finalize_terminal_result(builder.name, result)
         return result
 
     def _audit_detail(self, result: ToolExecutionResult) -> str:
-        allowlisted = {
-            key: result.audit[key]
-            for key in sorted(self._AUDIT_ALLOWLIST)
-            if key in result.audit
-        }
+        allowlisted = self._normalized_audit_fields(result.audit)
         if not allowlisted:
             return result.content
 
@@ -199,10 +205,31 @@ class CoreToolScheduler:
             return f"[audit] {prefix}"
         return f"[audit] {prefix}\n{result.content}"
 
+    async def _finalize_terminal_result(
+        self,
+        tool_name: str,
+        result: ToolExecutionResult,
+        *,
+        audit_detail: str | None = None,
+        error_label: str | None = None,
+    ) -> None:
+        await self.audit_logger.record(
+            tool_name=tool_name,
+            status=result.status.value,
+            detail=audit_detail if audit_detail is not None else self._audit_detail(result),
+        )
+        await self._publish_result_event(
+            tool_name,
+            result,
+            error_label=error_label,
+        )
+
     async def _publish_result_event(
         self,
         tool_name: str,
         result: ToolExecutionResult,
+        *,
+        error_label: str | None = None,
     ) -> None:
         if result.status == ToolStatus.SUCCESS:
             await self.event_bus.publish(
@@ -210,11 +237,35 @@ class CoreToolScheduler:
             )
             return
 
-        error_label = (
+        resolved_error_label = error_label or (
             "tool returned error"
             if result.status == ToolStatus.ERROR
             else f"tool returned {result.status.value}"
         )
         await self.event_bus.publish(
-            Event(type="tool.error", data={"tool": tool_name, "error": error_label})
+            Event(type="tool.error", data={"tool": tool_name, "error": resolved_error_label})
         )
+
+    def _normalized_audit_fields(self, audit: dict[str, Any]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for key in sorted(self._AUDIT_ALLOWLIST):
+            if key not in audit:
+                continue
+            if key == "unsafe_fallback_used":
+                if type(audit[key]) is bool:
+                    normalized[key] = "True" if audit[key] else "False"
+                continue
+            value = audit[key]
+            if not isinstance(value, str):
+                continue
+            safe_value = self._sanitize_audit_token(value)
+            if safe_value:
+                normalized[key] = safe_value
+        return normalized
+
+    def _sanitize_audit_token(self, value: str) -> str:
+        token = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+        token = re.sub(r"_+", "_", token).strip("._-")
+        if not token:
+            return ""
+        return token[:80]
