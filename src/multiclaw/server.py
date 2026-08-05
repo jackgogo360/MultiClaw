@@ -423,7 +423,13 @@ def create_agent(
     registry.register(GrepToolBuilder(workspace_root))
     registry.register(FindDirToolBuilder(workspace_root))
     if sandbox_controller.is_profile_ready(settings.governance.sandbox.profiles.shell):
-        registry.register(ShellToolBuilder(workspace_root))
+        registry.register(
+            ShellToolBuilder(
+                workspace_root,
+                sandbox_controller=sandbox_controller,
+                profile_name=settings.governance.sandbox.profiles.shell,
+            )
+        )
     else:
         _record_blocked_capability_safely(
             sandbox_controller,
