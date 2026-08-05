@@ -2,7 +2,7 @@
 
 **日期**：2026-08-03
 
-**状态**：已批准，待单独制定实施计划
+**状态**：已批准，实施计划与测试规格已制定，待实现
 
 **范围**：macOS `sandbox-exec` + Seatbelt、Linux nsjail；运行时自动选择；本文件只定义设计，不包含实现
 
@@ -97,9 +97,9 @@ MCP stdio 是长生命周期进程：MultiClaw 只把沙箱 wrapper 的 command/
 
 ### 公共环境与文件规则
 
-- 每次启动创建私有 `TMPDIR` 和空 `HOME=<TMPDIR>/home`，不继承宿主 home 或共享 `/tmp`。
+- 每次启动创建私有 `TMPDIR` 和空 `HOME=<TMPDIR>/home`，不继承宿主 home 或共享 `/tmp`；一次性执行结束后删除该目录，stdio MCP 在 disconnect 后删除，应用关闭时检查无残留根目录。
 - macOS 默认 `PATH=/usr/bin:/bin:/usr/sbin:/sbin`；Linux 默认 `/usr/bin:/bin`。
-- 仅保留 `LANG`、`LC_ALL` 和必要时的 `TERM`；注入合成的 `USER`、`SHELL`、`HOME`、`TMPDIR`、`PATH`。
+- 仅保留 `LANG`、`LC_ALL` 和必要时的 `TERM`；注入合成的 `USER`、`LOGNAME`、`SHELL`、`HOME`、`TMPDIR`、`PATH`。
 - `XDG_CONFIG_HOME`、`XDG_CACHE_HOME`、`XDG_DATA_HOME` 重定向到私有 home。
 - 默认拒绝 secret-shaped 环境变量；只有服务器配置中的显式安全授权可以传入。
 - 宿主 home、SSH/GPG agent、Docker/container socket、宿主临时目录均不进入可读视图。
@@ -167,17 +167,19 @@ nsjail_config_dir = ""
 - `auto`：按 OS 选择后端，任一探测、策略渲染或启动失败都不得回退宿主执行。
 - `host_unsafe_dev_only`：只在 `app.debug=true` 时有效；否则配置硬错误。启用时启动和每次危险执行都记录高危日志与事件。
 
+`unsafe_fallback_requires_debug` 在首版是不可关闭的固定真值；`backend_probe_on_startup=false` 只能用于诊断，并会让 `auto` 保持 blocked readiness，而不是跳过证明后继续注册危险能力。
+
 兼容迁移：
 
 - 旧值 `process` 映射为 `auto` 并输出精确弃用警告。
 - 旧值 `docker` 直接配置失败，因为仓库没有 Docker 后端。
 - 不提供生产 `off`。
 
-stdio MCP 增加：`cwd`（省略时工作区根）、`sandbox_network=disabled|inherit`、`sandbox_workspace=ro|rw`、`sandbox_allow_subprocesses`。网络继承、工作区写入、子进程和 secret-shaped env 都是显式安全授权，启动时记录服务器名和授权类型。
+stdio MCP 增加：`cwd`（省略时工作区根）、`sandbox_network=disabled|inherit`、`sandbox_workspace=ro|rw`、`sandbox_allow_subprocesses`、`sandbox_env_allowlist` 和 `sandbox_read_only_paths`。网络继承、工作区写入、子进程、secret-shaped env 与额外 runtime roots 都是显式安全授权，启动时记录服务器名和授权类型；每次启动最多允许 16 个额外只读根目录。受控 `PATH` 只由平台基线和这些显式 runtime roots 中可执行的 `bin` 目录组成，不继承宿主 `PATH`。
 
 ## Fail-closed 与 readiness
 
-启动时只创建一次不可变 `SandboxReadiness`，存入 `app.state.sandbox_readiness`，并由新增 `/health/ready` 返回后端、probe、各 profile、跳过能力和 unsafe fallback 状态。
+启动阶段先完成 probe 与注册门禁、收集跳过能力，再冻结且只创建一次不可变 `SandboxReadiness`，存入 `app.state.sandbox_readiness`，并由新增 `/health/ready` 返回后端、probe、各 profile、跳过能力和 unsafe fallback 状态。
 
 后端不可用时：
 
@@ -240,15 +242,15 @@ MCP tool call 仍经过现有 scheduler。stdio 沙箱事件发生在服务器�
 
 ## 实施顺序
 
-1. 在 `config/settings.py` 增加 typed settings 和旧值迁移，更新仓库配置与配置测试。
-2. 建立 `governance/sandbox/` 的模型、manager、runner、后端、模板、probe 和错误类型；保留独立 `ExecutionGuard`。
-3. 在 `server.py` 创建 manager/readiness，先过滤危险能力，再注册工具和连接 MCP，并增加 `/health/ready`。
-4. 迁移 `tools/shell.py`，先锁定行为兼容测试，再接入沙箱 runner。
-5. 迁移 `tools/code_exec.py` 到单 interpreter JSON-envelope 协议。
+1. 在 `src/multiclaw/config/settings.py` 增加 typed settings 和旧值迁移，更新仓库配置与配置测试。
+2. 建立 `src/multiclaw/governance/sandbox/` 的模型、manager、runner、后端、模板、probe 和错误类型；保留独立 `ExecutionGuard`。
+3. 在 `src/multiclaw/server.py` 创建 manager/readiness，先过滤危险能力，再注册工具和连接 MCP，并增加 `/health/ready`。
+4. 迁移 `src/multiclaw/tools/shell.py`，先锁定行为兼容测试，再接入沙箱 runner。
+5. 迁移 `src/multiclaw/tools/code_exec.py` 到单 interpreter JSON-envelope 协议。
 6. 扩展 MCP config/types/factory/stdio transport，加入三类 transport 的门禁。
 7. 完成两个平台的负向集成测试、事件顺序测试、部署说明和回滚说明后再启用默认 `auto`。
 
-完整实施任务与文件分工记录在 `.omx/plans/2026-08-03-native-sandbox-backends.md`。
+完整实施任务与文件分工记录在 `docs/superpowers/plans/2026-08-03-native-sandbox-backends.md`；PRD 与测试规格分别保存在 `docs/superpowers/specs/2026-08-03-native-sandbox-backends-prd.md` 和 `docs/superpowers/specs/2026-08-03-native-sandbox-backends-test-spec.md`，`.omx/plans/` 下保留执行门禁镜像。
 
 ## 验证与验收
 
@@ -296,4 +298,4 @@ MCP tool call 仍经过现有 scheduler。stdio 沙箱事件发生在服务器�
 
 **Consequences**：`code_exec` 需要实质改造；MCP 按 transport 分类；生产无普通 `off`；shell 只能保证固定入口和受限执行视图，不能预声明所有动态后代命令。
 
-**Follow-ups**：批准本规格后另行编写实施 PRD 与 test spec；实现完成后由安全审查和两个平台的负向测试共同验收。
+**Follow-ups**：按已制定的实施计划执行；实现完成后由安全审查和两个平台的负向测试共同验收。
