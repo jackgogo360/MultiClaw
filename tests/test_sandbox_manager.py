@@ -604,11 +604,100 @@ def test_fixed_profile_registry_matches_expected_policies_and_runtime_roots(
 
     mcp_policy = policies["mcp_stdio_local"]
     assert mcp_policy.workspace_mode == "ro"
-    assert mcp_policy.network_mode == "inherit"
-    assert mcp_policy.allow_subprocesses is True
+    assert mcp_policy.network_mode == "disabled"
+    assert mcp_policy.allow_subprocesses is False
     assert mcp_policy.entrypoints == (Path("/usr/bin/env").resolve(),)
     assert mcp_policy.write_protected_patterns == (".git",)
     assert mcp_policy.read_hidden_patterns == (".env", ".env.*")
+
+
+def test_mcp_launch_spec_uses_conservative_defaults_and_dynamic_policy_overrides(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    backend = RecordingBackend(name="recording")
+    manager = SandboxManager.create(
+        settings=_settings(),
+        debug=False,
+        workspace_root=tmp_path,
+        backend_override=backend,
+    )
+    manager.initialize()
+
+    runtime_root = tmp_path / "granted-runtime"
+    runtime_root.mkdir()
+
+    default_spec = manager.build_launch_spec(
+        _request(
+            tmp_path,
+            profile_name="mcp_stdio_local",
+            mode="exec_argv",
+            argv=("/usr/bin/env",),
+        )
+    )
+    default_policy = backend.build_calls[-1]["policy"]
+    assert default_spec.profile_name == "mcp_stdio_local"
+    assert default_policy.workspace_mode == "ro"
+    assert default_policy.network_mode == "disabled"
+    assert default_policy.allow_subprocesses is False
+    assert default_policy.entrypoints == (Path("/usr/bin/env").resolve(),)
+    assert default_policy.runtime_read_only_paths == ()
+
+    manager.build_launch_spec(
+        _request(
+            tmp_path,
+            profile_name="mcp_stdio_local",
+            mode="exec_argv",
+            argv=("/usr/bin/env",),
+            network_mode="inherit",
+            workspace_mode="rw",
+            allow_subprocesses=True,
+            read_only_paths=(runtime_root / ".", runtime_root),
+        )
+    )
+    dynamic_policy = backend.build_calls[-1]["policy"]
+    assert dynamic_policy.workspace_mode == "rw"
+    assert dynamic_policy.network_mode == "inherit"
+    assert dynamic_policy.allow_subprocesses is True
+    assert dynamic_policy.entrypoints == (Path("/usr/bin/env").resolve(),)
+    assert dynamic_policy.runtime_read_only_paths == (runtime_root.resolve(),)
+
+    registry_policy = next(
+        policy for policy in manager._policies if policy.name == "mcp_stdio_local"
+    )
+    assert registry_policy.workspace_mode == "ro"
+    assert registry_policy.network_mode == "disabled"
+    assert registry_policy.allow_subprocesses is False
+    assert registry_policy.runtime_read_only_paths == ()
+
+
+@pytest.mark.parametrize(
+    "request_kwargs",
+    [
+        {"network_mode": "inherit"},
+        {"workspace_mode": "ro"},
+        {"allow_subprocesses": False},
+        {"read_only_paths": (Path("/tmp"),)},
+    ],
+)
+def test_non_mcp_profiles_reject_dynamic_sandbox_overrides(
+    tmp_path: Path,
+    request_kwargs: dict[str, object],
+) -> None:
+    from multiclaw.governance import SandboxPolicyError
+    from multiclaw.governance.sandbox.manager import SandboxManager
+
+    manager = SandboxManager.create(
+        settings=_settings(),
+        debug=False,
+        workspace_root=tmp_path,
+        backend_override=RecordingBackend(name="recording"),
+    )
+    manager.initialize()
+
+    with pytest.raises(SandboxPolicyError, match="mcp_stdio"):
+        manager.build_launch_spec(_request(tmp_path, **request_kwargs))
 
 
 @pytest.mark.parametrize(
@@ -624,6 +713,7 @@ def test_build_launch_spec_requires_ready_profile_and_uses_scrubbed_platform_pat
     platform_name: str,
     expected_path: str,
 ) -> None:
+    from multiclaw.governance import SandboxPolicyError
     from multiclaw.governance.sandbox.manager import SandboxManager
 
     backend = RecordingBackend(name="recording")
@@ -664,7 +754,7 @@ def test_build_launch_spec_requires_ready_profile_and_uses_scrubbed_platform_pat
         manager.build_launch_spec(
             _request(tmp_path, profile_name="missing_profile")
         )
-    with pytest.raises(SandboxLaunchError, match="network_mode"):
+    with pytest.raises(SandboxPolicyError, match="mcp_stdio"):
         manager.build_launch_spec(
             _request(tmp_path, network_mode="inherit")
         )

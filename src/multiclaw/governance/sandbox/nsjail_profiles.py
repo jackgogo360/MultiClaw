@@ -96,17 +96,21 @@ CODE_EXEC_PYTHON_PROFILE = NsJailProfileTemplate(
 MCP_STDIO_LOCAL_PROFILE = NsJailProfileTemplate(
     name="mcp_stdio_local",
     workspace_mode="ro",
-    network_mode="inherit",
-    allow_subprocesses=True,
+    network_mode="disabled",
+    allow_subprocesses=False,
     write_protected_patterns=(".git",),
     read_hidden_patterns=(".env", ".env.*"),
     system_read_only_roots=_SYSTEM_READ_ONLY_ROOTS,
-    seccomp_policy=_seccomp_policy(*_COMMON_SECCOMP_RULES, _DEFAULT_ALLOW_SECCOMP_RULE),
+    seccomp_policy=_seccomp_policy(
+        *_COMMON_SECCOMP_RULES,
+        *_NO_CHILD_PROCESS_SECCOMP_RULES,
+        _DEFAULT_ALLOW_SECCOMP_RULE,
+    ),
     rlimit_as_mb=4096,
     rlimit_cpu_seconds=30,
     rlimit_fsize_mb=16,
     rlimit_nofile=64,
-    rlimit_nproc=1024,
+    rlimit_nproc=1,
 )
 
 NSJAIL_PROFILES = {
@@ -114,3 +118,30 @@ NSJAIL_PROFILES = {
     CODE_EXEC_PYTHON_PROFILE.name: CODE_EXEC_PYTHON_PROFILE,
     MCP_STDIO_LOCAL_PROFILE.name: MCP_STDIO_LOCAL_PROFILE,
 }
+
+
+def render_mcp_stdio_template(
+    *,
+    workspace_mode: str,
+    network_mode: str,
+    allow_subprocesses: bool,
+) -> NsJailProfileTemplate:
+    return NsJailProfileTemplate(
+        name="mcp_stdio_local",
+        workspace_mode=workspace_mode,
+        network_mode=network_mode,
+        allow_subprocesses=allow_subprocesses,
+        write_protected_patterns=(".git",),
+        read_hidden_patterns=(".env", ".env.*"),
+        system_read_only_roots=_SYSTEM_READ_ONLY_ROOTS,
+        seccomp_policy=_seccomp_policy(
+            *_COMMON_SECCOMP_RULES,
+            *(() if allow_subprocesses else _NO_CHILD_PROCESS_SECCOMP_RULES),
+            _DEFAULT_ALLOW_SECCOMP_RULE,
+        ),
+        rlimit_as_mb=4096,
+        rlimit_cpu_seconds=30,
+        rlimit_fsize_mb=16,
+        rlimit_nofile=64,
+        rlimit_nproc=1024 if allow_subprocesses else 1,
+    )

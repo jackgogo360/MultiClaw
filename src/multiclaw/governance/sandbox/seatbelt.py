@@ -19,6 +19,7 @@ from multiclaw.governance.sandbox.models import (
 from multiclaw.governance.sandbox.seatbelt_profiles import (
     SEATBELT_PROFILES,
     SeatbeltProfileTemplate,
+    render_mcp_stdio_profile,
 )
 
 _PRODUCTION_BINARY = Path("/usr/bin/sandbox-exec")
@@ -71,6 +72,7 @@ class SeatbeltBackend:
         private_home = self._canonicalize_path(environment.home, "private_home")
         private_tmp = self._canonicalize_path(environment.tmp, "private_tmp")
         runtime_roots = self._collect_runtime_roots(policy, request)
+        profile_text = self._render_profile_text(policy, template)
 
         args = (
             *self._profile_parameter_args(
@@ -80,7 +82,7 @@ class SeatbeltBackend:
                 runtime_roots=runtime_roots,
             ),
             "-p",
-            template.profile_text,
+            profile_text,
             "--",
             *target_argv,
         )
@@ -359,12 +361,13 @@ class SeatbeltBackend:
     ) -> None:
         if policy.network_mode not in _SUPPORTED_NETWORK_MODES:
             raise SandboxLaunchError("unsupported network mode for seatbelt profile")
-        if policy.network_mode != template.network_mode:
-            raise SandboxLaunchError("network mode is not represented by the static template")
-        if policy.workspace_mode != template.workspace_mode:
-            raise SandboxLaunchError("workspace mode is not represented by the static template")
-        if policy.allow_subprocesses != template.allow_subprocesses:
-            raise SandboxLaunchError("subprocess policy is not represented by the static template")
+        if policy.name != "mcp_stdio_local":
+            if policy.network_mode != template.network_mode:
+                raise SandboxLaunchError("network mode is not represented by the static template")
+            if policy.workspace_mode != template.workspace_mode:
+                raise SandboxLaunchError("workspace mode is not represented by the static template")
+            if policy.allow_subprocesses != template.allow_subprocesses:
+                raise SandboxLaunchError("subprocess policy is not represented by the static template")
         if tuple(policy.read_hidden_patterns) != template.read_hidden_patterns:
             raise SandboxLaunchError("hidden path policy is not represented by the static template")
         if tuple(policy.write_protected_patterns) != template.write_protected_patterns:
@@ -377,6 +380,19 @@ class SeatbeltBackend:
             raise SandboxLaunchError(
                 "protected path policy must match the reviewed seatbelt rules"
             )
+
+    def _render_profile_text(
+        self,
+        policy: SandboxProfilePolicy,
+        template: SeatbeltProfileTemplate,
+    ) -> str:
+        if policy.name != "mcp_stdio_local":
+            return template.profile_text
+        return render_mcp_stdio_profile(
+            workspace_mode=policy.workspace_mode,
+            network_mode=policy.network_mode,
+            allow_subprocesses=policy.allow_subprocesses,
+        )
 
     def _canonicalize_existing_path(self, path: Path, label: str) -> Path:
         value = str(path)

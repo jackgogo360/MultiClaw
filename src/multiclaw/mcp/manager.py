@@ -7,6 +7,7 @@ import concurrent.futures
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .circuit_breaker import CircuitBreaker
@@ -38,9 +39,13 @@ class MCPClientManager:
         *,
         local_batch_size: int = _LOCAL_BATCH_SIZE,
         remote_batch_size: int = _REMOTE_BATCH_SIZE,
+        sandbox_controller=None,
+        workspace_root: Path | None = None,
     ) -> None:
         self._local_batch_size = local_batch_size
         self._remote_batch_size = remote_batch_size
+        self._sandbox_controller = sandbox_controller
+        self._workspace_root = workspace_root
         self._clients: dict[str, MCPClient] = {}
         self._states: dict[str, ServerState] = {}
         self._breakers: dict[str, CircuitBreaker] = {}
@@ -150,11 +155,15 @@ class MCPClientManager:
         self._states[name] = state
         self._breakers.setdefault(name, CircuitBreaker())
 
-        transport = create_transport(config)
-        client = MCPClient(name=name, transport=transport)
-        client.set_on_tools_changed(self._on_tools_changed)
-
         try:
+            transport = create_transport(
+                config,
+                sandbox_controller=self._sandbox_controller,
+                workspace_root=self._workspace_root,
+                server_name=name,
+            )
+            client = MCPClient(name=name, transport=transport)
+            client.set_on_tools_changed(self._on_tools_changed)
             await client.connect()
             tools = await client.discover_tools()
             self._clients[name] = client
@@ -244,4 +253,7 @@ def _sanitize_error(text: str) -> str:
         r"|token=[^\s&,;\"']{1,255}|key=[^\s&,;\"']{1,255})",
         re.IGNORECASE,
     )
-    return pattern.sub("[REDACTED]", text)
+    sanitized = pattern.sub("[REDACTED]", text)
+    if "/" in sanitized or "\\" in sanitized:
+        return "details redacted"
+    return sanitized

@@ -299,7 +299,7 @@ def test_nsjail_mount_type_semantics_use_real_filesystem_types(tmp_path: Path) -
     [
         ("shell_workspace", "rw", "disabled", True, Path("/bin/sh")),
         ("code_exec_python", "rw", "disabled", False, Path("/usr/bin/python3")),
-        ("mcp_stdio_local", "ro", "inherit", True, Path("/usr/bin/env")),
+        ("mcp_stdio_local", "ro", "disabled", False, Path("/usr/bin/env")),
     ],
 )
 def test_nsjail_profile_templates_match_reviewed_policy_shapes(
@@ -409,6 +409,63 @@ def test_nsjail_rejects_policy_template_mismatches_and_unsupported_patterns(
             _policy(entrypoints=()),
             environment,
         )
+
+
+@pytest.mark.parametrize("workspace_mode", ["ro", "rw"])
+@pytest.mark.parametrize("network_mode", ["disabled", "inherit"])
+@pytest.mark.parametrize("allow_subprocesses", [False, True])
+def test_nsjail_renders_dynamic_mcp_policy_combinations(
+    tmp_path: Path,
+    workspace_mode: str,
+    network_mode: str,
+    allow_subprocesses: bool,
+) -> None:
+    from multiclaw.governance.sandbox.nsjail import NsJailBackend
+
+    workspace = _workspace_tree(tmp_path)
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="mcp",
+        profile_name="mcp_stdio_local",
+        mode="exec_argv",
+        argv=("/usr/bin/env",),
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        network_mode=network_mode,
+        workspace_mode=workspace_mode,
+        allow_subprocesses=allow_subprocesses,
+    )
+
+    launch = NsJailBackend(binary=Path("/usr/bin/nsjail")).build_launch_spec(
+        request,
+        _policy(
+            name="mcp_stdio_local",
+            workspace_mode=workspace_mode,
+            network_mode=network_mode,
+            allow_subprocesses=allow_subprocesses,
+            entrypoints=(Path("/usr/bin/env"),),
+        ),
+        environment,
+    )
+    config_text = _config_text(launch.args)
+
+    workspace_dst = f'dst: "{workspace.resolve()}"'
+    assert workspace_dst in config_text
+    if workspace_mode == "rw":
+        assert "rw: true" in config_text
+    else:
+        assert "rw: false" in config_text
+    if network_mode == "disabled":
+        assert "clone_newnet: true" in config_text
+    else:
+        assert "clone_newnet: false" in config_text
+    if allow_subprocesses:
+        assert "ERRNO(EPERM) { clone, clone3, fork, vfork, unshare }" not in config_text
+        assert "rlimit_nproc: 1024" in config_text
+    else:
+        assert "ERRNO(EPERM) { clone, clone3, fork, vfork, unshare }" in config_text
+        assert "rlimit_nproc: 1" in config_text
 
 
 def test_nsjail_rejects_relative_or_nul_paths_and_too_many_runtime_roots(

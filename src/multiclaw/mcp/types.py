@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 
@@ -28,6 +29,12 @@ class StdioServerConfig:
     command: str
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    cwd: Path | None = None
+    sandbox_network: str = "disabled"
+    sandbox_workspace: str = "ro"
+    sandbox_allow_subprocesses: bool = False
+    sandbox_env_allowlist: list[str] = field(default_factory=list)
+    sandbox_read_only_paths: list[Path] = field(default_factory=list)
     transport_type: TransportType = field(default=TransportType.STDIO, init=False)
 
 

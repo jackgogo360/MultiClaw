@@ -7,7 +7,18 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictStr,
+    ValidationError,
+    field_validator,
+)
 
 from .types import (
     HTTPServerConfig,
@@ -27,6 +38,67 @@ DEFAULT_CONFIG_PATHS = [
     Path.home() / ".mcp.json",
     Path(".mcp.json"),
 ]
+
+
+class _StdioServerConfigInput(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    command: StrictStr
+    args: list[StrictStr] = Field(default_factory=list)
+    env: dict[StrictStr, StrictStr] = Field(default_factory=dict)
+    cwd: StrictStr | None = None
+    sandbox_network: Literal["disabled", "inherit"] = Field(
+        default="disabled",
+        validation_alias=AliasChoices("sandbox_network", "sandboxNetwork"),
+    )
+    sandbox_workspace: Literal["ro", "rw"] = Field(
+        default="ro",
+        validation_alias=AliasChoices("sandbox_workspace", "sandboxWorkspace"),
+    )
+    sandbox_allow_subprocesses: StrictBool = Field(
+        default=False,
+        validation_alias=AliasChoices("sandbox_allow_subprocesses", "sandboxAllowSubprocesses"),
+    )
+    sandbox_env_allowlist: list[StrictStr] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("sandbox_env_allowlist", "sandboxEnvAllowlist"),
+    )
+    sandbox_read_only_paths: list[StrictStr] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("sandbox_read_only_paths", "sandboxReadOnlyPaths"),
+    )
+
+    @field_validator("args", "sandbox_env_allowlist", "sandbox_read_only_paths", mode="before")
+    @classmethod
+    def _validate_list_shape(cls, value: object) -> object:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("must be a list")
+        return value
+
+    @field_validator("env", mode="before")
+    @classmethod
+    def _validate_env_shape(cls, value: object) -> object:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("must be an object")
+        return value
+
+
+def _normalize_config_key(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def _sanitize_config_error(exc: Exception) -> str:
+    if isinstance(exc, ValidationError):
+        field_name = ".".join(
+            _normalize_config_key(str(part))
+            for part in exc.errors()[0].get("loc", ())
+        ) or "config"
+        return f"invalid config key {field_name}"
+    return str(exc)
 
 
 def load_mcp_config(
@@ -77,7 +149,7 @@ def _load_from_file(path: Path) -> dict[str, ServerConfig]:
             config = _parse_server_config(server_data)
             configs[name] = config
         except Exception as e:
-            logger.warning("Failed to parse server '%s': %s", name, e)
+            logger.warning("Failed to parse server '%s': %s", name, _sanitize_config_error(e))
     return configs
 
 
@@ -103,10 +175,20 @@ def _parse_server_config(data: dict[str, Any]) -> ServerConfig:
             headers=data.get("headers", {}),
         )
     elif "command" in data:
+        try:
+            parsed = _StdioServerConfigInput.model_validate(data)
+        except ValidationError as exc:
+            raise ValueError(_sanitize_config_error(exc)) from exc
         return StdioServerConfig(
-            command=data["command"],
-            args=data.get("args", []),
-            env=data.get("env", {}),
+            command=parsed.command,
+            args=list(parsed.args),
+            env=dict(parsed.env),
+            cwd=Path(parsed.cwd) if parsed.cwd is not None else None,
+            sandbox_network=parsed.sandbox_network,
+            sandbox_workspace=parsed.sandbox_workspace,
+            sandbox_allow_subprocesses=parsed.sandbox_allow_subprocesses,
+            sandbox_env_allowlist=list(parsed.sandbox_env_allowlist),
+            sandbox_read_only_paths=[Path(path) for path in parsed.sandbox_read_only_paths],
         )
     elif "url" in data:
         oauth_data = data.get("oauth")

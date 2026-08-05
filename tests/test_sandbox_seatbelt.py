@@ -380,9 +380,10 @@ def test_static_seatbelt_profiles_are_reviewable_and_semantically_distinct() -> 
     assert "(allow file-read*" in mcp_profile
     assert "(deny network*)" in shell_profile
     assert "(deny network*)" in code_profile
-    assert "(allow network*)" in mcp_profile
+    assert "(deny network*)" in mcp_profile
     assert "(allow process-fork)" in shell_profile
     assert "(deny process-fork)" in code_profile
+    assert "(deny process-fork)" in mcp_profile
 
 
 def test_mcp_profile_keeps_workspace_read_only_but_private_runtime_writeable() -> None:
@@ -396,6 +397,62 @@ def test_mcp_profile_keeps_workspace_read_only_but_private_runtime_writeable() -
     assert '(allow file-write* (subpath (param "WORKSPACE")))' not in profile_text
     assert '(deny file-read* (regex #".*/\\.env(\\..*)?$"))' in profile_text
     assert '(deny file-write* (regex #".*/\\.git($|/.*)"))' in profile_text
+
+
+@pytest.mark.parametrize("workspace_mode", ["ro", "rw"])
+@pytest.mark.parametrize("network_mode", ["disabled", "inherit"])
+@pytest.mark.parametrize("allow_subprocesses", [False, True])
+def test_seatbelt_renders_dynamic_mcp_policy_combinations(
+    tmp_path: Path,
+    workspace_mode: str,
+    network_mode: str,
+    allow_subprocesses: bool,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="mcp",
+        profile_name="mcp_stdio_local",
+        mode="exec_argv",
+        argv=("/usr/bin/env",),
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+        network_mode=network_mode,
+        workspace_mode=workspace_mode,
+        allow_subprocesses=allow_subprocesses,
+    )
+
+    launch = SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
+        request,
+        _policy(
+            name="mcp_stdio_local",
+            workspace_mode=workspace_mode,
+            network_mode=network_mode,
+            allow_subprocesses=allow_subprocesses,
+            entrypoints=(Path("/usr/bin/env"),),
+        ),
+        environment,
+    )
+    profile_text = launch.args[launch.args.index("-p") + 1]
+
+    if workspace_mode == "rw":
+        assert '(allow file-write* (subpath (param "WORKSPACE")))' in profile_text
+    else:
+        assert '(allow file-write* (subpath (param "WORKSPACE")))' not in profile_text
+    if network_mode == "disabled":
+        assert "(deny network*)" in profile_text
+        assert "(allow network*)" not in profile_text
+    else:
+        assert "(allow network*)" in profile_text
+    if allow_subprocesses:
+        assert "(allow process-fork)" in profile_text
+        assert "(deny process-fork)" not in profile_text
+    else:
+        assert "(deny process-fork)" in profile_text
 
 
 def test_seatbelt_rejects_network_or_capability_mismatches(tmp_path: Path) -> None:
