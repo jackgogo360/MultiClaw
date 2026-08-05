@@ -144,6 +144,7 @@ Status as of August 5, 2026:
 - Non-native verification remains required before release.
 - macOS native verification remains a release gate and must pass on a supported macOS host outside any interfering parent sandbox.
 - Linux native verification remains a release gate and has not been validated in this environment because `nsjail` is not available here.
-- A prior nested-macOS characterization reached Seatbelt profile execution but returned `-6`; treat that as an environment constraint, not as evidence to loosen the sandbox policy.
+- The current nested-macOS characterization failed at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'` and all native profile readiness values false.
+- A prior nested-macOS characterization had reached Seatbelt profile execution and returned `-6`; treat both outcomes as environment constraints, not as evidence to loosen the sandbox policy.
 
 Release should stay blocked until both native platform gates pass in their real host environments.
