@@ -453,3 +453,98 @@ def test_model_copy_update_preserves_raw_secret_env_values_while_redacting_repr_
     assert copied_launch.env["OPENAI_API_KEY"] == secret_value
     assert secret_value not in repr(copied_launch)
     assert copied_launch.model_dump()["env"]["OPENAI_API_KEY"] == "[REDACTED]"
+
+
+def test_model_copy_deep_preserves_immutable_wrapped_mappings() -> None:
+    from multiclaw.governance import (
+        SandboxEnvironment,
+        SandboxExecRequest,
+        SandboxProbeResult,
+        SandboxReadiness,
+        SandboxedLaunchSpec,
+    )
+
+    secret_value = "dummy-secret-value"
+
+    request = SandboxExecRequest(
+        tool_name="shell",
+        profile_name="shell_workspace",
+        mode="shell_string",
+        command="echo hello",
+        workspace_root=Path("/workspace"),
+        cwd=Path("/workspace"),
+        timeout_seconds=5.0,
+        env_overrides={
+            "OPENAI_API_KEY": secret_value,
+            "CUSTOM_FLAG": "1",
+        },
+    )
+    copied_request = request.model_copy(deep=True)
+    assert copied_request.env_overrides["OPENAI_API_KEY"] == secret_value
+    assert secret_value not in repr(copied_request)
+    assert copied_request.model_dump()["env_overrides"]["OPENAI_API_KEY"] == "[REDACTED]"
+    with pytest.raises(TypeError):
+        copied_request.env_overrides["SECOND_FLAG"] = "2"
+
+    environment = SandboxEnvironment(
+        env={
+            "OPENAI_API_KEY": secret_value,
+            "CUSTOM_FLAG": "1",
+        },
+        private_root=Path("/tmp/private"),
+        home=Path("/tmp/private/home"),
+        tmp=Path("/tmp/private/tmp"),
+    )
+    copied_environment = environment.model_copy(deep=True)
+    assert copied_environment.env["OPENAI_API_KEY"] == secret_value
+    assert secret_value not in repr(copied_environment)
+    assert copied_environment.model_dump()["env"]["OPENAI_API_KEY"] == "[REDACTED]"
+    with pytest.raises(TypeError):
+        copied_environment.env["SECOND_FLAG"] = "2"
+
+    launch = SandboxedLaunchSpec(
+        executable="/bin/sh",
+        args=("-c", "echo hello"),
+        cwd=Path("/workspace"),
+        env={
+            "OPENAI_API_KEY": secret_value,
+            "CUSTOM_FLAG": "1",
+        },
+        stdin_bytes=None,
+        private_root=Path("/tmp/private"),
+        backend_name="host_unsafe",
+        profile_name="shell_workspace",
+        correlation_id="corr-1",
+    )
+    copied_launch = launch.model_copy(deep=True)
+    assert copied_launch.env["OPENAI_API_KEY"] == secret_value
+    assert secret_value not in repr(copied_launch)
+    assert copied_launch.model_dump()["env"]["OPENAI_API_KEY"] == "[REDACTED]"
+    with pytest.raises(TypeError):
+        copied_launch.env["SECOND_FLAG"] = "2"
+
+    probe = SandboxProbeResult(
+        backend_name="host_unsafe",
+        available=True,
+        capabilities={"exec": True},
+    )
+    copied_probe = probe.model_copy(deep=True)
+    assert copied_probe.capabilities == {"exec": True}
+    with pytest.raises(TypeError):
+        copied_probe.capabilities["network"] = False
+
+    readiness = SandboxReadiness(
+        ready=True,
+        mode="auto",
+        backend_name="host_unsafe",
+        probe=probe,
+        profiles={"shell_workspace": True},
+        skipped_capabilities={"network": "disabled"},
+    )
+    copied_readiness = readiness.model_copy(deep=True)
+    assert copied_readiness.profiles == {"shell_workspace": True}
+    assert copied_readiness.skipped_capabilities == {"network": "disabled"}
+    with pytest.raises(TypeError):
+        copied_readiness.profiles["code_exec"] = False
+    with pytest.raises(TypeError):
+        copied_readiness.skipped_capabilities["filesystem"] = "blocked"

@@ -20,6 +20,14 @@ class _ImmutableDict(dict):
         del args, kwargs
         raise TypeError("mapping is immutable")
 
+    def __deepcopy__(self, memo):
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+        copied = _ImmutableDict(deepcopy(dict(self), memo))
+        memo[id(self)] = copied
+        return copied
+
     __setitem__ = _blocked
     __delitem__ = _blocked
     clear = _blocked
