@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import io
-import json
+import asyncio
 import sys
 from pathlib import Path
 
@@ -18,11 +17,7 @@ from multiclaw.governance import (
     SandboxedLaunchSpec,
 )
 from multiclaw.tools import _code_runner
-from multiclaw.tools.code_exec import (
-    MAX_ENVELOPE_BYTES,
-    MAX_OUTPUT_CHARS,
-    CodeExecToolBuilder,
-)
+from multiclaw.tools.code_exec import MAX_OUTPUT_CHARS, CodeExecToolBuilder
 from sandbox_fakes import ReadyRecordingSandboxController
 
 
@@ -31,7 +26,7 @@ class StaticSandboxRunner:
         self,
         *,
         result: SandboxExecResult | None = None,
-        exc: Exception | None = None,
+        exc: BaseException | None = None,
     ) -> None:
         self.result = result
         self.exc = exc
@@ -47,24 +42,6 @@ class StaticSandboxRunner:
             raise self.exc
         assert self.result is not None
         return self.result
-
-
-def _protocol_bytes(
-    *,
-    success: bool,
-    stdout: str = "",
-    stderr: str = "",
-    error: str = "",
-) -> bytes:
-    return json.dumps(
-        {
-            "success": success,
-            "stdout": stdout,
-            "stderr": stderr,
-            "error": error,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
 
 
 def _sandbox_result(
@@ -90,24 +67,11 @@ def _sandbox_result(
     )
 
 
-def _invoke_code_runner(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    code: str,
-    argv: list[str] | None = None,
-) -> tuple[int, str]:
-    protocol_stdout = io.StringIO()
-    monkeypatch.setattr(_code_runner.sys, "stdin", io.StringIO(code))
-    monkeypatch.setattr(_code_runner.sys, "__stdout__", protocol_stdout, raising=False)
-    exit_code = _code_runner.main(argv or [])
-    return exit_code, protocol_stdout.getvalue()
-
-
-def _build_tool(
+def _build_fake_tool(
     tmp_path: Path,
     *,
     result: SandboxExecResult | None = None,
-    exc: Exception | None = None,
+    exc: BaseException | None = None,
     profile_name: str = "code_exec_python",
     restrict_builtins: bool = True,
 ) -> tuple[CodeExecToolBuilder, ReadyRecordingSandboxController, StaticSandboxRunner]:
@@ -122,67 +86,20 @@ def _build_tool(
     return builder, controller, runner
 
 
-class TestCodeRunnerProtocol:
-    def test_main_emits_exact_json_shape_for_success_and_unicode(self, monkeypatch):
-        exit_code, payload = _invoke_code_runner(
-            monkeypatch,
-            code="print('你好, sandbox 🌍')",
-            argv=["--restrict-builtins"],
-        )
-
-        assert exit_code == 0
-        assert payload == json.dumps(
-            {
-                "success": True,
-                "stdout": "你好, sandbox 🌍\n",
-                "stderr": "",
-                "error": "",
-            },
-            ensure_ascii=False,
-        )
-
-    def test_main_captures_user_stdout_and_stderr(self, monkeypatch):
-        exit_code, payload = _invoke_code_runner(
-            monkeypatch,
-            code="import sys\nprint('out')\nsys.stderr.write('err')",
-            argv=["--restrict-builtins"],
-        )
-
-        assert exit_code == 0
-        assert json.loads(payload) == {
-            "success": True,
-            "stdout": "out\n",
-            "stderr": "err",
-            "error": "",
-        }
-
-    def test_main_captures_base_exception_traceback(self, monkeypatch):
-        exit_code, payload = _invoke_code_runner(
-            monkeypatch,
-            code="raise SystemExit('bad exit')",
-            argv=["--restrict-builtins"],
-        )
-
-        body = json.loads(payload)
-        assert exit_code == 0
-        assert body["success"] is False
-        assert body["stdout"] == ""
-        assert body["stderr"] == ""
-        assert "SystemExit: bad exit" in body["error"]
-
-    def test_main_blocks_restricted_imports_by_root_module(self, monkeypatch):
-        monkeypatch.setenv("TASK10_SECRET_VALUE", "dont-leak-me")
-        exit_code, payload = _invoke_code_runner(
-            monkeypatch,
-            code="__import__('subprocess.Popen')",
-            argv=["--restrict-builtins"],
-        )
-
-        body = json.loads(payload)
-        assert exit_code == 0
-        assert body["success"] is False
-        assert "Import of 'subprocess' is not allowed in sandbox mode" in body["error"]
-        assert "dont-leak-me" not in body["error"]
+def _build_real_tool(
+    tmp_path: Path,
+    *,
+    profile_name: str = "code_exec_python",
+    restrict_builtins: bool = True,
+) -> tuple[CodeExecToolBuilder, ReadyRecordingSandboxController]:
+    controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
+    builder = CodeExecToolBuilder(
+        tmp_path,
+        sandbox_controller=controller,
+        profile_name=profile_name,
+        restrict_builtins=restrict_builtins,
+    )
+    return builder, controller
 
 
 class TestCodeExecTool:
@@ -192,9 +109,9 @@ class TestCodeExecTool:
 
     @pytest.mark.asyncio
     async def test_code_exec_rejects_empty_code(self, tmp_path):
-        builder, _, _ = _build_tool(
+        builder, _, _ = _build_fake_tool(
             tmp_path,
-            result=_sandbox_result(stdout=_protocol_bytes(success=True)),
+            result=_sandbox_result(stdout=b"unused"),
         )
 
         result = await builder.build(builder.validate({"code": ""})).execute()
@@ -203,15 +120,13 @@ class TestCodeExecTool:
         assert "cannot be empty" in result.content.lower()
 
     @pytest.mark.asyncio
-    async def test_code_exec_invokes_sandboxed_runner_with_default_profile_and_restricted_builtins(
+    async def test_code_exec_invokes_sandboxed_runner_with_static_bootstrap_and_restricted_builtins(
         self,
         tmp_path,
     ):
-        builder, controller, runner = _build_tool(
+        builder, controller, runner = _build_fake_tool(
             tmp_path,
-            result=_sandbox_result(
-                stdout=_protocol_bytes(success=True, stdout="3\n"),
-            ),
+            result=_sandbox_result(stdout=b"3\n"),
         )
         code = "x = 1 + 2\nprint(x)"
 
@@ -239,25 +154,25 @@ class TestCodeExecTool:
         assert request.correlation_id
         assert request.argv == (
             str(Path(sys.executable).resolve()),
-            "-m",
-            "multiclaw.tools._code_runner",
-            "--restrict-builtins",
+            "-I",
+            "-S",
+            "-c",
+            _code_runner.build_bootstrap(True),
         )
         assert spec.executable == str(Path(sys.executable).resolve())
         assert spec.args == (
-            "-m",
-            "multiclaw.tools._code_runner",
-            "--restrict-builtins",
+            "-I",
+            "-S",
+            "-c",
+            _code_runner.build_bootstrap(True),
         )
         assert timeout_seconds == 1.25
 
     @pytest.mark.asyncio
     async def test_code_exec_omits_restrict_flag_when_disabled(self, tmp_path):
-        builder, controller, _ = _build_tool(
+        builder, controller, _ = _build_fake_tool(
             tmp_path,
-            result=_sandbox_result(
-                stdout=_protocol_bytes(success=True, stdout="ok\n"),
-            ),
+            result=_sandbox_result(stdout=b"ok\n"),
             restrict_builtins=False,
         )
 
@@ -270,145 +185,43 @@ class TestCodeExecTool:
         assert controller.requests[-1].profile_name == "code_exec_python"
         assert controller.requests[-1].argv == (
             str(Path(sys.executable).resolve()),
-            "-m",
-            "multiclaw.tools._code_runner",
+            "-I",
+            "-S",
+            "-c",
+            _code_runner.build_bootstrap(False),
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "stdout",
-        [
-            b"{",
-            b"[]",
-            _protocol_bytes(success=True)
-            + _protocol_bytes(success=True, stdout="extra"),
-            _protocol_bytes(success=True) + b"\n",
-            json.dumps(
-                {"success": True, "stdout": "", "stderr": ""},
-                ensure_ascii=False,
-            ).encode("utf-8"),
-            json.dumps(
-                {
-                    "success": True,
-                    "stdout": "",
-                    "stderr": "",
-                    "error": "",
-                    "extra": "x",
-                },
-                ensure_ascii=False,
-            ).encode("utf-8"),
-            json.dumps(
-                {
-                    "success": "yes",
-                    "stdout": "",
-                    "stderr": "",
-                    "error": "",
-                },
-                ensure_ascii=False,
-            ).encode("utf-8"),
-        ],
-    )
-    async def test_code_exec_rejects_invalid_runner_protocol(self, tmp_path, stdout):
-        builder, _, _ = _build_tool(
+    async def test_code_exec_maps_nonzero_exit_without_stderr_to_generic_error(self, tmp_path):
+        builder, _, _ = _build_fake_tool(
             tmp_path,
-            result=_sandbox_result(stdout=stdout),
+            result=_sandbox_result(exit_code=7),
         )
+
         result = await builder.build(
-            builder.validate({"code": "print('ok')"})
+            builder.validate({"code": "raise SystemExit(7)"})
         ).execute()
 
-        assert result.status == "error"
-        assert result.content == "sandbox execution failed"
-        assert "print('ok')" not in result.content
-        assert str(tmp_path) not in result.content
+        assert result.status == "success"
+        assert result.content == "[error]\nPython exited with code 7"
+        assert result.data == {"success": False, "error": "Python exited with code 7"}
 
     @pytest.mark.asyncio
-    async def test_code_exec_rejects_invalid_utf8_protocol_bytes(self, tmp_path):
-        builder, _, _ = _build_tool(
+    async def test_code_exec_uses_signal_name_when_process_exits_by_signal(self, tmp_path):
+        builder, _, _ = _build_fake_tool(
             tmp_path,
-            result=_sandbox_result(stdout=b"\xff"),
+            result=_sandbox_result(exit_code=None, signal="SIGTERM"),
         )
 
         result = await builder.build(
-            builder.validate({"code": "print('ok')"})
+            builder.validate({"code": "unused"})
         ).execute()
 
-        assert result.status == "error"
-        assert result.content == "sandbox execution failed"
-
-    @pytest.mark.asyncio
-    async def test_code_exec_rejects_oversized_raw_protocol_stdout(self, tmp_path):
-        builder, _, _ = _build_tool(
-            tmp_path,
-            result=_sandbox_result(stdout=b"x" * (MAX_ENVELOPE_BYTES + 1)),
-        )
-
-        result = await builder.build(
-            builder.validate({"code": "print('ok')"})
-        ).execute()
-
-        assert result.status == "error"
-        assert result.content == "sandbox execution failed"
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "stdout",
-        [
-            b'{"success":true,"stdout":"","stderr":"","error":"","error":"dup"}',
-            b'{"success":true,"success":false,"stdout":"","stderr":"","error":""}',
-            b'{"success":true,"success":"nope","stdout":"","stderr":"","error":""}',
-        ],
-    )
-    async def test_code_exec_rejects_duplicate_runner_protocol_keys(self, tmp_path, stdout):
-        builder, _, _ = _build_tool(
-            tmp_path,
-            result=_sandbox_result(stdout=stdout),
-        )
-
-        result = await builder.build(
-            builder.validate({"code": "print('ok')"})
-        ).execute()
-
-        assert result.status == "error"
-        assert result.content == "sandbox execution failed"
-        assert "dup" not in result.content
-        assert "print('ok')" not in result.content
-        assert str(tmp_path) not in result.content
-
-    @pytest.mark.asyncio
-    async def test_code_exec_rejects_non_zero_child_exit_even_with_json_output(self, tmp_path):
-        builder, _, _ = _build_tool(
-            tmp_path,
-            result=_sandbox_result(
-                stdout=_protocol_bytes(success=True, stdout="ok\n"),
-                exit_code=7,
-            ),
-        )
-
-        result = await builder.build(
-            builder.validate({"code": "print('ok')"})
-        ).execute()
-
-        assert result.status == "error"
-        assert result.content == "sandbox execution failed"
-
-    @pytest.mark.asyncio
-    async def test_code_exec_rejects_wrapper_stderr_output(self, tmp_path):
-        builder, _, _ = _build_tool(
-            tmp_path,
-            result=_sandbox_result(
-                stdout=_protocol_bytes(success=True, stdout="ok\n"),
-                stderr=b"wrapper secret stderr",
-            ),
-        )
-
-        result = await builder.build(
-            builder.validate({"code": "print('ok')"})
-        ).execute()
-
-        assert result.status == "error"
-        assert result.content == "sandbox execution failed"
-        assert "wrapper secret stderr" not in result.content
+        assert result.status == "success"
+        assert result.data == {
+            "success": False,
+            "error": "Python exited due to SIGTERM",
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -430,7 +243,7 @@ class TestCodeExecTool:
         exc,
         expected,
     ):
-        builder, _, _ = _build_tool(tmp_path, exc=exc)
+        builder, _, _ = _build_fake_tool(tmp_path, exc=exc)
 
         result = await builder.build(
             builder.validate({"code": "print('ok')"})
@@ -441,8 +254,18 @@ class TestCodeExecTool:
         assert "secret" not in result.content
 
     @pytest.mark.asyncio
+    async def test_code_exec_propagates_cancelled_error(self, tmp_path):
+        builder, _, _ = _build_fake_tool(
+            tmp_path,
+            exc=asyncio.CancelledError(),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await builder.build(builder.validate({"code": "print('ok')"})).execute()
+
+    @pytest.mark.asyncio
     async def test_code_exec_times_out_with_public_marker_and_empty_data(self, tmp_path):
-        builder, _, _ = _build_tool(
+        builder, _, _ = _build_fake_tool(
             tmp_path,
             result=_sandbox_result(timed_out=True, exit_code=None),
         )
@@ -456,40 +279,15 @@ class TestCodeExecTool:
         assert result.data == {}
 
     @pytest.mark.asyncio
-    async def test_code_exec_returns_exception_payload_in_success_result(self, tmp_path):
-        builder, _, _ = _build_tool(
-            tmp_path,
-            result=_sandbox_result(
-                stdout=_protocol_bytes(
-                    success=False,
-                    error="Traceback (most recent call last):\nValueError: bad",
-                ),
-            ),
-        )
-
-        result = await builder.build(
-            builder.validate({"code": "raise ValueError('bad')"})
-        ).execute()
-
-        assert result.status == "success"
-        assert result.data["success"] is False
-        assert "ValueError: bad" in result.data["error"]
-        assert "[error]" in result.content
-
-    @pytest.mark.asyncio
     async def test_code_exec_truncates_stdout_stderr_and_error(self, tmp_path):
-        long_stdout = "o" * (MAX_OUTPUT_CHARS * 2)
-        long_stderr = "e" * (MAX_OUTPUT_CHARS * 2)
-        long_error = "x" * (MAX_OUTPUT_CHARS * 2)
-        builder, _, _ = _build_tool(
+        long_stdout = ("o" * (MAX_OUTPUT_CHARS * 2)).encode("utf-8")
+        long_stderr = ("e" * (MAX_OUTPUT_CHARS * 2)).encode("utf-8")
+        builder, _, _ = _build_fake_tool(
             tmp_path,
             result=_sandbox_result(
-                stdout=_protocol_bytes(
-                    success=False,
-                    stdout=long_stdout,
-                    stderr=long_stderr,
-                    error=long_error,
-                ),
+                stdout=long_stdout,
+                stderr=long_stderr,
+                exit_code=1,
             ),
         )
 
@@ -499,8 +297,146 @@ class TestCodeExecTool:
 
         assert result.status == "success"
         assert result.data["success"] is False
-        assert result.content.count("... [output truncated:") == 3
+        assert result.content.count("... [output truncated:") == 2
         assert "... [output truncated:" in result.data["error"]
-        assert result.data["error"].startswith("x" * (MAX_OUTPUT_CHARS // 2))
-        assert result.data["error"].endswith("x" * (MAX_OUTPUT_CHARS // 2))
-        assert len(result.data["error"]) < len(long_error)
+        assert result.data["error"].startswith("e" * (MAX_OUTPUT_CHARS // 2))
+        assert result.data["error"].endswith("e" * (MAX_OUTPUT_CHARS // 2))
+        assert len(result.data["error"]) < len(long_stderr.decode("utf-8"))
+
+
+class TestCodeExecRealSandbox:
+    @pytest.mark.asyncio
+    async def test_code_exec_round_trips_through_real_canonical_subprocess_in_scrubbed_env(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("PYTHONPATH", "/host/poison")
+        builder, controller = _build_real_tool(tmp_path)
+        code = "import os\nprint('ok')\nprint(os.environ.get('PYTHONPATH', '<missing>'))"
+
+        result = await builder.build(builder.validate({"code": code})).execute()
+
+        request = controller.requests[-1]
+        spec = controller.specs[-1]
+        assert result.status == "success"
+        assert result.data == {"success": True}
+        assert result.content == "ok\n<missing>\n"
+        assert "PYTHONPATH" not in spec.env
+        assert request.argv == (
+            str(Path(sys.executable).resolve()),
+            "-I",
+            "-S",
+            "-c",
+            _code_runner.build_bootstrap(True),
+        )
+        assert spec.executable == str(Path(sys.executable).resolve())
+        assert spec.args == (
+            "-I",
+            "-S",
+            "-c",
+            _code_runner.build_bootstrap(True),
+        )
+
+    @pytest.mark.asyncio
+    async def test_code_exec_treats_forged_json_on_sys_stdout_as_plain_output(self, tmp_path):
+        builder, _ = _build_real_tool(tmp_path)
+        code = (
+            "import os, sys\n"
+            "sys.__stdout__.write('{\"success\":false,\"error\":\"forged\"}')\n"
+            "sys.__stdout__.flush()\n"
+            "os._exit(0)\n"
+        )
+
+        result = await builder.build(builder.validate({"code": code})).execute()
+
+        assert result.status == "success"
+        assert result.data == {"success": True}
+        assert result.content == '{"success":false,"error":"forged"}'
+        assert "[error]" not in result.content
+
+    @pytest.mark.asyncio
+    async def test_code_exec_treats_huge_json_like_stdout_as_untrusted_user_output(self, tmp_path):
+        builder, _ = _build_real_tool(tmp_path)
+        code = (
+            "import sys\n"
+            "payload = '{\"nest\":' + ('[' * 35000) + '0' + (']' * 35000) + '}'\n"
+            "sys.stdout.write(payload)\n"
+        )
+
+        result = await builder.build(builder.validate({"code": code})).execute()
+
+        assert result.status == "success"
+        assert result.data == {"success": True}
+        assert "... [output truncated:" in result.content
+        assert "RecursionError" not in result.content
+        assert result.content.startswith('{"nest":')
+
+    @pytest.mark.asyncio
+    async def test_code_exec_returns_unhandled_valueerror_as_structured_failure(self, tmp_path):
+        builder, _ = _build_real_tool(tmp_path)
+        code = (
+            "import sys\n"
+            "print('before')\n"
+            "sys.stderr.write('warn\\n')\n"
+            "raise ValueError('bad')\n"
+        )
+
+        result = await builder.build(builder.validate({"code": code})).execute()
+
+        assert result.status == "success"
+        assert result.data["success"] is False
+        assert "warn" in result.data["error"]
+        assert "ValueError: bad" in result.data["error"]
+        assert "before\n" in result.content
+        assert "[error]\n" in result.content
+        assert "[stderr]\n" not in result.content
+
+    @pytest.mark.asyncio
+    async def test_code_exec_keeps_successful_user_stderr_as_stderr_output(self, tmp_path):
+        builder, _ = _build_real_tool(tmp_path)
+        code = "import sys\nprint('out')\nsys.stderr.write('warn')\n"
+
+        result = await builder.build(builder.validate({"code": code})).execute()
+
+        assert result.status == "success"
+        assert result.data == {"success": True}
+        assert "out\n" in result.content
+        assert "[stderr]\nwarn" in result.content
+
+    @pytest.mark.asyncio
+    async def test_code_exec_times_out_with_real_sandbox_runner(self, tmp_path):
+        builder, _ = _build_real_tool(tmp_path)
+
+        result = await builder.build(
+            builder.validate({"code": "while True: pass", "timeout": 0.2})
+        ).execute()
+
+        assert result.status == "success"
+        assert result.content == "[Execution timed out after 0s]"
+        assert result.data == {}
+
+    @pytest.mark.asyncio
+    async def test_code_exec_blocks_subprocess_import_with_restrictions_enabled(self, tmp_path):
+        builder, _ = _build_real_tool(tmp_path, restrict_builtins=True)
+
+        result = await builder.build(
+            builder.validate({"code": "import subprocess"})
+        ).execute()
+
+        assert result.status == "success"
+        assert result.data["success"] is False
+        assert "ImportError" in result.data["error"]
+        assert "not allowed in sandbox mode" in result.data["error"]
+
+    @pytest.mark.asyncio
+    async def test_code_exec_allows_subprocess_import_when_restrictions_disabled(self, tmp_path):
+        builder, _ = _build_real_tool(tmp_path, restrict_builtins=False)
+
+        result = await builder.build(
+            builder.validate({"code": "import subprocess\nprint(subprocess.__name__)"})
+        ).execute()
+
+        assert result.status == "success"
+        assert result.data == {"success": True}
+        assert result.content == "subprocess\n"
