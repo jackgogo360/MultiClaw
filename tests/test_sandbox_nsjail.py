@@ -139,7 +139,7 @@ def test_nsjail_launch_spec_wraps_shell_string_without_shell_invocation(
     assert "VISIBLE_FLAG=visible" not in config_text
 
 
-def test_nsjail_launch_spec_preserves_exec_argv_after_validation(tmp_path: Path) -> None:
+def test_nsjail_launch_spec_rejects_noncanonical_exec_entrypoint_path(tmp_path: Path) -> None:
     from multiclaw.governance.sandbox.nsjail import NsJailBackend
 
     workspace = _workspace_tree(tmp_path)
@@ -153,6 +153,34 @@ def test_nsjail_launch_spec_preserves_exec_argv_after_validation(tmp_path: Path)
         profile_name="code_exec_python",
         mode="exec_argv",
         argv=(str(symlink_entrypoint), "-c", "print('ok')"),
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+    )
+
+    with pytest.raises(SandboxLaunchError, match="canonical entrypoint"):
+        NsJailBackend(binary=Path("/usr/bin/nsjail")).build_launch_spec(
+            request,
+            _policy(
+                name="code_exec_python",
+                network_mode="disabled",
+                allow_subprocesses=False,
+                entrypoints=(Path("/usr/bin/python3"),),
+            ),
+            environment,
+        )
+
+
+def test_nsjail_launch_spec_preserves_exact_canonical_exec_argv(tmp_path: Path) -> None:
+    from multiclaw.governance.sandbox.nsjail import NsJailBackend
+
+    workspace = _workspace_tree(tmp_path)
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="python",
+        profile_name="code_exec_python",
+        mode="exec_argv",
+        argv=("/usr/bin/python3", "-c", "print('ok')"),
         workspace_root=workspace,
         cwd=workspace,
         timeout_seconds=5.0,
@@ -224,6 +252,7 @@ def test_nsjail_config_contains_reviewed_namespace_mount_and_rlimit_fragments(
     assert 'rlimit_fsize_type: VALUE' in config_text
     assert 'rlimit_nofile_type: VALUE' in config_text
     assert 'rlimit_nproc_type: VALUE' in config_text
+    assert "cgroup_pids_max:" not in config_text
     assert 'mount {' in config_text
     assert f'src: "{protobuf_quote(str(weird_workspace.resolve()))}"' in config_text
     assert f'src: "{protobuf_quote(str(runtime_root.resolve()))}"' in config_text
@@ -331,10 +360,10 @@ def test_nsjail_profile_templates_match_reviewed_policy_shapes(
     else:
         assert "clone_newnet: false" in config_text
     if allow_subprocesses:
-        assert "cgroup_pids_max: 0" in config_text
+        assert "cgroup_pids_max:" not in config_text
         assert "ERRNO(EPERM) { clone, clone3, fork, vfork, unshare }" not in config_text
     else:
-        assert "cgroup_pids_max: 1" in config_text
+        assert "cgroup_pids_max:" not in config_text
         assert "ERRNO(EPERM) { clone, clone3, fork, vfork, unshare }" in config_text
 
 
