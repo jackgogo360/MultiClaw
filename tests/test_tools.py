@@ -76,6 +76,23 @@ class AuditedErrorInvocation(EchoInvocation):
         return result
 
 
+class WeirdAuditInvocation(EchoInvocation):
+    async def execute(self) -> ToolExecutionResult:
+        result = ToolExecutionResult(
+            status=ToolStatus.SUCCESS,
+            content="audit payload",
+        )
+        result.audit.update(
+            {
+                "sandbox_profile": "shell\x00workspace\r\nnext",
+                "sandbox_backend": "recording\nforged=true",
+                "unsafe_fallback_used": ["not-a-bool"],
+                "secret": "top-secret-value",
+            }
+        )
+        return result
+
+
 class EchoToolBuilder(ToolBuilder[EchoParams]):
     name = "echo"
     description = "Echoes the supplied text"
@@ -105,6 +122,11 @@ class GuardedAuditedToolBuilder(DeleteToolBuilder):
 class AuditedErrorToolBuilder(EchoToolBuilder):
     def build(self, params: EchoParams) -> ToolInvocation[EchoParams]:
         return AuditedErrorInvocation(name=self.name, params=params)
+
+
+class WeirdAuditToolBuilder(EchoToolBuilder):
+    def build(self, params: EchoParams) -> ToolInvocation[EchoParams]:
+        return WeirdAuditInvocation(name=self.name, params=params)
 
 
 @pytest.fixture
@@ -292,6 +314,110 @@ class TestCoreToolScheduler:
         assert "rejected" in result.content
 
     @pytest.mark.asyncio
+    async def test_guarded_tool_rejected_by_user_emits_single_terminal_cancelled_audit_and_event(self, scheduler):
+        import asyncio
+        import uuid
+
+        events = []
+
+        async def handler(event):
+            if event.type.startswith("tool."):
+                events.append((event.type.removeprefix("tool."), event.data))
+
+        scheduler.event_bus.subscribe("*", handler)
+
+        async def run():
+            return await scheduler.run(DeleteToolBuilder(), {"text": "danger"})
+
+        orig = uuid.uuid4
+        uuid.uuid4 = lambda: type("FakeUUID", (), {"hex": "req-5"})()
+
+        try:
+            run_task = asyncio.create_task(run())
+            await asyncio.sleep(0.02)
+            scheduler.resolve_approval("req-5", False)
+            result = await run_task
+        finally:
+            uuid.uuid4 = orig
+
+        assert result.status == ToolStatus.CANCELLED
+        assert events == [
+            ("scheduled", {"tool": "delete_file"}),
+            ("validating", {"tool": "delete_file"}),
+            (
+                "awaiting_approval",
+                {
+                    "request_id": "req-5",
+                    "tool": "delete_file",
+                    "params": {"text": "danger"},
+                    "description": '{"text": "danger"}',
+                },
+            ),
+            ("error", {"tool": "delete_file", "error": "tool returned cancelled"}),
+        ]
+        entries = await scheduler.audit_logger.list_entries()
+        assert [entry.status for entry in entries] == [
+            ToolStatus.AWAITING_APPROVAL.value,
+            ToolStatus.CANCELLED.value,
+        ]
+        assert entries[-1].detail == "rejected by user"
+
+    @pytest.mark.asyncio
+    async def test_guarded_tool_timeout_emits_single_terminal_cancelled_audit_and_event(
+        self,
+        scheduler,
+        monkeypatch,
+    ):
+        import asyncio
+        import multiclaw.tools.scheduler as scheduler_module
+        import uuid
+
+        events = []
+
+        async def handler(event):
+            if event.type.startswith("tool."):
+                events.append((event.type.removeprefix("tool."), event.data))
+
+        scheduler.event_bus.subscribe("*", handler)
+
+        async def fake_wait_for(awaitable, timeout):
+            del timeout
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        orig = uuid.uuid4
+        uuid.uuid4 = lambda: type("FakeUUID", (), {"hex": "req-6"})()
+        monkeypatch.setattr(scheduler_module.asyncio, "wait_for", fake_wait_for)
+
+        try:
+            result = await scheduler.run(DeleteToolBuilder(), {"text": "danger"})
+        finally:
+            uuid.uuid4 = orig
+
+        assert result.status == ToolStatus.CANCELLED
+        assert result.content == "Approval timed out after 120s."
+        assert events == [
+            ("scheduled", {"tool": "delete_file"}),
+            ("validating", {"tool": "delete_file"}),
+            (
+                "awaiting_approval",
+                {
+                    "request_id": "req-6",
+                    "tool": "delete_file",
+                    "params": {"text": "danger"},
+                    "description": '{"text": "danger"}',
+                },
+            ),
+            ("error", {"tool": "delete_file", "error": "tool returned cancelled"}),
+        ]
+        entries = await scheduler.audit_logger.list_entries()
+        assert [entry.status for entry in entries] == [
+            ToolStatus.AWAITING_APPROVAL.value,
+            ToolStatus.CANCELLED.value,
+        ]
+        assert entries[-1].detail == "Approval timed out after 120s."
+
+    @pytest.mark.asyncio
     async def test_records_audit_entries(self, scheduler):
         await scheduler.run(EchoToolBuilder(), {"text": "audit"})
 
@@ -311,6 +437,21 @@ class TestCoreToolScheduler:
             "audit"
         )
         assert "OPENAI_API_KEY" not in entries[-1].detail
+
+    @pytest.mark.asyncio
+    async def test_drops_invalid_or_injected_allowlisted_audit_values(self, scheduler):
+        await scheduler.run(WeirdAuditToolBuilder(), {"text": "ignored"})
+
+        entries = await scheduler.audit_logger.list_entries()
+        assert entries[-1].detail == (
+            "[audit] sandbox_backend=recording_forged_true "
+            "sandbox_profile=shell_workspace_next\n"
+            "audit payload"
+        )
+        assert entries[-1].detail.count("\n") == 1
+        assert "forged=true" not in entries[-1].detail
+        assert "top-secret-value" not in entries[-1].detail
+        assert "['not-a-bool']" not in entries[-1].detail
 
     @pytest.mark.asyncio
     async def test_records_allowlisted_audit_prefix_after_approval(self, scheduler):
@@ -342,6 +483,14 @@ class TestCoreToolScheduler:
     @pytest.mark.asyncio
     async def test_records_allowlisted_audit_prefix_for_mcp_results(self, scheduler):
         from multiclaw.mcp.tool_adapter import MCPToolBuilder
+
+        events = []
+
+        async def handler(event):
+            if event.type.startswith("tool."):
+                events.append(event.type.removeprefix("tool."))
+
+        scheduler.event_bus.subscribe("*", handler)
 
         class MCPParams(BaseModel):
             pass
@@ -385,6 +534,7 @@ class TestCoreToolScheduler:
             "mcp audit"
         )
         assert "OPENAI_API_KEY" not in entries[-1].detail
+        assert events == ["scheduled", "validating", "completed"]
 
     @pytest.mark.asyncio
     async def test_returned_error_uses_error_audit_status_and_error_event(self, scheduler):
@@ -474,6 +624,57 @@ class TestCoreToolScheduler:
             "mcp boom"
         )
         assert "OPENAI_API_KEY" not in entries[-1].detail
+
+    @pytest.mark.asyncio
+    async def test_mcp_execute_exception_records_error_audit_and_terminal_error_event(
+        self,
+        scheduler,
+    ):
+        from multiclaw.mcp.tool_adapter import MCPToolBuilder
+
+        events = []
+
+        async def handler(event):
+            if event.type.startswith("tool."):
+                events.append((event.type.removeprefix("tool."), event.data))
+
+        scheduler.event_bus.subscribe("*", handler)
+
+        class MCPParams(BaseModel):
+            pass
+
+        class RaisingMCPToolBuilder(MCPToolBuilder):
+            def build(self, params):
+                del params
+
+                class _Invocation(ToolInvocation[MCPParams]):
+                    async def execute(self_inner) -> ToolExecutionResult:
+                        raise RuntimeError("secret-token-123")
+
+                return _Invocation(name=self.name, params=MCPParams())
+
+        result = await scheduler.run(
+            RaisingMCPToolBuilder(
+                name="mcp__demo__tool",
+                server_name="demo",
+                original_name="tool",
+                description="demo",
+                input_schema={},
+                manager=object(),
+            ),
+            {},
+        )
+
+        assert result.status == ToolStatus.ERROR
+        entries = await scheduler.audit_logger.list_entries()
+        assert entries[-1].status == ToolStatus.ERROR.value
+        assert entries[-1].detail == "tool execution failed"
+        assert "secret-token-123" not in entries[-1].detail
+        assert events == [
+            ("scheduled", {"tool": "mcp__demo__tool"}),
+            ("validating", {"tool": "mcp__demo__tool"}),
+            ("error", {"tool": "mcp__demo__tool", "error": "tool execution failed"}),
+        ]
 
     @pytest.mark.asyncio
     async def test_safe_tool_emits_expected_event_order_and_audit_before_return(self, scheduler):
