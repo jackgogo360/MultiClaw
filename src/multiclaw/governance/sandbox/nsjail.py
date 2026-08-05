@@ -561,7 +561,6 @@ class NsJailBackend:
             "rlimit_nofile_type: VALUE",
             f"rlimit_nproc: {template.rlimit_nproc}",
             "rlimit_nproc_type: VALUE",
-            f'cgroup_pids_max: {0 if template.allow_subprocesses else 1}',
             f'seccomp_string: "{protobuf_quote(template.seccomp_policy)}"',
         ]
         lines.extend(
@@ -709,7 +708,12 @@ class NsJailBackend:
             if request.command is not None or not request.argv:
                 raise SandboxLaunchError("argv must include executable for exec_argv mode")
             executable = Path(request.argv[0])
+            if not executable.is_absolute():
+                raise SandboxLaunchError("entrypoint is invalid")
+            normalized_entrypoint = executable.absolute()
             target_entrypoint = self._canonicalize_existing_file(executable, "entrypoint")
+            if normalized_entrypoint != target_entrypoint:
+                raise SandboxLaunchError("canonical entrypoint is required")
             if target_entrypoint not in allowed_entrypoints:
                 raise SandboxLaunchError("entrypoint is not allowed by the nsjail policy")
             for index, arg in enumerate(request.argv):
