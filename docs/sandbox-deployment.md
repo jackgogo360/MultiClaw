@@ -22,6 +22,7 @@ This guide covers production deployment and rollback for MultiClaw's native sand
 - Set `MULTICLAW_NSJAIL_PATH` to the exact deployed binary path for native verification.
 - The host kernel must support the namespaces and restrictions required by the configured nsjail profile.
 - The startup probe must prove the same deny-path matrix as macOS before readiness can become healthy.
+- The Linux native gate additionally proves from inside the jailed process view that no non-loopback interfaces and no default route are visible while parent-listener access is denied.
 
 ## Configuration
 
@@ -144,6 +145,7 @@ Status as of August 5, 2026:
 - Non-native verification remains required before release.
 - macOS native verification remains a release gate and must pass on a supported macOS host outside any interfering parent sandbox.
 - Linux native verification remains a release gate and has not been validated in this environment because `nsjail` is not available here.
+- The Linux native gate is designed to fail if it cannot inspect `/proc/net/route` or enumerate interfaces from inside the jail; it must not silently pass on parent-loopback denial alone.
 - The current nested-macOS characterization failed at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'` and all native profile readiness values false.
 - A prior nested-macOS characterization had reached Seatbelt profile execution and returned `-6`; treat both outcomes as environment constraints, not as evidence to loosen the sandbox policy.
 
