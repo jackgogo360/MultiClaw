@@ -37,6 +37,7 @@ def _policy(
     workspace_mode: str = "rw",
     network_mode: str = "disabled",
     allow_subprocesses: bool = True,
+    entrypoints: tuple[Path, ...] | None = None,
     runtime_read_only_paths: tuple[Path, ...] = (),
     write_protected_patterns: tuple[str, ...] = (".git",),
     read_hidden_patterns: tuple[str, ...] = (".env", ".env.*"),
@@ -46,7 +47,7 @@ def _policy(
         workspace_mode=workspace_mode,
         network_mode=network_mode,
         allow_subprocesses=allow_subprocesses,
-        entrypoints=(Path("/bin/sh"),),
+        entrypoints=entrypoints or (Path("/bin/sh"),),
         runtime_read_only_paths=runtime_read_only_paths,
         write_protected_patterns=write_protected_patterns,
         read_hidden_patterns=read_hidden_patterns,
@@ -92,6 +93,7 @@ def test_seatbelt_launch_spec_wraps_shell_requests_without_profile_interpolation
     assert launch.args[-4:] == ("--", "/bin/sh", "-c", request.command)
     assert request.command not in profile_text
     assert str(workspace) not in profile_text
+    assert max(index for index, arg in enumerate(launch.args) if arg.startswith("WORKSPACE=") or arg.startswith("PRIVATE_HOME=") or arg.startswith("PRIVATE_TMP=")) < launch.args.index("-p")
 
 
 def test_seatbelt_launch_spec_preserves_exec_argv_targets(tmp_path: Path) -> None:
@@ -115,6 +117,7 @@ def test_seatbelt_launch_spec_preserves_exec_argv_targets(tmp_path: Path) -> Non
         _policy(
             name="code_exec_python",
             allow_subprocesses=False,
+            entrypoints=(Path("/usr/bin/python3"),),
         ),
         environment,
     )
@@ -148,7 +151,10 @@ def test_seatbelt_launch_spec_uses_stable_parameter_pairs_for_canonical_paths(
 
     launch = SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
         request,
-        _policy(runtime_read_only_paths=(policy_runtime / ".",)),
+        _policy(
+            entrypoints=(Path("/usr/bin/env"),),
+            runtime_read_only_paths=(policy_runtime / ".",),
+        ),
         environment,
     )
 
@@ -168,6 +174,14 @@ def test_seatbelt_launch_spec_uses_stable_parameter_pairs_for_canonical_paths(
 
     first_define_index = launch.args.index("-D")
     assert launch.args[first_define_index : first_define_index + len(expected_pairs)] == expected_pairs
+    assert max(
+        index
+        for index, arg in enumerate(launch.args)
+        if arg.startswith("WORKSPACE=")
+        or arg.startswith("PRIVATE_HOME=")
+        or arg.startswith("PRIVATE_TMP=")
+        or arg.startswith("RUNTIME_ROOT_")
+    ) < launch.args.index("-p")
     assert str(workspace.resolve()) not in profile_text
     assert str(policy_runtime.resolve()) not in profile_text
     assert str(request_runtime.resolve()) not in profile_text
@@ -278,6 +292,7 @@ def test_code_exec_profile_requires_child_creation_denial(tmp_path: Path) -> Non
         _policy(
             name="code_exec_python",
             allow_subprocesses=False,
+            entrypoints=(Path("/usr/bin/python3"),),
         ),
         environment,
     )
@@ -291,9 +306,192 @@ def test_code_exec_profile_requires_child_creation_denial(tmp_path: Path) -> Non
             _policy(
                 name="code_exec_python",
                 allow_subprocesses=True,
+                entrypoints=(Path("/usr/bin/python3"),),
             ),
             environment,
         )
+
+
+def test_exec_argv_requires_canonical_entrypoint_match_but_preserves_original_argv(
+    tmp_path: Path,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = _environment(tmp_path)
+    request = SandboxExecRequest(
+        tool_name="python",
+        profile_name="code_exec_python",
+        mode="exec_argv",
+        argv=("/usr/bin/../bin/python3", "-c", "print('ok')"),
+        workspace_root=workspace,
+        cwd=workspace,
+        timeout_seconds=5.0,
+    )
+
+    launch = SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
+        request,
+        _policy(
+            name="code_exec_python",
+            allow_subprocesses=False,
+            entrypoints=(Path("/usr/bin/python3"),),
+        ),
+        environment,
+    )
+
+    assert launch.args[-4:] == ("--", "/usr/bin/../bin/python3", "-c", "print('ok')")
+
+
+@pytest.mark.parametrize(
+    ("request_factory", "policy_factory", "pattern"),
+    [
+        pytest.param(
+            lambda workspace: SandboxExecRequest(
+                tool_name="python",
+                profile_name="code_exec_python",
+                mode="shell_string",
+                command="echo nope",
+                workspace_root=workspace,
+                cwd=workspace,
+                timeout_seconds=5.0,
+            ),
+            lambda: _policy(
+                name="code_exec_python",
+                allow_subprocesses=False,
+                entrypoints=(Path("/usr/bin/python3"),),
+            ),
+            "entrypoint",
+            id="code-policy-rejects-shell-wrapper",
+        ),
+        pytest.param(
+            lambda workspace: SandboxExecRequest(
+                tool_name="shell",
+                profile_name="shell_workspace",
+                mode="shell_string",
+                command=":",
+                workspace_root=workspace,
+                cwd=workspace,
+                timeout_seconds=5.0,
+            ),
+            lambda: _policy(entrypoints=(Path("/usr/bin/python3"),)),
+            "entrypoint",
+            id="shell-wrapper-must-be-allowed",
+        ),
+        pytest.param(
+            lambda workspace: SandboxExecRequest(
+                tool_name="python",
+                profile_name="code_exec_python",
+                mode="exec_argv",
+                argv=("/bin/sh", "-c", "echo nope"),
+                workspace_root=workspace,
+                cwd=workspace,
+                timeout_seconds=5.0,
+            ),
+            lambda: _policy(
+                name="code_exec_python",
+                allow_subprocesses=False,
+                entrypoints=(Path("/usr/bin/python3"),),
+            ),
+            "entrypoint",
+            id="exec-argv-mismatch-rejected",
+        ),
+        pytest.param(
+            lambda workspace: SandboxExecRequest(
+                tool_name="python",
+                profile_name="code_exec_python",
+                mode="exec_argv",
+                argv=("python3", "-c", "print('ok')"),
+                workspace_root=workspace,
+                cwd=workspace,
+                timeout_seconds=5.0,
+            ),
+            lambda: _policy(
+                name="code_exec_python",
+                allow_subprocesses=False,
+                entrypoints=(Path("/usr/bin/python3"),),
+            ),
+            "entrypoint",
+            id="bare-executable-rejected",
+        ),
+        pytest.param(
+            lambda workspace: SandboxExecRequest(
+                tool_name="python",
+                profile_name="code_exec_python",
+                mode="exec_argv",
+                argv=("./python3", "-c", "print('ok')"),
+                workspace_root=workspace,
+                cwd=workspace,
+                timeout_seconds=5.0,
+            ),
+            lambda: _policy(
+                name="code_exec_python",
+                allow_subprocesses=False,
+                entrypoints=(Path("/usr/bin/python3"),),
+            ),
+            "entrypoint",
+            id="relative-executable-rejected",
+        ),
+        pytest.param(
+            lambda workspace: SandboxExecRequest(
+                tool_name="python",
+                profile_name="code_exec_python",
+                mode="exec_argv",
+                argv=("/usr/bin/python3", "-c", "print('ok')"),
+                workspace_root=workspace,
+                cwd=workspace,
+                timeout_seconds=5.0,
+            ),
+            lambda: _policy(
+                name="code_exec_python",
+                allow_subprocesses=False,
+                entrypoints=(),
+            ),
+            "entrypoint",
+            id="empty-entrypoints-rejected",
+        ),
+        pytest.param(
+            lambda workspace: SandboxExecRequest(
+                tool_name="python",
+                profile_name="code_exec_python",
+                mode="exec_argv",
+                argv=("/usr/bin/python3", "-c", "print('ok')"),
+                workspace_root=workspace,
+                cwd=workspace,
+                timeout_seconds=5.0,
+            ),
+            lambda: _policy(
+                name="code_exec_python",
+                allow_subprocesses=False,
+                entrypoints=(Path("python3"),),
+            ),
+            "entrypoint",
+            id="relative-policy-entrypoint-rejected",
+        ),
+    ],
+)
+def test_seatbelt_fails_closed_on_invalid_entrypoint_configurations(
+    tmp_path: Path,
+    request_factory,
+    policy_factory,
+    pattern: str,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = _environment(tmp_path)
+
+    with pytest.raises(SandboxLaunchError, match=pattern) as excinfo:
+        SeatbeltBackend(binary=Path("/usr/bin/sandbox-exec")).build_launch_spec(
+            request_factory(workspace),
+            policy_factory(),
+            environment,
+        )
+
+    message = str(excinfo.value)
+    assert str(workspace) not in message
+    assert "echo nope" not in message
 
 
 def test_probe_short_circuits_when_binary_missing_or_not_executable(
@@ -356,7 +554,8 @@ def test_probe_interprets_behavioral_checks_with_exec_form_subprocess_calls(
     calls: list[dict[str, object]] = []
     responses = iter(
         [
-            subprocess.CompletedProcess(args=["ok"], returncode=0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(args=["shell-ok"], returncode=0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(args=["code-ok"], returncode=0, stdout=b"", stderr=b""),
             subprocess.CompletedProcess(args=["outside"], returncode=1, stdout=b"", stderr=b""),
             subprocess.CompletedProcess(args=["network"], returncode=1, stdout=b"", stderr=b""),
             subprocess.CompletedProcess(args=["hidden"], returncode=1, stdout=b"", stderr=b""),
@@ -383,10 +582,11 @@ def test_probe_interprets_behavioral_checks_with_exec_form_subprocess_calls(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     policies = (
-        _policy(),
+        _policy(entrypoints=(Path("/bin/sh"),)),
         _policy(
             name="code_exec_python",
             allow_subprocesses=False,
+            entrypoints=(Path("/usr/bin/python3"),),
         ),
     )
 
@@ -401,7 +601,7 @@ def test_probe_interprets_behavioral_checks_with_exec_form_subprocess_calls(
         "protected_git_write_denied": True,
         "child_creation_denied": True,
     }
-    assert len(calls) == 6
+    assert len(calls) == 7
     assert all(isinstance(call["args"], list) for call in calls)
     assert all(call["shell"] is False for call in calls)
     assert all(call["capture_output"] is True for call in calls)
@@ -409,6 +609,61 @@ def test_probe_interprets_behavioral_checks_with_exec_form_subprocess_calls(
     assert all(call["timeout"] == 3.0 for call in calls)
     assert all(call["env"]["PATH"] == "/usr/bin:/bin" for call in calls)
     assert all(call["args"][0] == "/usr/bin/sandbox-exec" for call in calls)
+    assert calls[0]["args"][-4:] == ["--", "/bin/sh", "-c", ":"]
+    assert calls[1]["args"][-4:] == ["--", "/usr/bin/python3", "-c", "pass"]
+    assert all("mcp_stdio_local" not in str(call["args"]) for call in calls)
+
+
+def test_probe_uses_disposable_workspace_and_does_not_mutate_caller_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiclaw.governance.sandbox.seatbelt import SeatbeltBackend
+
+    workspace = tmp_path / "caller-workspace"
+    workspace.mkdir()
+    calls: list[list[str]] = []
+    responses = iter(
+        [
+            subprocess.CompletedProcess(args=["shell"], returncode=0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(args=["code"], returncode=0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(args=["outside"], returncode=1, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(args=["network"], returncode=1, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(args=["hidden"], returncode=1, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(args=["protected"], returncode=1, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(args=["child"], returncode=1, stdout=b"", stderr=b""),
+        ]
+    )
+
+    def fake_runner(args, **kwargs):
+        calls.append(list(args))
+        return next(responses)
+
+    backend = SeatbeltBackend(
+        binary=Path("/usr/bin/sandbox-exec"),
+        subprocess_run=fake_runner,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_probe_binary_ready",
+        lambda: (True, Path("/usr/bin/sandbox-exec"), ""),
+    )
+
+    result = backend.probe(
+        workspace,
+        (
+            _policy(entrypoints=(Path("/bin/sh"),)),
+            _policy(
+                name="code_exec_python",
+                allow_subprocesses=False,
+                entrypoints=(Path("/usr/bin/python3"),),
+            ),
+        ),
+    )
+
+    assert result.available is True
+    assert list(workspace.iterdir()) == []
+    assert all(str(workspace / ".git") not in " ".join(args) for args in calls)
 
 
 def test_probe_reports_failed_capability_without_leaking_secret_values(
@@ -439,10 +694,11 @@ def test_probe_reports_failed_capability_without_leaking_secret_values(
     result = backend.probe(
         workspace,
         (
-            _policy(),
+            _policy(entrypoints=(Path("/bin/sh"),)),
             _policy(
                 name="code_exec_python",
                 allow_subprocesses=False,
+                entrypoints=(Path("/usr/bin/python3"),),
             ),
         ),
     )
@@ -480,10 +736,11 @@ def test_probe_treats_timeout_as_unavailable_with_capability_map(
     result = backend.probe(
         workspace,
         (
-            _policy(),
+            _policy(entrypoints=(Path("/bin/sh"),)),
             _policy(
                 name="code_exec_python",
                 allow_subprocesses=False,
+                entrypoints=(Path("/usr/bin/python3"),),
             ),
         ),
     )
