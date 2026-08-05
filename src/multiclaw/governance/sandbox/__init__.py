@@ -14,6 +14,7 @@ from multiclaw.governance.sandbox.execution_guard import (
     ExecutionGuard,
     ExecutionTimeoutError,
 )
+from multiclaw.governance.sandbox.manager import SandboxManager
 from multiclaw.governance.sandbox.models import (
     SandboxEnvironment,
     SandboxExecRequest,
@@ -36,6 +37,7 @@ __all__ = [
     "SandboxExecRequest",
     "SandboxExecResult",
     "SandboxLaunchError",
+    "SandboxManager",
     "SandboxPolicyError",
     "SandboxProcessRunner",
     "SandboxProbeResult",
