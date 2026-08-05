@@ -23,6 +23,7 @@ from multiclaw.governance.sandbox.models import (
     SandboxReadiness,
     SandboxedLaunchSpec,
 )
+from multiclaw.governance.sandbox.runner import SandboxProcessRunner
 
 __all__ = [
     "ExecutionGuard",
@@ -36,6 +37,7 @@ __all__ = [
     "SandboxExecResult",
     "SandboxLaunchError",
     "SandboxPolicyError",
+    "SandboxProcessRunner",
     "SandboxProbeResult",
     "SandboxProfilePolicy",
     "SandboxReadiness",

@@ -1,0 +1,366 @@
+import asyncio
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import textwrap
+import time
+
+import pytest
+
+from multiclaw.governance import SandboxLaunchError, SandboxedLaunchSpec
+from multiclaw.governance.sandbox.runner import SandboxProcessRunner
+
+
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="requires POSIX signals")
+
+
+def _make_spec(
+    tmp_path: Path,
+    *,
+    code: str,
+    stdin_bytes: bytes | None = None,
+    env: dict[str, str] | None = None,
+    private_root: Path | None = None,
+    backend_name: str = "fake",
+    profile_name: str = "test",
+    correlation_id: str = "corr",
+    unsafe_fallback_used: bool = False,
+    cwd: Path | None = None,
+    executable: str | None = None,
+) -> SandboxedLaunchSpec:
+    return SandboxedLaunchSpec(
+        executable=executable or sys.executable,
+        args=("-c", code),
+        cwd=cwd or tmp_path,
+        env=env or dict(os.environ),
+        stdin_bytes=stdin_bytes,
+        private_root=private_root or tmp_path,
+        backend_name=backend_name,
+        profile_name=profile_name,
+        correlation_id=correlation_id,
+        unsafe_fallback_used=unsafe_fallback_used,
+    )
+
+
+def _process_missing(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def _assert_pid_gone(pid: int, *, timeout_seconds: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _process_missing(pid):
+            return
+        time.sleep(0.05)
+    os.kill(pid, 0)
+
+
+def _best_effort_kill_pid(pid: int | None) -> None:
+    if pid is None:
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+
+
+def _read_pid_record(record_path: Path) -> dict[str, int]:
+    return json.loads(record_path.read_text(encoding="utf-8"))
+
+
+async def _wait_for_file(path: Path, *, timeout_seconds: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path}")
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_captures_success_and_metadata(tmp_path: Path) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code=(
+            "import sys; "
+            "sys.stdout.write('hello stdout'); "
+            "sys.stderr.write('hello stderr')"
+        ),
+        backend_name="fake-backend",
+        profile_name="shell-profile",
+        correlation_id="success",
+        unsafe_fallback_used=True,
+    )
+
+    result = await SandboxProcessRunner().run(spec, 1.0)
+
+    assert result.exit_code == 0
+    assert result.timed_out is False
+    assert result.signal is None
+    assert result.stdout == b"hello stdout"
+    assert result.stderr == b"hello stderr"
+    assert result.backend_name == "fake-backend"
+    assert result.profile_name == "shell-profile"
+    assert result.unsafe_fallback_used is True
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_passes_stdin_bytes(tmp_path: Path) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code=(
+            "import sys; "
+            "data = sys.stdin.buffer.read(); "
+            "sys.stdout.buffer.write(data[::-1]); "
+            "sys.stderr.buffer.write(b'stderr-bytes')"
+        ),
+        stdin_bytes=b"abcdef",
+        correlation_id="stdin",
+    )
+
+    result = await SandboxProcessRunner().run(spec, 1.0)
+
+    assert result.exit_code == 0
+    assert result.stdout == b"fedcba"
+    assert result.stderr == b"stderr-bytes"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_returns_non_zero_exit_code(tmp_path: Path) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code="import sys; sys.stderr.write('boom'); raise SystemExit(7)",
+        correlation_id="non-zero",
+    )
+
+    result = await SandboxProcessRunner().run(spec, 1.0)
+
+    assert result.exit_code == 7
+    assert result.timed_out is False
+    assert result.signal is None
+    assert result.stderr == b"boom"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_maps_signal_exit_to_signal_name(tmp_path: Path) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code="import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+        correlation_id="signal-exit",
+    )
+
+    result = await SandboxProcessRunner().run(spec, 1.0)
+
+    assert result.exit_code is None
+    assert result.timed_out is False
+    assert result.signal == "SIGTERM"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_marks_term_responsive_timeout(tmp_path: Path) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code="import time; time.sleep(60)",
+        correlation_id="term-timeout",
+    )
+
+    result = await SandboxProcessRunner(term_grace_seconds=0.1).run(spec, 0.05)
+
+    assert result.exit_code is None
+    assert result.timed_out is True
+    assert result.signal == "SIGTERM"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_escalates_to_kill_when_term_ignored(
+    tmp_path: Path,
+) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code=(
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(60)"
+        ),
+        correlation_id="kill-timeout",
+    )
+
+    result = await SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 0.05)
+
+    assert result.exit_code is None
+    assert result.timed_out is True
+    assert result.signal == "SIGKILL"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_kills_descendants_on_timeout(tmp_path: Path) -> None:
+    record_path = tmp_path / "pids.json"
+    script = textwrap.dedent(
+        f"""
+        import json
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+        )
+        Path({str(record_path)!r}).write_text(
+            json.dumps({{"parent_pid": child.pid, "child_pid": __import__("os").getpid()}}),
+            encoding="utf-8",
+        )
+        time.sleep(60)
+        """
+    )
+    spec = _make_spec(tmp_path, code=script, correlation_id="descendant-timeout")
+
+    child_pid: int | None = None
+    parent_pid: int | None = None
+    try:
+        task = asyncio.create_task(
+            SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 0.2)
+        )
+        await _wait_for_file(record_path)
+        result = await task
+        record = _read_pid_record(record_path)
+        parent_pid = record["parent_pid"]
+        child_pid = record["child_pid"]
+
+        assert result.timed_out is True
+        assert result.signal in {"SIGTERM", "SIGKILL"}
+        _assert_pid_gone(parent_pid)
+        _assert_pid_gone(child_pid)
+    finally:
+        _best_effort_kill_pid(parent_pid)
+        _best_effort_kill_pid(child_pid)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_cleans_up_on_cancellation(tmp_path: Path) -> None:
+    record_path = tmp_path / "cancel-pids.json"
+    script = textwrap.dedent(
+        f"""
+        import json
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+        )
+        Path({str(record_path)!r}).write_text(
+            json.dumps({{"parent_pid": child.pid, "child_pid": __import__("os").getpid()}}),
+            encoding="utf-8",
+        )
+        time.sleep(60)
+        """
+    )
+    spec = _make_spec(tmp_path, code=script, correlation_id="cancel")
+
+    task = asyncio.create_task(SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 60.0))
+    await _wait_for_file(record_path)
+    record = _read_pid_record(record_path)
+    parent_pid = record["parent_pid"]
+    child_pid = record["child_pid"]
+
+    try:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        _assert_pid_gone(parent_pid)
+        _assert_pid_gone(child_pid)
+    finally:
+        _best_effort_kill_pid(parent_pid)
+        _best_effort_kill_pid(child_pid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("spec", "expected_fragment"),
+    [
+        pytest.param(
+            lambda tmp_path: _make_spec(
+                tmp_path,
+                code="print('unused')",
+                executable="/definitely/missing/executable",
+                env={"SECRET_TOKEN": "top-secret"},
+                stdin_bytes=b"super-secret-stdin",
+                backend_name="missing-backend",
+                profile_name="missing-profile",
+                correlation_id="missing-executable",
+            ),
+            "missing-backend",
+            id="missing-executable",
+        ),
+        pytest.param(
+            lambda tmp_path: _make_spec(
+                tmp_path,
+                code="print('unused')",
+                cwd=tmp_path / "missing-dir",
+                env={"SECRET_TOKEN": "top-secret"},
+                stdin_bytes=b"super-secret-stdin",
+                backend_name="cwd-backend",
+                profile_name="cwd-profile",
+                correlation_id="missing-cwd",
+            ),
+            "cwd-backend",
+            id="missing-cwd",
+        ),
+    ],
+)
+async def test_sandbox_runner_wraps_pre_spawn_failures(
+    tmp_path: Path,
+    spec,
+    expected_fragment: str,
+) -> None:
+    with pytest.raises(SandboxLaunchError) as excinfo:
+        await SandboxProcessRunner().run(spec(tmp_path), 1.0)
+
+    message = str(excinfo.value)
+    assert expected_fragment in message
+    assert "SECRET_TOKEN" not in message
+    assert "top-secret" not in message
+    assert "super-secret-stdin" not in message
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_does_not_delete_private_root(tmp_path: Path) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    spec = _make_spec(
+        tmp_path,
+        code="print('ok')",
+        private_root=private_root,
+        correlation_id="private-root",
+    )
+
+    result = await SandboxProcessRunner().run(spec, 1.0)
+
+    assert result.exit_code == 0
+    assert private_root.exists()
+    assert private_root.is_dir()
+
+
+def test_sandbox_runner_requires_positive_term_grace_seconds() -> None:
+    with pytest.raises(ValueError, match="term_grace_seconds"):
+        SandboxProcessRunner(term_grace_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_requires_positive_timeout_seconds(tmp_path: Path) -> None:
+    spec = _make_spec(tmp_path, code="print('unused')", correlation_id="bad-timeout")
+
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        await SandboxProcessRunner().run(spec, 0)
