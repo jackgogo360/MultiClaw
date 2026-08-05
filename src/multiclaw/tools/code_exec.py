@@ -150,7 +150,7 @@ class CodeExecInvocation(ToolInvocation[CodeExecParams]):
         except UnicodeDecodeError as exc:
             raise ValueError("runner output must be utf-8") from exc
 
-        decoder = json.JSONDecoder()
+        decoder = json.JSONDecoder(object_pairs_hook=self._reject_duplicate_keys)
         try:
             payload, end_index = decoder.raw_decode(envelope_text)
         except JSONDecodeError as exc:
@@ -168,6 +168,17 @@ class CodeExecInvocation(ToolInvocation[CodeExecParams]):
         for key in ("stdout", "stderr", "error"):
             if not isinstance(payload[key], str):
                 raise ValueError(f"runner {key} must be a string")
+        return payload
+
+    def _reject_duplicate_keys(
+        self,
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        for key, value in pairs:
+            if key in payload:
+                raise ValueError("runner payload contained duplicate keys")
+            payload[key] = value
         return payload
 
     def _with_audit(
