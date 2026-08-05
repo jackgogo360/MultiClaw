@@ -463,7 +463,10 @@ def create_agent(
     # Register MCP tools if enabled
     mcp_manager = None
     if settings.mcp.enabled:
-        mcp_manager = MCPClientManager()
+        mcp_manager = MCPClientManager(
+            sandbox_controller=sandbox_controller,
+            workspace_root=workspace_root,
+        )
         _register_mcp_tools(
             registry=registry,
             mcp_manager=mcp_manager,

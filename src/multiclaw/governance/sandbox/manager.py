@@ -8,6 +8,7 @@ import sysconfig
 import tempfile
 import threading
 from pathlib import Path
+from typing import Literal
 
 from multiclaw.config.settings import SandboxSettings
 from multiclaw.events import Event, EventBus
@@ -276,11 +277,14 @@ class SandboxManager(SandboxController):
 
         canonical_workspace = self._canonical_request_workspace(request.workspace_root)
         canonical_cwd = self._canonical_request_cwd(request.cwd, canonical_workspace)
+        effective_policy, request_update = self._effective_policy_for_request(
+            request=request,
+            base_policy=policy,
+            canonical_workspace=canonical_workspace,
+            canonical_cwd=canonical_cwd,
+        )
         normalized_request = request.model_copy(
-            update={
-                "workspace_root": canonical_workspace,
-                "cwd": canonical_cwd,
-            }
+            update=request_update,
         )
 
         environment = build_sandbox_environment(
@@ -290,12 +294,21 @@ class SandboxManager(SandboxController):
             temp_root=self._manager_root,
             default_path=self._default_path(),
         )
+        if normalized_request.profile_name == self._settings.profiles.mcp_stdio:
+            environment = environment.model_copy(
+                update={
+                    "env": {
+                        **dict(environment.env),
+                        "PATH": self._controlled_mcp_path(effective_policy.runtime_read_only_paths),
+                    }
+                }
+            )
         try:
-            rendered = self._backend.build_launch_spec(normalized_request, policy, environment)
+            rendered = self._backend.build_launch_spec(normalized_request, effective_policy, environment)
             spec = rendered.model_copy(
                 update={
                     "backend_name": self._backend_name,
-                    "profile_name": policy.name,
+                    "profile_name": effective_policy.name,
                     "unsafe_fallback_used": self.mode == "host_unsafe_dev_only",
                 }
             )
@@ -311,6 +324,122 @@ class SandboxManager(SandboxController):
                 )
             )
         return spec
+
+    def _effective_policy_for_request(
+        self,
+        *,
+        request: SandboxExecRequest,
+        base_policy: SandboxProfilePolicy,
+        canonical_workspace: Path,
+        canonical_cwd: Path,
+    ) -> tuple[SandboxProfilePolicy, dict[str, object]]:
+        update: dict[str, object] = {
+            "workspace_root": canonical_workspace,
+            "cwd": canonical_cwd,
+        }
+        has_dynamic_override = any(
+            (
+                request.network_mode is not None,
+                request.workspace_mode is not None,
+                request.allow_subprocesses is not None,
+                bool(request.read_only_paths),
+            )
+        )
+        if request.profile_name != self._settings.profiles.mcp_stdio:
+            if has_dynamic_override:
+                raise SandboxPolicyError(
+                    "dynamic sandbox overrides are reserved for the configured mcp_stdio profile"
+                )
+            return base_policy, update
+
+        explicit_roots = self._canonical_mcp_read_only_roots(request.read_only_paths)
+        effective_policy = base_policy.model_copy(
+            update={
+                "workspace_mode": self._mcp_workspace_mode(request.workspace_mode),
+                "network_mode": self._mcp_network_mode(request.network_mode),
+                "allow_subprocesses": self._mcp_allow_subprocesses(request.allow_subprocesses),
+                "entrypoints": self._mcp_entrypoints(request),
+                "runtime_read_only_paths": explicit_roots,
+            }
+        )
+        update["read_only_paths"] = ()
+        if request.mode == "exec_argv" and request.argv:
+            update["argv"] = (str(effective_policy.entrypoints[0]), *request.argv[1:])
+        return effective_policy, update
+
+    def _mcp_network_mode(self, override: Literal["disabled", "inherit"] | None) -> str:
+        return override or "disabled"
+
+    def _mcp_workspace_mode(self, override: Literal["ro", "rw"] | None) -> str:
+        return override or "ro"
+
+    def _mcp_allow_subprocesses(self, override: bool | None) -> bool:
+        return override if override is not None else False
+
+    def _mcp_entrypoints(self, request: SandboxExecRequest) -> tuple[Path, ...]:
+        if request.mode != "exec_argv" or not request.argv:
+            return (Path("/usr/bin/env").resolve(),)
+        return (self._canonical_request_entrypoint(Path(request.argv[0])),)
+
+    def _canonical_request_entrypoint(self, entrypoint: Path) -> Path:
+        lexical = self._absolute_lexical_path(entrypoint)
+        try:
+            resolved = lexical.resolve(strict=True)
+        except OSError as exc:
+            raise SandboxPolicyError("MCP entrypoint must exist") from exc
+        if lexical != resolved:
+            raise SandboxPolicyError("MCP entrypoint must use its canonical path")
+        if not resolved.is_file():
+            raise SandboxPolicyError("MCP entrypoint must be a file")
+        return resolved
+
+    def _canonical_mcp_read_only_roots(self, paths: tuple[Path, ...]) -> tuple[Path, ...]:
+        if not paths:
+            return ()
+
+        ordered: list[Path] = []
+        seen: set[Path] = set()
+        for path in paths:
+            lexical = self._absolute_lexical_path(path)
+            try:
+                resolved = lexical.resolve(strict=True)
+            except OSError as exc:
+                raise SandboxPolicyError("MCP read-only roots must exist") from exc
+            if lexical != resolved:
+                raise SandboxPolicyError("MCP read-only roots must use canonical paths")
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            ordered.append(resolved)
+        if len(ordered) > 16:
+            raise SandboxPolicyError("MCP read-only roots cannot exceed 16 entries")
+        return tuple(ordered)
+
+    def _controlled_mcp_path(self, explicit_roots: tuple[Path, ...]) -> str:
+        entries = self._default_path().split(":")
+        for root in explicit_roots:
+            if root.is_file():
+                if root.parent.name == "bin":
+                    entries.append(str(root.parent))
+                continue
+            if root.name == "bin":
+                entries.append(str(root))
+                continue
+            candidate = root / "bin"
+            if candidate.is_dir():
+                entries.append(str(candidate.resolve(strict=True)))
+
+        ordered: list[str] = []
+        seen: set[Path] = set()
+        for entry in entries:
+            if not entry:
+                continue
+            canonical = Path(entry).resolve(strict=False)
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            ordered.append(str(canonical))
+        return ":".join(ordered)
 
     async def run(self, request: SandboxExecRequest) -> SandboxExecResult:
         spec = self.build_launch_spec(request)
@@ -475,11 +604,8 @@ class SandboxManager(SandboxController):
             SandboxProfilePolicy(
                 name=self._settings.profiles.mcp_stdio,
                 workspace_mode="ro",
-                # Task 7 keeps the backend-compatible MCP base profile. Task 11
-                # will layer server-specific request overrides and conservative
-                # per-server defaults on top of this profile.
-                network_mode="inherit",
-                allow_subprocesses=True,
+                network_mode="disabled",
+                allow_subprocesses=False,
                 entrypoints=(Path("/usr/bin/env").resolve(),),
                 write_protected_patterns=protected,
                 read_hidden_patterns=hidden,

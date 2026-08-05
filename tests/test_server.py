@@ -918,6 +918,43 @@ def test_create_agent_passes_configured_mcp_profile_name(tmp_path, monkeypatch):
     assert captured["mcp_profile_name"] == "custom_mcp_profile"
 
 
+def test_create_agent_injects_sandbox_context_into_mcp_manager(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "true")
+    monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+
+    import multiclaw.server as server_module
+
+    captured = {}
+
+    class FakeManager:
+        def __init__(self, *, sandbox_controller=None, workspace_root=None, **kwargs):
+            captured["sandbox_controller"] = sandbox_controller
+            captured["workspace_root"] = workspace_root
+            captured["kwargs"] = kwargs
+
+        def set_tools_changed_callback(self, callback) -> None:
+            self._callback = callback
+
+        def connect_servers(self, configs):
+            self.connected = dict(configs)
+            return {}
+
+        def get_server_states(self):
+            return {}
+
+    monkeypatch.setattr(server_module, "MCPClientManager", FakeManager)
+    monkeypatch.setattr(server_module, "load_mcp_config", lambda path=None: {})
+    monkeypatch.setattr(server_module, "load_mcp_tools_config", lambda path=None: {})
+
+    controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
+    agent = server_module.create_agent(sandbox_controller=controller)
+
+    assert captured["sandbox_controller"] is controller
+    assert captured["workspace_root"] == agent.workspace_root
+    assert agent.mcp_manager is not None
+
+
 def test_create_agent_passes_configured_shell_profile_and_controller(tmp_path, monkeypatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")

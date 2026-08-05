@@ -21,6 +21,7 @@ from multiclaw.governance.sandbox.nsjail_profiles import (
     NSJAIL_PROFILES,
     NsJailProfileTemplate,
     NsJailSystemMount,
+    render_mcp_stdio_template,
 )
 
 _PRODUCTION_BINARY = Path("/usr/bin/nsjail")
@@ -76,6 +77,7 @@ class NsJailBackend:
         template = self._template_for(policy.name)
         self._validate_request_overrides(request, policy)
         self._validate_policy_against_template(policy, template)
+        template = self._render_template(policy, template)
         target_argv = self._target_argv_for(request, policy)
 
         binary = self._canonicalize_path(self.binary, "binary")
@@ -393,12 +395,13 @@ class NsJailBackend:
     ) -> None:
         if policy.network_mode not in _SUPPORTED_NETWORK_MODES:
             raise SandboxLaunchError("unsupported network mode for nsjail profile")
-        if policy.network_mode != template.network_mode:
-            raise SandboxLaunchError("network mode is not represented by the reviewed template")
-        if policy.workspace_mode != template.workspace_mode:
-            raise SandboxLaunchError("workspace mode is not represented by the reviewed template")
-        if policy.allow_subprocesses != template.allow_subprocesses:
-            raise SandboxLaunchError("subprocess policy is not represented by the reviewed template")
+        if policy.name != "mcp_stdio_local":
+            if policy.network_mode != template.network_mode:
+                raise SandboxLaunchError("network mode is not represented by the reviewed template")
+            if policy.workspace_mode != template.workspace_mode:
+                raise SandboxLaunchError("workspace mode is not represented by the reviewed template")
+            if policy.allow_subprocesses != template.allow_subprocesses:
+                raise SandboxLaunchError("subprocess policy is not represented by the reviewed template")
         if tuple(policy.read_hidden_patterns) != template.read_hidden_patterns:
             raise SandboxLaunchError("hidden path policy is not represented by the reviewed template")
         if tuple(policy.write_protected_patterns) != template.write_protected_patterns:
@@ -407,6 +410,19 @@ class NsJailBackend:
             raise SandboxLaunchError("hidden path policy must match the reviewed nsjail rules")
         if tuple(policy.write_protected_patterns) != _SUPPORTED_PROTECTED_PATTERNS:
             raise SandboxLaunchError("protected path policy must match the reviewed nsjail rules")
+
+    def _render_template(
+        self,
+        policy: SandboxProfilePolicy,
+        template: NsJailProfileTemplate,
+    ) -> NsJailProfileTemplate:
+        if policy.name != "mcp_stdio_local":
+            return template
+        return render_mcp_stdio_template(
+            workspace_mode=policy.workspace_mode,
+            network_mode=policy.network_mode,
+            allow_subprocesses=policy.allow_subprocesses,
+        )
 
     def _canonicalize_existing_file(self, path: Path, label: str) -> Path:
         self._reject_nul(str(path), label)

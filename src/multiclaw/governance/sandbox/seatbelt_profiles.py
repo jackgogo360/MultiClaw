@@ -78,10 +78,17 @@ _CODE_PROCESS_BLOCK = """
 (deny network*)
 """.strip()
 
-_MCP_PROCESS_BLOCK = """
-(allow process-fork)
-(allow network*)
-""".strip()
+def _mcp_process_block(*, network_mode: str, allow_subprocesses: bool) -> str:
+    rules = []
+    if allow_subprocesses:
+        rules.append("(allow process-fork)")
+    else:
+        rules.append("(deny process-fork)")
+    if network_mode == "inherit":
+        rules.append("(allow network*)")
+    else:
+        rules.append("(deny network*)")
+    return "\n".join(rules)
 
 
 def _build_profile(process_block: str, workspace_block: str) -> str:
@@ -117,10 +124,13 @@ CODE_EXEC_PYTHON_PROFILE = SeatbeltProfileTemplate(
 
 MCP_STDIO_LOCAL_PROFILE = SeatbeltProfileTemplate(
     name="mcp_stdio_local",
-    profile_text=_build_profile(_MCP_PROCESS_BLOCK, _WORKSPACE_RO_BLOCK),
+    profile_text=_build_profile(
+        _mcp_process_block(network_mode="disabled", allow_subprocesses=False),
+        _WORKSPACE_RO_BLOCK,
+    ),
     workspace_mode="ro",
-    network_mode="inherit",
-    allow_subprocesses=True,
+    network_mode="disabled",
+    allow_subprocesses=False,
     write_protected_patterns=(".git",),
     read_hidden_patterns=(".env", ".env.*"),
 )
@@ -130,3 +140,17 @@ SEATBELT_PROFILES = {
     CODE_EXEC_PYTHON_PROFILE.name: CODE_EXEC_PYTHON_PROFILE,
     MCP_STDIO_LOCAL_PROFILE.name: MCP_STDIO_LOCAL_PROFILE,
 }
+
+
+def render_mcp_stdio_profile(
+    *,
+    workspace_mode: str,
+    network_mode: str,
+    allow_subprocesses: bool,
+) -> str:
+    workspace_block = _WORKSPACE_RW_BLOCK if workspace_mode == "rw" else _WORKSPACE_RO_BLOCK
+    process_block = _mcp_process_block(
+        network_mode=network_mode,
+        allow_subprocesses=allow_subprocesses,
+    )
+    return _build_profile(process_block, workspace_block)
