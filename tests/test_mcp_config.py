@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 import multiclaw.mcp.config as mcp_config_module
-from multiclaw.mcp.config import _load_from_file, _parse_server_config, load_mcp_config
+from multiclaw.mcp.config import (
+    _load_from_file,
+    _parse_server_config,
+    load_mcp_config,
+    load_mcp_tools_config,
+)
 from multiclaw.mcp.types import HTTPServerConfig, StdioServerConfig
 
 
@@ -337,6 +342,124 @@ def test_load_mcp_config_preserves_home_first_winner_provenance(
     assert loaded["demo"].config_trust == "trusted_operator"
 
 
+def test_load_mcp_tools_config_keeps_earliest_same_name_filter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home_config = tmp_path / "home" / ".mcp.json"
+    workspace_config = workspace / ".mcp.json"
+    _write_mcp_config(
+        home_config,
+        {
+            "demo": {
+                "command": "/usr/bin/env",
+                "tools": {"include": ["home"], "exclude": ["home_ex"]},
+            }
+        },
+    )
+    _write_mcp_config(
+        workspace_config,
+        {
+            "demo": {
+                "command": "/bin/echo",
+                "tools": {"include": ["workspace"], "exclude": ["workspace_ex"]},
+            }
+        },
+    )
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [home_config, Path(".mcp.json")],
+    )
+
+    tool_filters = load_mcp_tools_config(search_parents=False)
+
+    assert tool_filters == {
+        "demo": {"include": ["home"], "exclude": ["home_ex"]},
+    }
+
+
+def test_load_mcp_tools_config_does_not_merge_later_filter_into_earlier_server_without_filter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home_config = tmp_path / "home" / ".mcp.json"
+    workspace_config = workspace / ".mcp.json"
+    _write_mcp_config(
+        home_config,
+        {
+            "demo": {
+                "command": "/usr/bin/env",
+            }
+        },
+    )
+    _write_mcp_config(
+        workspace_config,
+        {
+            "demo": {
+                "command": "/bin/echo",
+                "tools": {"include": ["workspace"], "exclude": ["workspace_ex"]},
+            }
+        },
+    )
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [home_config, Path(".mcp.json")],
+    )
+
+    tool_filters = load_mcp_tools_config(search_parents=False)
+
+    assert tool_filters == {}
+
+
+def test_load_mcp_tools_config_unions_distinct_server_names_with_own_filters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home_config = tmp_path / "home" / ".mcp.json"
+    workspace_config = workspace / ".mcp.json"
+    _write_mcp_config(
+        home_config,
+        {
+            "home_demo": {
+                "command": "/usr/bin/env",
+                "tools": {"include": ["home"], "exclude": ["home_ex"]},
+            }
+        },
+    )
+    _write_mcp_config(
+        workspace_config,
+        {
+            "workspace_demo": {
+                "command": "/bin/echo",
+                "tools": {"include": ["workspace"], "exclude": ["workspace_ex"]},
+            }
+        },
+    )
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [home_config, Path(".mcp.json")],
+    )
+
+    tool_filters = load_mcp_tools_config(search_parents=False)
+
+    assert tool_filters == {
+        "home_demo": {"include": ["home"], "exclude": ["home_ex"]},
+        "workspace_demo": {"include": ["workspace"], "exclude": ["workspace_ex"]},
+    }
+
+
 def test_load_mcp_config_rejects_any_template_in_untrusted_remote_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -362,6 +485,37 @@ def test_load_mcp_config_rejects_any_template_in_untrusted_remote_config(
     assert loaded == {}
     assert "workspace_untrusted" in caplog.text
     assert "dummy-secret-token" not in caplog.text
+
+
+def test_load_mcp_config_rejects_untrusted_remote_oauth_template_and_sanitizes_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_path = workspace / ".mcp.json"
+    monkeypatch.setenv("DUMMY_OAUTH_TOKEN", "dummy-oauth-secret")
+    _write_mcp_config(
+        config_path,
+        {
+            "demo": {
+                "url": "https://example.com/mcp",
+                "oauth": {
+                    "tokenUrl": "https://auth.example.com/${DUMMY_OAUTH_TOKEN}",
+                    "clientSecret": "${DUMMY_OAUTH_TOKEN}",
+                },
+            }
+        },
+    )
+
+    with caplog.at_level("WARNING"):
+        loaded = load_mcp_config(path=config_path, workspace_root=workspace)
+
+    assert loaded == {}
+    assert "workspace_untrusted" in caplog.text
+    assert "dummy-oauth-secret" not in caplog.text
+    assert str(config_path) not in caplog.text
 
 
 def test_load_mcp_config_keeps_untrusted_remote_literal_config_allowed(
