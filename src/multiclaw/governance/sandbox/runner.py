@@ -318,32 +318,39 @@ class SandboxProcessRunner:
         timeout: float,
         proc_wait_task: asyncio.Task[int] | None = None,
     ) -> bool:
+        owns_local_waiter = proc_wait_task is None
         local_proc_wait_task = proc_wait_task or asyncio.create_task(proc.wait())
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
 
-        while True:
-            if not self._process_group_exists(process_group_id):
-                await self._drain_wait_task(local_proc_wait_task, deadline=deadline)
-                return True
+        try:
+            while True:
+                if not self._process_group_exists(process_group_id):
+                    await self._drain_wait_task(local_proc_wait_task, deadline=deadline)
+                    return True
 
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return False
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
 
-            if local_proc_wait_task.done():
-                await asyncio.sleep(min(0.01, remaining))
-                continue
+                if local_proc_wait_task.done():
+                    await asyncio.sleep(min(0.01, remaining))
+                    continue
 
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(local_proc_wait_task),
-                    timeout=min(0.05, remaining),
-                )
-            except asyncio.TimeoutError:
-                await asyncio.sleep(0)
-            except Exception:
-                return not self._process_group_exists(process_group_id)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(local_proc_wait_task),
+                        timeout=min(0.05, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    await asyncio.sleep(0)
+                except Exception:
+                    return not self._process_group_exists(process_group_id)
+        finally:
+            if owns_local_waiter:
+                if not local_proc_wait_task.done():
+                    local_proc_wait_task.cancel()
+                await asyncio.gather(local_proc_wait_task, return_exceptions=True)
 
     async def _drain_wait_task(
         self,

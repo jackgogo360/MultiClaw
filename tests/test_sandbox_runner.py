@@ -258,6 +258,56 @@ async def test_sandbox_runner_wait_for_process_group_exit_reuses_single_proc_wai
 
 
 @pytest.mark.asyncio
+async def test_sandbox_runner_wait_for_process_group_exit_cleans_local_waiter_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = SandboxProcessRunner()
+    baseline_tasks = {
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+    }
+
+    class FakeProc:
+        wait_calls = 0
+
+        @property
+        def returncode(self) -> int | None:
+            return None
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            await asyncio.sleep(60)
+            return 0
+
+    monkeypatch.setattr(
+        runner,
+        "_process_group_exists",
+        lambda process_group_id: True,
+    )
+    proc = FakeProc()
+
+    exited = await runner._wait_for_process_group_exit(
+        proc,
+        999,
+        timeout=0.05,
+    )
+    await asyncio.sleep(0)
+
+    leaked_tasks = [
+        pending
+        for pending in asyncio.all_tasks()
+        if pending is not asyncio.current_task()
+        and not pending.done()
+        and pending not in baseline_tasks
+    ]
+
+    assert exited is False
+    assert proc.wait_calls == 1
+    assert leaked_tasks == []
+
+
+@pytest.mark.asyncio
 async def test_sandbox_runner_clears_captured_output_when_stdout_limit_exceeded(tmp_path: Path) -> None:
     spec = _make_spec(
         tmp_path,
