@@ -529,11 +529,14 @@ async def test_sandbox_runner_output_limit_kills_descendants_even_if_parent_exit
     tmp_path: Path,
 ) -> None:
     record_path = tmp_path / "overflow-descendant-pids.json"
+    child_ready_path = tmp_path / "overflow-descendant-ready"
     child_code = textwrap.dedent(
-        """
+        f"""
         import os
+        from pathlib import Path
         import time
 
+        Path({str(child_ready_path)!r}).write_text("ready", encoding="utf-8")
         os.write(1, b"x" * (128 * 1024 + 1))
         time.sleep(60)
         """
@@ -555,6 +558,11 @@ async def test_sandbox_runner_output_limit_kills_descendants_even_if_parent_exit
             json.dumps({{"parent_pid": os.getpid(), "child_pid": child.pid}}),
             encoding="utf-8",
         )
+        deadline = __import__("time").monotonic() + 2.0
+        while not Path({str(child_ready_path)!r}).exists():
+            if __import__("time").monotonic() >= deadline:
+                raise SystemExit("child did not become ready")
+            __import__("time").sleep(0.01)
         raise SystemExit(0)
         """
     )
@@ -575,6 +583,179 @@ async def test_sandbox_runner_output_limit_kills_descendants_even_if_parent_exit
         assert result.output_limit_stream == "stdout"
         assert result.stdout == b""
         assert result.stderr == b""
+        _assert_pid_gone(child_pid)
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if record is not None:
+            parent_pid = record["parent_pid"]
+            child_pid = record["child_pid"]
+        _best_effort_kill_pgid(parent_pid)
+        _best_effort_kill_pid(parent_pid)
+        _best_effort_kill_pid(child_pid)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_cleans_overflow_descendants_before_return_when_communicate_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record_path = tmp_path / "overflow-fast-finish-pids.json"
+    child_ready_path = tmp_path / "overflow-fast-finish-child-ready"
+    child_code = textwrap.dedent(
+        f"""
+        import signal
+        import time
+        from pathlib import Path
+
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        Path({str(child_ready_path)!r}).write_text("ready", encoding="utf-8")
+        time.sleep(60)
+        """
+    ).strip()
+    script = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        with open(os.devnull, "wb", buffering=0) as sink:
+            child = subprocess.Popen(
+                [sys.executable, "-c", {child_code!r}],
+                stdin=subprocess.DEVNULL,
+                stdout=sink,
+                stderr=sink,
+            )
+            Path({str(record_path)!r}).write_text(
+                json.dumps({{"parent_pid": os.getpid(), "child_pid": child.pid}}),
+                encoding="utf-8",
+            )
+            deadline = time.monotonic() + 2.0
+            while not Path({str(child_ready_path)!r}).exists():
+                if time.monotonic() >= deadline:
+                    raise SystemExit("child did not become ready")
+                time.sleep(0.01)
+            os.write(1, b"x" * (128 * 1024 + 1))
+        raise SystemExit(0)
+        """
+    )
+    spec = _make_spec(tmp_path, code=script, correlation_id="overflow-fast-finish")
+
+    real_wait = asyncio.wait
+
+    async def fake_wait(tasks, *, timeout=None, return_when=asyncio.FIRST_COMPLETED):
+        del timeout, return_when
+        communicate_task = next(task for task in tasks if task.get_coro().__name__ == "_communicate_with_limits")
+        output_limit_task = next(task for task in tasks if task is not communicate_task)
+        await real_wait({communicate_task, output_limit_task}, timeout=3.0, return_when=asyncio.ALL_COMPLETED)
+        assert communicate_task.done()
+        assert output_limit_task.done()
+        return {communicate_task}, set()
+
+    monkeypatch.setattr(asyncio, "wait", fake_wait)
+
+    task = asyncio.create_task(SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 1.0))
+    record: dict[str, int] | None = None
+    parent_pid: int | None = None
+    child_pid: int | None = None
+
+    try:
+        record = await _wait_for_pid_record(record_path)
+        parent_pid = record["parent_pid"]
+        child_pid = record["child_pid"]
+        result = await asyncio.wait_for(task, timeout=2.0)
+
+        assert result.completion_state == "output_limit_exceeded"
+        assert result.output_limit_stream == "stdout"
+        _assert_pid_gone(child_pid)
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if record is not None:
+            parent_pid = record["parent_pid"]
+            child_pid = record["child_pid"]
+        _best_effort_kill_pgid(parent_pid)
+        _best_effort_kill_pid(parent_pid)
+        _best_effort_kill_pid(child_pid)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_rethrows_helper_errors_after_killing_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record_path = tmp_path / "helper-error-pids.json"
+    script = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        Path({str(record_path)!r}).write_text(
+            json.dumps({{"parent_pid": os.getpid(), "child_pid": child.pid}}),
+            encoding="utf-8",
+        )
+        time.sleep(60)
+        """
+    )
+    spec = _make_spec(tmp_path, code=script, correlation_id="helper-error-cleanup")
+
+    class InjectedReaderError(RuntimeError):
+        pass
+
+    tracked_tasks: list[asyncio.Task[object]] = []
+    real_create_task = asyncio.create_task
+    real_read_stream = SandboxProcessRunner._read_stream
+
+    def tracking_create_task(coro, *args, **kwargs):
+        task = real_create_task(coro, *args, **kwargs)
+        tracked_tasks.append(task)
+        return task
+
+    async def exploding_read_stream(self, stream, *, stream_name, captured_output, output_limit_event):
+        if stream_name == "stdout":
+            deadline = time.monotonic() + 2.0
+            while not record_path.exists():
+                if time.monotonic() >= deadline:
+                    raise AssertionError("helper error injection outran pid record creation")
+                await asyncio.sleep(0.01)
+            raise InjectedReaderError("reader exploded")
+        return await real_read_stream(
+            self,
+            stream,
+            stream_name=stream_name,
+            captured_output=captured_output,
+            output_limit_event=output_limit_event,
+        )
+
+    monkeypatch.setattr(asyncio, "create_task", tracking_create_task)
+    monkeypatch.setattr(SandboxProcessRunner, "_read_stream", exploding_read_stream)
+
+    task = asyncio.create_task(SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 1.0))
+    record: dict[str, int] | None = None
+    parent_pid: int | None = None
+    child_pid: int | None = None
+
+    try:
+        record = await _wait_for_pid_record(record_path)
+        parent_pid = record["parent_pid"]
+        child_pid = record["child_pid"]
+        with pytest.raises(InjectedReaderError, match="reader exploded"):
+            await task
+        await asyncio.sleep(0)
+        assert all(task.done() for task in tracked_tasks)
+        _assert_pid_gone(parent_pid)
         _assert_pid_gone(child_pid)
     finally:
         if not task.done():
