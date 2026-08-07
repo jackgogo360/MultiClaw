@@ -63,6 +63,7 @@ class SandboxProcessRunner:
                 f"backend={spec.backend_name!r} profile={spec.profile_name!r} "
                 f"executable={spec.executable!r} cwd={str(spec.cwd)!r}"
             ) from exc
+        process_group_id = self._preserve_process_group_id(proc)
 
         captured_output = _CapturedOutput(stdout=bytearray(), stderr=bytearray())
         output_limit_event = asyncio.Event()
@@ -86,42 +87,50 @@ class SandboxProcessRunner:
                 stdout, stderr = await self._await_communicate(communicate_task)
                 if captured_output.output_limit_stream is not None:
                     return self._build_result(
-                        spec,
-                        proc.returncode,
-                        stdout,
-                        stderr,
-                        timed_out=False,
-                        completion_state="output_limit_exceeded",
-                        output_limit_stream=captured_output.output_limit_stream,
-                    )
+                    spec,
+                    proc.returncode,
+                    stdout,
+                    stderr,
+                    captured_output=captured_output,
+                    timed_out=False,
+                )
                 return self._build_result(spec, proc.returncode, stdout, stderr, timed_out=False)
             if output_limit_task in done:
                 stdout, stderr = await self._cleanup_after_interrupt(
                     proc,
                     communicate_task,
+                    process_group_id,
                     escalation_timeout=self._term_grace_seconds,
                 )
-                return self._build_result(
+                return self._build_result_for_completion(
                     spec,
                     proc.returncode,
                     stdout,
                     stderr,
+                    captured_output=captured_output,
                     timed_out=False,
-                    completion_state="output_limit_exceeded",
-                    output_limit_stream=captured_output.output_limit_stream,
                 )
 
             stdout, stderr = await self._cleanup_after_interrupt(
                 proc,
                 communicate_task,
+                process_group_id,
                 escalation_timeout=self._term_grace_seconds,
             )
-            return self._build_result(spec, proc.returncode, stdout, stderr, timed_out=True)
+            return self._build_result_for_completion(
+                spec,
+                proc.returncode,
+                stdout,
+                stderr,
+                captured_output=captured_output,
+                timed_out=True,
+            )
         except asyncio.CancelledError:
             await asyncio.shield(
                 self._cleanup_after_interrupt(
                     proc,
                     communicate_task,
+                    process_group_id,
                     escalation_timeout=self._term_grace_seconds,
                 )
             )
@@ -135,11 +144,11 @@ class SandboxProcessRunner:
         self,
         proc: asyncio.subprocess.Process,
         communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
+        process_group_id: int,
         *,
         escalation_timeout: float,
     ) -> tuple[bytes, bytes]:
-        pgid = self._get_process_group_id(proc.pid)
-        self._send_signal(proc, pgid, signal.SIGTERM)
+        self._send_signal(proc, process_group_id, signal.SIGTERM)
 
         try:
             return await self._await_communicate(
@@ -147,7 +156,7 @@ class SandboxProcessRunner:
                 timeout=escalation_timeout,
             )
         except asyncio.TimeoutError:
-            self._send_signal(proc, pgid, signal.SIGKILL)
+            self._send_signal(proc, process_group_id, signal.SIGKILL)
             return await self._await_communicate(communicate_task)
 
     async def _await_communicate(
@@ -251,18 +260,25 @@ class SandboxProcessRunner:
     def _send_signal(
         self,
         proc: asyncio.subprocess.Process,
-        pgid: int | None,
+        process_group_id: int,
         sig: signal.Signals,
     ) -> None:
         try:
-            if pgid is not None:
-                os.killpg(pgid, sig)
+            if process_group_id > 0:
+                os.killpg(process_group_id, sig)
             elif proc.returncode is None:
                 os.kill(proc.pid, sig)
         except ProcessLookupError:
             return
         except OSError:
             return
+
+    def _preserve_process_group_id(self, proc: asyncio.subprocess.Process) -> int:
+        process_group_id = self._get_process_group_id(proc.pid)
+        if process_group_id is not None:
+            return process_group_id
+        # start_new_session=True makes the spawned pid the process-group leader.
+        return proc.pid
 
     def _get_process_group_id(self, pid: int) -> int | None:
         try:
@@ -295,6 +311,34 @@ class SandboxProcessRunner:
             backend_name=spec.backend_name,
             profile_name=spec.profile_name,
             unsafe_fallback_used=spec.unsafe_fallback_used,
+        )
+
+    def _build_result_for_completion(
+        self,
+        spec: SandboxedLaunchSpec,
+        returncode: int | None,
+        stdout: bytes | None,
+        stderr: bytes | None,
+        *,
+        captured_output: _CapturedOutput,
+        timed_out: bool,
+    ) -> SandboxExecResult:
+        if captured_output.output_limit_stream is not None:
+            return self._build_result(
+                spec,
+                returncode,
+                b"",
+                b"",
+                timed_out=False,
+                completion_state="output_limit_exceeded",
+                output_limit_stream=captured_output.output_limit_stream,
+            )
+        return self._build_result(
+            spec,
+            returncode,
+            stdout,
+            stderr,
+            timed_out=timed_out,
         )
 
     def _decode_returncode(self, returncode: int | None) -> tuple[int | None, str | None]:

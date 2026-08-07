@@ -209,6 +209,14 @@ class SandboxExecResult(_SandboxModel):
                 raise ValueError(
                     "output_limit_stream is required when completion_state is output_limit_exceeded"
                 )
+            if self.stdout != b"":
+                raise ValueError(
+                    "stdout must be empty when completion_state is output_limit_exceeded"
+                )
+            if self.stderr != b"":
+                raise ValueError(
+                    "stderr must be empty when completion_state is output_limit_exceeded"
+                )
 
         object.__setattr__(self, "completion_state", completion_state)
         return self

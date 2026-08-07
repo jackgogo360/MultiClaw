@@ -75,6 +75,17 @@ def _best_effort_kill_pid(pid: int | None) -> None:
         return
 
 
+def _best_effort_kill_pgid(pgid: int | None) -> None:
+    if pgid is None:
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+
+
 def _is_pid_record(value: object) -> bool:
     return (
         isinstance(value, dict)
@@ -297,21 +308,109 @@ async def test_sandbox_runner_marks_term_responsive_timeout(tmp_path: Path) -> N
 async def test_sandbox_runner_escalates_to_kill_when_term_ignored(
     tmp_path: Path,
 ) -> None:
+    ready_path = tmp_path / "term-ignored-ready"
     spec = _make_spec(
         tmp_path,
-        code=(
-            "import signal, time; "
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "time.sleep(60)"
+        code=textwrap.dedent(
+            f"""
+            import signal
+            import time
+            from pathlib import Path
+
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            Path({str(ready_path)!r}).write_text("ready", encoding="utf-8")
+            time.sleep(60)
+            """
         ),
         correlation_id="kill-timeout",
     )
 
-    result = await SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 0.05)
+    await asyncio.to_thread(ready_path.unlink, missing_ok=True)
+    runner_task = asyncio.create_task(
+        SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 1.0)
+    )
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if ready_path.exists():
+            break
+        if runner_task.done():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        runner_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner_task
+        raise AssertionError("timed out waiting for SIGTERM ignore handler readiness")
+
+    if not ready_path.exists():
+        result = await runner_task
+        raise AssertionError(f"runner finished before readiness marker was written: {result!r}")
+
+    result = await runner_task
 
     assert result.exit_code is None
     assert result.timed_out is True
     assert result.signal == "SIGKILL"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_prefers_output_limit_over_timeout_when_overflow_happens_during_cleanup(
+    tmp_path: Path,
+) -> None:
+    ready_path = tmp_path / "overflow-ready"
+    spec = _make_spec(
+        tmp_path,
+        code=textwrap.dedent(
+            f"""
+            import os
+            import signal
+            import time
+            from pathlib import Path
+
+            triggered = False
+
+            def on_term(signum, frame):
+                global triggered
+                triggered = True
+
+            signal.signal(signal.SIGTERM, on_term)
+            Path({str(ready_path)!r}).write_text("ready", encoding="utf-8")
+            while not triggered:
+                time.sleep(0.01)
+            os.write(1, b"x" * (128 * 1024 + 1))
+            time.sleep(60)
+            """
+        ),
+        correlation_id="overflow-during-cleanup",
+    )
+
+    runner_task = asyncio.create_task(
+        SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 1.0)
+    )
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if ready_path.exists():
+            break
+        if runner_task.done():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        runner_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner_task
+        raise AssertionError("timed out waiting for overflow handler readiness")
+
+    if not ready_path.exists():
+        result = await runner_task
+        raise AssertionError(f"runner finished before overflow readiness marker was written: {result!r}")
+
+    result = await runner_task
+
+    assert result.timed_out is False
+    assert result.completion_state == "output_limit_exceeded"
+    assert result.output_limit_stream == "stdout"
+    assert result.stdout == b""
+    assert result.stderr == b""
 
 
 @pytest.mark.asyncio
@@ -343,7 +442,7 @@ async def test_sandbox_runner_kills_descendants_on_timeout(tmp_path: Path) -> No
     parent_pid: int | None = None
     try:
         task = asyncio.create_task(
-            SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 0.2)
+            SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 1.0)
         )
         record = await _wait_for_pid_record(record_path)
         result = await task
@@ -362,6 +461,71 @@ async def test_sandbox_runner_kills_descendants_on_timeout(tmp_path: Path) -> No
         if record is not None:
             parent_pid = record["parent_pid"]
             child_pid = record["child_pid"]
+        _best_effort_kill_pid(parent_pid)
+        _best_effort_kill_pid(child_pid)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_output_limit_kills_descendants_even_if_parent_exits(
+    tmp_path: Path,
+) -> None:
+    record_path = tmp_path / "overflow-descendant-pids.json"
+    child_code = textwrap.dedent(
+        """
+        import os
+        import time
+
+        os.write(1, b"x" * (128 * 1024 + 1))
+        time.sleep(60)
+        """
+    ).strip()
+    script = textwrap.dedent(
+        f"""
+        import json
+        import subprocess
+        import sys
+        from pathlib import Path
+        import os
+
+        child = subprocess.Popen(
+            [sys.executable, "-c", {child_code!r}],
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+        Path({str(record_path)!r}).write_text(
+            json.dumps({{"parent_pid": os.getpid(), "child_pid": child.pid}}),
+            encoding="utf-8",
+        )
+        raise SystemExit(0)
+        """
+    )
+    spec = _make_spec(tmp_path, code=script, correlation_id="overflow-parent-exits")
+
+    task = asyncio.create_task(SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 1.0))
+    record: dict[str, int] | None = None
+    parent_pid: int | None = None
+    child_pid: int | None = None
+
+    try:
+        record = await _wait_for_pid_record(record_path)
+        parent_pid = record["parent_pid"]
+        child_pid = record["child_pid"]
+        result = await asyncio.wait_for(task, timeout=2.0)
+
+        assert result.completion_state == "output_limit_exceeded"
+        assert result.output_limit_stream == "stdout"
+        assert result.stdout == b""
+        assert result.stderr == b""
+        _assert_pid_gone(child_pid)
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if record is not None:
+            parent_pid = record["parent_pid"]
+            child_pid = record["child_pid"]
+        _best_effort_kill_pgid(parent_pid)
         _best_effort_kill_pid(parent_pid)
         _best_effort_kill_pid(child_pid)
 
