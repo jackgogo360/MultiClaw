@@ -205,6 +205,33 @@ def test_sandbox_exec_result_rejects_inconsistent_state_combinations(
         )
 
 
+@pytest.mark.parametrize(
+    ("stdout", "stderr"),
+    [
+        (b"leak", b""),
+        (b"", b"leak"),
+    ],
+)
+def test_sandbox_exec_result_rejects_output_limit_state_with_buffered_output(
+    stdout: bytes,
+    stderr: bytes,
+) -> None:
+    from multiclaw.governance import SandboxExecResult
+
+    with pytest.raises(ValidationError, match="must be empty"):
+        SandboxExecResult(
+            exit_code=None,
+            timed_out=False,
+            signal="SIGKILL",
+            stdout=stdout,
+            stderr=stderr,
+            backend_name="host_unsafe",
+            profile_name="shell_workspace",
+            completion_state="output_limit_exceeded",
+            output_limit_stream="stdout",
+        )
+
+
 def test_sandbox_mapping_fields_are_immutably_wrapped_after_validation() -> None:
     from multiclaw.governance import (
         SandboxEnvironment,

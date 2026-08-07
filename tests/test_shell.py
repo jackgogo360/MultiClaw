@@ -193,8 +193,8 @@ class TestShellTool:
                     exit_code=9,
                     timed_out=False,
                     signal=None,
-                    stdout=b"secret stdout",
-                    stderr=b"secret stderr",
+                    stdout=b"",
+                    stderr=b"",
                     backend_name="recording",
                     profile_name="shell_workspace",
                     completion_state="output_limit_exceeded",
@@ -213,4 +213,3 @@ class TestShellTool:
         assert result.status == "success"
         assert result.content == "[Command exceeded output limit on stderr]"
         assert result.data == {"exit_code": -1}
-        assert "secret" not in result.content
