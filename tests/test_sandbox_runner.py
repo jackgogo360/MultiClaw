@@ -219,6 +219,65 @@ async def test_sandbox_runner_allows_exact_output_limit_boundary(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_sandbox_runner_returns_output_limit_result_when_communicate_finishes_after_latch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code="print('unused')",
+        correlation_id="communicate-done-overflow-latched",
+    )
+
+    class _FakeProcess:
+        pid = 43210
+        returncode = 0
+        stdout = None
+        stderr = None
+        stdin = None
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        del args, kwargs
+        return _FakeProcess()
+
+    async def fake_communicate_with_limits(
+        self,
+        proc,
+        stdin_bytes,
+        captured_output,
+        output_limit_event,
+    ):
+        del self, proc, stdin_bytes
+        captured_output.mark_output_limit_exceeded("stdout")
+        output_limit_event.set()
+        return b"", b""
+
+    real_wait = asyncio.wait
+
+    async def fake_wait(tasks, *, timeout=None, return_when=asyncio.FIRST_COMPLETED):
+        done, pending = await real_wait(tasks, timeout=timeout, return_when=return_when)
+        communicate_task = next(task for task in tasks if task is not None and task.done())
+        return {communicate_task}, pending
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(
+        SandboxProcessRunner,
+        "_communicate_with_limits",
+        fake_communicate_with_limits,
+    )
+    monkeypatch.setattr(SandboxProcessRunner, "_get_process_group_id", lambda self, pid: pid)
+    monkeypatch.setattr(asyncio, "wait", fake_wait)
+
+    result = await SandboxProcessRunner().run(spec, 1.0)
+
+    assert result.completion_state == "output_limit_exceeded"
+    assert result.output_limit_stream == "stdout"
+    assert result.timed_out is False
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
+@pytest.mark.asyncio
 async def test_sandbox_runner_clears_captured_output_when_stdout_limit_exceeded(tmp_path: Path) -> None:
     spec = _make_spec(
         tmp_path,
