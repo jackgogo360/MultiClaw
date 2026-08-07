@@ -146,6 +146,65 @@ def test_sandbox_models_are_frozen_and_expose_expected_defaults() -> None:
     assert request.stdin_bytes is None
 
 
+def test_sandbox_exec_result_defaults_completion_state_from_timed_out_flag() -> None:
+    from multiclaw.governance import SandboxExecResult
+
+    completed = SandboxExecResult(
+        exit_code=0,
+        timed_out=False,
+        signal=None,
+        stdout=b"ok",
+        stderr=b"",
+        backend_name="host_unsafe",
+        profile_name="shell_workspace",
+    )
+    timed_out = SandboxExecResult(
+        exit_code=None,
+        timed_out=True,
+        signal="SIGTERM",
+        stdout=b"",
+        stderr=b"",
+        backend_name="host_unsafe",
+        profile_name="shell_workspace",
+    )
+
+    assert completed.completion_state == "completed"
+    assert completed.output_limit_stream is None
+    assert timed_out.completion_state == "timed_out"
+    assert timed_out.output_limit_stream is None
+
+
+@pytest.mark.parametrize(
+    ("timed_out", "completion_state", "output_limit_stream", "message"),
+    [
+        (False, "timed_out", None, "timed_out"),
+        (True, "completed", None, "timed_out"),
+        (False, "output_limit_exceeded", None, "output_limit_stream"),
+        (False, "completed", "stdout", "output_limit_stream"),
+    ],
+)
+def test_sandbox_exec_result_rejects_inconsistent_state_combinations(
+    timed_out: bool,
+    completion_state: str,
+    output_limit_stream: str | None,
+    message: str,
+) -> None:
+    from multiclaw.governance import SandboxExecResult
+
+    with pytest.raises(ValidationError, match=message):
+        SandboxExecResult(
+            exit_code=0,
+            timed_out=timed_out,
+            signal=None,
+            stdout=b"",
+            stderr=b"",
+            backend_name="host_unsafe",
+            profile_name="shell_workspace",
+            completion_state=completion_state,
+            output_limit_stream=output_limit_stream,
+        )
+
+
 def test_sandbox_mapping_fields_are_immutably_wrapped_after_validation() -> None:
     from multiclaw.governance import (
         SandboxEnvironment,

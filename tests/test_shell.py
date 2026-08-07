@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from multiclaw.governance import SandboxExecResult
 from sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
 from multiclaw.tools.shell import ShellParams, ShellToolBuilder
 
@@ -182,3 +183,34 @@ class TestShellTool:
         assert result.status == "error"
         assert "allow" in result.content.lower()
         assert controller.requests == []
+
+    @pytest.mark.asyncio
+    async def test_shell_maps_output_limit_exceeded_to_generic_marker(self, workspace):
+        class StaticResultController(ReadyRecordingSandboxController):
+            async def run(self, request):
+                self.requests.append(request)
+                return SandboxExecResult(
+                    exit_code=9,
+                    timed_out=False,
+                    signal=None,
+                    stdout=b"secret stdout",
+                    stderr=b"secret stderr",
+                    backend_name="recording",
+                    profile_name="shell_workspace",
+                    completion_state="output_limit_exceeded",
+                    output_limit_stream="stderr",
+                )
+
+        builder = ShellToolBuilder(
+            str(workspace),
+            sandbox_controller=StaticResultController(workspace_root=workspace),
+        )
+
+        result = await builder.build(
+            builder.validate({"command": "printf huge"})
+        ).execute()
+
+        assert result.status == "success"
+        assert result.content == "[Command exceeded output limit on stderr]"
+        assert result.data == {"exit_code": -1}
+        assert "secret" not in result.content

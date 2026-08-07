@@ -50,6 +50,8 @@ def _sandbox_result(
     stderr: bytes = b"",
     exit_code: int | None = 0,
     timed_out: bool = False,
+    completion_state: str | None = None,
+    output_limit_stream: str | None = None,
     signal: str | None = None,
     backend_name: str = "recording",
     profile_name: str = "code_exec_python",
@@ -58,6 +60,8 @@ def _sandbox_result(
     return SandboxExecResult(
         exit_code=exit_code,
         timed_out=timed_out,
+        completion_state=completion_state,
+        output_limit_stream=output_limit_stream,
         signal=signal,
         stdout=stdout,
         stderr=stderr,
@@ -277,6 +281,31 @@ class TestCodeExecTool:
         assert result.status == "success"
         assert result.content == "[Execution timed out after 1s]"
         assert result.data == {}
+
+    @pytest.mark.asyncio
+    async def test_code_exec_maps_output_limit_exceeded_to_generic_failure(self, tmp_path):
+        builder, _, _ = _build_fake_tool(
+            tmp_path,
+            result=_sandbox_result(
+                stdout=b"secret stdout",
+                stderr=b"secret stderr",
+                exit_code=3,
+                completion_state="output_limit_exceeded",
+                output_limit_stream="stdout",
+            ),
+        )
+
+        result = await builder.build(
+            builder.validate({"code": "print('huge')"})
+        ).execute()
+
+        assert result.status == "success"
+        assert result.content == "[error]\nExecution exceeded output limit on stdout"
+        assert result.data == {
+            "success": False,
+            "error": "Execution exceeded output limit on stdout",
+        }
+        assert "secret" not in result.content
 
     @pytest.mark.asyncio
     async def test_code_exec_truncates_stdout_stderr_and_error(self, tmp_path):

@@ -25,6 +25,7 @@ DEFAULT_TIMEOUT = 30.0
 MAX_TIMEOUT = 300.0
 MAX_OUTPUT_CHARS = 30_000
 TRUNCATION_MARKER = "\n... [output truncated: {removed} characters removed] ...\n"
+OUTPUT_LIMIT_ERROR = "Execution exceeded output limit on {stream}"
 
 
 class CodeExecParams(BaseModel):
@@ -86,6 +87,16 @@ class CodeExecInvocation(ToolInvocation[CodeExecParams]):
             return self._with_request_audit(_error("sandbox failed to launch command"))
         except Exception:
             return self._with_request_audit(_error("sandbox execution failed"))
+
+        if exec_result.completion_state == "output_limit_exceeded":
+            error = OUTPUT_LIMIT_ERROR.format(stream=exec_result.output_limit_stream)
+            return self._with_audit(
+                _success(
+                    f"[error]\n{error}",
+                    data={"success": False, "error": error},
+                ),
+                exec_result,
+            )
 
         if exec_result.timed_out:
             return self._with_audit(

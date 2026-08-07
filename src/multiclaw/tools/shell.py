@@ -31,6 +31,7 @@ DEFAULT_TIMEOUT = 120.0
 MAX_TIMEOUT = 600.0
 MAX_OUTPUT_CHARS = 30_000
 TRUNCATION_MARKER = "\n... [output truncated: {removed} characters removed] ...\n"
+OUTPUT_LIMIT_MARKER = "[Command exceeded output limit on {stream}]"
 
 DANGEROUS_PATTERNS = [
     "rm -rf /",
@@ -120,6 +121,20 @@ class ShellInvocation(ToolInvocation[ShellParams]):
             return _error("sandbox failed to launch command")
         except Exception:
             return _error("sandbox execution failed")
+
+        if exec_result.completion_state == "output_limit_exceeded":
+            result = _success(
+                OUTPUT_LIMIT_MARKER.format(stream=exec_result.output_limit_stream),
+                data={"exit_code": -1},
+            )
+            result.audit.update(
+                {
+                    "sandbox_backend": exec_result.backend_name,
+                    "sandbox_profile": exec_result.profile_name,
+                    "unsafe_fallback_used": exec_result.unsafe_fallback_used,
+                }
+            )
+            return result
 
         stdout = (
             exec_result.stdout.decode("utf-8", errors="replace")
