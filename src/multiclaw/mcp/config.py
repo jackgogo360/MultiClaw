@@ -258,13 +258,21 @@ def load_mcp_tools_config(
 
     Returns {server_name: {"include": [...], "exclude": [...]}}
     """
-    paths = [Path(path)] if path else _find_config_files(search_parents)
+    candidates = (
+        [_ConfigPathCandidate(path=Path(path), source="explicit_path")]
+        if path
+        else _find_config_file_candidates(search_parents)
+    )
     result: dict[str, dict[str, list[str]]] = {}
-    for config_path in paths:
+    seen_server_names: set[str] = set()
+    for candidate in candidates:
         try:
-            raw = json.loads(config_path.read_text())
+            raw = json.loads(candidate.path.read_text())
             servers = raw.get("mcpServers", raw.get("servers", {}))
             for name, server_data in servers.items():
+                if name in seen_server_names:
+                    continue
+                seen_server_names.add(name)
                 tools = server_data.get("tools", {})
                 if isinstance(tools, dict):
                     inc = tools.get("include", [])
@@ -275,7 +283,7 @@ def load_mcp_tools_config(
                             "exclude": exc if isinstance(exc, list) else [],
                         }
         except Exception as e:
-            logger.warning("Failed to load tools config from %s: %s", config_path, e)
+            logger.warning("Failed to load tools config from %s: %s", candidate.path, e)
     return result
 
 
