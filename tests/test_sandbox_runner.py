@@ -176,6 +176,78 @@ async def test_sandbox_runner_passes_stdin_bytes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_sandbox_runner_treats_broken_pipe_on_stdin_as_nonfatal(tmp_path: Path) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code="import sys; sys.exit(0)",
+        stdin_bytes=b"x" * 200_000,
+        correlation_id="stdin-broken-pipe",
+    )
+
+    result = await SandboxProcessRunner().run(spec, 1.0)
+
+    assert result.exit_code == 0
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_allows_exact_output_limit_boundary(tmp_path: Path) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code="import sys; sys.stdout.buffer.write(b'a' * (128 * 1024))",
+        correlation_id="stdout-boundary",
+    )
+
+    result = await SandboxProcessRunner().run(spec, 1.0)
+
+    assert result.completion_state == "completed"
+    assert result.output_limit_stream is None
+    assert len(result.stdout) == 128 * 1024
+    assert result.stderr == b""
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_clears_captured_output_when_stdout_limit_exceeded(tmp_path: Path) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code=(
+            "import sys; "
+            "sys.stdout.buffer.write(b'a' * (128 * 1024 + 1)); "
+            "sys.stderr.write('should not leak')"
+        ),
+        correlation_id="stdout-overflow",
+    )
+
+    result = await SandboxProcessRunner().run(spec, 1.0)
+
+    assert result.completion_state == "output_limit_exceeded"
+    assert result.output_limit_stream == "stdout"
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_clears_captured_output_when_stderr_limit_exceeded(tmp_path: Path) -> None:
+    spec = _make_spec(
+        tmp_path,
+        code=(
+            "import sys; "
+            "sys.stderr.buffer.write(b'e' * (128 * 1024 + 1)); "
+            "sys.stdout.write('should not leak')"
+        ),
+        correlation_id="stderr-overflow",
+    )
+
+    result = await SandboxProcessRunner().run(spec, 1.0)
+
+    assert result.completion_state == "output_limit_exceeded"
+    assert result.output_limit_stream == "stderr"
+    assert result.stdout == b""
+    assert result.stderr == b""
+
+
+@pytest.mark.asyncio
 async def test_sandbox_runner_returns_non_zero_exit_code(tmp_path: Path) -> None:
     spec = _make_spec(
         tmp_path,

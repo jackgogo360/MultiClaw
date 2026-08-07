@@ -169,12 +169,49 @@ class SandboxExecResult(_SandboxModel):
 
     exit_code: int | None
     timed_out: bool
+    completion_state: (
+        Literal["completed", "timed_out", "output_limit_exceeded"] | None
+    ) = None
+    output_limit_stream: Literal["stdout", "stderr"] | None = None
     signal: str | None
     stdout: bytes
     stderr: bytes
     backend_name: str
     profile_name: str
     unsafe_fallback_used: bool = False
+
+    @model_validator(mode="after")
+    def validate_completion_state(self) -> "SandboxExecResult":
+        completion_state = self.completion_state
+        if completion_state is None:
+            completion_state = "timed_out" if self.timed_out else "completed"
+
+        if completion_state == "completed":
+            if self.timed_out:
+                raise ValueError("timed_out must be false when completion_state is completed")
+            if self.output_limit_stream is not None:
+                raise ValueError(
+                    "output_limit_stream must be omitted unless completion_state is output_limit_exceeded"
+                )
+        elif completion_state == "timed_out":
+            if not self.timed_out:
+                raise ValueError("timed_out must be true when completion_state is timed_out")
+            if self.output_limit_stream is not None:
+                raise ValueError(
+                    "output_limit_stream must be omitted unless completion_state is output_limit_exceeded"
+                )
+        else:
+            if self.timed_out:
+                raise ValueError(
+                    "timed_out must be false when completion_state is output_limit_exceeded"
+                )
+            if self.output_limit_stream is None:
+                raise ValueError(
+                    "output_limit_stream is required when completion_state is output_limit_exceeded"
+                )
+
+        object.__setattr__(self, "completion_state", completion_state)
+        return self
 
 
 class SandboxProbeResult(_SandboxModel):
