@@ -1,6 +1,6 @@
 # Native Sandbox Backends Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Add fail-closed native process isolation for shell, Python execution, and local MCP stdio servers using Seatbelt on macOS and nsjail on Linux.
 
@@ -146,7 +146,7 @@ class SandboxProcessRunner:
 - Modify: `tests/test_code_exec.py`
 - Modify: `tests/test_tools.py`
 
-- [ ] **Step 1: Add passing shell characterization tests**
+- [x] **Step 1: Add passing shell characterization tests**
 
 Add explicit tests before changing production code:
 
@@ -175,7 +175,7 @@ async def test_shell_preserves_nonzero_exit_code_and_stderr(workspace):
     assert result.data == {"exit_code": 7}
 ```
 
-- [ ] **Step 2: Add exact code-exec result characterization tests**
+- [x] **Step 2: Add exact code-exec result characterization tests**
 
 ```python
 @pytest.mark.asyncio
@@ -205,7 +205,7 @@ async def test_code_exec_timeout_data_contract(tmp_path):
     assert "timed out" in result.content.lower()
 ```
 
-- [ ] **Step 3: Add scheduler event-order characterization**
+- [x] **Step 3: Add scheduler event-order characterization**
 
 Subscribe a wildcard handler and assert successful guarded execution retains:
 
@@ -221,7 +221,7 @@ assert seen == [
 Also assert the audit success entry is recorded before the completion assertion is
 made by the test.
 
-- [ ] **Step 4: Run the characterization tests**
+- [x] **Step 4: Run the characterization tests**
 
 Run:
 
@@ -236,7 +236,7 @@ Expected: PASS. If a proposed characterization does not match the current public
 contract, correct the test to the observed contract before continuing; do not change
 production code in this task.
 
-- [ ] **Step 5: Commit the behavior lock**
+- [x] **Step 5: Commit the behavior lock**
 
 ```bash
 git add tests/test_shell.py tests/test_code_exec.py tests/test_tools.py
@@ -256,7 +256,7 @@ git commit -m "Preserve process-tool contracts before isolation work" \
 - Modify: `multiclaw.toml`
 - Modify: `config/multiclaw.toml`
 
-- [ ] **Step 1: Write failing typed-config tests**
+- [x] **Step 1: Write failing typed-config tests**
 
 Add tests for defaults, legacy values, debug gating, nested env overrides, and MCP
 profile defaults:
@@ -299,14 +299,14 @@ def test_unsafe_mode_requires_debug(tmp_path):
         Settings(_config_file=str(path))
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `.venv/bin/python -m pytest tests/test_config.py -q`
 
 Expected: FAIL because `GovernanceSettings` has no nested `sandbox` model and legacy
 values are not validated.
 
-- [ ] **Step 3: Add typed settings and validators**
+- [x] **Step 3: Add typed settings and validators**
 
 Implement these models in `settings.py`:
 
@@ -368,7 +368,7 @@ Also test that `unsafe_fallback_requires_debug=false` is rejected. In `auto`, se
 must yield blocked readiness with no risky registration; it never treats unprobed
 profiles as ready.
 
-- [ ] **Step 4: Update checked-in configs and fixtures**
+- [x] **Step 4: Update checked-in configs and fixtures**
 
 Replace legacy `[governance] sandbox_mode = "process"` with:
 
@@ -386,13 +386,13 @@ read_hidden_workspace_paths = [".env", ".env.*"]
 
 Do not alter or reproduce unrelated credential-bearing values in the config files.
 
-- [ ] **Step 5: Run config tests**
+- [x] **Step 5: Run config tests**
 
 Run: `.venv/bin/python -m pytest tests/test_config.py -q`
 
 Expected: PASS with only the test-captured legacy deprecation warning.
 
-- [ ] **Step 6: Commit typed configuration**
+- [x] **Step 6: Commit typed configuration**
 
 ```bash
 git add src/multiclaw/config/settings.py tests/test_config.py tests/conftest.py multiclaw.toml config/multiclaw.toml
@@ -424,7 +424,7 @@ git commit -m "Make unsafe process execution an explicit configuration decision"
 - Create: `tests/test_sandbox_models.py`
 - Create: `tests/test_sandbox_environment.py`
 
-- [ ] **Step 1: Write failing model and environment tests**
+- [x] **Step 1: Write failing model and environment tests**
 
 Cover request exclusivity, frozen readiness, secret-key rejection, and private paths:
 
@@ -458,7 +458,7 @@ def test_environment_scrubs_secrets_and_redirects_home(tmp_path):
     assert result.env["LOGNAME"] == "sandbox"
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run:
 
@@ -471,7 +471,7 @@ Run:
 
 Expected: FAIL because the package and new names do not exist.
 
-- [ ] **Step 3: Implement typed errors and models**
+- [x] **Step 3: Implement typed errors and models**
 
 Define `SandboxConfigurationError`, `SandboxUnavailableError`,
 `SandboxPolicyError`, and `SandboxLaunchError` in
@@ -572,7 +572,7 @@ class SandboxReadiness(BaseModel):
     unsafe_fallback_active: bool = False
 ```
 
-- [ ] **Step 4: Move timeout behavior to `ExecutionGuard` and rename scheduler wiring**
+- [x] **Step 4: Move timeout behavior to `ExecutionGuard` and rename scheduler wiring**
 
 Move the current implementation unchanged except for names:
 
@@ -596,7 +596,7 @@ Export `ExecutionGuard` and `ExecutionTimeoutError` from `multiclaw.governance`;
 process-level timeouts remain represented by `SandboxExecResult.timed_out` rather
 than a second, ambiguously named timeout exception.
 
-- [ ] **Step 5: Implement deterministic environment shaping**
+- [x] **Step 5: Implement deterministic environment shaping**
 
 `build_sandbox_environment()` must:
 
@@ -626,14 +626,14 @@ patterns: `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*API_KEY*`, `*ACCESS_KEY*`, and
 `default_path` into the helper (`/usr/bin:/bin:/usr/sbin:/sbin` on macOS and
 `/usr/bin:/bin` on Linux); never derive the child PATH from `os.environ`.
 
-- [ ] **Step 6: Add protocols and unsafe host backend**
+- [x] **Step 6: Add protocols and unsafe host backend**
 
 Define the `SandboxBackend` and `SandboxController` protocols shown above. Add
 `HostUnsafeBackend` that returns direct `/bin/sh -c` or argv specs, sets
 `unsafe_fallback_used=True`, and still uses the common scrubbed environment and cwd
 validation. It is constructed only by the manager in explicit unsafe debug mode.
 
-- [ ] **Step 7: Run focused tests**
+- [x] **Step 7: Run focused tests**
 
 Run:
 
@@ -649,7 +649,7 @@ Run:
 
 Expected: PASS; no `ProcessSandbox` references remain under `src/` or `tests/`.
 
-- [ ] **Step 8: Commit core contracts**
+- [x] **Step 8: Commit core contracts**
 
 ```bash
 git add \
@@ -678,7 +678,7 @@ git commit -m "Separate execution timeouts from process isolation" \
 - Create: `src/multiclaw/governance/sandbox/runner.py`
 - Create: `tests/test_sandbox_runner.py`
 
-- [ ] **Step 1: Write failing runner lifecycle tests**
+- [x] **Step 1: Write failing runner lifecycle tests**
 
 Use `sys.executable -c` children to test stdout/stderr, stdin, non-zero exit,
 SIGTERM, TERM-ignore/KILL, and descendant cleanup. The orphan test records the child
@@ -706,13 +706,13 @@ async def test_runner_kills_process_group_after_timeout(tmp_path):
     assert result.signal == "SIGKILL"
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `.venv/bin/python -m pytest tests/test_sandbox_runner.py -q`
 
 Expected: FAIL because `SandboxProcessRunner` does not exist.
 
-- [ ] **Step 3: Implement process creation and capture**
+- [x] **Step 3: Implement process creation and capture**
 
 Use only exec-form spawning:
 
@@ -752,13 +752,13 @@ Add a cancellation test as well as timeout tests; cancellation must leave no chi
 or descendant process. Private-root deletion is manager/transport ownership, not the
 runner's responsibility.
 
-- [ ] **Step 4: Run runner tests**
+- [x] **Step 4: Run runner tests**
 
 Run: `.venv/bin/python -m pytest tests/test_sandbox_runner.py -q`
 
 Expected: PASS, including no surviving descendant PID.
 
-- [ ] **Step 5: Commit the runner**
+- [x] **Step 5: Commit the runner**
 
 ```bash
 git add src/multiclaw/governance/sandbox/runner.py tests/test_sandbox_runner.py
@@ -776,7 +776,7 @@ git commit -m "Make process lifetime part of the sandbox contract" \
 - Create: `src/multiclaw/governance/sandbox/seatbelt.py`
 - Create: `tests/test_sandbox_seatbelt.py`
 
-- [ ] **Step 1: Write failing Seatbelt rendering tests**
+- [x] **Step 1: Write failing Seatbelt rendering tests**
 
 Tests must assert:
 
@@ -797,13 +797,13 @@ def test_seatbelt_shell_spec_keeps_wrapper_exec_form(tmp_path):
     assert request.command not in profile_text
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `.venv/bin/python -m pytest tests/test_sandbox_seatbelt.py -q`
 
 Expected: FAIL because no Seatbelt backend exists.
 
-- [ ] **Step 3: Add reviewed static profiles**
+- [x] **Step 3: Add reviewed static profiles**
 
 Define separate immutable profile strings for shell, code exec, and MCP stdio.
 Each profile must start from `(deny default)` and include explicit rules for:
@@ -819,28 +819,28 @@ Each profile must start from `(deny default)` and include explicit rules for:
 Use `(param "WORKSPACE")`, `(param "PRIVATE_HOME")`, `(param "PRIVATE_TMP")`,
 and numbered runtime-root params. Never format path or command text into the profile.
 
-- [ ] **Step 4: Implement spec rendering**
+- [x] **Step 4: Implement spec rendering**
 
 `SeatbeltBackend.build_launch_spec()` must canonicalize the selected static profile,
 generate stable `-D` arguments, then append `--` and the target argv. It must reject
 network values other than `disabled`/`inherit` and reject a profile whose required
 protected-path capability is not represented.
 
-- [ ] **Step 5: Implement a behavioral probe**
+- [x] **Step 5: Implement a behavioral probe**
 
 The probe uses `subprocess.run(..., shell=False, timeout=...)` with temporary workspace
 and sentinel paths. It records booleans for allowed execution, denied outside write,
 denied network, hidden read, protected write, and denied child creation. Unit tests
 mock subprocess results; real behavior is proven in Task 12.
 
-- [ ] **Step 6: Run Seatbelt unit tests on any OS**
+- [x] **Step 6: Run Seatbelt unit tests on any OS**
 
 Run: `.venv/bin/python -m pytest tests/test_sandbox_seatbelt.py -q`
 
 Expected: PASS without executing Seatbelt because unit tests inject binary existence
 and subprocess results.
 
-- [ ] **Step 7: Commit the Seatbelt backend**
+- [x] **Step 7: Commit the Seatbelt backend**
 
 ```bash
 git add src/multiclaw/governance/sandbox/seatbelt.py src/multiclaw/governance/sandbox/seatbelt_profiles.py tests/test_sandbox_seatbelt.py
@@ -860,7 +860,7 @@ git commit -m "Express macOS process policy through reviewed Seatbelt profiles" 
 - Create: `src/multiclaw/governance/sandbox/nsjail.py`
 - Create: `tests/test_sandbox_nsjail.py`
 
-- [ ] **Step 1: Write failing nsjail rendering tests**
+- [x] **Step 1: Write failing nsjail rendering tests**
 
 Assert normalized config fragments for:
 
@@ -873,13 +873,13 @@ Assert normalized config fragments for:
 - exact target argv after `--`;
 - protobuf-text escaping for quotes, backslashes, and newlines.
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `.venv/bin/python -m pytest tests/test_sandbox_nsjail.py -q`
 
 Expected: FAIL because no nsjail renderer exists.
 
-- [ ] **Step 3: Implement protobuf-text rendering helpers**
+- [x] **Step 3: Implement protobuf-text rendering helpers**
 
 Add a strict string encoder:
 
@@ -897,27 +897,27 @@ Build mount blocks from canonical paths only. Reject paths containing NUL and re
 relative roots after canonicalization. The renderer returns text written to a private
 config file below the launch temp root; permissions are `0o600`.
 
-- [ ] **Step 4: Implement nsjail launch specs**
+- [x] **Step 4: Implement nsjail launch specs**
 
 The spec executable is the configured canonical nsjail binary. Args include the
 private config path, `--`, and the exact target argv. The backend never invokes a
 shell. Network `inherit` removes only the isolated-network clause; all filesystem,
 env, capability, and process constraints remain.
 
-- [ ] **Step 5: Implement behavioral probe interpretation**
+- [x] **Step 5: Implement behavioral probe interpretation**
 
 Probe binary existence/executability, required namespace/kernel support, config
 loading, allowed execution, outside-write denial, network denial, hidden/protected
 paths, and code child denial. Return unavailable if any required capability is not
 proven; do not downgrade to a weaker profile.
 
-- [ ] **Step 6: Run nsjail unit tests on any OS**
+- [x] **Step 6: Run nsjail unit tests on any OS**
 
 Run: `.venv/bin/python -m pytest tests/test_sandbox_nsjail.py -q`
 
 Expected: PASS with subprocess/kernel behavior mocked.
 
-- [ ] **Step 7: Commit the nsjail backend**
+- [x] **Step 7: Commit the nsjail backend**
 
 ```bash
 git add src/multiclaw/governance/sandbox/nsjail.py src/multiclaw/governance/sandbox/nsjail_profiles.py tests/test_sandbox_nsjail.py
@@ -938,7 +938,7 @@ git commit -m "Describe Linux isolation as a verifiable nsjail configuration" \
 - Create: `tests/sandbox_fakes.py`
 - Create: `tests/test_sandbox_manager.py`
 
-- [ ] **Step 1: Write failing manager tests**
+- [x] **Step 1: Write failing manager tests**
 
 Cover Darwin/Linux/unsupported selection, probe failure, unsafe debug gating,
 profile lookup, run delegation, startup-event buffering, and immutable readiness.
@@ -987,13 +987,13 @@ Add parameterized async coverage proving success, timeout, cancellation, and
 pre-spawn failure all remove the generated per-launch root while leaving the manager
 root itself available for later launches.
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `.venv/bin/python -m pytest tests/test_sandbox_manager.py -q`
 
 Expected: FAIL because `SandboxManager` does not exist.
 
-- [ ] **Step 3: Build the fixed profile registry**
+- [x] **Step 3: Build the fixed profile registry**
 
 Create exactly three `SandboxProfilePolicy` instances:
 
@@ -1009,7 +1009,7 @@ roots from `sys.prefix`, `sys.base_prefix`, and `sysconfig.get_paths()`; dedupli
 ancestor/descendant overlaps and omit roots already inside the workspace. These are
 built-in runtime roots and do not consume the MCP limit of 16 explicit extra roots.
 
-- [ ] **Step 4: Implement selection and initialization**
+- [x] **Step 4: Implement selection and initialization**
 
 `SandboxManager.create()` accepts explicit `platform_name` for tests. `auto` selects
 Seatbelt for `Darwin`, nsjail for `Linux`, and an unavailable state otherwise.
@@ -1040,7 +1040,7 @@ Create the manager root with `Path(tempfile.mkdtemp(prefix="multiclaw-sandbox-")
 and immediately enforce mode `0o700`. Pass this root to environment creation; never
 mount the parent host temp directory into a sandbox.
 
-- [ ] **Step 5: Implement launch and event behavior**
+- [x] **Step 5: Implement launch and event behavior**
 
 `build_launch_spec()` validates profile readiness, cwd under workspace, entrypoint,
 env grants, and policy. If environment creation succeeds but policy rendering fails,
@@ -1060,7 +1060,7 @@ per rendered launch (not once in both `build_launch_spec()` and `run()`).
 Auto failures record `sandbox.profile_unavailable` or
 `sandbox.registration_skipped`; they never construct a host spec.
 
-- [ ] **Step 6: Add reusable test controllers**
+- [x] **Step 6: Add reusable test controllers**
 
 `tests/sandbox_fakes.py` contains:
 
@@ -1075,7 +1075,7 @@ its per-request temp roots so cleanup tests exercise the same ownership contract
 
 These fakes are test-only and are never imported by production modules.
 
-- [ ] **Step 7: Run manager and contract tests**
+- [x] **Step 7: Run manager and contract tests**
 
 Run:
 
@@ -1089,7 +1089,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit manager behavior**
+- [x] **Step 8: Commit manager behavior**
 
 ```bash
 git add src/multiclaw/governance/sandbox tests/sandbox_fakes.py tests/test_sandbox_manager.py
@@ -1109,7 +1109,7 @@ git commit -m "Make sandbox readiness authoritative for local process launch" \
 - Modify: `tests/test_server.py`
 - Modify: `tests/test_tools.py`
 
-- [ ] **Step 1: Write failing server wiring tests**
+- [x] **Step 1: Write failing server wiring tests**
 
 Add tests that inject ready/unavailable controllers into `create_agent()` and assert
 registry contents, MCP filtering order, app state, public health access, and status
@@ -1131,13 +1131,13 @@ def test_ready_endpoint_returns_503_for_blocked_sandbox(client, blocked_readines
     assert response.json()["ready"] is False
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `.venv/bin/python -m pytest tests/test_server.py tests/test_tools.py -q`
 
 Expected: FAIL because injection, gating, and `/health/ready` do not exist.
 
-- [ ] **Step 3: Construct the manager before risky registration**
+- [x] **Step 3: Construct the manager before risky registration**
 
 Change the signature to:
 
@@ -1155,7 +1155,7 @@ After MCP filtering/connection has recorded all startup skips, call
 `runtime_agent.sandbox_controller` and the returned
 `runtime_agent.sandbox_readiness` for lifespan use.
 
-- [ ] **Step 4: Gate MCP before connection**
+- [x] **Step 4: Gate MCP before connection**
 
 Add `sandbox_controller` and `workspace_root` parameters to `_register_mcp_tools()`.
 Before `connect_servers()`, partition configs:
@@ -1168,7 +1168,7 @@ Before `connect_servers()`, partition configs:
 
 Preserve callback installation before connect and existing namespace refresh order.
 
-- [ ] **Step 5: Publish readiness through FastAPI**
+- [x] **Step 5: Publish readiness through FastAPI**
 
 In lifespan:
 
@@ -1194,12 +1194,12 @@ env values from the response; expose only backend/profile/capability names and r
 During lifespan shutdown, stop MCP first so stdio transports remove their private
 roots, then call `agent.sandbox_controller.close()` and log any residual-root error.
 
-- [ ] **Step 6: Rename scheduler construction**
+- [x] **Step 6: Rename scheduler construction**
 
 Construct `CoreToolScheduler(execution_guard=ExecutionGuard(), ...)`. Update any test
 factories still using the old keyword.
 
-- [ ] **Step 7: Run server/tool tests**
+- [x] **Step 7: Run server/tool tests**
 
 Run:
 
@@ -1212,7 +1212,7 @@ Run:
 
 Expected: PASS with injected fakes; no unit test requires a native backend.
 
-- [ ] **Step 8: Commit fail-closed runtime wiring**
+- [x] **Step 8: Commit fail-closed runtime wiring**
 
 ```bash
 git add src/multiclaw/server.py src/multiclaw/auth/middleware.py tests/test_server.py tests/test_tools.py tests/test_mcp_integration.py
@@ -1233,7 +1233,7 @@ git commit -m "Keep the service diagnosable while blocking unsafe capabilities" 
 - Modify: `tests/test_shell.py`
 - Modify: `tests/test_tools.py`
 
-- [ ] **Step 1: Update shell tests to inject the ready recording controller**
+- [x] **Step 1: Update shell tests to inject the ready recording controller**
 
 Keep the Task 1 characterization assertions unchanged. Add request assertions:
 
@@ -1252,14 +1252,14 @@ assert result.data == {"exit_code": 0}
 Add unavailable-controller coverage expecting a tool error whose content says the
 sandbox profile is unavailable and contains no command/env secret.
 
-- [ ] **Step 2: Run shell tests to verify failure**
+- [x] **Step 2: Run shell tests to verify failure**
 
 Run: `.venv/bin/python -m pytest tests/test_shell.py -q`
 
 Expected: FAIL because the builder has no controller parameter and still calls
 `create_subprocess_shell`.
 
-- [ ] **Step 3: Add internal audit metadata without changing tool data**
+- [x] **Step 3: Add internal audit metadata without changing tool data**
 
 Extend `ToolExecutionResult`:
 
@@ -1285,7 +1285,7 @@ def _audit_detail(result: ToolExecutionResult) -> str:
 Assert `result.model_dump()` excludes `audit` and existing `data` assertions remain
 unchanged.
 
-- [ ] **Step 4: Replace host shell spawning**
+- [x] **Step 4: Replace host shell spawning**
 
 Require `sandbox_controller` in `ShellToolBuilder` and `ShellInvocation`. Preserve
 validation/safety/cwd/timeout code, then build:
@@ -1308,7 +1308,7 @@ Delete `_build_env`, direct subprocess creation, and local kill helpers. Format
 stdout/stderr/timeout/exit code exactly as before. Map policy/probe/launch errors to
 `_error(...)`; add backend/profile/unsafe values to the internal `audit` field.
 
-- [ ] **Step 5: Run shell and scheduler tests**
+- [x] **Step 5: Run shell and scheduler tests**
 
 Run:
 
@@ -1319,7 +1319,7 @@ Run:
 Expected: PASS; `rg "create_subprocess_shell" src/multiclaw/tools/shell.py` returns no
 matches.
 
-- [ ] **Step 6: Commit shell isolation**
+- [x] **Step 6: Commit shell isolation**
 
 ```bash
 git add src/multiclaw/tools/base.py src/multiclaw/tools/scheduler.py src/multiclaw/tools/shell.py tests/test_shell.py tests/test_tools.py
@@ -1338,12 +1338,17 @@ git commit -m "Put shell compatibility behind an OS-enforced launch boundary" \
 - Modify: `src/multiclaw/tools/code_exec.py`
 - Modify: `tests/test_code_exec.py`
 
-- [ ] **Step 1: Write failing runner-protocol and compatibility tests**
+- [x] **Step 1: Write failing runner-protocol and compatibility tests**
 
 Add direct tests for `_code_runner.main()` using monkeypatched stdin and a captured
 real stdout protocol stream. Cover success, user stderr, exception, restricted import,
 and JSON shape. Add invocation tests using `ReadyRecordingSandboxController` for the
 exact argv and result contracts from Task 1.
+
+Amendment note: the approved security deviation replaced the draft trusted JSON
+envelope child protocol with a static `python -I -S -c` bootstrap. The parent now
+trusts only process outcome plus stdout/stderr, isolated mode intentionally removes
+ambient workspace imports, and no multiprocessing/helper tree remains.
 
 ```python
 @pytest.mark.asyncio
@@ -1367,13 +1372,13 @@ sandbox launch failure tests; all must return tool status error. Define the prot
 limit as `MAX_ENVELOPE_BYTES = 1_048_576` and enforce it on raw stdout bytes before
 UTF-8 decode/JSON parsing.
 
-- [ ] **Step 2: Run code-exec tests to verify failure**
+- [x] **Step 2: Run code-exec tests to verify failure**
 
 Run: `.venv/bin/python -m pytest tests/test_code_exec.py -q`
 
 Expected: FAIL because `_code_runner` and controller injection do not exist.
 
-- [ ] **Step 3: Implement the child runner**
+- [x] **Step 3: Implement the child runner**
 
 Move `SAFE_BUILTINS`, `BLOCKED_MODULES`, and restricted import logic into
 `_code_runner.py`. The entrypoint:
@@ -1404,7 +1409,7 @@ def main(argv: list[str] | None = None) -> int:
 
 Call `raise SystemExit(main())` under `if __name__ == "__main__"`.
 
-- [ ] **Step 4: Rewrite `CodeExecInvocation` around the controller**
+- [x] **Step 4: Rewrite `CodeExecInvocation` around the controller**
 
 Require the controller in builder/invocation. Send UTF-8 code as `stdin_bytes`, use
 profile `code_exec_python`, exact argv above, workspace cwd, and existing timeout.
@@ -1422,7 +1427,7 @@ Preserve result formatting:
 
 Add internal audit metadata without changing public `data`.
 
-- [ ] **Step 5: Prove multiprocessing is gone**
+- [x] **Step 5: Prove multiprocessing is gone**
 
 Run:
 
@@ -1432,13 +1437,13 @@ rg -n "multiprocessing|Manager\(|Process\(" src/multiclaw/tools/code_exec.py src
 
 Expected: no matches.
 
-- [ ] **Step 6: Run code-exec tests**
+- [x] **Step 6: Run code-exec tests**
 
 Run: `.venv/bin/python -m pytest tests/test_code_exec.py -q`
 
 Expected: PASS, including exact Task 1 contracts.
 
-- [ ] **Step 7: Commit code-exec isolation**
+- [x] **Step 7: Commit code-exec isolation**
 
 ```bash
 git add src/multiclaw/tools/_code_runner.py src/multiclaw/tools/code_exec.py tests/test_code_exec.py
@@ -1463,7 +1468,7 @@ git commit -m "Remove the unsandboxed helper tree from Python execution" \
 - Modify: `tests/test_mcp_tool_adapter.py`
 - Modify: `tests/test_server.py`
 
-- [ ] **Step 1: Write failing MCP config and transport tests**
+- [x] **Step 1: Write failing MCP config and transport tests**
 
 Extend config tests for snake_case and camelCase input aliases. The parsed dataclass
 must have:
@@ -1486,7 +1491,7 @@ class StdioServerConfig:
 Add factory/transport tests that assert `StdioServerParameters` receives the rendered
 wrapper executable, args, canonical cwd, and fully controlled env.
 
-- [ ] **Step 2: Run MCP tests to verify failure**
+- [x] **Step 2: Run MCP tests to verify failure**
 
 Run:
 
@@ -1500,7 +1505,7 @@ Run:
 
 Expected: FAIL because the new fields and sandbox-aware factory do not exist.
 
-- [ ] **Step 3: Parse explicit security grants**
+- [x] **Step 3: Parse explicit security grants**
 
 In `_parse_server_config`, accept both forms:
 
@@ -1524,7 +1529,11 @@ sandbox_read_only_paths=data.get(
 Validate types and enum values during parsing. Error logs may contain server/key names,
 never env values.
 
-- [ ] **Step 4: Apply the Task 3 MCP override fields in manager policy**
+Security amendment note: Tasks 11 and 13 also recorded trusted config provenance,
+workspace-untrusted conservative-only local MCP grants, exact same-key allowlisted env
+expansion, and atomic same-server/filter winner selection.
+
+- [x] **Step 4: Apply the Task 3 MCP override fields in manager policy**
 
 Use the frozen optional fields already introduced in Task 3:
 
@@ -1539,7 +1548,7 @@ Manager accepts these overrides only for `mcp_stdio_local`. Shell/code requests 
 overrides raise `SandboxPolicyError`. Canonicalize extra roots and require them to be
 explicitly listed in the server config. Reject more than 16 roots.
 
-- [ ] **Step 5: Render the stdio wrapper at the factory boundary**
+- [x] **Step 5: Render the stdio wrapper at the factory boundary**
 
 Change:
 
@@ -1571,7 +1580,7 @@ existing direct `bin/` child. Deduplicate canonical directories while retaining
 order. This supports launchers such as `/opt/homebrew/bin/npx` and their
 `/usr/bin/env node` shebangs without inheriting unrelated host PATH entries.
 
-- [ ] **Step 6: Prevent MCP SDK default env from restoring host values**
+- [x] **Step 6: Prevent MCP SDK default env from restoring host values**
 
 The installed SDK merges `get_default_environment()` before the supplied env. In
 `StdioTransport.connect()`, blank every SDK-default key first, then overlay the
@@ -1597,14 +1606,14 @@ exception path. In `disconnect()`, always exit the SDK context first, then remov
 `self._launch_spec.private_root` in `finally`. A cleanup failure is logged with server/
 correlation metadata and never causes a second host launch.
 
-- [ ] **Step 7: Preserve manager lifecycle and refresh behavior**
+- [x] **Step 7: Preserve manager lifecycle and refresh behavior**
 
 Pass controller/workspace/server name from `MCPClientManager._connect_server()` to the
 factory. Keep connect/disconnect/tool discovery/circuit breaker/refresh callback order
 unchanged. When a stdio policy render fails, mark only that server FAILED with a
 sanitized reason; do not affect remote servers.
 
-- [ ] **Step 8: Run MCP and server tests**
+- [x] **Step 8: Run MCP and server tests**
 
 Run:
 
@@ -1618,7 +1627,7 @@ Run:
 
 Expected: PASS, including stdio connect/disconnect/reconnect and registry refresh.
 
-- [ ] **Step 9: Commit MCP isolation**
+- [x] **Step 9: Commit MCP isolation**
 
 ```bash
 git add \
@@ -1648,7 +1657,7 @@ git commit -m "Make local MCP privileges explicit at server startup" \
 - Modify: `docs/superpowers/specs/2026-08-03-native-sandbox-backends-design.md`
 - Create: `docs/sandbox-deployment.md`
 
-- [ ] **Step 1: Register platform markers**
+- [x] **Step 1: Register platform markers**
 
 Add this marker configuration to `pyproject.toml`:
 
@@ -1671,7 +1680,7 @@ Each module skips when `MULTICLAW_RUN_NATIVE_SANDBOX_TESTS != "1"` or the OS doe
 not match. Once explicitly enabled on the matching OS, a missing/non-executable
 backend is `pytest.fail(...)`, not a skip, so the release gate cannot pass silently.
 
-- [ ] **Step 2: Implement deterministic parent-host fixtures**
+- [x] **Step 2: Implement deterministic parent-host fixtures**
 
 Each native module creates:
 
@@ -1682,7 +1691,7 @@ Each native module creates:
 
 No test contacts the public internet.
 
-- [ ] **Step 3: Add macOS negative cases**
+- [x] **Step 3: Add macOS negative cases**
 
 Use real `SandboxManager`/Seatbelt and assert:
 
@@ -1694,13 +1703,13 @@ Use real `SandboxManager`/Seatbelt and assert:
 - code child creation fails;
 - timed-out shell leaves no descendant.
 
-- [ ] **Step 4: Add Linux negative cases**
+- [x] **Step 4: Add Linux negative cases**
 
 Run the same behavioral matrix through configured nsjail. Also execute a small inside-
 jail probe that asserts host home/socket paths are absent from the mount view and the
 network namespace cannot reach the parent listener.
 
-- [ ] **Step 5: Run the current-platform native gate**
+- [x] **Step 5: Run the current-platform native gate**
 
 macOS:
 
@@ -1719,8 +1728,11 @@ MULTICLAW_NSJAIL_PATH=/usr/bin/nsjail \
 
 Expected: PASS on the matching prepared host. A missing prerequisite is a release
 blocker, not a passing skip, once the environment variable opts into the native gate.
+Partial note: the macOS nested parent sandbox gate still failed readiness at
+`seatbelt capability check failed: allowed_execution`, so the final native-evidence
+commit remains pending and the Linux nsjail gate was not run.
 
-- [ ] **Step 6: Document deployment and migration**
+- [x] **Step 6: Document deployment and migration**
 
 `docs/sandbox-deployment.md` must include:
 
@@ -1735,6 +1747,9 @@ blocker, not a passing skip, once the environment variable opts into the native 
 
 Link the deployment guide from the approved design. Do not mark implementation
 complete in this task because the opposite platform gate may still be outstanding.
+
+Partial note: the docs were committed, but the final native-evidence commit remains
+pending until both native gates pass on prepared real hosts.
 
 - [ ] **Step 7: Commit native gates and docs**
 
@@ -1760,7 +1775,7 @@ git commit -m "Require native denial evidence before sandbox release" \
 - Modify: `docs/superpowers/plans/2026-08-03-native-sandbox-backends.md` (checkboxes/evidence)
 - Modify: `docs/superpowers/specs/2026-08-03-native-sandbox-backends-design.md` (final status)
 
-- [ ] **Step 1: Run static and focused checks**
+- [x] **Step 1: Run static and focused checks**
 
 ```bash
 .venv/bin/python -m compileall -q src/multiclaw
@@ -1784,7 +1799,7 @@ git commit -m "Require native denial evidence before sandbox release" \
 
 Expected: PASS.
 
-- [ ] **Step 2: Run the non-native full suite**
+- [x] **Step 2: Run the non-native full suite**
 
 Run: `.venv/bin/python -m pytest -m "not native_sandbox" -q`
 
@@ -1796,7 +1811,7 @@ Run the Task 12 commands on their matching hosts. Record exact pytest counts and
 backend versions in the final verification report. Both must pass before default
 `auto` is considered releasable.
 
-- [ ] **Step 4: Verify security invariants mechanically**
+- [x] **Step 4: Verify security invariants mechanically**
 
 ```bash
 rg -n "create_subprocess_shell|multiprocessing\.Manager|multiprocessing\.Process" \
@@ -1813,7 +1828,7 @@ Expected:
 - unsafe references are limited to typed config, explicit backend, tests, and docs;
 - diff check exits 0.
 
-- [ ] **Step 5: Run credential and response-redaction checks**
+- [x] **Step 5: Run credential and response-redaction checks**
 
 Scan only added diff lines so pre-existing config values are not printed:
 
@@ -1829,17 +1844,40 @@ values and assert those exact dummy values are absent from response bodies, capt
 logs, event data, and audit details. Do not print existing repository credentials into
 logs or reports.
 
-- [ ] **Step 6: Request security and completion review**
+- [x] **Step 6: Request security and completion review**
 
 Use `security-reviewer` for backend policy/trust-boundary review and `verifier` for
 PRD/test-spec evidence. Any Critical or Important finding returns to the responsible
 task and repeats focused plus full verification.
+
+Security review after fixes: APPROVE WITH RELEASE BLOCKERS. Prior CRITICAL env
+laundering and HIGH workspace self-grant issues were fixed; the remaining Medium item
+is that `SandboxProcessRunner` fully buffers stdout/stderr before presentation
+truncation.
 
 - [ ] **Step 7: Commit plan closeout evidence**
 
 After both native gates and all reviews pass, change the design status to
 “implemented and verified on macOS and Linux” and record the exact backend versions
 and pytest counts in the plan evidence section.
+
+### Partial closeout evidence (2026-08-07)
+
+- `compileall` passed.
+- Current focused contract suite: 344 passed, 1 existing `aiosqlite` warning.
+- Current non-native suite: 548 passed, 15 deselected, 13 existing `aiosqlite` warnings.
+- Static risky-launch scan no matches; diff check clean; precise added-line credential
+  scan no real-secret matches; redaction tests passed.
+- Security review after fixes: APPROVE WITH RELEASE BLOCKERS; prior CRITICAL env
+  laundering and HIGH workspace self-grant fixed.
+- Remaining Medium: `SandboxProcessRunner` fully buffers stdout/stderr before
+  presentation truncation.
+- Dependency audit unavailable; no new Python dependency.
+- Native macOS gate in nested parent sandbox failed readiness at
+  `seatbelt capability check failed: allowed_execution`.
+- Linux nsjail gate not run.
+- Release is blocked until both native gates pass on prepared real hosts and backend
+  versions/counts are recorded.
 
 ```bash
 git add \
