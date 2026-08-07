@@ -33,6 +33,29 @@ class _CapturedOutput:
         self.stderr.clear()
 
 
+@dataclass
+class _RunContext:
+    proc: asyncio.subprocess.Process
+    process_group_id: int
+    captured_output: _CapturedOutput
+    output_limit_event: asyncio.Event
+    stdout_task: asyncio.Task[None]
+    stderr_task: asyncio.Task[None]
+    stdin_task: asyncio.Task[None]
+    proc_wait_task: asyncio.Task[int]
+    all_done: asyncio.Future[tuple[None, None, None, int]]
+    overflow_task: asyncio.Task[bool]
+
+    @property
+    def helper_tasks(self) -> tuple[asyncio.Task[object], ...]:
+        return (
+            self.stdout_task,
+            self.stderr_task,
+            self.stdin_task,
+            self.proc_wait_task,
+        )
+
+
 class SandboxProcessRunner:
     def __init__(self, *, term_grace_seconds: float = 1.0) -> None:
         if term_grace_seconds <= 0:
@@ -47,8 +70,46 @@ class SandboxProcessRunner:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
+        proc = await self._spawn_process(spec)
+        context = self._create_run_context(proc, spec.stdin_bytes)
+
+        stop_reason = "completed"
+        primary_exception: BaseException | None = None
+
         try:
-            proc = await asyncio.create_subprocess_exec(
+            done, _ = await asyncio.wait(
+                {context.all_done, context.overflow_task},
+                timeout=timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                stop_reason = "timed_out"
+            elif context.overflow_task in done:
+                stop_reason = "overflow"
+            else:
+                await context.all_done
+                if context.captured_output.output_limit_stream is not None:
+                    stop_reason = "overflow"
+        except asyncio.CancelledError as exc:
+            stop_reason = "cancelled"
+            primary_exception = exc
+        except Exception as exc:
+            stop_reason = "failed"
+            primary_exception = exc
+
+        result = await self._finalize_run(
+            context,
+            spec,
+            stop_reason=stop_reason,
+        )
+
+        if primary_exception is not None:
+            raise primary_exception
+        return result
+
+    async def _spawn_process(self, spec: SandboxedLaunchSpec) -> asyncio.subprocess.Process:
+        try:
+            return await asyncio.create_subprocess_exec(
                 spec.executable,
                 *spec.args,
                 stdin=asyncio.subprocess.PIPE if spec.stdin_bytes is not None else None,
@@ -64,192 +125,14 @@ class SandboxProcessRunner:
                 f"backend={spec.backend_name!r} profile={spec.profile_name!r} "
                 f"executable={spec.executable!r} cwd={str(spec.cwd)!r}"
             ) from exc
-        process_group_id = self._preserve_process_group_id(proc)
 
-        captured_output = _CapturedOutput(stdout=bytearray(), stderr=bytearray())
-        output_limit_event = asyncio.Event()
-        communicate_task = asyncio.create_task(
-            self._communicate_with_limits(
-                proc,
-                spec.stdin_bytes,
-                captured_output,
-                output_limit_event,
-            )
-        )
-        output_limit_task = asyncio.create_task(output_limit_event.wait())
-
-        try:
-            done, _ = await asyncio.wait(
-                {communicate_task, output_limit_task},
-                timeout=timeout_seconds,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if communicate_task in done:
-                stdout, stderr = await self._await_communicate(communicate_task)
-                if captured_output.output_limit_stream is not None:
-                    stdout, stderr = await self._cleanup_after_interrupt(
-                        proc,
-                        communicate_task,
-                        process_group_id,
-                        escalation_timeout=self._term_grace_seconds,
-                    )
-                    return self._build_result_for_completion(
-                        spec,
-                        proc.returncode,
-                        stdout,
-                        stderr,
-                        captured_output=captured_output,
-                        timed_out=False,
-                    )
-                return self._build_result(spec, proc.returncode, stdout, stderr, timed_out=False)
-            if output_limit_task in done:
-                stdout, stderr = await self._cleanup_after_interrupt(
-                    proc,
-                    communicate_task,
-                    process_group_id,
-                    escalation_timeout=self._term_grace_seconds,
-                )
-                return self._build_result_for_completion(
-                    spec,
-                    proc.returncode,
-                    stdout,
-                    stderr,
-                    captured_output=captured_output,
-                    timed_out=False,
-                )
-
-            stdout, stderr = await self._cleanup_after_interrupt(
-                proc,
-                communicate_task,
-                process_group_id,
-                escalation_timeout=self._term_grace_seconds,
-            )
-            return self._build_result_for_completion(
-                spec,
-                proc.returncode,
-                stdout,
-                stderr,
-                captured_output=captured_output,
-                timed_out=True,
-            )
-        except asyncio.CancelledError:
-            await asyncio.shield(
-                self._cleanup_after_interrupt(
-                    proc,
-                    communicate_task,
-                    process_group_id,
-                    escalation_timeout=self._term_grace_seconds,
-                )
-            )
-            raise
-        except Exception:
-            await asyncio.shield(
-                self._cleanup_after_failure(
-                    proc,
-                    communicate_task,
-                    process_group_id,
-                    escalation_timeout=self._term_grace_seconds,
-                )
-            )
-            raise
-        finally:
-            output_limit_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await output_limit_task
-
-    async def _cleanup_after_interrupt(
-        self,
-        proc: asyncio.subprocess.Process,
-        communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
-        process_group_id: int,
-        *,
-        escalation_timeout: float,
-    ) -> tuple[bytes, bytes]:
-        self._send_signal(proc, process_group_id, signal.SIGTERM)
-        stdout = b""
-        stderr = b""
-        communicate_timed_out = False
-        communicate_failed: Exception | None = None
-
-        try:
-            stdout, stderr = await self._await_communicate(
-                communicate_task,
-                timeout=escalation_timeout,
-            )
-        except asyncio.TimeoutError:
-            communicate_timed_out = True
-        except Exception as exc:
-            communicate_failed = exc
-
-        if not await self._wait_for_process_group_exit(
-            proc,
-            process_group_id,
-            timeout=escalation_timeout,
-        ):
-            self._send_signal(proc, process_group_id, signal.SIGKILL)
-            await self._wait_for_process_group_exit(
-                proc,
-                process_group_id,
-                timeout=escalation_timeout,
-            )
-
-        if communicate_timed_out:
-            stdout, stderr = await self._await_communicate(communicate_task)
-        elif communicate_failed is not None:
-            raise communicate_failed
-
-        return stdout, stderr
-
-    async def _cleanup_after_failure(
-        self,
-        proc: asyncio.subprocess.Process,
-        communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
-        process_group_id: int,
-        *,
-        escalation_timeout: float,
-    ) -> None:
-        if not communicate_task.done():
-            communicate_task.cancel()
-        await self._drain_task(communicate_task)
-        self._send_signal(proc, process_group_id, signal.SIGTERM)
-        if not await self._wait_for_process_group_exit(
-            proc,
-            process_group_id,
-            timeout=escalation_timeout,
-        ):
-            self._send_signal(proc, process_group_id, signal.SIGKILL)
-            await self._wait_for_process_group_exit(
-                proc,
-                process_group_id,
-                timeout=escalation_timeout,
-            )
-
-    async def _await_communicate(
-        self,
-        communicate_task: asyncio.Task[tuple[bytes | None, bytes | None]],
-        timeout: float | None = None,
-    ) -> tuple[bytes, bytes]:
-        try:
-            waiter = asyncio.shield(communicate_task)
-            if timeout is None:
-                stdout, stderr = await waiter
-            else:
-                stdout, stderr = await asyncio.wait_for(waiter, timeout=timeout)
-        except asyncio.TimeoutError:
-            raise
-        except Exception:
-            if communicate_task.done():
-                communicate_task.exception()
-            raise
-        return stdout or b"", stderr or b""
-
-    async def _communicate_with_limits(
+    def _create_run_context(
         self,
         proc: asyncio.subprocess.Process,
         stdin_bytes: bytes | None,
-        captured_output: _CapturedOutput,
-        output_limit_event: asyncio.Event,
-    ) -> tuple[bytes, bytes]:
+    ) -> _RunContext:
+        captured_output = _CapturedOutput(stdout=bytearray(), stderr=bytearray())
+        output_limit_event = asyncio.Event()
         stdout_task = asyncio.create_task(
             self._read_stream(
                 proc.stdout,
@@ -267,24 +150,78 @@ class SandboxProcessRunner:
             )
         )
         stdin_task = asyncio.create_task(self._write_stdin(proc.stdin, stdin_bytes))
-        process_wait_task = asyncio.create_task(proc.wait())
-        helper_tasks = (
-            stdout_task,
-            stderr_task,
-            stdin_task,
-            process_wait_task,
+        proc_wait_task = asyncio.create_task(proc.wait())
+        return _RunContext(
+            proc=proc,
+            process_group_id=self._preserve_process_group_id(proc),
+            captured_output=captured_output,
+            output_limit_event=output_limit_event,
+            stdout_task=stdout_task,
+            stderr_task=stderr_task,
+            stdin_task=stdin_task,
+            proc_wait_task=proc_wait_task,
+            all_done=asyncio.gather(
+                stdout_task,
+                stderr_task,
+                stdin_task,
+                proc_wait_task,
+            ),
+            overflow_task=asyncio.create_task(output_limit_event.wait()),
         )
 
-        try:
-            await asyncio.gather(*helper_tasks)
-        except BaseException:
-            for task in helper_tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*helper_tasks, return_exceptions=True)
-            raise
+    async def _finalize_run(
+        self,
+        context: _RunContext,
+        spec: SandboxedLaunchSpec,
+        *,
+        stop_reason: str,
+    ) -> SandboxExecResult:
+        if stop_reason != "completed":
+            await self._terminate_process_group(context)
 
-        return bytes(captured_output.stdout), bytes(captured_output.stderr)
+        await self._drain_run_context(context)
+
+        return self._build_result_for_completion(
+            spec,
+            context.proc.returncode,
+            bytes(context.captured_output.stdout),
+            bytes(context.captured_output.stderr),
+            captured_output=context.captured_output,
+            timed_out=(stop_reason == "timed_out"),
+        )
+
+    async def _terminate_process_group(self, context: _RunContext) -> None:
+        self._send_signal(context.proc, context.process_group_id, signal.SIGTERM)
+        if await self._wait_for_process_group_exit(
+            context.proc,
+            context.process_group_id,
+            timeout=self._term_grace_seconds,
+            proc_wait_task=context.proc_wait_task,
+        ):
+            return
+
+        self._send_signal(context.proc, context.process_group_id, signal.SIGKILL)
+        await self._wait_for_process_group_exit(
+            context.proc,
+            context.process_group_id,
+            timeout=self._term_grace_seconds,
+            proc_wait_task=context.proc_wait_task,
+        )
+
+    async def _drain_run_context(self, context: _RunContext) -> None:
+        if not context.overflow_task.done():
+            context.overflow_task.cancel()
+
+        for task in context.helper_tasks:
+            if not task.done():
+                task.cancel()
+
+        await asyncio.gather(*context.helper_tasks, return_exceptions=True)
+        await asyncio.gather(
+            context.all_done,
+            context.overflow_task,
+            return_exceptions=True,
+        )
 
     async def _read_stream(
         self,
@@ -350,7 +287,6 @@ class SandboxProcessRunner:
         process_group_id = self._get_process_group_id(proc.pid)
         if process_group_id is not None:
             return process_group_id
-        # start_new_session=True makes the spawned pid the process-group leader.
         return proc.pid
 
     def _process_group_exists(self, process_group_id: int) -> bool:
@@ -380,33 +316,56 @@ class SandboxProcessRunner:
         process_group_id: int,
         *,
         timeout: float,
+        proc_wait_task: asyncio.Task[int] | None = None,
     ) -> bool:
-        deadline = asyncio.get_running_loop().time() + timeout
+        local_proc_wait_task = proc_wait_task or asyncio.create_task(proc.wait())
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
         while True:
             if not self._process_group_exists(process_group_id):
-                if proc.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        await proc.wait()
+                await self._drain_wait_task(local_proc_wait_task, deadline=deadline)
                 return True
 
-            remaining = deadline - asyncio.get_running_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
                 return False
 
-            if proc.returncode is None:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(proc.wait()),
-                        timeout=min(0.05, remaining),
-                    )
-                except asyncio.TimeoutError:
-                    pass
-            else:
+            if local_proc_wait_task.done():
                 await asyncio.sleep(min(0.01, remaining))
+                continue
 
-    async def _drain_task(self, task: asyncio.Task[object]) -> None:
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(local_proc_wait_task),
+                    timeout=min(0.05, remaining),
+                )
+            except asyncio.TimeoutError:
+                await asyncio.sleep(0)
+            except Exception:
+                return not self._process_group_exists(process_group_id)
+
+    async def _drain_wait_task(
+        self,
+        proc_wait_task: asyncio.Task[int],
+        *,
+        deadline: float,
+    ) -> None:
+        if proc_wait_task.done():
+            await asyncio.gather(proc_wait_task, return_exceptions=True)
+            return
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return
+
+        await asyncio.gather(
+            asyncio.wait_for(
+                asyncio.shield(proc_wait_task),
+                timeout=remaining,
+            ),
+            return_exceptions=True,
+        )
 
     def _build_result(
         self,

@@ -219,62 +219,42 @@ async def test_sandbox_runner_allows_exact_output_limit_boundary(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_sandbox_runner_returns_output_limit_result_when_communicate_finishes_after_latch(
-    tmp_path: Path,
+async def test_sandbox_runner_wait_for_process_group_exit_reuses_single_proc_waiter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = _make_spec(
-        tmp_path,
-        code="print('unused')",
-        correlation_id="communicate-done-overflow-latched",
-    )
+    runner = SandboxProcessRunner()
+    proc_wait_task = asyncio.create_task(asyncio.sleep(0.16, result=0))
 
-    class _FakeProcess:
-        pid = 43210
-        returncode = 0
-        stdout = None
-        stderr = None
-        stdin = None
+    class FakeProc:
+        wait_calls = 0
 
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        del args, kwargs
-        return _FakeProcess()
+        @property
+        def returncode(self) -> int | None:
+            return 0 if proc_wait_task.done() else None
 
-    async def fake_communicate_with_limits(
-        self,
-        proc,
-        stdin_bytes,
-        captured_output,
-        output_limit_event,
-    ):
-        del self, proc, stdin_bytes
-        captured_output.mark_output_limit_exceeded("stdout")
-        output_limit_event.set()
-        return b"", b""
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            return await asyncio.shield(proc_wait_task)
 
-    real_wait = asyncio.wait
-
-    async def fake_wait(tasks, *, timeout=None, return_when=asyncio.FIRST_COMPLETED):
-        done, pending = await real_wait(tasks, timeout=timeout, return_when=return_when)
-        communicate_task = next(task for task in tasks if task is not None and task.done())
-        return {communicate_task}, pending
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    process_group_checks = iter([True, True, True, False])
     monkeypatch.setattr(
-        SandboxProcessRunner,
-        "_communicate_with_limits",
-        fake_communicate_with_limits,
+        runner,
+        "_process_group_exists",
+        lambda process_group_id: next(process_group_checks),
     )
-    monkeypatch.setattr(SandboxProcessRunner, "_get_process_group_id", lambda self, pid: pid)
-    monkeypatch.setattr(asyncio, "wait", fake_wait)
+    proc = FakeProc()
 
-    result = await SandboxProcessRunner().run(spec, 1.0)
+    try:
+        exited = await runner._wait_for_process_group_exit(
+            proc,
+            999,
+            timeout=0.3,
+        )
+    finally:
+        await proc_wait_task
 
-    assert result.completion_state == "output_limit_exceeded"
-    assert result.output_limit_stream == "stdout"
-    assert result.timed_out is False
-    assert result.stdout == b""
-    assert result.stderr == b""
+    assert exited is True
+    assert proc.wait_calls == 1
 
 
 @pytest.mark.asyncio
@@ -529,15 +509,15 @@ async def test_sandbox_runner_output_limit_kills_descendants_even_if_parent_exit
     tmp_path: Path,
 ) -> None:
     record_path = tmp_path / "overflow-descendant-pids.json"
-    child_ready_path = tmp_path / "overflow-descendant-ready"
+    write_complete_path = tmp_path / "overflow-descendant-write-complete"
     child_code = textwrap.dedent(
         f"""
         import os
         from pathlib import Path
         import time
 
-        Path({str(child_ready_path)!r}).write_text("ready", encoding="utf-8")
         os.write(1, b"x" * (128 * 1024 + 1))
+        Path({str(write_complete_path)!r}).write_text("done", encoding="utf-8")
         time.sleep(60)
         """
     ).strip()
@@ -559,9 +539,9 @@ async def test_sandbox_runner_output_limit_kills_descendants_even_if_parent_exit
             encoding="utf-8",
         )
         deadline = __import__("time").monotonic() + 2.0
-        while not Path({str(child_ready_path)!r}).exists():
+        while not Path({str(write_complete_path)!r}).exists():
             if __import__("time").monotonic() >= deadline:
-                raise SystemExit("child did not become ready")
+                raise SystemExit("child did not finish writing overflow output")
             __import__("time").sleep(0.01)
         raise SystemExit(0)
         """
@@ -600,18 +580,21 @@ async def test_sandbox_runner_output_limit_kills_descendants_even_if_parent_exit
 @pytest.mark.asyncio
 async def test_sandbox_runner_cleans_overflow_descendants_before_return_when_communicate_finishes(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     record_path = tmp_path / "overflow-fast-finish-pids.json"
-    child_ready_path = tmp_path / "overflow-fast-finish-child-ready"
+    write_complete_path = tmp_path / "overflow-fast-finish-write-complete"
     child_code = textwrap.dedent(
         f"""
         import signal
+        import os
         import time
         from pathlib import Path
 
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
-        Path({str(child_ready_path)!r}).write_text("ready", encoding="utf-8")
+        os.write(1, b"x" * (128 * 1024 + 1))
+        Path({str(write_complete_path)!r}).write_text("done", encoding="utf-8")
+        os.close(1)
+        os.close(2)
         time.sleep(60)
         """
     ).strip()
@@ -624,40 +607,23 @@ async def test_sandbox_runner_cleans_overflow_descendants_before_return_when_com
         import time
         from pathlib import Path
 
-        with open(os.devnull, "wb", buffering=0) as sink:
-            child = subprocess.Popen(
-                [sys.executable, "-c", {child_code!r}],
-                stdin=subprocess.DEVNULL,
-                stdout=sink,
-                stderr=sink,
-            )
-            Path({str(record_path)!r}).write_text(
-                json.dumps({{"parent_pid": os.getpid(), "child_pid": child.pid}}),
-                encoding="utf-8",
-            )
-            deadline = time.monotonic() + 2.0
-            while not Path({str(child_ready_path)!r}).exists():
-                if time.monotonic() >= deadline:
-                    raise SystemExit("child did not become ready")
-                time.sleep(0.01)
-            os.write(1, b"x" * (128 * 1024 + 1))
+        child = subprocess.Popen(
+            [sys.executable, "-c", {child_code!r}],
+            stdin=subprocess.DEVNULL,
+        )
+        Path({str(record_path)!r}).write_text(
+            json.dumps({{"parent_pid": os.getpid(), "child_pid": child.pid}}),
+            encoding="utf-8",
+        )
+        deadline = time.monotonic() + 2.0
+        while not Path({str(write_complete_path)!r}).exists():
+            if time.monotonic() >= deadline:
+                raise SystemExit("child did not finish overflow write before parent exit")
+            time.sleep(0.01)
         raise SystemExit(0)
         """
     )
     spec = _make_spec(tmp_path, code=script, correlation_id="overflow-fast-finish")
-
-    real_wait = asyncio.wait
-
-    async def fake_wait(tasks, *, timeout=None, return_when=asyncio.FIRST_COMPLETED):
-        del timeout, return_when
-        communicate_task = next(task for task in tasks if task.get_coro().__name__ == "_communicate_with_limits")
-        output_limit_task = next(task for task in tasks if task is not communicate_task)
-        await real_wait({communicate_task, output_limit_task}, timeout=3.0, return_when=asyncio.ALL_COMPLETED)
-        assert communicate_task.done()
-        assert output_limit_task.done()
-        return {communicate_task}, set()
-
-    monkeypatch.setattr(asyncio, "wait", fake_wait)
 
     task = asyncio.create_task(SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 1.0))
     record: dict[str, int] | None = None
@@ -672,6 +638,8 @@ async def test_sandbox_runner_cleans_overflow_descendants_before_return_when_com
 
         assert result.completion_state == "output_limit_exceeded"
         assert result.output_limit_stream == "stdout"
+        assert result.stdout == b""
+        assert result.stderr == b""
         _assert_pid_gone(child_pid)
     finally:
         if not task.done():
@@ -714,22 +682,24 @@ async def test_sandbox_runner_rethrows_helper_errors_after_killing_process_group
     class InjectedReaderError(RuntimeError):
         pass
 
-    tracked_tasks: list[asyncio.Task[object]] = []
-    real_create_task = asyncio.create_task
     real_read_stream = SandboxProcessRunner._read_stream
+    error_gate = asyncio.Event()
+    baseline_tasks = {
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+    }
 
-    def tracking_create_task(coro, *args, **kwargs):
-        task = real_create_task(coro, *args, **kwargs)
-        tracked_tasks.append(task)
-        return task
-
-    async def exploding_read_stream(self, stream, *, stream_name, captured_output, output_limit_event):
+    async def exploding_read_stream(
+        self,
+        stream,
+        *,
+        stream_name,
+        captured_output,
+        output_limit_event,
+    ):
         if stream_name == "stdout":
-            deadline = time.monotonic() + 2.0
-            while not record_path.exists():
-                if time.monotonic() >= deadline:
-                    raise AssertionError("helper error injection outran pid record creation")
-                await asyncio.sleep(0.01)
+            await error_gate.wait()
             raise InjectedReaderError("reader exploded")
         return await real_read_stream(
             self,
@@ -739,7 +709,6 @@ async def test_sandbox_runner_rethrows_helper_errors_after_killing_process_group
             output_limit_event=output_limit_event,
         )
 
-    monkeypatch.setattr(asyncio, "create_task", tracking_create_task)
     monkeypatch.setattr(SandboxProcessRunner, "_read_stream", exploding_read_stream)
 
     task = asyncio.create_task(SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 1.0))
@@ -751,10 +720,18 @@ async def test_sandbox_runner_rethrows_helper_errors_after_killing_process_group
         record = await _wait_for_pid_record(record_path)
         parent_pid = record["parent_pid"]
         child_pid = record["child_pid"]
+        error_gate.set()
         with pytest.raises(InjectedReaderError, match="reader exploded"):
-            await task
+            await asyncio.wait_for(task, timeout=2.0)
         await asyncio.sleep(0)
-        assert all(task.done() for task in tracked_tasks)
+        leaked_tasks = [
+            pending
+            for pending in asyncio.all_tasks()
+            if pending is not asyncio.current_task()
+            and not pending.done()
+            and pending not in baseline_tasks
+        ]
+        assert leaked_tasks == []
         _assert_pid_gone(parent_pid)
         _assert_pid_gone(child_pid)
     finally:
