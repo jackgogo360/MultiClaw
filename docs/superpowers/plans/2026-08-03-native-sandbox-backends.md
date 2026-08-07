@@ -1709,7 +1709,7 @@ Run the same behavioral matrix through configured nsjail. Also execute a small i
 jail probe that asserts host home/socket paths are absent from the mount view and the
 network namespace cannot reach the parent listener.
 
-- [x] **Step 5: Run the current-platform native gate**
+- [ ] **Step 5: Run the current-platform native gate**
 
 macOS:
 
