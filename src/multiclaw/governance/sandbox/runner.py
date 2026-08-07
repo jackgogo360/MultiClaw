@@ -86,14 +86,14 @@ class SandboxProcessRunner:
             if communicate_task in done:
                 stdout, stderr = await self._await_communicate(communicate_task)
                 if captured_output.output_limit_stream is not None:
-                    return self._build_result(
-                    spec,
-                    proc.returncode,
-                    stdout,
-                    stderr,
-                    captured_output=captured_output,
-                    timed_out=False,
-                )
+                    return self._build_result_for_completion(
+                        spec,
+                        proc.returncode,
+                        stdout,
+                        stderr,
+                        captured_output=captured_output,
+                        timed_out=False,
+                    )
                 return self._build_result(spec, proc.returncode, stdout, stderr, timed_out=False)
             if output_limit_task in done:
                 stdout, stderr = await self._cleanup_after_interrupt(
