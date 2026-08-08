@@ -93,7 +93,26 @@ env = { SERVICE_TOKEN = "${SERVICE_TOKEN}" }
 
 - `stdout` and `stderr` are each capped at 128 KiB.
 - If either stream exceeds that cap, the runner terminates the full process group, sets `completion_state=output_limit_exceeded`, clears both captured streams, and returns no partial output.
+- The runner guarantees TERM then KILL against the original process group and cleans up ordinary descendants that remain in that group.
+- On macOS, the contract does not guarantee forced cleanup of malicious or abnormal children that break away from the original PGID via `setsid(2)`, `setpgid(2)`, or double-fork patterns.
 - The runner cleans up only the `proc.wait` waiter it created itself; it does not cancel waiters owned by the caller.
+
+## Accepted Risk
+
+Accepted on August 8, 2026:
+
+- This is a Medium lifecycle/availability/workspace-integrity risk, not a Seatbelt host-isolation escape. Breakaway descendants still inherit the launched Seatbelt profile.
+- The residual risk is continued resource consumption plus continued access to already-authorized workspace paths and any explicitly granted MCP network or environment access.
+- Exposure is highest for `shell_workspace` and stdio MCP servers using `sandbox_allow_subprocesses = true`.
+- `code_exec_python` and default stdio MCP configs are not exposed to this specific path because their policies deny process creation.
+- `host_unsafe_dev_only` raises impact further and remains prohibited in production.
+
+Operational guidance:
+
+- Use subprocess-enabled local MCP servers only on trusted local macOS hosts.
+- Do not treat a timeout audit record as proof that every arbitrary breakaway child was stopped.
+- After timeouts on macOS subprocess-enabled workloads, monitor for residual processes and clean them up operationally if needed.
+- Do not enable `host_unsafe_dev_only` in production to work around native gate failures.
 
 ## Migration Notes
 
@@ -158,11 +177,11 @@ Do not bypass rollback pressure by enabling `host_unsafe_dev_only` in production
 
 ## Known Verification Status
 
-Status as of August 7, 2026:
+Status as of August 8, 2026:
 
-- Non-native JUnit verification recorded 567 passed, 0 failures, 0 errors, and 0 skipped, for 582 total tests with 15 native-gated cases excluded.
+- Non-native JUnit verification recorded 568 passed, 0 failures, 0 errors, and 0 skipped, for 583 total tests with 15 native-gated cases excluded.
 - `python -m compileall` passed.
-- Runner coverage passed with 24 tests, and the asyncio debug subset passed with 3 tests.
+- Runner coverage passed with 25 tests, and the asyncio debug subset passed with 3 tests. The accepted-risk breakaway characterization also passed separately with `PYTHONASYNCIODEBUG=1`.
 - Runner follow-up specification and quality/security reviews completed with 0 Critical, 0 Important, and 0 Minor findings.
 - Lock-only dependency upgrades were verified exactly at `mcp==1.28.1`, `starlette==1.3.1`, `pydantic-settings==2.14.2`, `cryptography==50.0.0`, `h2==4.4.1`, and `hpack==4.2.0`.
 - `uv sync --locked --offline` and `uv lock --check` both passed.
@@ -172,6 +191,8 @@ Status as of August 7, 2026:
 - Exact long-token scanning found no matches; a broader `re_` rule still reports 59 identifier or dummy Bearer false positives.
 - The redaction subset passed with 8 tests.
 - Remaining warnings are pre-existing `aiosqlite` closed-event-loop thread warnings plus one Starlette `httpx`/`TestClient` deprecation warning.
+- macOS breakaway-child behavior is a documented accepted Medium risk: runner timeout cleanup reliably clears the original process group, but a reproduced `setsid`/`setpgid`/double-fork child can survive runner timeout. The diagnostic test harness—not the runner—detects that survivor and precisely `SIGKILL`s its PID during teardown.
+- Current macOS evidence does not show a native kernel or service hook that closes this gap: deny-default plus `deny system-sched` did not block `setsid`, current kqueue headers mark `NOTE_TRACK`/`NOTE_CHILD` unsupported since 10.5, and `launchd bootout` testing did not terminate `setsid` children.
 - macOS nested gating still fails at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'`.
 - The Linux native gate was not executed in this environment.
 - Final full-branch security/completeness review remains pending after this documentation update and the current-host native-gate attempt; Linux real-host evidence remains a separate release gate.

@@ -555,6 +555,78 @@ async def test_sandbox_runner_kills_descendants_on_timeout(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_sandbox_runner_timeout_leaves_breakaway_child_alive_accepted_risk(
+    tmp_path: Path,
+) -> None:
+    record_path = tmp_path / "breakaway-child-pids.json"
+    child_code = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import time
+        from pathlib import Path
+
+        Path({str(record_path)!r}).write_text(
+            json.dumps({{"parent_pid": os.getppid(), "child_pid": os.getpid()}}),
+            encoding="utf-8",
+        )
+        time.sleep(60)
+        """
+    ).strip()
+    script = textwrap.dedent(
+        f"""
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        child = subprocess.Popen(
+            [sys.executable, "-c", {child_code!r}],
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 2.0
+        while not Path({str(record_path)!r}).exists():
+            if time.monotonic() >= deadline:
+                raise SystemExit("breakaway child did not publish pid record")
+            time.sleep(0.01)
+        time.sleep(60)
+        """
+    )
+    spec = _make_spec(tmp_path, code=script, correlation_id="accepted-breakaway-timeout")
+
+    # Accepted-risk characterization for the 2026-08-08 contract: a child that
+    # breaks away into a new session survives timeout cleanup today. If timeout
+    # cleanup is hardened later, update this test and the contract together.
+    result_task: asyncio.Task | None = None
+    record: dict[str, int] | None = None
+    child_pid: int | None = None
+    parent_pid: int | None = None
+    try:
+        result_task = asyncio.create_task(
+            SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 0.5)
+        )
+        record = await _wait_for_pid_record(record_path, timeout_seconds=1.5)
+        parent_pid = record["parent_pid"]
+        child_pid = record["child_pid"]
+        result = await asyncio.wait_for(result_task, timeout=2.0)
+
+        assert result.timed_out is True
+        assert parent_pid is not None
+        assert child_pid is not None
+        assert parent_pid != child_pid
+        assert _process_missing(child_pid) is False
+    finally:
+        if result_task is not None and not result_task.done():
+            result_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await result_task
+        _best_effort_kill_pid(child_pid)
+        if child_pid is not None:
+            _assert_pid_gone(child_pid)
+        _best_effort_kill_pid(parent_pid)
+
+
+@pytest.mark.asyncio
 async def test_sandbox_runner_output_limit_kills_descendants_even_if_parent_exits(
     tmp_path: Path,
 ) -> None:
