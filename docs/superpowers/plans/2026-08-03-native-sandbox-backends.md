@@ -1851,9 +1851,10 @@ PRD/test-spec evidence. Any Critical or Important finding returns to the respons
 task and repeats focused plus full verification.
 
 Security review after fixes: APPROVE WITH RELEASE BLOCKERS. Prior CRITICAL env
-laundering and HIGH workspace self-grant issues were fixed; the remaining Medium item
-is that `SandboxProcessRunner` fully buffers stdout/stderr before presentation
-truncation.
+laundering and HIGH workspace self-grant issues were fixed; runner follow-up spec
+and quality/security reviews reported 0 Critical/Important/Minor, and the prior
+Medium fully-buffered capture risk is closed by bounded per-stream capture with
+zero-output overflow handling.
 
 - [ ] **Step 7: Commit plan closeout evidence**
 
@@ -1864,18 +1865,34 @@ and pytest counts in the plan evidence section.
 ### Partial closeout evidence (2026-08-07)
 
 - `compileall` passed.
-- Current focused contract suite: 344 passed, 1 existing `aiosqlite` warning.
-- Current non-native suite: 548 passed, 15 deselected, 13 existing `aiosqlite` warnings.
+- Non-native JUnit suite: 567 passed, 0 failures, 0 errors, 0 skipped; 582 total
+  tests with 15 `native_sandbox` cases excluded.
+- Existing warnings are unchanged: `aiosqlite` closed-event-loop thread warnings
+  plus one Starlette `httpx`/`TestClient` deprecation warning.
+- Runner contract suite: 24 passed; `asyncio` debug subset: 3 passed; waiter leak
+  fix landed and spec/quality-security review reported 0 Critical/Important/Minor.
 - Static risky-launch scan no matches; diff check clean; precise added-line credential
-  scan no real-secret matches; redaction tests passed.
+  scan no exact-token matches; broad `re_` rule produced 59 false positives only;
+  redaction subset (8 tests) passed.
 - Security review after fixes: APPROVE WITH RELEASE BLOCKERS; prior CRITICAL env
   laundering and HIGH workspace self-grant fixed.
-- Remaining Medium: `SandboxProcessRunner` fully buffers stdout/stderr before
-  presentation truncation.
-- Dependency audit unavailable; no new Python dependency.
+- Runner capture contract now enforces 128 KiB per stream; overflow clears both
+  streams, returns `output_limit_exceeded`, and terminates the process group,
+  resolving the prior fully-buffered Medium.
+- Lock-only dependency upgrades landed: `mcp` 1.28.1, `starlette` 1.3.1,
+  `pydantic-settings` 2.14.2, `cryptography` 50.0.0, `h2` 4.4.1, `hpack` 4.2.0;
+  `uv sync --locked --offline` and `uv lock --check` passed, the compatibility
+  suite reported 116 passed, and `pip-audit` 2.10.1 found no known
+  vulnerabilities.
+- Static scan confirmed no `create_subprocess_shell` or multiprocessing helper in
+  the governed launch paths; `auto` still has no host fallback and production
+  remains off-limits to unsafe mode.
 - Native macOS gate in nested parent sandbox failed readiness at
   `seatbelt capability check failed: allowed_execution`.
 - Linux nsjail gate not run.
+- Final full-branch security/completeness review remains pending with the lead
+  agent after this documentation and current-host native-gate attempt; Linux
+  real-host evidence remains a separate release gate.
 - Release is blocked until both native gates pass on prepared real hosts and backend
   versions/counts are recorded.
 

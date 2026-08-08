@@ -89,7 +89,7 @@ CoreToolScheduler
 
 在 `shell_string` 模式中，目标 argv 固定为 `/bin/sh -c <raw command>`。在 `exec_argv` 模式中不经过 shell。
 
-一次性进程启动后开始计时；超时先向进程组发送 `SIGTERM`，等待 2 秒，再发送 `SIGKILL`。stdout/stderr 按字节独立捕获，由调用方以 UTF-8 replacement 解码并保持现有截断行为。
+一次性进程启动后开始计时；超时先向进程组发送 `SIGTERM`，等待 2 秒，再发送 `SIGKILL`。stdout/stderr 按字节独立捕获，每个流都有 128 KiB 硬上限；任一流超限时立即终止整个进程组，`completion_state=output_limit_exceeded`，并清空 stdout/stderr 两个返回流，不返回部分输出。`SandboxProcessRunner` 负责本地 `proc.wait()` waiter 的创建与清理，不改变调用方 waiter ownership。
 
 MCP stdio 是长生命周期进程：MultiClaw 只把沙箱 wrapper 的 command/args/cwd/env 传给 MCP SDK 的 `StdioServerParameters`，继续使用 `stdio_client` 的 JSON-RPC、关闭 stdin、TERM 和 KILL 流程，不重写 MCP 协议。
 
@@ -255,6 +255,14 @@ MCP tool call 仍经过现有 scheduler。stdio 沙箱事件发生在服务器�
 部署、迁移、原生验证命令与回滚说明见 `docs/sandbox-deployment.md`。
 
 ## 验证与验收
+
+当前验证状态（2026-08-07）：
+
+- 非原生全量套件通过：582 总测试中排除 15 个 `native_sandbox` 后，JUnit 结果为 567 passed、0 failures、0 errors、0 skipped。
+- runner 合同套件 24 passed，`asyncio` debug 子集 3 passed；waiter leak 已修复。
+- 精确 lock-only 依赖升级为 `mcp` 1.28.1、`starlette` 1.3.1、`pydantic-settings` 2.14.2、`cryptography` 50.0.0、`h2` 4.4.1、`hpack` 4.2.0；`uv sync --locked --offline`、`uv lock --check`、兼容性回归 116 passed、`pip-audit` 2.10.1 均通过。
+- 先前“fully-buffered stdout/stderr” Medium 风险已由 bounded capture + overflow 时零输出返回语义解决。
+- macOS 原生门禁在嵌套父沙箱环境仍失败于 `seatbelt capability check failed: allowed_execution`；Linux 原生门禁尚未执行，因此发布仍 blocked。
 
 单元测试覆盖 OS 选择、请求互斥校验、profile 渲染、env scrub、路径规则、旧值迁移、unsafe fallback 门禁。
 
