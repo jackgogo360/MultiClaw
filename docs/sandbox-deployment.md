@@ -7,6 +7,9 @@ This guide covers production deployment and rollback for MultiClaw's native sand
 ### macOS
 
 - `/usr/bin/sandbox-exec` must exist and be executable.
+- `cryptography==50.0.0` does not publish an Intel macOS `x86_64` wheel.
+- Intel macOS source builds for `cryptography==50.0.0` require a Rust toolchain plus OpenSSL development headers and libraries.
+- Current validation on this machine succeeded only with a temporary Rust + OpenSSL setup; no system Rust installation is present.
 - Native verification must run on a supported macOS host, not inside another parent sandbox that interferes with Seatbelt policy execution.
 - The startup probe must prove:
   - allowed execution works
@@ -86,6 +89,12 @@ env = { SERVICE_TOKEN = "${SERVICE_TOKEN}" }
 - Liveness can remain healthy while readiness is `503`; this is intentional so operators can inspect diagnostics without exposing unsafe execution.
 - In `auto`, failed probes block local stdio sandboxed capabilities instead of falling back to host execution.
 
+## Runner Output And Cleanup Semantics
+
+- `stdout` and `stderr` are each capped at 128 KiB.
+- If either stream exceeds that cap, the runner terminates the full process group, sets `completion_state=output_limit_exceeded`, clears both captured streams, and returns no partial output.
+- The runner cleans up only the `proc.wait` waiter it created itself; it does not cancel waiters owned by the caller.
+
 ## Migration Notes
 
 Legacy modes map as follows:
@@ -149,15 +158,22 @@ Do not bypass rollback pressure by enabling `host_unsafe_dev_only` in production
 
 ## Known Verification Status
 
-Status as of August 5, 2026:
+Status as of August 7, 2026:
 
-- Default collection and default skip behavior are verified in this branch.
-- Non-native verification remains required before release.
-- macOS native verification remains a release gate and must pass on a supported macOS host outside any interfering parent sandbox.
-- Linux native verification remains a release gate and has not been validated in this environment because `nsjail` is not available here.
-- Both native gates remain pending until they pass in real host environments with the reviewed MCP restrictions enabled.
-- The Linux native gate is designed to fail if it cannot inspect `/proc/net/route` or enumerate interfaces from inside the jail; it must not silently pass on parent-loopback denial alone.
-- The current nested-macOS characterization failed at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'` and all native profile readiness values false.
-- A prior nested-macOS characterization had reached Seatbelt profile execution and returned `-6`; treat both outcomes as environment constraints, not as evidence to loosen the sandbox policy.
+- Non-native JUnit verification recorded 567 passed, 0 failures, 0 errors, and 0 skipped, for 582 total tests with 15 native-gated cases excluded.
+- `python -m compileall` passed.
+- Runner coverage passed with 24 tests, and the asyncio debug subset passed with 3 tests.
+- Two-phase review completed with 0 Critical, 0 Important, and 0 Minor findings.
+- Lock-only dependency upgrades were verified exactly at `mcp==1.28.1`, `starlette==1.3.1`, `pydantic-settings==2.14.2`, `cryptography==50.0.0`, `h2==4.4.1`, and `hpack==4.2.0`.
+- `uv sync --locked --offline` and `uv lock --check` both passed.
+- Compatibility verification passed with 116 tests.
+- `pip-audit==2.10.1` reported no known vulnerabilities.
+- Static scanning found no `create_subprocess_shell`, no multiprocessing helper usage, no `auto` host fallback, and no production `off` mode.
+- Exact long-token scanning found no matches; a broader `re_` rule still reports 59 identifier or dummy Bearer false positives.
+- The redaction subset passed with 8 tests.
+- Remaining warnings are pre-existing `aiosqlite` closed-event-loop thread warnings plus one Starlette `httpx`/`TestClient` deprecation warning.
+- macOS nested gating still fails at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'`.
+- The Linux native gate was not executed in this environment.
+- Release remains blocked until both real-host native gates pass with the reviewed MCP restrictions enabled.
 
 Release should stay blocked until both native platform gates pass in their real host environments.
