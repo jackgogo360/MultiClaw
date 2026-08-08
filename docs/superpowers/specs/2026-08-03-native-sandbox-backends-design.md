@@ -280,11 +280,12 @@ MCP tool call 仍经过现有 scheduler。stdio 沙箱事件发生在服务器�
 
 当前验证状态（2026-08-08）：
 
-- 非原生全量套件通过：583 总测试中排除 15 个 `native_sandbox` 后，JUnit 结果为 568 passed、0 failures、0 errors、0 skipped。
+- 非原生全量套件通过：586 总测试中排除 15 个 `native_sandbox` 后，JUnit 结果为 571 passed、0 failures、0 errors、0 skipped。
 - runner 合同套件 25 passed，`asyncio` debug 子集 3 passed；新增的 accepted-risk breakaway characterization test 也在 `PYTHONASYNCIODEBUG=1` 下单独通过，waiter leak 已修复。
 - 精确 lock-only 依赖升级为 `mcp` 1.28.1、`starlette` 1.3.1、`pydantic-settings` 2.14.2、`cryptography` 50.0.0、`h2` 4.4.1、`hpack` 4.2.0；`uv sync --locked --offline`、`uv lock --check`、兼容性回归 116 passed、`pip-audit` 2.10.1 均通过。
 - 先前“fully-buffered stdout/stderr” Medium 风险已由 bounded capture + overflow 时零输出返回语义解决。
 - 2026-08-08 安全复审确认一个独立的 macOS breakaway-child Medium 风险：原始进程组与测试 PID 清理可验证，但 breakaway 子进程不在当前强制清理合同内；用户已接受该风险。
+- 最终全分支复审确认 `workspace_untrusted` MCP 自动连接 High 问题已关闭，当前代码与文档为 0 个 Critical/High/Medium/Low finding，结论为 `APPROVE WITH RELEASE BLOCKERS`。
 - macOS 原生门禁在嵌套父沙箱环境仍失败于 `seatbelt capability check failed: allowed_execution`；Linux 原生门禁尚未执行，因此发布仍 blocked。
 
 单元测试覆盖 OS 选择、请求互斥校验、profile 渲染、env scrub、路径规则、旧值迁移、unsafe fallback 门禁。

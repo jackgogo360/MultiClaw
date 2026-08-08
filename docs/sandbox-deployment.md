@@ -181,7 +181,7 @@ Do not bypass rollback pressure by enabling `host_unsafe_dev_only` in production
 
 Status as of August 8, 2026:
 
-- Non-native JUnit verification recorded 568 passed, 0 failures, 0 errors, and 0 skipped, for 583 total tests with 15 native-gated cases excluded.
+- Non-native JUnit verification recorded 571 passed, 0 failures, 0 errors, and 0 skipped, for 586 total tests with 15 native-gated cases excluded.
 - `python -m compileall` passed.
 - Runner coverage passed with 25 tests, and the asyncio debug subset passed with 3 tests. The accepted-risk breakaway characterization also passed separately with `PYTHONASYNCIODEBUG=1`.
 - Earlier focused runner follow-up specification and quality/security reviews completed with 0 Critical, 0 Important, and 0 Minor findings.
@@ -194,11 +194,10 @@ Status as of August 8, 2026:
 - The redaction subset passed with 8 tests.
 - Remaining warnings are pre-existing `aiosqlite` closed-event-loop thread warnings plus one Starlette `httpx`/`TestClient` deprecation warning.
 - macOS breakaway-child behavior is a documented accepted Medium risk: runner timeout cleanup reliably clears the original process group, but the characterization test reproduces a `start_new_session`/`setsid` child surviving runner timeout. The diagnostic test harness—not the runner—detects that survivor and precisely `SIGKILL`s its PID during teardown. `setpgid` and double-fork breakaways remain outside the guaranteed contract but were not separately characterized.
-- A later final full-branch security/completeness review found and this branch remediated a High trust-boundary issue: `workspace_untrusted` MCP configs could still auto-connect through stdio or remote transports. Those configs now never auto-connect and must be moved to an operator-managed config outside the workspace. Final rereview of the full branch is still required.
+- A later final full-branch security/completeness review found and this branch remediated a High trust-boundary issue: `workspace_untrusted` MCP configs could still auto-connect through stdio or remote transports. Those configs now never auto-connect and must be moved to an operator-managed config outside the workspace. Final rereview found 0 remaining Critical, High, Medium, or Low issues and returned `APPROVE WITH RELEASE BLOCKERS`.
 - Current macOS evidence does not show a native kernel or service hook that closes this gap: deny-default plus `deny system-sched` did not block `setsid`, current kqueue headers mark `NOTE_TRACK`/`NOTE_CHILD` unsupported since 10.5, and `launchd bootout` testing did not terminate `setsid` children.
 - macOS nested gating still fails at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'`.
 - The Linux native gate was not executed in this environment.
-- Final full-branch security/completeness review remains pending after this documentation update and the current-host native-gate attempt; Linux real-host evidence remains a separate release gate.
 - Release remains blocked until both real-host native gates pass with the reviewed MCP restrictions enabled.
 
 Release should stay blocked until both native platform gates pass in their real host environments.
