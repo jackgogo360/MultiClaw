@@ -222,8 +222,11 @@ Accepted risk / out-of-contract behavior:
 - Native orphan semantics cover the original process group only.
 - macOS breakaway children that escape the original PGID via `setsid`, `setpgid`, or
   double-fork patterns are explicitly out of contract for forced cleanup.
-- A reproduced breakaway survivor after runner timeout is therefore a documented
-  accepted-risk result, not by itself a test failure against RUN-06, RUN-09, or SH-11.
+- The characterization test reproduces a `start_new_session`/`setsid` survivor after
+  runner timeout. `setpgid` and double-fork remain out of contract but are not
+  separately characterized.
+- That reproduced survivor is a documented accepted-risk result, not by itself a
+  test failure against RUN-06, RUN-09, or SH-11.
 - The recorded breakaway PID is diagnostic/test-harness state, not runner contract.
 - Test teardown must detect any surviving breakaway PID, precisely clean it up, and
   confirm no residual process remains so tests can prove the launched task and
