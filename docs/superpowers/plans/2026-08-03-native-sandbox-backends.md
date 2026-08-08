@@ -1877,7 +1877,9 @@ Security review after fixes: APPROVE WITH RELEASE BLOCKERS. Prior CRITICAL env
 laundering and HIGH workspace self-grant issues were fixed; runner follow-up spec
 and quality/security reviews reported 0 Critical/Important/Minor, and the prior
 Medium fully-buffered capture risk is closed by bounded per-stream capture with
-zero-output overflow handling.
+zero-output overflow handling. The final full-branch rereview at `5731b31` also
+reported 0 Critical/High/Medium/Low findings and retained only the native evidence
+release blockers.
 
 - [ ] **Step 7: Commit plan closeout evidence**
 
@@ -1894,7 +1896,7 @@ risk remains documented rather than remediated.
 ### Updated closeout evidence (2026-08-08)
 
 - `compileall` passed.
-- Non-native JUnit suite: 568 passed, 0 failures, 0 errors, 0 skipped; 583 total
+- Non-native JUnit suite: 571 passed, 0 failures, 0 errors, 0 skipped; 586 total
   tests with 15 `native_sandbox` cases excluded.
 - Existing warnings are unchanged: `aiosqlite` closed-event-loop thread warnings
   plus one Starlette `httpx`/`TestClient` deprecation warning.
@@ -1912,12 +1914,13 @@ risk remains documented rather than remediated.
   cleans same-PGID descendants while the detached child can survive. The
   diagnostic/test teardown—not the runner—detects and precisely cleans that PID.
   `setpgid` and double-fork remain out of contract but were not separately
-  characterized. The user accepted this risk for trusted local use, and final
-  full-branch review remains pending.
+  characterized. The user accepted this risk for trusted local use, and the final
+  full-branch rereview retained it as an accepted Medium residual risk.
 - Final full-branch security/completeness review then found a separate High
   workspace MCP auto-connect issue. This branch remediates it by fail-closing all
-  `workspace_untrusted` MCP registration paths, but final rereview is still
-  pending.
+  `workspace_untrusted` MCP registration paths. Final rereview confirmed the issue
+  closed with 0 remaining Critical/High/Medium/Low findings and returned
+  `APPROVE WITH RELEASE BLOCKERS`.
 - Runner capture contract now enforces 128 KiB per stream; overflow clears both
   streams, returns `output_limit_exceeded`, and terminates the process group,
   resolving the prior fully-buffered Medium.
@@ -1932,9 +1935,9 @@ risk remains documented rather than remediated.
 - Native macOS gate in nested parent sandbox failed readiness at
   `seatbelt capability check failed: allowed_execution`.
 - Linux nsjail gate not run.
-- Final full-branch security/completeness review remains pending with the lead
-  agent after this documentation and current-host native-gate attempt; Linux
-  real-host evidence remains a separate release gate.
+- Final full-branch security/completeness rereview completed at `5731b31` with 0
+  Critical/High/Medium/Low findings and verdict `APPROVE WITH RELEASE BLOCKERS`;
+  Linux real-host evidence remains a separate release gate.
 - Release is blocked until both native gates pass on prepared real hosts and backend
   versions/counts are recorded.
 

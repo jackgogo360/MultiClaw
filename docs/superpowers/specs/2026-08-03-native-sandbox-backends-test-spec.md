@@ -1,7 +1,7 @@
 # Test Specification: Native Sandbox Backends
 
 Date: 2026-08-03
-Status: approved design coverage; implementation pending
+Status: implementation complete; macOS and Linux native release evidence pending
 PRD: `docs/superpowers/specs/2026-08-03-native-sandbox-backends-prd.md`
 Execution-gate mirror: `.omx/plans/test-spec-native-sandbox-backends.md`
 
