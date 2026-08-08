@@ -8,7 +8,13 @@ from starlette.requests import Request
 
 from multiclaw.events import Event
 from multiclaw.governance.sandbox.models import SandboxProbeResult, SandboxReadiness
-from multiclaw.mcp.types import HTTPServerConfig, InProcessServerConfig, StdioServerConfig
+from multiclaw.mcp.types import (
+    HTTPServerConfig,
+    InProcessServerConfig,
+    SSEServerConfig,
+    StdioServerConfig,
+    WebSocketServerConfig,
+)
 from multiclaw.mcp.types import ToolInfo
 from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.shell import ShellToolBuilder
@@ -545,9 +551,10 @@ def test_register_mcp_tools_skips_unready_stdio_but_keeps_remote(
     assert "transport_remote_unsandboxed=true" in caplog.text
 
 
-def test_register_mcp_tools_allows_conservative_untrusted_stdio(
+def test_register_mcp_tools_skips_conservative_untrusted_stdio_before_connect(
     tmp_path,
     monkeypatch,
+    caplog,
 ):
     from multiclaw.server import _register_mcp_tools
     from multiclaw.tools.registry import ToolRegistry
@@ -555,11 +562,13 @@ def test_register_mcp_tools_allows_conservative_untrusted_stdio(
     class FakeManager:
         def __init__(self) -> None:
             self.connected = None
+            self.connect_calls = 0
 
         def set_tools_changed_callback(self, callback) -> None:
             self._callback = callback
 
         def connect_servers(self, configs):
+            self.connect_calls += 1
             self.connected = dict(configs)
 
         def get_server_states(self):
@@ -574,17 +583,22 @@ def test_register_mcp_tools_allows_conservative_untrusted_stdio(
 
     controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
     manager = FakeManager()
-    _register_mcp_tools(
-        registry=ToolRegistry(),
-        mcp_manager=manager,
-        config_path=None,
-        sandbox_controller=controller,
-        workspace_root=tmp_path,
-        mcp_profile_name="mcp_stdio_local",
-    )
+    with caplog.at_level("WARNING"):
+        _register_mcp_tools(
+            registry=ToolRegistry(),
+            mcp_manager=manager,
+            config_path=None,
+            sandbox_controller=controller,
+            workspace_root=tmp_path,
+            mcp_profile_name="mcp_stdio_local",
+        )
 
-    assert list(manager.connected) == ["local"]
+    assert manager.connect_calls == 1
+    assert manager.connected == {}
     assert controller.requests == []
+    events = controller.drain_startup_events()
+    assert any(event.type == "sandbox.registration_skipped" for event in events)
+    assert "/usr/bin/env" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -697,9 +711,20 @@ def test_register_mcp_tools_rejects_untrusted_in_process_even_in_unsafe_mode(
     assert all(event.type != "sandbox.unsafe_fallback_used" for event in events)
 
 
-def test_register_mcp_tools_keeps_untrusted_remote_literal_configs(
+@pytest.mark.parametrize(
+    ("config_factory", "server_name"),
+    [
+        (lambda: HTTPServerConfig(url="https://example.com/mcp"), "remote-http"),
+        (lambda: SSEServerConfig(url="https://example.com/sse"), "remote-sse"),
+        (lambda: WebSocketServerConfig(url="wss://example.com/ws"), "remote-ws"),
+    ],
+)
+def test_register_mcp_tools_skips_untrusted_remote_configs_before_connect(
     tmp_path,
     monkeypatch,
+    caplog,
+    config_factory,
+    server_name,
 ):
     from multiclaw.server import _register_mcp_tools
     from multiclaw.tools.registry import ToolRegistry
@@ -707,34 +732,42 @@ def test_register_mcp_tools_keeps_untrusted_remote_literal_configs(
     class FakeManager:
         def __init__(self) -> None:
             self.connected = None
+            self.connect_calls = 0
 
         def set_tools_changed_callback(self, callback) -> None:
             self._callback = callback
 
         def connect_servers(self, configs):
+            self.connect_calls += 1
             self.connected = dict(configs)
 
         def get_server_states(self):
             return {}
 
-    config = HTTPServerConfig(url="https://example.com/mcp")
+    config = config_factory()
     config.config_trust = "workspace_untrusted"
     config.config_source = "auto_workspace"
 
-    monkeypatch.setattr("multiclaw.server.load_mcp_config", lambda path=None, **kwargs: {"remote": config})
+    monkeypatch.setattr("multiclaw.server.load_mcp_config", lambda path=None, **kwargs: {server_name: config})
     monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
 
     manager = FakeManager()
-    _register_mcp_tools(
-        registry=ToolRegistry(),
-        mcp_manager=manager,
-        config_path=None,
-        sandbox_controller=ReadyRecordingSandboxController(workspace_root=tmp_path),
-        workspace_root=tmp_path,
-        mcp_profile_name="mcp_stdio_local",
-    )
+    controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
+    with caplog.at_level("WARNING"):
+        _register_mcp_tools(
+            registry=ToolRegistry(),
+            mcp_manager=manager,
+            config_path=None,
+            sandbox_controller=controller,
+            workspace_root=tmp_path,
+            mcp_profile_name="mcp_stdio_local",
+        )
 
-    assert list(manager.connected) == ["remote"]
+    assert manager.connect_calls == 1
+    assert manager.connected == {}
+    events = controller.drain_startup_events()
+    assert any(event.type == "sandbox.registration_skipped" for event in events)
+    assert "example.com" not in caplog.text
 
 
 def test_register_mcp_tools_skips_in_process_in_auto_mode(tmp_path, monkeypatch):

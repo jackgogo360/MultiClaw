@@ -1538,8 +1538,15 @@ Validate types and enum values during parsing. Error logs may contain server/key
 never env values.
 
 Security amendment note: Tasks 11 and 13 also recorded trusted config provenance,
-workspace-untrusted conservative-only local MCP grants, exact same-key allowlisted env
-expansion, and atomic same-server/filter winner selection.
+exact same-key allowlisted env expansion, and atomic same-server/filter winner
+selection.
+
+Superseding note (2026-08-08): the final full-branch security/completeness review
+found that allowing any `workspace_untrusted` MCP config to auto-connect was a High
+trust-boundary flaw. Registration now rejects all `workspace_untrusted` MCP
+transports before connect/start, including conservative stdio and literal
+HTTP/SSE/WebSocket configs. Operator-managed configs outside the workspace remain
+the only startup-connection path.
 
 - [x] **Step 4: Apply the Task 3 MCP override fields in manager policy**
 
@@ -1907,6 +1914,10 @@ risk remains documented rather than remediated.
   `setpgid` and double-fork remain out of contract but were not separately
   characterized. The user accepted this risk for trusted local use, and final
   full-branch review remains pending.
+- Final full-branch security/completeness review then found a separate High
+  workspace MCP auto-connect issue. This branch remediates it by fail-closing all
+  `workspace_untrusted` MCP registration paths, but final rereview is still
+  pending.
 - Runner capture contract now enforces 128 KiB per stream; overflow clears both
   streams, returns `output_limit_exceeded`, and terminates the process group,
   resolving the prior fully-buffered Medium.

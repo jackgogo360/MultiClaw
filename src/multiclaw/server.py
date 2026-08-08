@@ -299,23 +299,27 @@ def _register_mcp_tools(
 
     filtered_configs: dict[str, object] = {}
     for server_name, config in configs.items():
+        if _is_workspace_untrusted_config(config):
+            capability_prefix = _mcp_transport_capability_prefix(config)
+            if capability_prefix is not None:
+                reason = (
+                    "workspace_untrusted MCP configs never auto-connect; "
+                    "move this server to an operator-managed config outside the workspace"
+                )
+                _record_blocked_capability_safely(
+                    sandbox_controller,
+                    name=_mcp_capability_id(capability_prefix, server_name),
+                    reason=reason,
+                    workspace_root=workspace_root,
+                )
+                logger.warning(
+                    "Skipping workspace-untrusted MCP server '%s': %s",
+                    server_name,
+                    reason,
+                )
+                continue
+
         if isinstance(config, StdioServerConfig):
-            if _is_workspace_untrusted_config(config):
-                violation = _workspace_untrusted_stdio_violation(config)
-                if violation is not None:
-                    reason = f"workspace_untrusted stdio config requested forbidden {violation}"
-                    _record_blocked_capability_safely(
-                        sandbox_controller,
-                        name=_mcp_capability_id("mcp_stdio", server_name),
-                        reason=reason,
-                        workspace_root=workspace_root,
-                    )
-                    logger.warning(
-                        "Skipping workspace stdio MCP server '%s': %s",
-                        server_name,
-                        reason,
-                    )
-                    continue
             if sandbox_controller.is_profile_ready(mcp_profile_name):
                 filtered_configs[server_name] = config
                 continue
@@ -420,17 +424,17 @@ def _is_workspace_untrusted_config(config: object) -> bool:
     return getattr(config, "config_trust", "trusted_operator") == "workspace_untrusted"
 
 
-def _workspace_untrusted_stdio_violation(config: StdioServerConfig) -> str | None:
-    if config.sandbox_network != "disabled":
-        return "network grant"
-    if config.sandbox_workspace != "ro":
-        return "workspace write grant"
-    if config.sandbox_allow_subprocesses:
-        return "subprocess grant"
-    if config.sandbox_env_allowlist:
-        return "env allowlist grant"
-    if config.sandbox_read_only_paths:
-        return "read-only path grant"
+def _mcp_transport_capability_prefix(config: object) -> str | None:
+    if isinstance(config, StdioServerConfig):
+        return "mcp_stdio"
+    if isinstance(config, InProcessServerConfig):
+        return "mcp_in_process"
+    if isinstance(config, HTTPServerConfig):
+        return "mcp_http"
+    if isinstance(config, SSEServerConfig):
+        return "mcp_sse"
+    if isinstance(config, WebSocketServerConfig):
+        return "mcp_websocket"
     return None
 
 

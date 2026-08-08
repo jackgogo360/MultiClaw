@@ -96,9 +96,12 @@ unhealthy readiness, and omits blocked risky capabilities.
 
 - Create one immutable `SandboxReadiness` snapshot during agent construction.
 - Gate `shell` and `code_exec` before registry insertion.
-- Gate stdio and in-process MCP before `connect_servers()`.
-- Remote HTTP/SSE/WebSocket MCP remains available and is marked as outside the
-  local OS sandbox boundary.
+- Gate every `workspace_untrusted` MCP config before `connect_servers()`,
+  regardless of transport.
+- Allow startup MCP connections only from trusted operator-managed configs outside
+  the workspace.
+- Trusted remote HTTP/SSE/WebSocket MCP remains available and is marked as outside
+  the local OS sandbox boundary.
 - Store readiness on `app.state.sandbox_readiness` and expose public
   `GET /health/ready` with HTTP 200 when ready and HTTP 503 when blocked.
 
@@ -124,6 +127,8 @@ unhealthy readiness, and omits blocked risky capabilities.
   `sandbox_read_only_paths`.
 - Defaults are network disabled, workspace read-only, subprocesses disabled, no
   secret env grants, and no extra runtime roots.
+- These defaults do not make workspace-owned MCP configs trusted; provenance still
+  decides whether the config may auto-connect.
 - In-process transport is rejected in `auto` and accepted only in unsafe dev mode.
 - Stdio connect/disconnect/reconnect and dynamic tool refresh remain functional.
 
@@ -174,21 +179,23 @@ negative suites are green.
 1. `auto` selects Seatbelt on Darwin and nsjail on Linux; other OS values fail closed.
 2. A missing or failed backend yields readiness 503, omits `shell`/`code_exec`, skips
    stdio MCP, and never launches a host child.
-3. Unsafe host execution is impossible unless mode is explicit and debug is true;
+3. Any `workspace_untrusted` MCP config is skipped before connect/start, even when it
+   uses conservative stdio defaults or literal remote URLs.
+4. Unsafe host execution is impossible unless mode is explicit and debug is true;
    startup and every unsafe launch emit high-severity evidence.
-4. Shell compatibility tests cover quoting, pipes, redirects, globbing, env assignment,
+5. Shell compatibility tests cover quoting, pipes, redirects, globbing, env assignment,
    cwd, stdout/stderr, exit code, timeout, and cleanup of descendants that remain in
    the original process group.
-5. Code-exec preserves success, exception, timeout, and truncation contracts with one
+6. Code-exec preserves success, exception, timeout, and truncation contracts with one
    interpreter child and no multiprocessing helper.
-6. Default shell/code-exec network and outside-workspace writes are denied on both OSes.
-7. `.git` writes and `.env*` reads are denied according to policy on both OSes.
-8. Stdio MCP honors its explicit grants; in-process and remote transports follow the
+7. Default shell/code-exec network and outside-workspace writes are denied on both OSes.
+8. `.git` writes and `.env*` reads are denied according to policy on both OSes.
+9. Trusted stdio MCP honors its explicit grants; in-process and remote transports follow the
    transport matrix.
-9. Approval/audit/tool events retain current ordering for registered tools.
-10. Relevant unit/integration suite, full backend suite, and platform-native release
+10. Approval/audit/tool events retain current ordering for registered tools.
+11. Relevant unit/integration suite, full backend suite, and platform-native release
     checks pass with no secret-bearing logs or responses.
-11. Release documentation and readiness language state that macOS breakaway-child
+12. Release documentation and readiness language state that macOS breakaway-child
     cleanup is out of contract, accepted for trusted local use, and not a reason to
     mark the dual-platform native release gate complete.
 

@@ -186,9 +186,11 @@ snapshot volatile correlation IDs or temp paths.
 | MCP-03 | network/workspace/subprocess grants | reflected in request and startup security log |
 | MCP-04 | secret env missing allowlist | server state FAILED/skipped without value leak |
 | MCP-05 | backend unavailable | stdio filtered before `connect_servers()` |
+| MCP-05a | `workspace_untrusted` stdio defaults | skipped before `connect_servers()` with sanitized `sandbox.registration_skipped` evidence |
+| MCP-05b | `workspace_untrusted` HTTP/SSE/WS literal config | skipped before `connect_servers()` with no URL/header leakage |
 | MCP-06 | in-process in auto | rejected before factory creates transport |
 | MCP-07 | in-process unsafe debug | allowed with unsafe evidence |
-| MCP-08 | HTTP/SSE/WS without backend | still created; marked remote-unsandboxed |
+| MCP-08 | trusted HTTP/SSE/WS without backend | still created; marked remote-unsandboxed |
 | MCP-09 | wrapped stdio connect/disconnect | existing SDK context enter/exit used once |
 | MCP-10 | reconnect/tool refresh | registry namespace updates as today |
 | MCP-11 | MCP SDK default env contains host HOME/PATH/USER/LOGNAME | controlled sandbox values or blanks override every SDK-default key |
@@ -202,6 +204,8 @@ snapshot volatile correlation IDs or temp paths.
 - SRV-03: `/health/ready` is public through `AuthMiddleware`.
 - SRV-04: ready response is HTTP 200; blocked response is HTTP 503.
 - SRV-05: response contains no absolute secret paths or env values.
+- SRV-06: `workspace_untrusted` MCP registration is fail-closed before any
+  transport-specific connect/start branch and records sanitized skip evidence.
 - EVT-01: native success order remains scheduled, validating, executing, audit success,
   completed.
 - EVT-02: approval order remains awaiting-approval audit before executing.
