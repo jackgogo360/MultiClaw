@@ -301,23 +301,22 @@ def _register_mcp_tools(
     for server_name, config in configs.items():
         if _is_workspace_untrusted_config(config):
             capability_prefix = _mcp_transport_capability_prefix(config)
-            if capability_prefix is not None:
-                reason = (
-                    "workspace_untrusted MCP configs never auto-connect; "
-                    "move this server to an operator-managed config outside the workspace"
-                )
-                _record_blocked_capability_safely(
-                    sandbox_controller,
-                    name=_mcp_capability_id(capability_prefix, server_name),
-                    reason=reason,
-                    workspace_root=workspace_root,
-                )
-                logger.warning(
-                    "Skipping workspace-untrusted MCP server '%s': %s",
-                    server_name,
-                    reason,
-                )
-                continue
+            reason = (
+                "workspace_untrusted MCP configs never auto-connect; "
+                "move this server to an operator-managed config outside the workspace"
+            )
+            _record_blocked_capability_safely(
+                sandbox_controller,
+                name=_mcp_capability_id(capability_prefix, server_name),
+                reason=reason,
+                workspace_root=workspace_root,
+            )
+            logger.warning(
+                "Skipping workspace-untrusted MCP server '%s': %s",
+                server_name,
+                reason,
+            )
+            continue
 
         if isinstance(config, StdioServerConfig):
             if sandbox_controller.is_profile_ready(mcp_profile_name):
@@ -335,16 +334,6 @@ def _register_mcp_tools(
             continue
 
         if isinstance(config, InProcessServerConfig):
-            if _is_workspace_untrusted_config(config):
-                reason = "workspace_untrusted config cannot use in-process MCP transport"
-                _record_blocked_capability_safely(
-                    sandbox_controller,
-                    name=_mcp_capability_id("mcp_in_process", server_name),
-                    reason=reason,
-                    workspace_root=workspace_root,
-                )
-                logger.warning("Skipping in-process MCP server '%s': %s", server_name, reason)
-                continue
             if sandbox_controller.mode == "host_unsafe_dev_only":
                 sandbox_controller.record_unsafe_capability(
                     _mcp_capability_id("mcp_in_process", server_name),
@@ -424,7 +413,7 @@ def _is_workspace_untrusted_config(config: object) -> bool:
     return getattr(config, "config_trust", "trusted_operator") == "workspace_untrusted"
 
 
-def _mcp_transport_capability_prefix(config: object) -> str | None:
+def _mcp_transport_capability_prefix(config: object) -> str:
     if isinstance(config, StdioServerConfig):
         return "mcp_stdio"
     if isinstance(config, InProcessServerConfig):
@@ -435,7 +424,7 @@ def _mcp_transport_capability_prefix(config: object) -> str | None:
         return "mcp_sse"
     if isinstance(config, WebSocketServerConfig):
         return "mcp_websocket"
-    return None
+    return "mcp_unknown"
 
 
 def create_agent(
