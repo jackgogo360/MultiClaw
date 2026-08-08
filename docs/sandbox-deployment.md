@@ -191,7 +191,7 @@ Status as of August 8, 2026:
 - Exact long-token scanning found no matches; a broader `re_` rule still reports 59 identifier or dummy Bearer false positives.
 - The redaction subset passed with 8 tests.
 - Remaining warnings are pre-existing `aiosqlite` closed-event-loop thread warnings plus one Starlette `httpx`/`TestClient` deprecation warning.
-- macOS breakaway-child behavior is a documented accepted Medium risk: runner timeout cleanup reliably clears the original process group, but a reproduced `setsid`/`setpgid`/double-fork child can survive runner timeout. The diagnostic test harness—not the runner—detects that survivor and precisely `SIGKILL`s its PID during teardown.
+- macOS breakaway-child behavior is a documented accepted Medium risk: runner timeout cleanup reliably clears the original process group, but the characterization test reproduces a `start_new_session`/`setsid` child surviving runner timeout. The diagnostic test harness—not the runner—detects that survivor and precisely `SIGKILL`s its PID during teardown. `setpgid` and double-fork breakaways remain outside the guaranteed contract but were not separately characterized.
 - Current macOS evidence does not show a native kernel or service hook that closes this gap: deny-default plus `deny system-sched` did not block `setsid`, current kqueue headers mark `NOTE_TRACK`/`NOTE_CHILD` unsupported since 10.5, and `launchd bootout` testing did not terminate `setsid` children.
 - macOS nested gating still fails at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'`.
 - The Linux native gate was not executed in this environment.

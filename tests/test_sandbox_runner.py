@@ -559,6 +559,8 @@ async def test_sandbox_runner_timeout_leaves_breakaway_child_alive_accepted_risk
     tmp_path: Path,
 ) -> None:
     record_path = tmp_path / "breakaway-child-pids.json"
+    release_path = tmp_path / "release-breakaway-child"
+    detached_path = tmp_path / "breakaway-child-detached"
     child_code = textwrap.dedent(
         f"""
         import json
@@ -566,10 +568,23 @@ async def test_sandbox_runner_timeout_leaves_breakaway_child_alive_accepted_risk
         import time
         from pathlib import Path
 
-        Path({str(record_path)!r}).write_text(
+        record_path = Path({str(record_path)!r})
+        record_tmp_path = record_path.with_suffix(".tmp")
+        record_tmp_path.write_text(
             json.dumps({{"parent_pid": os.getppid(), "child_pid": os.getpid()}}),
             encoding="utf-8",
         )
+        os.replace(record_tmp_path, record_path)
+
+        release_path = Path({str(release_path)!r})
+        deadline = time.monotonic() + 10.0
+        while not release_path.exists():
+            if time.monotonic() >= deadline:
+                raise SystemExit("breakaway child was not released")
+            time.sleep(0.01)
+
+        os.setsid()
+        Path({str(detached_path)!r}).write_text("detached", encoding="utf-8")
         time.sleep(60)
         """
     ).strip()
@@ -582,12 +597,11 @@ async def test_sandbox_runner_timeout_leaves_breakaway_child_alive_accepted_risk
 
         child = subprocess.Popen(
             [sys.executable, "-c", {child_code!r}],
-            start_new_session=True,
         )
         deadline = time.monotonic() + 2.0
-        while not Path({str(record_path)!r}).exists():
+        while not Path({str(detached_path)!r}).exists():
             if time.monotonic() >= deadline:
-                raise SystemExit("breakaway child did not publish pid record")
+                raise SystemExit("child did not detach")
             time.sleep(0.01)
         time.sleep(60)
         """
@@ -603,11 +617,20 @@ async def test_sandbox_runner_timeout_leaves_breakaway_child_alive_accepted_risk
     parent_pid: int | None = None
     try:
         result_task = asyncio.create_task(
-            SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 0.5)
+            SandboxProcessRunner(term_grace_seconds=0.05).run(spec, 1.0)
         )
         record = await _wait_for_pid_record(record_path, timeout_seconds=1.5)
         parent_pid = record["parent_pid"]
         child_pid = record["child_pid"]
+
+        # The child stays in the runner-owned PGID until its exact PID is known.
+        # If PID acquisition fails, no release is sent and runner cleanup owns it.
+        release_path.write_text("detach", encoding="utf-8")
+        detached_deadline = time.monotonic() + 0.75
+        while not detached_path.exists():
+            if time.monotonic() >= detached_deadline:
+                raise AssertionError("timed out waiting for child to detach")
+            await asyncio.sleep(0.01)
         result = await asyncio.wait_for(result_task, timeout=2.0)
 
         assert result.timed_out is True

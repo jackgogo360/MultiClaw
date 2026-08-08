@@ -95,7 +95,7 @@ CoreToolScheduler
 
 - 公共合同保证的是对启动时原始 process group 的 TERM→KILL，以及仍处于该组内的普通后代清理。
 - 在 macOS 上，不承诺强制清理通过 `setsid(2)`、`setpgid(2)` 或 double-fork 脱离原始 PGID 的恶意或异常子进程。
-- 该限制已在 2026-08-08 稳定复现：runner timeout 后，breakaway 子进程可继续存活；诊断/测试 harness（而非 runner）会检测该 survivor，并在 teardown 中精确清理其 PID，确认无残留。
+- 2026-08-08 的 characterization test 稳定复现了 `start_new_session`/`setsid` 子进程在 runner timeout 后继续存活；诊断/测试 harness（而非 runner）会检测该 survivor，并在 teardown 中精确清理其 PID，确认无残留。`setpgid` 与 double-fork 仍在强制清理合同之外，但未分别建立 characterization 证据。
 - 这不是 Seatbelt host-isolation escape：breakaway 后代仍继承 Seatbelt profile；风险是继续消耗资源、修改已授权 workspace，并继承显式 MCP 网络或环境授权。
 - 影响面集中于 `shell_workspace` 与 `sandbox_allow_subprocesses=true` 的 stdio MCP；`code_exec_python` 与默认 MCP 因 `deny process-fork` 不落入此路径。
 - 当前证据不支持把该限制视为短期内可通过现有 macOS 原语消除：deny-default 和 `deny system-sched` 不阻止 `setsid`；当前 macOS kqueue 头文件明确 `NOTE_TRACK`/`NOTE_CHILD` 自 10.5 起不再支持；`launchd bootout` 实验也未清理 `setsid` 子进程。

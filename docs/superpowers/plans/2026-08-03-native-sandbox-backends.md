@@ -1740,11 +1740,13 @@ Partial note: the macOS nested parent sandbox gate still failed readiness at
 `seatbelt capability check failed: allowed_execution`, so the final native-evidence
 commit remains pending and the Linux nsjail gate was not run.
 
-Superseding note (2026-08-08): security review and reproduction established an
-accepted Medium macOS breakaway-child risk. Task 12 release evidence must therefore
-describe native orphan cleanup as limited to same-PGID descendants, must not claim
-arbitrary breakaway-child termination, and must still keep the macOS
-`allowed_execution` failure plus unrun Linux gate as separate release blockers.
+Superseding note (2026-08-08): security review and a
+`start_new_session`/`setsid` characterization established an accepted Medium macOS
+breakaway-child risk. Task 12 release evidence must therefore describe native orphan
+cleanup as limited to same-PGID descendants, must not claim arbitrary breakaway-child
+termination, and must still keep the macOS `allowed_execution` failure plus unrun
+Linux gate as separate release blockers. `setpgid` and double-fork breakaways remain
+out of contract but were not separately characterized.
 
 - [x] **Step 6: Document deployment and migration**
 
@@ -1899,10 +1901,12 @@ risk remains documented rather than remediated.
 - Security review after fixes: APPROVE WITH RELEASE BLOCKERS; prior CRITICAL env
   laundering and HIGH workspace self-grant fixed.
 - Follow-up security review identified a separate Medium macOS breakaway-child risk;
-  reproduction showed runner timeout still cleans same-PGID descendants, while a
-  breakaway child can survive runner timeout. The diagnostic/test teardown—not the
-  runner—detects and precisely cleans that PID. The user accepted this risk for trusted local use, and
-  final full-branch review remains pending.
+  the `start_new_session`/`setsid` characterization showed runner timeout still
+  cleans same-PGID descendants while the detached child can survive. The
+  diagnostic/test teardown—not the runner—detects and precisely cleans that PID.
+  `setpgid` and double-fork remain out of contract but were not separately
+  characterized. The user accepted this risk for trusted local use, and final
+  full-branch review remains pending.
 - Runner capture contract now enforces 128 KiB per stream; overflow clears both
   streams, returns `output_limit_exceeded`, and terminates the process group,
   resolving the prior fully-buffered Medium.
