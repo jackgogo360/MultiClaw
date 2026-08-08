@@ -163,7 +163,7 @@ Status as of August 7, 2026:
 - Non-native JUnit verification recorded 567 passed, 0 failures, 0 errors, and 0 skipped, for 582 total tests with 15 native-gated cases excluded.
 - `python -m compileall` passed.
 - Runner coverage passed with 24 tests, and the asyncio debug subset passed with 3 tests.
-- Two-phase review completed with 0 Critical, 0 Important, and 0 Minor findings.
+- Runner follow-up specification and quality/security reviews completed with 0 Critical, 0 Important, and 0 Minor findings.
 - Lock-only dependency upgrades were verified exactly at `mcp==1.28.1`, `starlette==1.3.1`, `pydantic-settings==2.14.2`, `cryptography==50.0.0`, `h2==4.4.1`, and `hpack==4.2.0`.
 - `uv sync --locked --offline` and `uv lock --check` both passed.
 - Compatibility verification passed with 116 tests.
@@ -174,6 +174,7 @@ Status as of August 7, 2026:
 - Remaining warnings are pre-existing `aiosqlite` closed-event-loop thread warnings plus one Starlette `httpx`/`TestClient` deprecation warning.
 - macOS nested gating still fails at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'`.
 - The Linux native gate was not executed in this environment.
+- Final full-branch security/completeness review remains pending after this documentation update and the current-host native-gate attempt; Linux real-host evidence remains a separate release gate.
 - Release remains blocked until both real-host native gates pass with the reviewed MCP restrictions enabled.
 
 Release should stay blocked until both native platform gates pass in their real host environments.
