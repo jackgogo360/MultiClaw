@@ -685,6 +685,12 @@ SIGTERM, TERM-ignore/KILL, and descendant cleanup. The orphan test records the c
 PID in a workspace file and asserts `os.kill(pid, 0)` raises `ProcessLookupError`
 after runner completion.
 
+Superseding note (2026-08-08): the accepted public contract is cleanup of the
+original process group plus ordinary descendants that remain in that PGID. macOS
+breakaway children created via `setsid`, `setpgid`, or double-fork are explicitly
+out of contract for forced cleanup; the diagnostic harness must detect any
+surviving recorded PID and terminate it precisely during teardown.
+
 Representative test:
 
 ```python
@@ -756,7 +762,9 @@ runner's responsibility.
 
 Run: `.venv/bin/python -m pytest tests/test_sandbox_runner.py -q`
 
-Expected: PASS, including no surviving descendant PID.
+Expected: PASS, including no surviving descendant PID within the original process
+group; any detected breakaway survivor PID is then cleaned up precisely by the
+diagnostic harness during teardown.
 
 - [x] **Step 5: Commit the runner**
 
@@ -1732,6 +1740,12 @@ Partial note: the macOS nested parent sandbox gate still failed readiness at
 `seatbelt capability check failed: allowed_execution`, so the final native-evidence
 commit remains pending and the Linux nsjail gate was not run.
 
+Superseding note (2026-08-08): security review and reproduction established an
+accepted Medium macOS breakaway-child risk. Task 12 release evidence must therefore
+describe native orphan cleanup as limited to same-PGID descendants, must not claim
+arbitrary breakaway-child termination, and must still keep the macOS
+`allowed_execution` failure plus unrun Linux gate as separate release blockers.
+
 - [x] **Step 6: Document deployment and migration**
 
 `docs/sandbox-deployment.md` must include:
@@ -1862,20 +1876,33 @@ After both native gates and all reviews pass, change the design status to
 “implemented and verified on macOS and Linux” and record the exact backend versions
 and pytest counts in the plan evidence section.
 
-### Partial closeout evidence (2026-08-07)
+Superseding note (2026-08-08): even after accepted-risk documentation lands, do not
+close Task 13 or mark the design dual-platform release-ready until macOS
+`allowed_execution` gating is proven on a real host, Linux native evidence is
+recorded, and final review explicitly confirms the accepted Medium breakaway-child
+risk remains documented rather than remediated.
+
+### Updated closeout evidence (2026-08-08)
 
 - `compileall` passed.
-- Non-native JUnit suite: 567 passed, 0 failures, 0 errors, 0 skipped; 582 total
+- Non-native JUnit suite: 568 passed, 0 failures, 0 errors, 0 skipped; 583 total
   tests with 15 `native_sandbox` cases excluded.
 - Existing warnings are unchanged: `aiosqlite` closed-event-loop thread warnings
   plus one Starlette `httpx`/`TestClient` deprecation warning.
-- Runner contract suite: 24 passed; `asyncio` debug subset: 3 passed; waiter leak
-  fix landed and spec/quality-security review reported 0 Critical/Important/Minor.
+- Runner contract suite: 25 passed; `asyncio` debug subset: 3 passed; the accepted-risk
+  breakaway characterization also passed separately with `PYTHONASYNCIODEBUG=1`;
+  waiter leak fix landed and spec/quality-security review reported 0
+  Critical/Important/Minor.
 - Static risky-launch scan no matches; diff check clean; precise added-line credential
   scan no exact-token matches; broad `re_` rule produced 59 false positives only;
   redaction subset (8 tests) passed.
 - Security review after fixes: APPROVE WITH RELEASE BLOCKERS; prior CRITICAL env
   laundering and HIGH workspace self-grant fixed.
+- Follow-up security review identified a separate Medium macOS breakaway-child risk;
+  reproduction showed runner timeout still cleans same-PGID descendants, while a
+  breakaway child can survive runner timeout. The diagnostic/test teardown—not the
+  runner—detects and precisely cleans that PID. The user accepted this risk for trusted local use, and
+  final full-branch review remains pending.
 - Runner capture contract now enforces 128 KiB per stream; overflow clears both
   streams, returns `output_limit_exceeded`, and terminates the process group,
   resolving the prior fully-buffered Medium.

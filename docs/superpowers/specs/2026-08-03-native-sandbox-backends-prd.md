@@ -62,7 +62,8 @@ unhealthy readiness, and omits blocked risky capabilities.
 - Validate canonical cwd, exact entrypoint, environment grants, filesystem roots,
   network mode, and profile readiness before rendering a launch.
 - One-shot runner owns process groups, stdin, stdout/stderr bytes, timeout, TERM,
-  KILL, and descendant cleanup; the manager owns private-root cleanup.
+  KILL, and cleanup for ordinary descendants that remain in the original process
+  group; the manager owns private-root cleanup.
 - MCP stdio consumes a rendered wrapper through the installed MCP SDK rather than
   reimplementing JSON-RPC transport.
 
@@ -141,6 +142,12 @@ unhealthy readiness, and omits blocked risky capabilities.
 - Linux nsjail is an external deployment prerequisite.
 - Policy rendering never invokes a shell or interpolates raw user values into
   Seatbelt/nsjail policy text.
+- On macOS, the accepted process-lifecycle contract is process-group cleanup, not
+  forced cleanup of every arbitrary descendant after `setsid`, `setpgid`, or
+  double-fork breakaway.
+- This accepted exception is a Medium availability/workspace-integrity risk rather
+  than a Seatbelt host-isolation escape because descendants retain the launched
+  Seatbelt profile.
 - Existing scheduler approval and event ordering remains stable.
 - Normal unit tests run without requiring a native backend; native negative tests
   are explicitly marked and platform-gated.
@@ -170,7 +177,8 @@ negative suites are green.
 3. Unsafe host execution is impossible unless mode is explicit and debug is true;
    startup and every unsafe launch emit high-severity evidence.
 4. Shell compatibility tests cover quoting, pipes, redirects, globbing, env assignment,
-   cwd, stdout/stderr, exit code, timeout, and orphan cleanup.
+   cwd, stdout/stderr, exit code, timeout, and cleanup of descendants that remain in
+   the original process group.
 5. Code-exec preserves success, exception, timeout, and truncation contracts with one
    interpreter child and no multiprocessing helper.
 6. Default shell/code-exec network and outside-workspace writes are denied on both OSes.
@@ -180,6 +188,9 @@ negative suites are green.
 9. Approval/audit/tool events retain current ordering for registered tools.
 10. Relevant unit/integration suite, full backend suite, and platform-native release
     checks pass with no secret-bearing logs or responses.
+11. Release documentation and readiness language state that macOS breakaway-child
+    cleanup is out of contract, accepted for trusted local use, and not a reason to
+    mark the dual-platform native release gate complete.
 
 ## Rollback
 

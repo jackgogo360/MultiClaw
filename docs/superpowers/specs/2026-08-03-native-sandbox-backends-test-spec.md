@@ -112,10 +112,10 @@ Commands:
 | RUN-03 | signal exit | signal metadata populated |
 | RUN-04 | timeout with cooperative child | TERM ends process group |
 | RUN-05 | timeout with TERM-ignoring child | KILL after two-second grace |
-| RUN-06 | child forks descendant | no descendant remains after timeout |
+| RUN-06 | child forks descendant that stays in the original PGID | no descendant remaining in the original process group after timeout |
 | RUN-07 | spawn raises OSError | typed launch error, no success result |
 | RUN-08 | stdin payload | fully delivered, then closed |
-| RUN-09 | parent task cancellation | process group terminated and no descendant remains |
+| RUN-09 | parent task cancellation | process group terminated and no descendant remaining in the original process group |
 | RUN-10 | manager success, timeout, cancellation, and pre-spawn failure | per-launch private root removed |
 
 ## Backend rendering cases
@@ -160,7 +160,7 @@ snapshot volatile correlation IDs or temp paths.
 | SH-08 | oversized stdout/stderr | current 30,000-char truncation contract preserved |
 | SH-09 | outside-workspace write | denied on native backends |
 | SH-10 | local host TCP listener | connection denied when network disabled |
-| SH-11 | timeout/fork tree | timeout marker and zero remaining descendants |
+| SH-11 | timeout/fork tree within the original PGID | timeout marker and no same-PGID descendants remaining after timeout |
 
 ### Code execution
 
@@ -214,8 +214,20 @@ snapshot volatile correlation IDs or temp paths.
 
 Each native test creates a workspace and a separate sentinel directory owned by the
 test parent. It starts a local TCP listener on the parent host for deterministic
-network denial and records child PIDs for orphan checks. Tests never contact the
-public internet.
+network denial and records child PIDs for process-group cleanup checks.
+Tests never contact the public internet.
+
+Accepted risk / out-of-contract behavior:
+
+- Native orphan semantics cover the original process group only.
+- macOS breakaway children that escape the original PGID via `setsid`, `setpgid`, or
+  double-fork patterns are explicitly out of contract for forced cleanup.
+- A reproduced breakaway survivor after runner timeout is therefore a documented
+  accepted-risk result, not by itself a test failure against RUN-06, RUN-09, or SH-11.
+- The recorded breakaway PID is diagnostic/test-harness state, not runner contract.
+- Test teardown must detect any surviving breakaway PID, precisely clean it up, and
+  confirm no residual process remains so tests can prove the launched task and
+  same-PGID descendants were terminated.
 
 macOS gate proves:
 
@@ -223,6 +235,8 @@ macOS gate proves:
 - outside write, `.git` write, `.env` read, parent TCP listener access, and code child
   creation are denied.
 - allowed workspace write and Python runtime reads succeed.
+- same-PGID timeout descendants are cleaned up; breakaway descendants are documented
+  as accepted out of contract.
 
 Linux gate proves the same behavior through nsjail and additionally verifies the
 expected namespace/mount view from inside the jail.

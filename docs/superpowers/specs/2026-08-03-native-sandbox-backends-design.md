@@ -2,7 +2,7 @@
 
 **日期**：2026-08-03
 
-**状态**：已批准，实施计划与测试规格已制定，已实现；发布验证待 macOS/Linux 原生门禁
+**状态**：已实现，并于 2026-08-08 增补 macOS breakaway-child accepted-risk 合同；发布验证仍待 macOS `allowed_execution` 原生门禁与 Linux 原生门禁
 
 **范围**：macOS `sandbox-exec` + Seatbelt、Linux nsjail；运行时自动选择；本文件只定义设计，不包含实现
 
@@ -89,7 +89,16 @@ CoreToolScheduler
 
 在 `shell_string` 模式中，目标 argv 固定为 `/bin/sh -c <raw command>`。在 `exec_argv` 模式中不经过 shell。
 
-一次性进程启动后开始计时；超时先向进程组发送 `SIGTERM`，等待 2 秒，再发送 `SIGKILL`。stdout/stderr 按字节独立捕获，每个流都有 128 KiB 硬上限；任一流超限时立即终止整个进程组，`completion_state=output_limit_exceeded`，并清空 stdout/stderr 两个返回流，不返回部分输出。`SandboxProcessRunner` 负责本地 `proc.wait()` waiter 的创建与清理，不改变调用方 waiter ownership。
+一次性进程启动后开始计时；超时先向启动时原始进程组发送 `SIGTERM`，等待 2 秒，再发送 `SIGKILL`。stdout/stderr 按字节独立捕获，每个流都有 128 KiB 硬上限；任一流超限时立即终止整个进程组，`completion_state=output_limit_exceeded`，并清空 stdout/stderr 两个返回流，不返回部分输出。`SandboxProcessRunner` 负责本地 `proc.wait()` waiter 的创建与清理，不改变调用方 waiter ownership，并清理仍留在原始 PGID 内的普通后代。
+
+### 已接受限制：macOS breakaway child
+
+- 公共合同保证的是对启动时原始 process group 的 TERM→KILL，以及仍处于该组内的普通后代清理。
+- 在 macOS 上，不承诺强制清理通过 `setsid(2)`、`setpgid(2)` 或 double-fork 脱离原始 PGID 的恶意或异常子进程。
+- 该限制已在 2026-08-08 稳定复现：runner timeout 后，breakaway 子进程可继续存活；诊断/测试 harness（而非 runner）会检测该 survivor，并在 teardown 中精确清理其 PID，确认无残留。
+- 这不是 Seatbelt host-isolation escape：breakaway 后代仍继承 Seatbelt profile；风险是继续消耗资源、修改已授权 workspace，并继承显式 MCP 网络或环境授权。
+- 影响面集中于 `shell_workspace` 与 `sandbox_allow_subprocesses=true` 的 stdio MCP；`code_exec_python` 与默认 MCP 因 `deny process-fork` 不落入此路径。
+- 当前证据不支持把该限制视为短期内可通过现有 macOS 原语消除：deny-default 和 `deny system-sched` 不阻止 `setsid`；当前 macOS kqueue 头文件明确 `NOTE_TRACK`/`NOTE_CHILD` 自 10.5 起不再支持；`launchd bootout` 实验也未清理 `setsid` 子进程。
 
 MCP stdio 是长生命周期进程：MultiClaw 只把沙箱 wrapper 的 command/args/cwd/env 传给 MCP SDK 的 `StdioServerParameters`，继续使用 `stdio_client` 的 JSON-RPC、关闭 stdin、TERM 和 KILL 流程，不重写 MCP 协议。
 
@@ -254,14 +263,21 @@ MCP tool call 仍经过现有 scheduler。stdio 沙箱事件发生在服务器�
 
 部署、迁移、原生验证命令与回滚说明见 `docs/sandbox-deployment.md`。
 
+运营建议：
+
+- 原生 subprocess 能力仅建议在可信本地 macOS 主机上启用。
+- 生产环境不要启用 `host_unsafe_dev_only`，也不要把 timeout 审计记录解读为“任意 breakaway 后代均已停止”的证明。
+- macOS subprocess-enabled 工作负载超时后，应补充残余进程监控与人工/运维清理预案。
+
 ## 验证与验收
 
-当前验证状态（2026-08-07）：
+当前验证状态（2026-08-08）：
 
-- 非原生全量套件通过：582 总测试中排除 15 个 `native_sandbox` 后，JUnit 结果为 567 passed、0 failures、0 errors、0 skipped。
-- runner 合同套件 24 passed，`asyncio` debug 子集 3 passed；waiter leak 已修复。
+- 非原生全量套件通过：583 总测试中排除 15 个 `native_sandbox` 后，JUnit 结果为 568 passed、0 failures、0 errors、0 skipped。
+- runner 合同套件 25 passed，`asyncio` debug 子集 3 passed；新增的 accepted-risk breakaway characterization test 也在 `PYTHONASYNCIODEBUG=1` 下单独通过，waiter leak 已修复。
 - 精确 lock-only 依赖升级为 `mcp` 1.28.1、`starlette` 1.3.1、`pydantic-settings` 2.14.2、`cryptography` 50.0.0、`h2` 4.4.1、`hpack` 4.2.0；`uv sync --locked --offline`、`uv lock --check`、兼容性回归 116 passed、`pip-audit` 2.10.1 均通过。
 - 先前“fully-buffered stdout/stderr” Medium 风险已由 bounded capture + overflow 时零输出返回语义解决。
+- 2026-08-08 安全复审确认一个独立的 macOS breakaway-child Medium 风险：原始进程组与测试 PID 清理可验证，但 breakaway 子进程不在当前强制清理合同内；用户已接受该风险。
 - macOS 原生门禁在嵌套父沙箱环境仍失败于 `seatbelt capability check failed: allowed_execution`；Linux 原生门禁尚未执行，因此发布仍 blocked。
 
 单元测试覆盖 OS 选择、请求互斥校验、profile 渲染、env scrub、路径规则、旧值迁移、unsafe fallback 门禁。
@@ -294,7 +310,7 @@ MCP tool call 仍经过现有 scheduler。stdio 沙箱事件发生在服务器�
 
 1. **系统升级使 backend 不可用**：行为 probe 阻止危险能力注册，readiness 失败，绝不回退宿主执行。
 2. **profile 过严破坏合法命令或 MCP**：runtime-root 探测、shell 兼容矩阵和明确拒绝诊断阻止操作者盲目开启 unsafe fallback。
-3. **超时/断开留下孤儿进程**：一次性进程组 TERM→KILL 测试和 MCP connect/disconnect/reconnect 后的进程清点作为发布门禁。
+3. **超时/断开留下同组后代进程**：一次性进程组 TERM→KILL 测试和 MCP connect/disconnect/reconnect 后的进程清点作为发布门禁；macOS 上脱离原始 PGID 的 breakaway 子进程属于已记录并接受的独立限制。
 
 ## ADR
 
