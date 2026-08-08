@@ -57,7 +57,9 @@ nsjail_config_dir = ""
 Grant extra stdio MCP access explicitly and minimally. Never embed literal credentials in config files.
 
 - High-privilege local MCP settings must come from a trusted operator-managed config outside the workspace.
-- Workspace `.mcp.json` files are conservative-only:
+- Workspace `.mcp.json` files marked `workspace_untrusted` never auto-connect, even when they request only conservative defaults.
+- Move any MCP server that should connect at startup into an explicit operator-managed config outside the workspace, then point MultiClaw at that trusted config path.
+- Trusted operator-managed stdio configs may still use the conservative defaults below when no extra grants are needed:
   - `sandbox_network = "disabled"`
   - `sandbox_workspace = "ro"`
   - `sandbox_allow_subprocesses = false`
@@ -182,7 +184,7 @@ Status as of August 8, 2026:
 - Non-native JUnit verification recorded 568 passed, 0 failures, 0 errors, and 0 skipped, for 583 total tests with 15 native-gated cases excluded.
 - `python -m compileall` passed.
 - Runner coverage passed with 25 tests, and the asyncio debug subset passed with 3 tests. The accepted-risk breakaway characterization also passed separately with `PYTHONASYNCIODEBUG=1`.
-- Runner follow-up specification and quality/security reviews completed with 0 Critical, 0 Important, and 0 Minor findings.
+- Earlier focused runner follow-up specification and quality/security reviews completed with 0 Critical, 0 Important, and 0 Minor findings.
 - Lock-only dependency upgrades were verified exactly at `mcp==1.28.1`, `starlette==1.3.1`, `pydantic-settings==2.14.2`, `cryptography==50.0.0`, `h2==4.4.1`, and `hpack==4.2.0`.
 - `uv sync --locked --offline` and `uv lock --check` both passed.
 - Compatibility verification passed with 116 tests.
@@ -192,6 +194,7 @@ Status as of August 8, 2026:
 - The redaction subset passed with 8 tests.
 - Remaining warnings are pre-existing `aiosqlite` closed-event-loop thread warnings plus one Starlette `httpx`/`TestClient` deprecation warning.
 - macOS breakaway-child behavior is a documented accepted Medium risk: runner timeout cleanup reliably clears the original process group, but the characterization test reproduces a `start_new_session`/`setsid` child surviving runner timeout. The diagnostic test harness—not the runner—detects that survivor and precisely `SIGKILL`s its PID during teardown. `setpgid` and double-fork breakaways remain outside the guaranteed contract but were not separately characterized.
+- A later final full-branch security/completeness review found and this branch remediated a High trust-boundary issue: `workspace_untrusted` MCP configs could still auto-connect through stdio or remote transports. Those configs now never auto-connect and must be moved to an operator-managed config outside the workspace. Final rereview of the full branch is still required.
 - Current macOS evidence does not show a native kernel or service hook that closes this gap: deny-default plus `deny system-sched` did not block `setsid`, current kqueue headers mark `NOTE_TRACK`/`NOTE_CHILD` unsupported since 10.5, and `launchd bootout` testing did not terminate `setsid` children.
 - macOS nested gating still fails at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'`.
 - The Linux native gate was not executed in this environment.

@@ -186,6 +186,11 @@ nsjail_config_dir = ""
 
 stdio MCP 增加：`cwd`（省略时工作区根）、`sandbox_network=disabled|inherit`、`sandbox_workspace=ro|rw`、`sandbox_allow_subprocesses`、`sandbox_env_allowlist` 和 `sandbox_read_only_paths`。网络继承、工作区写入、子进程、secret-shaped env 与额外 runtime roots 都是显式安全授权，启动时记录服务器名和授权类型；每次启动最多允许 16 个额外只读根目录。受控 `PATH` 只由平台基线和这些显式 runtime roots 中可执行的 `bin` 目录组成，不继承宿主 `PATH`。
 
+补充说明（2026-08-08，覆盖旧的 conservative-only 假设）：工作区内或经工作区信任判定为
+`workspace_untrusted` 的 MCP 配置只保留“可解析、可审计 provenance”的作用，不再允许任何
+transport 自动连接。注册层必须在 transport 分支前统一拒绝这些配置；只有工作区外的受信
+任 operator-managed 配置可以启动 stdio、HTTP、SSE、WebSocket 或 in-process MCP。
+
 ## Fail-closed 与 readiness
 
 启动阶段先完成 probe 与注册门禁、收集跳过能力，再冻结且只创建一次不可变 `SandboxReadiness`，存入 `app.state.sandbox_readiness`，并由新增 `/health/ready` 返回后端、probe、各 profile、跳过能力和 unsafe fallback 状态。
@@ -195,8 +200,10 @@ stdio MCP 增加：`cwd`（省略时工作区根）、`sandbox_network=disabled|
 - 服务 liveness 保持正常，便于登录和查看诊断。
 - readiness 返回失败，阻止生产流量或部署继续推进。
 - 在注册阶段跳过 `shell` 和 `code_exec`。
-- 在调用 `MCPClientManager.connect_servers(...)` 前过滤 stdio MCP；不启动、不注册。
-- 远程 HTTP/SSE/WS MCP 可继续注册，但日志明确标注“无本地 OS 沙箱边界”。
+- 在调用 `MCPClientManager.connect_servers(...)` 前过滤所有 `workspace_untrusted`
+  MCP；不启动、不连接、不注册。
+- 只有受信任 operator-managed 的远程 HTTP/SSE/WS MCP 可继续注册，并在日志中明确标注
+  “无本地 OS 沙箱边界”。
 - in-process MCP 在 `auto` 中禁止，只能在 `host_unsafe_dev_only` 中启用。
 
 不存在“探测失败后自动改为宿主进程”的路径。
