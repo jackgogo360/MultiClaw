@@ -1,13 +1,16 @@
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import httpx
 
 from multiclaw.agent.context import ContextBuilder, ContextRequest
-from multiclaw.agent.models import Action, ActionType, Observation, ObservationType
+from multiclaw.agent.models import Observation, ObservationType
+from multiclaw.agent.resilience import ResilienceAction, ResilienceController
+from multiclaw.agent.tool_batch import ToolBatchExecutor, ToolCallOutcome, ToolCallSpec
 from multiclaw.agent.toolcall import ToolCallAgent
 from multiclaw.config import Settings
 from multiclaw.events import AgentState, EventBus
@@ -18,26 +21,46 @@ from multiclaw.tools import CoreToolScheduler, ToolRegistry
 from multiclaw.skills import SkillManager
 
 logger = logging.getLogger(__name__)
+DSML_TOOLCALL_PATTERN = re.compile(
+    r"<｜｜DSML｜｜tool_calls>.*?</｜｜DSML｜｜tool_calls>",
+    re.DOTALL,
+)
+DSML_TAG_PATTERN = re.compile(r"</?｜｜DSML｜｜[^>]*>")
+FINAL_SUMMARY_PLAIN_TEXT_PROMPT = (
+    "You have reached the tool limit. "
+    "Do not call any tools. "
+    "Do not output DSML, XML, HTML, or any tool-call tags. "
+    "Using only the information already gathered in the conversation, "
+    "answer directly in plain Markdown for the user."
+)
+REFLECTION_PROMPT = (
+    "Runtime reflection required. The previous approach made no progress: {reason}. "
+    "Explain the likely root cause in at most 120 words and choose materially different "
+    "tools or parameters. Do not call tools in this reflection."
+)
 
 
-def _build_assistant_tool_calls_msg(response: LLMResponse) -> dict:
+def _build_assistant_tool_calls_msg(
+    calls: list[dict[str, Any]],
+    reasoning_content: str = "",
+) -> dict:
     msg: dict = {
         "role": "assistant",
         "content": None,
         "tool_calls": [
             {
-                "id": tc.id or f"call_{i}",
+                "id": tc["id"] or f"call_{i}",
                 "type": "function",
                 "function": {
-                    "name": tc.name,
-                    "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                    "name": tc["name"],
+                    "arguments": json.dumps(tc["arguments"], ensure_ascii=False),
                 },
             }
-            for i, tc in enumerate(response.tool_calls)
+            for i, tc in enumerate(calls)
         ],
     }
-    if response.reasoning_content:
-        msg["reasoning_content"] = response.reasoning_content
+    if reasoning_content:
+        msg["reasoning_content"] = reasoning_content
     return msg
 
 
@@ -71,8 +94,118 @@ class MultiClawAgent(ToolCallAgent):
             recent_turns=settings.memory.recent_turns,
             context_history_ratio=settings.memory.context_history_ratio,
             include_legacy_memory=settings.memory.include_legacy_memory_in_retrieval,
+            progressive_enabled=settings.memory.progressive_context_enabled,
+            response_reserve_tokens=settings.memory.context_response_reserve_tokens,
+            l1_ratio=settings.memory.context_l1_ratio,
         )
         self.skill_manager = skill_manager or SkillManager()
+        self.tool_batch_executor = ToolBatchExecutor(
+            registry=registry,
+            scheduler=scheduler,
+            max_concurrency=settings.tools.parallel_max_concurrency,
+            enabled=settings.tools.parallel_read_only_enabled,
+        )
+
+    def _build_resilience_controller(self) -> ResilienceController | None:
+        if not self.settings.agent.resilience_enabled:
+            return None
+        return ResilienceController(
+            repeat_limit=self.settings.agent.no_progress_repeat_limit,
+            max_reflections=self.settings.agent.reflection_max_attempts,
+        )
+
+    async def _generate_reflection(
+        self,
+        messages: list[dict[str, Any]],
+        reason: str,
+    ) -> str:
+        prompt = REFLECTION_PROMPT.format(reason=reason)
+        response = await self.router.completion(
+            model=self.settings.llm.default_model,
+            messages=[*messages, {"role": "system", "content": prompt}],
+            tools=None,
+        )
+        reflection = response.content.strip()
+        return reflection or "Use a materially different approach."
+
+    async def _attempt_reflection(
+        self,
+        messages: list[dict[str, Any]],
+        reason: str,
+    ) -> str | None:
+        try:
+            reflection = await self._generate_reflection(messages, reason)
+        except Exception:
+            logger.exception("reflection generation failed")
+            return None
+        return reflection
+
+    @staticmethod
+    def _normalize_tool_calls(calls: list[Any]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for i, call in enumerate(calls):
+            if hasattr(call, "name") and hasattr(call, "arguments"):
+                call_id = getattr(call, "id", "") or f"call_{i}"
+                name = call.name
+                arguments = call.arguments
+            else:
+                call_id = call.get("id") or f"call_{i}"
+                name = call["name"]
+                arguments = call["arguments"]
+            normalized.append(
+                {
+                    "id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _build_reflection_feedback_msg(reflection: str) -> dict[str, str]:
+        return {
+            "role": "system",
+            "content": f"Runtime reflection feedback: {reflection}",
+        }
+
+    def _require_tool_batch_executor(self) -> ToolBatchExecutor:
+        executor = getattr(self, "tool_batch_executor", None)
+        if executor is None:
+            raise RuntimeError("tool_batch_executor is not initialized")
+        return executor
+
+    async def _build_context(self, request: ContextRequest) -> list[dict[str, Any]]:
+        result = await self.context_builder.build_with_report(request)
+        logger.info(
+            "context_budget used=%s dropped=%s limit=%d reserve=%d",
+            result.report.used_tokens_by_level,
+            result.report.dropped_by_level,
+            result.report.limit_tokens,
+            result.report.reserved_response_tokens,
+        )
+        return result.messages
+
+    @staticmethod
+    def _build_tool_call_specs(calls: list[dict[str, Any]]) -> list[ToolCallSpec]:
+        return [
+            ToolCallSpec(
+                call_id=call["id"],
+                name=call["name"],
+                arguments=call["arguments"],
+            )
+            for call in calls
+        ]
+
+    async def _execute_tool_batch(
+        self,
+        calls: list[dict[str, Any]],
+    ) -> list[ToolCallOutcome]:
+        if not calls:
+            return []
+        await self.transition(AgentState.ACTING)
+        return await self._require_tool_batch_executor().execute(
+            self._build_tool_call_specs(calls)
+        )
 
     # ------------------------------------------------------------------
     # non-streaming path
@@ -101,7 +234,7 @@ class MultiClawAgent(ToolCallAgent):
 
         skill_prompts = self.skill_manager.get_active_skill_prompts()
 
-        messages = await self.context_builder.build(
+        messages = await self._build_context(
             ContextRequest(
                 system_prompt=self.settings.agent.system_prompt,
                 user_input=user_msg,
@@ -113,6 +246,7 @@ class MultiClawAgent(ToolCallAgent):
         await self._save_chat_msg(user_msg, "user", session_id)
         tools = self.registry.to_openai_schemas()
         max_rounds = self.settings.agent.max_tool_rounds
+        controller = self._build_resilience_controller()
 
         for _ in range(max_rounds):
             response: LLMResponse = await self.router.completion(
@@ -128,23 +262,51 @@ class MultiClawAgent(ToolCallAgent):
                     content=response.content,
                 )
 
-            # Execute each tool call
-            assistant_msg = _build_assistant_tool_calls_msg(response)
-            messages.append(assistant_msg)
+            normalized_calls = self._normalize_tool_calls(response.tool_calls)
+            if controller is not None:
+                call_decision = controller.observe_calls(normalized_calls)
+                if call_decision.action == ResilienceAction.REFLECT:
+                    reflection = await self._attempt_reflection(
+                        messages, call_decision.reason
+                    )
+                    if reflection is None:
+                        break
+                    controller.mark_reflection_used()
+                    messages.append(self._build_reflection_feedback_msg(reflection))
+                    continue
+                if call_decision.action == ResilienceAction.TERMINATE:
+                    break
 
-            for i, tc in enumerate(response.tool_calls):
-                call_id = tc.id or f"call_{i}"
-                action = Action(
-                    type=ActionType.TOOL_CALL,
-                    tool_name=tc.name,
-                    tool_params=tc.arguments,
-                )
-                await self.transition(AgentState.ACTING)
-                obs = await self.act(action)
+            assistant_msg = _build_assistant_tool_calls_msg(
+                normalized_calls,
+                response.reasoning_content,
+            )
+            messages.append(assistant_msg)
+            outcomes = await self._execute_tool_batch(normalized_calls)
+            result_contents = [outcome.observation.content for outcome in outcomes]
+
+            for outcome in outcomes:
                 messages.append(
-                    _build_tool_result_msg(call_id, obs.content)
+                    _build_tool_result_msg(
+                        outcome.call_id,
+                        outcome.observation.content,
+                    )
                 )
-                await self.remember(obs.content, "tool_result")
+                await self.remember(outcome.observation.content, "tool_result")
+
+            if controller is not None:
+                result_decision = controller.observe_results(result_contents)
+                if result_decision.action == ResilienceAction.REFLECT:
+                    reflection = await self._attempt_reflection(
+                        messages, result_decision.reason
+                    )
+                    if reflection is None:
+                        break
+                    controller.mark_reflection_used()
+                    messages.append(self._build_reflection_feedback_msg(reflection))
+                    continue
+                if result_decision.action == ResilienceAction.TERMINATE:
+                    break
 
         # Max rounds exceeded — force a final summary without tools
         logger.warning(
@@ -152,15 +314,14 @@ class MultiClawAgent(ToolCallAgent):
             max_rounds, session_id, len(messages),
         )
         try:
-            response = await self.router.completion(
-                model=self.settings.llm.default_model,
-                messages=messages,
-                tools=None,
+            full_text = await self._generate_final_summary(
+                messages,
+                self._collect_completion_text_response,
             )
-            await self._save_chat_msg(response.content, "assistant", session_id)
+            await self._save_chat_msg(full_text, "assistant", session_id)
             return Observation(
                 type=ObservationType.USER_RESPONSE,
-                content=response.content,
+                content=full_text,
             )
         except Exception:
             logger.exception("final summary failed")
@@ -172,6 +333,65 @@ class MultiClawAgent(ToolCallAgent):
     # ------------------------------------------------------------------
     # streaming path
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _contains_dsml_tool_markup(text: str) -> bool:
+        return "<｜｜DSML｜｜" in text
+
+    @staticmethod
+    def _strip_dsml_tool_markup(text: str) -> str:
+        cleaned = DSML_TOOLCALL_PATTERN.sub("", text)
+        cleaned = DSML_TAG_PATTERN.sub("", cleaned)
+        return cleaned.strip()
+
+    async def _collect_completion_text_response(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        response = await self.router.completion(
+            model=self.settings.llm.default_model,
+            messages=messages,
+            tools=None,
+        )
+        return response.content
+
+    async def _collect_plain_text_response(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        full_text = ""
+        reasoning_text = ""
+        async for event in self.router.stream_completion(
+            model=self.settings.llm.default_model,
+            messages=messages,
+            tools=None,
+        ):
+            if event["type"] == "token":
+                full_text += event["content"]
+            elif event["type"] == "reasoning":
+                reasoning_text += event["content"]
+        return full_text or reasoning_text
+
+    async def _generate_final_summary(
+        self,
+        messages: list[dict[str, Any]],
+        collect_response: Callable[
+            [list[dict[str, Any]]],
+            Awaitable[str],
+        ],
+    ) -> str:
+        full_text = await collect_response(messages)
+        if self._contains_dsml_tool_markup(full_text):
+            logger.warning(
+                "DSML tool markup detected in forced final summary, retrying with stricter plain-text prompt"
+            )
+            retry_messages = [
+                {"role": "system", "content": FINAL_SUMMARY_PLAIN_TEXT_PROMPT},
+                *messages,
+            ]
+            retry_text = await collect_response(retry_messages)
+            full_text = retry_text or full_text
+        return self._strip_dsml_tool_markup(full_text)
 
     async def handle_message_stream(
         self, user_input: str, session_id: str = ""
@@ -209,7 +429,7 @@ class MultiClawAgent(ToolCallAgent):
 
         skill_prompts = self.skill_manager.get_active_skill_prompts()
 
-        messages = await self.context_builder.build(
+        messages = await self._build_context(
             ContextRequest(
                 system_prompt=self.settings.agent.system_prompt,
                 user_input=user_msg,
@@ -221,12 +441,17 @@ class MultiClawAgent(ToolCallAgent):
         await self._save_chat_msg(user_msg, "user", session_id)
         tools = self.registry.to_openai_schemas()
         max_rounds = self.settings.agent.max_tool_rounds
+        controller = self._build_resilience_controller()
 
         for round_num in range(max_rounds):
             logger.info("round %d/%d, messages=%d", round_num + 1, max_rounds, len(messages))
             for i, msg in enumerate(messages):
                 logger.info("  msg[%d] role=%s tc=%s", i, msg.get("role"), bool(msg.get("tool_calls")))
             full_text = ""
+            reasoning_text = ""
+            handled_tool_calls = False
+            reflect_requested = False
+            terminate_requested = False
 
             try:
                 async for event in self.router.stream_completion(
@@ -239,6 +464,7 @@ class MultiClawAgent(ToolCallAgent):
                         yield event
 
                     elif event["type"] == "reasoning":
+                        reasoning_text += event["content"]
                         yield event
 
                     elif event["type"] == "tool_calls":
@@ -249,59 +475,99 @@ class MultiClawAgent(ToolCallAgent):
                             event.get("reasoning_content", "")[:120],
                         )
                         reasoning = event.get("reasoning_content", "")
-                        for tc in event["calls"]:
+                        normalized_calls = self._normalize_tool_calls(event["calls"])
+                        if controller is not None:
+                            call_decision = controller.observe_calls(normalized_calls)
+                            if call_decision.action == ResilienceAction.REFLECT:
+                                reflection = await self._attempt_reflection(
+                                    messages, call_decision.reason
+                                )
+                                if reflection is None:
+                                    terminate_requested = True
+                                    break
+                                controller.mark_reflection_used()
+                                messages.append(
+                                    self._build_reflection_feedback_msg(reflection)
+                                )
+                                yield {
+                                    "type": "state",
+                                    "name": "reflection",
+                                    "content": reflection,
+                                }
+                                reflect_requested = True
+                                break
+                            if call_decision.action == ResilienceAction.TERMINATE:
+                                terminate_requested = True
+                                break
+
+                        for call in normalized_calls:
                             yield {
                                 "type": "tool_call",
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
+                                "call_id": call["id"],
+                                "name": call["name"],
+                                "arguments": call["arguments"],
                             }
 
-                        tool_calls_msg: dict = {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": tc["id"] or f"call_{i}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc["name"],
-                                        "arguments": json.dumps(
-                                            tc["arguments"], ensure_ascii=False
-                                        ),
-                                    },
-                                }
-                                for i, tc in enumerate(event["calls"])
-                            ],
-                        }
-                        if reasoning:
-                            tool_calls_msg["reasoning_content"] = reasoning
+                        tool_calls_msg = _build_assistant_tool_calls_msg(
+                            normalized_calls,
+                            reasoning,
+                        )
                         messages.append(tool_calls_msg)
+                        outcomes = await self._execute_tool_batch(normalized_calls)
+                        result_contents: list[str] = []
 
-                        for i, tc in enumerate(event["calls"]):
-                            call_id = tc["id"] or f"call_{i}"
-                            action = Action(
-                                type=ActionType.TOOL_CALL,
-                                tool_name=tc["name"],
-                                tool_params=tc["arguments"],
-                            )
-                            await self.transition(AgentState.ACTING)
-                            obs = await self.act(action)
-
+                        for outcome in outcomes:
                             yield {
                                 "type": "tool_result",
-                                "name": tc["name"],
-                                "content": obs.content,
+                                "call_id": outcome.call_id,
+                                "name": outcome.name,
+                                "content": outcome.observation.content,
                             }
 
+                            result_contents.append(outcome.observation.content)
                             messages.append(
-                                _build_tool_result_msg(call_id, obs.content)
+                                _build_tool_result_msg(
+                                    outcome.call_id,
+                                    outcome.observation.content,
+                                )
                             )
-                            await self.remember(obs.content, "tool_result")
+                            await self.remember(
+                                outcome.observation.content,
+                                "tool_result",
+                            )
 
+                        if controller is not None:
+                            result_decision = controller.observe_results(result_contents)
+                            if result_decision.action == ResilienceAction.REFLECT:
+                                reflection = await self._attempt_reflection(
+                                    messages, result_decision.reason
+                                )
+                                if reflection is None:
+                                    terminate_requested = True
+                                else:
+                                    controller.mark_reflection_used()
+                                    messages.append(
+                                        self._build_reflection_feedback_msg(reflection)
+                                    )
+                                    yield {
+                                        "type": "state",
+                                        "name": "reflection",
+                                        "content": reflection,
+                                    }
+                                    reflect_requested = True
+                            elif result_decision.action == ResilienceAction.TERMINATE:
+                                terminate_requested = True
+
+                        handled_tool_calls = True
                         break  # tool_calls handled, continue outer loop
 
                 else:
-                    # No tool_calls — pure text response
+                    # No tool_calls — pure text response.
+                    # DeepSeek thinking mode may emit only reasoning_content with no
+                    # content deltas; use reasoning as the visible text in that case.
+                    if not full_text and reasoning_text:
+                        full_text = reasoning_text
+                        yield {"type": "token", "content": full_text}
                     logger.info("streaming complete, text_len=%d", len(full_text))
                     await self._save_chat_msg(full_text, "assistant", session_id)
                     await self.transition(AgentState.FINISHED)
@@ -319,25 +585,24 @@ class MultiClawAgent(ToolCallAgent):
                 }
                 return
 
+            if terminate_requested:
+                break
+            if reflect_requested or handled_tool_calls:
+                continue
+
         # Max rounds exceeded — force a final summary without tools
         logger.warning(
             "max tool rounds (%d) exceeded for session=%s, forcing final summary with %d messages",
             max_rounds, session_id, len(messages),
         )
-        full_text = ""
         try:
-            async for event in self.router.stream_completion(
-                model=self.settings.llm.default_model,
-                messages=messages,
-                tools=None,  # no tools — force text response
-            ):
-                if event["type"] == "token":
-                    full_text += event["content"]
-                    yield event
-                elif event["type"] == "reasoning":
-                    yield event
+            full_text = await self._generate_final_summary(
+                messages,
+                self._collect_plain_text_response,
+            )
             if full_text:
                 await self._save_chat_msg(full_text, "assistant", session_id)
+                yield {"type": "token", "content": full_text}
             yield {"type": "done", "content": full_text, "data": {}}
         except Exception:
             logger.exception("final summary failed")

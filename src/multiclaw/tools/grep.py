@@ -194,6 +194,7 @@ class GrepToolBuilder(WorkspaceToolBuilder):
     name = "grep"
     description = "Search file contents in the workspace."
     parameters_schema = GrepParams
+    read_only = True
 
     def validate(self, params: dict) -> GrepParams:
         return GrepParams(**params)

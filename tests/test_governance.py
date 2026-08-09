@@ -105,74 +105,80 @@ async def test_in_memory_audit_logger_history_is_tamper_resistant():
 
 
 @pytest.mark.asyncio
-async def test_process_sandbox_runs_async_callable():
-    from multiclaw.governance import ProcessSandbox
+async def test_execution_guard_runs_async_callable():
+    from multiclaw.governance import ExecutionGuard
 
-    sandbox = ProcessSandbox()
+    guard = ExecutionGuard()
 
     async def operation():
         return "done"
 
-    result = await sandbox.run(operation)
+    result = await guard.run(operation)
 
     assert result == "done"
 
 
 @pytest.mark.asyncio
-async def test_process_sandbox_runs_sync_callable():
-    from multiclaw.governance import ProcessSandbox
+async def test_execution_guard_runs_sync_callable():
+    from multiclaw.governance import ExecutionGuard
 
-    sandbox = ProcessSandbox()
+    guard = ExecutionGuard()
 
     def operation():
         return "done"
 
-    result = await sandbox.run(operation)
+    result = await guard.run(operation)
 
     assert result == "done"
 
 
 @pytest.mark.asyncio
-async def test_process_sandbox_times_out_async_operation():
-    from multiclaw.governance import ProcessSandbox, SandboxTimeoutError
+async def test_execution_guard_times_out_async_operation():
+    from multiclaw.governance import ExecutionGuard, ExecutionTimeoutError
 
-    sandbox = ProcessSandbox(timeout=0.05)
+    guard = ExecutionGuard(timeout=0.05)
 
     async def operation():
         await asyncio.sleep(10)
         return "never"
 
-    with pytest.raises(SandboxTimeoutError, match="timed out"):
-        await sandbox.run(operation)
+    with pytest.raises(ExecutionTimeoutError, match="timed out"):
+        await guard.run(operation)
 
 
 @pytest.mark.asyncio
-async def test_process_sandbox_times_out_sync_operation():
-    from multiclaw.governance import ProcessSandbox, SandboxTimeoutError
+async def test_execution_guard_times_out_sync_operation():
+    from multiclaw.governance import ExecutionGuard, ExecutionTimeoutError
 
-    sandbox = ProcessSandbox(timeout=0.05)
+    guard = ExecutionGuard(timeout=0.05)
 
     def operation():
         import time
         time.sleep(10)
         return "never"
 
-    with pytest.raises(SandboxTimeoutError, match="timed out"):
-        await sandbox.run(operation)
+    with pytest.raises(ExecutionTimeoutError, match="timed out"):
+        await guard.run(operation)
 
 
 def test_governance_package_exports():
     from multiclaw import governance
     from multiclaw.governance import (
         AuditLog,
+        ExecutionGuard,
+        ExecutionTimeoutError,
         InMemoryAuditLogger,
         PermissionChecker,
         PermissionDecision,
-        ProcessSandbox,
+        SandboxExecRequest,
+        SandboxProcessRunner,
     )
 
     assert governance.AuditLog is AuditLog
+    assert governance.ExecutionGuard is ExecutionGuard
+    assert governance.ExecutionTimeoutError is ExecutionTimeoutError
     assert governance.InMemoryAuditLogger is InMemoryAuditLogger
     assert governance.PermissionChecker is PermissionChecker
     assert governance.PermissionDecision is PermissionDecision
-    assert governance.ProcessSandbox is ProcessSandbox
+    assert governance.SandboxExecRequest is SandboxExecRequest
+    assert governance.SandboxProcessRunner is SandboxProcessRunner

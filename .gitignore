@@ -10,6 +10,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!frontend/src/lib/
+!frontend/src/lib/**
 lib64/
 parts/
 sdist/
@@ -35,6 +37,13 @@ data/
 *.log
 *.jsonl
 .DS_Store
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.idea/
 
 # Runtime data
 .omx/

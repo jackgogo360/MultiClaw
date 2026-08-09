@@ -1,12 +1,21 @@
 import asyncio
+import hashlib
+import inspect
 import json
 import logging
+import re
+import threading
+import tempfile
 from contextlib import asynccontextmanager
+from collections.abc import Iterable
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from time import perf_counter
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 LOG_DIR = Path.home() / ".multiclaw" / "logs"
@@ -78,7 +87,15 @@ def _friendly_error(exc: Exception) -> str:
 from multiclaw.agent import MultiClawAgent
 from multiclaw.config import Settings
 from multiclaw.events import Event, EventBus
-from multiclaw.governance import InMemoryAuditLogger, PermissionChecker, ProcessSandbox
+from multiclaw.governance import (
+    ExecutionGuard,
+    InMemoryAuditLogger,
+    PermissionChecker,
+    SandboxController,
+    SandboxProcessRunner,
+    SandboxReadiness,
+)
+from multiclaw.governance.sandbox.manager import SandboxManager
 from multiclaw.llm import ModelRouter
 from multiclaw.memory import SqliteMemory
 from multiclaw.planner import Planner
@@ -98,10 +115,27 @@ from multiclaw.tools.shell import ShellToolBuilder
 from multiclaw.tools.web_fetch import WebFetchToolBuilder
 from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
+from multiclaw.mcp import (
+    MCPClientManager,
+    MCPToolBuilder,
+    ToolInfo,
+    load_mcp_config,
+    load_mcp_tools_config,
+)
+from multiclaw.mcp.types import (
+    HTTPServerConfig,
+    InProcessServerConfig,
+    SSEServerConfig,
+    StdioServerConfig,
+    WebSocketServerConfig,
+)
+
+from uuid import uuid4
 
 from multiclaw.auth.store import AuthStore
 from multiclaw.auth.middleware import AuthMiddleware, require_auth
 from multiclaw.auth.router import router as auth_router
+from multiclaw.stream import DataStreamEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +144,293 @@ from multiclaw.auth.router import router as auth_router
 
 agent: MultiClawAgent
 shared_bus: EventBus
+_PUBLIC_SECRET_PATTERN = re.compile(
+    r"(?:ghp_[A-Za-z0-9_]{1,255}|sk-[A-Za-z0-9_]{1,255}|Bearer\s+\S+"
+    r"|token=[^\s&,;\"']{1,255}|key=[^\s&,;\"']{1,255})",
+    re.IGNORECASE,
+)
+_PUBLIC_ASSIGNMENT_PATTERN = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_.-]*)\b\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_PUBLIC_AUTHORIZATION_PATTERN = re.compile(
+    r"(?i)\bAuthorization\s*:\s*Bearer\s+[^\s,;]+"
+)
+_PUBLIC_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
 
 
-def create_agent() -> MultiClawAgent:
+def _sanitize_mcp_namespace(name: str) -> str:
+    return "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in name)
+
+
+def _mcp_namespace_prefix(server_name: str) -> str:
+    return f"mcp__{_sanitize_mcp_namespace(server_name)}__"
+
+
+def _sanitize_public_reason(
+    reason: str,
+    *,
+    workspace_root: Path | None = None,
+) -> str:
+    text = reason.strip()
+    text = _PUBLIC_AUTHORIZATION_PATTERN.sub("Authorization: [REDACTED]", text)
+    text = _PUBLIC_BEARER_PATTERN.sub("Bearer [REDACTED]", text)
+    text = _PUBLIC_ASSIGNMENT_PATTERN.sub(r"\1=[REDACTED]", text)
+    text = _PUBLIC_SECRET_PATTERN.sub("[REDACTED]", text)
+    if not text:
+        return ""
+
+    path_markers = {tempfile.gettempdir(), str(Path.home())}
+    if workspace_root is not None:
+        resolved = workspace_root.resolve()
+        path_markers.update({str(workspace_root), str(resolved)})
+
+    if any(marker and marker in text for marker in path_markers):
+        return "details redacted"
+    if "/." in text or "\\." in text:
+        return "details redacted"
+    if "/" in text or "\\" in text:
+        return "details redacted"
+    return text
+
+
+def _sanitize_public_readiness(
+    readiness: SandboxReadiness,
+    *,
+    workspace_root: Path | None,
+) -> SandboxReadiness:
+    return readiness.model_copy(
+        update={
+            "probe": readiness.probe.model_copy(
+                update={
+                    "reason": _sanitize_public_reason(
+                        readiness.probe.reason,
+                        workspace_root=workspace_root,
+                    )
+                }
+            ),
+            "skipped_capabilities": {
+                _sanitize_mcp_namespace(name): _sanitize_public_reason(
+                    reason,
+                    workspace_root=workspace_root,
+                )
+                for name, reason in readiness.skipped_capabilities.items()
+            },
+        }
+    )
+
+
+def _record_blocked_capability_safely(
+    controller: SandboxController,
+    *,
+    name: str,
+    reason: str,
+    workspace_root: Path,
+) -> None:
+    controller.record_blocked_capability(
+        name,
+        _sanitize_public_reason(reason, workspace_root=workspace_root),
+    )
+
+
+def _mcp_capability_id(prefix: str, server_name: str) -> str:
+    readable = _sanitize_mcp_namespace(server_name).strip("_") or "server"
+    digest = hashlib.sha256(server_name.encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}_{readable}_{digest}"
+
+
+def _build_mcp_adapters(
+    server_name: str,
+    tools: list[ToolInfo],
+    manager: MCPClientManager,
+    tool_filter: dict[str, list[str]] | None,
+) -> list[MCPToolBuilder]:
+    from multiclaw.mcp.config import _matches_tool_filter
+
+    prefix = _mcp_namespace_prefix(server_name)
+    adapters: list[MCPToolBuilder] = []
+    for tool in tools:
+        if tool_filter and not _matches_tool_filter(tool.original_name, tool_filter):
+            continue
+        adapter = MCPToolBuilder.from_tool_info(tool, manager)
+        if not adapter.name.startswith(prefix):
+            adapter.name = f"{prefix}{_sanitize_mcp_namespace(tool.original_name)}"
+        adapters.append(adapter)
+    return adapters
+
+
+def _register_mcp_tools(
+    *,
+    registry: ToolRegistry,
+    mcp_manager: MCPClientManager,
+    config_path: str | None,
+    sandbox_controller: SandboxController | None,
+    workspace_root: Path,
+    mcp_profile_name: str,
+) -> None:
+    if sandbox_controller is None:
+        raise RuntimeError("sandbox controller is required for MCP transport gating")
+
+    configs = _load_mcp_config_for_workspace(
+        config_path,
+        workspace_root=workspace_root,
+    )
+    if not configs:
+        logger.info("No MCP servers configured (no .mcp.json found)")
+        return
+
+    tools_configs = load_mcp_tools_config(config_path)
+    registry_lock = threading.RLock()
+    refreshed_servers: set[str] = set()
+
+    def _replace_server_namespace(server_name: str, tools: list[ToolInfo]) -> list[MCPToolBuilder]:
+        adapters = _build_mcp_adapters(
+            server_name,
+            tools,
+            mcp_manager,
+            tools_configs.get(server_name),
+        )
+        registry.replace_namespace(_mcp_namespace_prefix(server_name), adapters)
+        return adapters
+
+    def _refresh_registry(server_name: str, tools: list[ToolInfo]) -> None:
+        with registry_lock:
+            _replace_server_namespace(server_name, tools)
+            refreshed_servers.add(server_name)
+
+    filtered_configs: dict[str, object] = {}
+    for server_name, config in configs.items():
+        if _is_workspace_untrusted_config(config):
+            capability_prefix = _mcp_transport_capability_prefix(config)
+            reason = (
+                "workspace_untrusted MCP configs never auto-connect; "
+                "move this server to an operator-managed config outside the workspace"
+            )
+            _record_blocked_capability_safely(
+                sandbox_controller,
+                name=_mcp_capability_id(capability_prefix, server_name),
+                reason=reason,
+                workspace_root=workspace_root,
+            )
+            logger.warning(
+                "Skipping workspace-untrusted MCP server '%s': %s",
+                server_name,
+                reason,
+            )
+            continue
+
+        if isinstance(config, StdioServerConfig):
+            if sandbox_controller.is_profile_ready(mcp_profile_name):
+                filtered_configs[server_name] = config
+                continue
+
+            reason = f"sandbox profile {mcp_profile_name!r} is not ready"
+            _record_blocked_capability_safely(
+                sandbox_controller,
+                name=_mcp_capability_id("mcp_stdio", server_name),
+                reason=reason,
+                workspace_root=workspace_root,
+            )
+            logger.warning("Skipping stdio MCP server '%s': %s", server_name, reason)
+            continue
+
+        if isinstance(config, InProcessServerConfig):
+            if sandbox_controller.mode == "host_unsafe_dev_only":
+                sandbox_controller.record_unsafe_capability(
+                    _mcp_capability_id("mcp_in_process", server_name),
+                    "unsafe transport kept for development",
+                )
+                filtered_configs[server_name] = config
+                logger.warning(
+                    "Keeping in-process MCP server '%s' with unsafe host execution enabled",
+                    server_name,
+                )
+                continue
+
+            reason = "in-process MCP transport requires host_unsafe_dev_only"
+            _record_blocked_capability_safely(
+                sandbox_controller,
+                name=_mcp_capability_id("mcp_in_process", server_name),
+                reason=reason,
+                workspace_root=workspace_root,
+            )
+            logger.warning("Skipping in-process MCP server '%s': %s", server_name, reason)
+            continue
+
+        if isinstance(config, (HTTPServerConfig, SSEServerConfig, WebSocketServerConfig)):
+            logger.info(
+                "Keeping remote MCP server '%s' unsandboxed transport=%s transport_remote_unsandboxed=true",
+                server_name,
+                config.transport_type.value,
+            )
+        filtered_configs[server_name] = config
+
+    mcp_manager.set_tools_changed_callback(_refresh_registry)
+
+    try:
+        mcp_manager.connect_servers(filtered_configs)
+        states = mcp_manager.get_server_states()
+        for server_name, state in states.items():
+            if state.status.value == "connected":
+                tool_filter = tools_configs.get(server_name)
+                skipped = len(state.tools)
+                with registry_lock:
+                    if server_name in refreshed_servers:
+                        adapters = _build_mcp_adapters(
+                            server_name,
+                            state.tools,
+                            mcp_manager,
+                            tool_filter,
+                        )
+                    else:
+                        adapters = _replace_server_namespace(server_name, state.tools)
+                registered = len(adapters)
+                skipped -= registered
+                logger.info(
+                    "Registered %d tools from MCP server '%s'%s",
+                    registered, server_name,
+                    f" ({skipped} filtered)" if skipped else "",
+                )
+            else:
+                logger.warning(
+                    "MCP server '%s' failed to connect: %s",
+                    server_name, state.error,
+                )
+    except Exception:
+        logger.exception("Failed to connect MCP servers")
+
+
+def _load_mcp_config_for_workspace(
+    config_path: str | None,
+    *,
+    workspace_root: Path,
+) -> dict[str, object]:
+    if "workspace_root" in inspect.signature(load_mcp_config).parameters:
+        return load_mcp_config(config_path, workspace_root=workspace_root)
+    return load_mcp_config(config_path)
+
+
+def _is_workspace_untrusted_config(config: object) -> bool:
+    return getattr(config, "config_trust", "trusted_operator") == "workspace_untrusted"
+
+
+def _mcp_transport_capability_prefix(config: object) -> str:
+    if isinstance(config, StdioServerConfig):
+        return "mcp_stdio"
+    if isinstance(config, InProcessServerConfig):
+        return "mcp_in_process"
+    if isinstance(config, HTTPServerConfig):
+        return "mcp_http"
+    if isinstance(config, SSEServerConfig):
+        return "mcp_sse"
+    if isinstance(config, WebSocketServerConfig):
+        return "mcp_websocket"
+    return "mcp_unknown"
+
+
+def create_agent(
+    *,
+    sandbox_controller: SandboxController | None = None,
+) -> MultiClawAgent:
     global shared_bus
     shared_bus = EventBus()
 
@@ -134,6 +452,16 @@ def create_agent() -> MultiClawAgent:
     if settings.skill.enabled if hasattr(settings, 'skill') else True:
         skill_manager.discover()
 
+    if sandbox_controller is None:
+        sandbox_controller = SandboxManager.create(
+            settings=settings.governance.sandbox,
+            debug=settings.app.debug,
+            workspace_root=workspace_root,
+            event_bus=shared_bus,
+            runner=SandboxProcessRunner(),
+        )
+    sandbox_controller.initialize()
+
     registry = ToolRegistry()
     read_builder = ReadFileToolBuilder(workspace_root)
     edit_builder = EditFileToolBuilder(workspace_root)
@@ -145,10 +473,63 @@ def create_agent() -> MultiClawAgent:
     registry.register(ListDirToolBuilder(workspace_root))
     registry.register(GrepToolBuilder(workspace_root))
     registry.register(FindDirToolBuilder(workspace_root))
-    registry.register(ShellToolBuilder(workspace_root))
-    registry.register(CodeExecToolBuilder(workspace_root))
-    registry.register(WebFetchToolBuilder(workspace_root))
+    if sandbox_controller.is_profile_ready(settings.governance.sandbox.profiles.shell):
+        registry.register(
+            ShellToolBuilder(
+                workspace_root,
+                sandbox_controller=sandbox_controller,
+                profile_name=settings.governance.sandbox.profiles.shell,
+            )
+        )
+    else:
+        _record_blocked_capability_safely(
+            sandbox_controller,
+            name="shell",
+            reason=f"sandbox profile {settings.governance.sandbox.profiles.shell!r} is not ready",
+            workspace_root=workspace_root,
+        )
+    if sandbox_controller.is_profile_ready(settings.governance.sandbox.profiles.code_exec):
+        registry.register(
+            CodeExecToolBuilder(
+                workspace_root,
+                sandbox_controller=sandbox_controller,
+                profile_name=settings.governance.sandbox.profiles.code_exec,
+            )
+        )
+    else:
+        _record_blocked_capability_safely(
+            sandbox_controller,
+            name="code_exec",
+            reason=f"sandbox profile {settings.governance.sandbox.profiles.code_exec!r} is not ready",
+            workspace_root=workspace_root,
+        )
+    registry.register(
+        WebFetchToolBuilder(
+            workspace_root,
+            allow_private_networks=settings.tools.web_fetch_allow_private_networks,
+        )
+    )
     registry.register(WebSearchToolBuilder(workspace_root))
+
+    # Register MCP tools if enabled
+    mcp_manager = None
+    if settings.mcp.enabled:
+        mcp_manager = MCPClientManager(
+            sandbox_controller=sandbox_controller,
+            workspace_root=workspace_root,
+        )
+        _register_mcp_tools(
+            registry=registry,
+            mcp_manager=mcp_manager,
+            config_path=(
+                settings.mcp.config_path if settings.mcp.config_path else None
+            ),
+            sandbox_controller=sandbox_controller,
+            workspace_root=workspace_root,
+            mcp_profile_name=settings.governance.sandbox.profiles.mcp_stdio,
+        )
+
+    readiness = sandbox_controller.finalize_readiness()
 
     scheduler = CoreToolScheduler(
         permission_checker=PermissionChecker(
@@ -160,7 +541,7 @@ def create_agent() -> MultiClawAgent:
                 "code_exec",
             }
         ),
-        sandbox=ProcessSandbox(),
+        execution_guard=ExecutionGuard(),
         audit_logger=InMemoryAuditLogger(),
         event_bus=shared_bus,
     )
@@ -176,6 +557,10 @@ def create_agent() -> MultiClawAgent:
         skill_manager=skill_manager,
     )
     runtime_agent.session_store = SqliteSessionStore(settings.database.path)
+    runtime_agent.mcp_manager = mcp_manager
+    runtime_agent.sandbox_controller = sandbox_controller
+    runtime_agent.sandbox_readiness = readiness
+    runtime_agent.workspace_root = workspace_root
     return runtime_agent
 
 
@@ -192,17 +577,70 @@ async def lifespan(app: FastAPI):
     await auth_store.initialize()
     app.state.auth_store = auth_store
     app.state.settings = agent.settings
-    yield
+    app.state.sandbox_readiness = agent.sandbox_readiness
+    app.state.workspace_root = getattr(agent, "workspace_root", None)
+    sandbox_controller = getattr(agent, "sandbox_controller", None)
+    if sandbox_controller is not None:
+        for event in sandbox_controller.drain_startup_events():
+            await shared_bus.publish(event)
+    try:
+        yield
+    finally:
+        try:
+            if hasattr(agent, "mcp_manager") and agent.mcp_manager:
+                try:
+                    agent.mcp_manager.stop()
+                except Exception:
+                    logger.warning("MCP manager shutdown failed; details redacted")
+        finally:
+            if sandbox_controller is not None:
+                try:
+                    sandbox_controller.close()
+                except Exception:
+                    logger.warning(
+                        "Sandbox controller reported residual startup state during shutdown; details redacted"
+                    )
 
 
 app = FastAPI(title="MultiClaw", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 app.include_router(auth_router)
+app.include_router(auth_router, prefix="/api")
+
+api = APIRouter(prefix="/api")
+
+
+@app.middleware("http")
+async def log_http_requests(request, call_next):
+    started = perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (perf_counter() - started) * 1000
+        logger.exception(
+            "HTTP %s %s -> 500 (%.1fms)",
+            request.method,
+            request.url.path,
+            duration_ms,
+        )
+        raise
+
+    duration_ms = (perf_counter() - started) * 1000
+    logger.info(
+        "HTTP %s %s -> %d (%.1fms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str | None = None
     session_id: str | None = None
+    id: str | None = None
+    messages: list[dict[str, Any]] | None = None
 
 
 class SessionCreateRequest(BaseModel):
@@ -218,13 +656,42 @@ class ApproveRequest(BaseModel):
     approved: bool
 
 
-@app.post("/approve")
+@app.get("/health/ready")
+async def health_ready(request: Request):
+    readiness = getattr(request.app.state, "sandbox_readiness", None)
+    if readiness is None:
+        payload = {
+            "ready": False,
+            "mode": "auto",
+            "backend_name": "unknown",
+            "probe": {
+                "backend_name": "unknown",
+                "available": False,
+                "capabilities": {},
+                "reason": "readiness unavailable",
+            },
+            "profiles": {},
+            "skipped_capabilities": {"sandbox_readiness": "readiness unavailable"},
+            "unsafe_fallback_active": False,
+        }
+        return JSONResponse(payload, status_code=503)
+
+    workspace_root = getattr(request.app.state, "workspace_root", None)
+    public_readiness = _sanitize_public_readiness(
+        readiness,
+        workspace_root=workspace_root.resolve() if isinstance(workspace_root, Path) else workspace_root,
+    )
+    payload = public_readiness.model_dump(mode="json")
+    return JSONResponse(payload, status_code=200 if readiness.ready else 503)
+
+
+@api.post("/approve")
 async def approve(req: ApproveRequest, user: dict = Depends(require_auth)):
     ok = agent.scheduler.resolve_approval(req.request_id, req.approved)
     return {"ok": ok}
 
 
-@app.get("/sessions")
+@api.get("/sessions")
 async def list_sessions(include_archived: bool = False, user: dict = Depends(require_auth)):
     sessions = await agent.session_store.list_sessions(
         include_archived=include_archived, user_id=user["id"]
@@ -232,13 +699,13 @@ async def list_sessions(include_archived: bool = False, user: dict = Depends(req
     return [session.model_dump(mode="json") for session in sessions]
 
 
-@app.post("/sessions")
+@api.post("/sessions")
 async def create_session(req: SessionCreateRequest, user: dict = Depends(require_auth)):
     session = await agent.session_store.create(title=req.title, user_id=user["id"])
     return session.model_dump(mode="json")
 
 
-@app.patch("/sessions/{session_id}")
+@api.patch("/sessions/{session_id}")
 async def rename_session(session_id: str, req: SessionRenameRequest, user: dict = Depends(require_auth)):
     session = await agent.session_store.get(session_id)
     if session is None or session.user_id != user["id"]:
@@ -247,7 +714,7 @@ async def rename_session(session_id: str, req: SessionRenameRequest, user: dict 
     return session.model_dump(mode="json")
 
 
-@app.post("/sessions/{session_id}/archive")
+@api.post("/sessions/{session_id}/archive")
 async def archive_session(session_id: str, user: dict = Depends(require_auth)):
     session = await agent.session_store.get(session_id)
     if session is None or session.user_id != user["id"]:
@@ -256,7 +723,7 @@ async def archive_session(session_id: str, user: dict = Depends(require_auth)):
     return session.model_dump(mode="json")
 
 
-@app.post("/sessions/{session_id}/restore")
+@api.post("/sessions/{session_id}/restore")
 async def restore_session(session_id: str, user: dict = Depends(require_auth)):
     session = await agent.session_store.get(session_id)
     if session is None or session.user_id != user["id"]:
@@ -265,7 +732,7 @@ async def restore_session(session_id: str, user: dict = Depends(require_auth)):
     return session.model_dump(mode="json")
 
 
-@app.delete("/sessions/{session_id}")
+@api.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, user: dict = Depends(require_auth)):
     session = await agent.session_store.get(session_id)
     if session is None or session.user_id != user["id"]:
@@ -274,7 +741,7 @@ async def delete_session(session_id: str, user: dict = Depends(require_auth)):
     return {"ok": True}
 
 
-@app.get("/sessions/{session_id}/messages")
+@api.get("/sessions/{session_id}/messages")
 async def get_session_messages(session_id: str, limit: int = 50, user: dict = Depends(require_auth)):
     session = await agent.session_store.get(session_id)
     if session is None or session.user_id != user["id"]:
@@ -282,39 +749,75 @@ async def get_session_messages(session_id: str, limit: int = 50, user: dict = De
     return await agent.session_store.get_messages(session_id, limit)
 
 
-@app.post("/chat")
+@api.post("/chat")
 async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
     """SSE streaming — real token streaming from LLM with state events."""
+    message = _resolve_chat_message(req)
+    requested_session_id = req.session_id or req.id
 
     # Resolve or create session
     session = None
-    if req.session_id:
-        session = await agent.session_store.get(req.session_id)
+    if requested_session_id:
+        session = await agent.session_store.get(requested_session_id)
         if session is None or session.user_id != user["id"]:
-            raise HTTPException(status_code=404, detail="session not found")
-        if session.status == SessionStatus.ARCHIVED:
+            session = None
+        elif session.status == SessionStatus.ARCHIVED:
             raise HTTPException(status_code=409, detail="session is archived")
-    else:
+    if session is None:
         session = await agent.session_store.create(user_id=user["id"])
 
     # Update session activity (title from first message)
-    await agent.session_store.touch_message(session.id, req.message)
+    session = await agent.session_store.touch_message(session.id, message)
 
     async def event_stream():
-        logger.info("SSE stream started, message=%r, session=%r", req.message[:80], session.id)
+        logger.info("SSE stream started, message=%r, session=%r", message[:80], session.id)
+        enc = DataStreamEncoder()
+        text_part_id: str | None = None
+        reasoning_part_id: str | None = None
+        step_open = False
+        pending_tool_results = 0
 
-        # Emit session event first
-        yield (
-            "data: "
-            + json.dumps(
-                {
-                    "type": "session",
-                    "session_id": session.id,
-                    "title": session.title,
-                }
-            )
-            + "\n\n"
+        def close_text_part() -> list[str]:
+            nonlocal text_part_id
+            if text_part_id is None:
+                return []
+            chunks = [enc.text_end(text_part_id)]
+            text_part_id = None
+            return chunks
+
+        def close_reasoning_part() -> list[str]:
+            nonlocal reasoning_part_id
+            if reasoning_part_id is None:
+                return []
+            chunks = [enc.reasoning_end(reasoning_part_id)]
+            reasoning_part_id = None
+            return chunks
+
+        def close_open_parts() -> list[str]:
+            return [*close_reasoning_part(), *close_text_part()]
+
+        def open_step() -> list[str]:
+            nonlocal step_open
+            if step_open:
+                return []
+            step_open = True
+            return [enc.start_step()]
+
+        def close_step() -> list[str]:
+            nonlocal step_open
+            if not step_open:
+                return []
+            step_open = False
+            return [enc.finish_step()]
+
+        yield enc.start()
+        yield enc.data_part(
+            "data-session",
+            session.model_dump(mode="json"),
+            transient=True,
         )
+        for chunk in open_step():
+            yield chunk
 
         token_queue: asyncio.Queue[dict] = asyncio.Queue()
         event_queue: asyncio.Queue[Event] = asyncio.Queue()
@@ -326,7 +829,7 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
 
         async def run_stream():
             try:
-                async for item in agent.handle_message_stream(req.message, session_id=session.id):
+                async for item in agent.handle_message_stream(message, session_id=session.id):
                     await token_queue.put(item)
             except Exception as exc:
                 logger.exception("stream error")
@@ -337,7 +840,6 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
 
         try:
             while True:
-                # Non-blocking drain of the token stream
                 token_count = 0
                 while True:
                     try:
@@ -347,79 +849,109 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
 
                     token_count += 1
                     if item["type"] == "token":
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                {"type": "token", "content": item["content"]},
-                                ensure_ascii=False,
-                            )
-                            + "\n\n"
-                        )
+                        for chunk in open_step():
+                            yield chunk
+                        for chunk in close_reasoning_part():
+                            yield chunk
+                        if text_part_id is None:
+                            text_part_id = uuid4().hex
+                            yield enc.text_start(text_part_id)
+                        yield enc.text_delta(text_part_id, item["content"])
                     elif item["type"] == "done":
                         logger.info("stream done, tokens=%d, content_len=%d", token_count, len(item.get("content", "")))
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                {"type": "done", "content": item["content"], "data": item.get("data", {})},
-                                ensure_ascii=False,
-                            )
-                            + "\n\n"
-                        )
+                        for chunk in close_open_parts():
+                            yield chunk
+                        for chunk in close_step():
+                            yield chunk
+                        yield enc.finish("stop")
                         return
                     elif item["type"] == "error":
                         logger.error("stream error: %s", item["content"])
-                        yield (
-                            "data: "
-                            + json.dumps({"type": "error", "content": item["content"]})
-                            + "\n\n"
-                        )
+                        for chunk in close_open_parts():
+                            yield chunk
+                        for chunk in close_step():
+                            yield chunk
+                        yield enc.error(item["content"])
                         return
-                    else:
-                        # Forward tool_call, tool_result, reasoning, and any new types
-                        yield (
-                            "data: "
-                            + json.dumps(item, ensure_ascii=False)
-                            + "\n\n"
+                    elif item["type"] == "tool_call":
+                        for chunk in open_step():
+                            yield chunk
+                        for chunk in close_open_parts():
+                            yield chunk
+                        pending_tool_results += 1
+                        tool_call_id = item.get("call_id") or uuid4().hex
+                        yield enc.tool_input_available(
+                            tool_call_id,
+                            item["name"],
+                            item.get("arguments", {}),
                         )
+                    elif item["type"] == "tool_result":
+                        for chunk in close_open_parts():
+                            yield chunk
+                        tool_call_id = item.get("call_id", "")
+                        if item.get("is_error", False):
+                            yield enc.tool_output_error(tool_call_id, item.get("content", ""))
+                        else:
+                            yield enc.tool_output_available(
+                                tool_call_id,
+                                {"content": item.get("content", "")},
+                            )
+                        if pending_tool_results > 0:
+                            pending_tool_results -= 1
+                        if pending_tool_results == 0:
+                            for chunk in close_step():
+                                yield chunk
+                    elif item["type"] == "reasoning":
+                        for chunk in open_step():
+                            yield chunk
+                        for chunk in close_text_part():
+                            yield chunk
+                        if reasoning_part_id is None:
+                            reasoning_part_id = uuid4().hex
+                            yield enc.reasoning_start(reasoning_part_id)
+                        yield enc.reasoning_delta(reasoning_part_id, item["content"])
+                    else:
+                        yield enc.data_part("data-state", {"item": item}, transient=True)
 
-                # Non-blocking drain of bus events
                 while not event_queue.empty():
                     evt = event_queue.get_nowait()
                     if evt.type == "tool.awaiting_approval":
                         logger.info(
-                            "SSE yield approval_required: request_id=%s tool=%s",
+                            "yield approval_required: request_id=%s tool=%s",
                             evt.data.get("request_id"), evt.data.get("tool"),
                         )
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                {
-                                    "type": "approval_required",
-                                    "request_id": evt.data.get("request_id", ""),
-                                    "tool": evt.data.get("tool", ""),
-                                    "params": evt.data.get("params", {}),
-                                    "description": evt.data.get("description", ""),
-                                }
-                            )
-                            + "\n\n"
+                        for chunk in open_step():
+                            yield chunk
+                        for chunk in close_open_parts():
+                            yield chunk
+                        tool_call_id = evt.data.get("call_id") or uuid4().hex
+                        yield enc.tool_input_available(
+                            tool_call_id,
+                            evt.data.get("tool", ""),
+                            evt.data.get("params", {}),
+                        )
+                        yield enc.tool_approval_request(
+                            evt.data.get("request_id", ""),
+                            tool_call_id,
                         )
                     else:
-                        yield (
-                            "data: "
-                            + json.dumps({"type": "state", "state": evt.type})
-                            + "\n\n"
-                        )
+                        yield enc.data_part("data-state", {"state": evt.type}, transient=True)
 
-                # Check if stream task crashed
                 if stream_task.done():
                     exc = stream_task.exception()
                     if exc:
                         logger.exception("stream task crashed")
-                        yield (
-                            "data: "
-                            + json.dumps({"type": "error", "content": str(exc)})
-                            + "\n\n"
-                        )
+                        for chunk in close_open_parts():
+                            yield chunk
+                        for chunk in close_step():
+                            yield chunk
+                        yield enc.error(str(exc))
+                    else:
+                        for chunk in close_open_parts():
+                            yield chunk
+                        for chunk in close_step():
+                            yield chunk
+                        yield enc.finish("stop")
                     return
 
                 await asyncio.sleep(0.02)
@@ -428,7 +960,47 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
             shared_bus.unsubscribe(sub_id)
             logger.info("SSE stream ended")
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"X-Vercel-AI-Data-Stream": "v1"},
+    )
+
+
+def _resolve_chat_message(req: ChatRequest) -> str:
+    if req.message:
+        return req.message
+
+    message = _extract_latest_user_message(req.messages or [])
+    if message:
+        return message
+
+    raise HTTPException(status_code=422, detail="No user message found in request")
+
+
+def _extract_latest_user_message(messages: list[dict[str, Any]]) -> str | None:
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        text = _extract_message_text(message)
+        if text:
+            return text
+    return None
+
+
+def _extract_message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Iterable) and not isinstance(content, (str, bytes, dict)):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "".join(parts)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +1017,14 @@ async def index():
     return HTMLResponse(content=_CHAT_HTML)
 
 
+# Mount static assets built by Vite (JS, CSS bundles)
+_STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/assets", StaticFiles(directory=str(_STATIC_DIR / "assets")), name="assets")
+
+
 @app.get("/multiclaw.png")
 async def favicon():
     return FileResponse(_PNG_PATH, media_type="image/png")
+
+
+app.include_router(api)

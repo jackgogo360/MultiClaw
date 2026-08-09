@@ -6,11 +6,11 @@ from typing import TypeVar
 T = TypeVar("T")
 
 
-class SandboxTimeoutError(asyncio.TimeoutError):
+class ExecutionTimeoutError(asyncio.TimeoutError):
     pass
 
 
-class ProcessSandbox:
+class ExecutionGuard:
     def __init__(self, timeout: float = 30.0) -> None:
         self._timeout = timeout
 
@@ -23,6 +23,6 @@ class ProcessSandbox:
         try:
             return await asyncio.wait_for(coro, timeout=self._timeout)
         except asyncio.TimeoutError:
-            raise SandboxTimeoutError(
+            raise ExecutionTimeoutError(
                 f"Operation timed out after {self._timeout}s"
             )

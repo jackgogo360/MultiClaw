@@ -129,14 +129,15 @@ Research body.
     assert "last30days" in skill.keyword_triggers
 
 
-def test_no_frontmatter_defaults_to_manual():
+def test_no_frontmatter_defaults_to_name_keyword():
     content = "Just plain text, no frontmatter."
     with tempfile.TemporaryDirectory() as tmp:
         path = _make_skill_dir(Path(tmp), "plain", content)
         skill = parse_skill_file(path)
 
     assert skill.name == "plain"
-    assert skill.metadata.triggers[0].type == TriggerType.MANUAL
+    assert skill.metadata.triggers[0].type == TriggerType.KEYWORD
+    assert skill.keyword_triggers == ["plain"]
 
 
 def test_idempotent_load_body():
@@ -178,7 +179,7 @@ def test_project_overrides_user():
         discovery = SkillDiscovery(project_root=tmp, user_dirs=[user_dir])
         skills = discovery.discover()
 
-    assert skills["shared"].keyword_triggers == ["deploy"]
+    assert skills["shared"].keyword_triggers == ["shared", "deploy"]
 
 
 def test_empty_dirs_no_error():

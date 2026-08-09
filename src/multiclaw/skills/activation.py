@@ -6,7 +6,7 @@ import fnmatch
 import logging
 
 from multiclaw.skills.types import Skill, DisclosureLevel
-from multiclaw.skills.parser import load_skill_body
+from multiclaw.skills.parser import load_skill_body, load_skill_resources
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +56,13 @@ class SkillActivator:
         return matched
 
     def activate(self, skill: Skill) -> Skill:
-        """Activate a skill: load its body and mark as active."""
+        """Activate a skill: load body, then resources, mark as active."""
         if skill.level == DisclosureLevel.METADATA:
             load_skill_body(skill)
             logger.info("Loaded body for skill '%s' (%d chars)", skill.name, len(skill.body))
+        load_skill_resources(skill)
+        if skill.resources:
+            logger.info("Loaded %d resource(s) for skill '%s'", len(skill.resources), skill.name)
         skill.active = True
         return skill
 

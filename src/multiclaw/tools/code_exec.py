@@ -1,79 +1,31 @@
-"""CodeExecTool — execute Python code in a sandboxed subprocess."""
+"""CodeExecTool — execute Python code in a sandboxed interpreter."""
 
 from __future__ import annotations
 
-import multiprocessing
 import sys
-import traceback
-from io import StringIO
-from typing import Any
+import uuid
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
+from multiclaw.tools import _code_runner
+from multiclaw.governance import (
+    SandboxConfigurationError,
+    SandboxController,
+    SandboxExecRequest,
+    SandboxLaunchError,
+    SandboxPolicyError,
+    SandboxUnavailableError,
+)
 from multiclaw.tools._common import WorkspaceToolBuilder, _error, _success
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
 
 DEFAULT_TIMEOUT = 30.0
 MAX_TIMEOUT = 300.0
 MAX_OUTPUT_CHARS = 30_000
-
-SAFE_BUILTINS = {
-    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
-    "callable", "chr", "complex", "dict", "dir", "divmod", "enumerate",
-    "filter", "float", "format", "frozenset", "getattr", "hasattr",
-    "hash", "hex", "id", "int", "isinstance", "issubclass", "iter",
-    "len", "list", "map", "max", "min", "next", "object", "oct",
-    "ord", "pow", "print", "range", "repr", "reversed", "round",
-    "set", "slice", "sorted", "str", "sum", "tuple", "type", "vars",
-    "zip",
-    "True", "False", "None",
-    "Exception", "BaseException", "ValueError", "TypeError", "KeyError",
-    "IndexError", "AttributeError", "ImportError", "RuntimeError",
-    "StopIteration", "GeneratorExit", "SystemExit", "KeyboardInterrupt",
-    "ArithmeticError", "ZeroDivisionError", "OverflowError",
-    "FileNotFoundError", "IOError", "OSError", "PermissionError",
-    "NotImplementedError", "RecursionError", "MemoryError",
-    "NameError", "UnboundLocalError", "SyntaxError", "IndentationError",
-    "UnicodeError", "UnicodeDecodeError", "UnicodeEncodeError",
-    "AssertionError", "EOFError", "LookupError",
-}
-
-BLOCKED_MODULES = {"subprocess", "shutil", "ctypes", "signal"}
-
-
-def _execute_in_process(code: str, result_dict: dict, restrict_builtins: bool) -> None:
-    old_stdout = sys.stdout
-    old_stderr = sys.stderr
-    captured_stdout = StringIO()
-    captured_stderr = StringIO()
-    sys.stdout = captured_stdout
-    sys.stderr = captured_stderr
-    try:
-        if restrict_builtins:
-            import builtins
-            safe_globals = {"__builtins__": {
-                k: getattr(builtins, k) for k in SAFE_BUILTINS if hasattr(builtins, k)
-            }}
-            safe_globals["__builtins__"]["__import__"] = _restricted_import
-        else:
-            safe_globals = {"__builtins__": __builtins__}
-        exec(code, safe_globals)
-        result_dict["success"] = True
-    except Exception:
-        result_dict["success"] = False
-        result_dict["error"] = traceback.format_exc()
-    finally:
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
-        result_dict["stdout"] = captured_stdout.getvalue()
-        result_dict["stderr"] = captured_stderr.getvalue()
-
-
-def _restricted_import(name, *args, **kwargs):
-    if name in BLOCKED_MODULES:
-        raise ImportError(f"Import of '{name}' is not allowed in sandbox mode")
-    return __import__(name, *args, **kwargs)
+TRUNCATION_MARKER = "\n... [output truncated: {removed} characters removed] ...\n"
+OUTPUT_LIMIT_ERROR = "Execution exceeded output limit on {stream}"
 
 
 class CodeExecParams(BaseModel):
@@ -82,10 +34,19 @@ class CodeExecParams(BaseModel):
 
 
 class CodeExecInvocation(ToolInvocation[CodeExecParams]):
-    def __init__(self, name: str, params: CodeExecParams,
-                 workspace_root: Path | None, restrict_builtins: bool) -> None:
+    def __init__(
+        self,
+        name: str,
+        params: CodeExecParams,
+        workspace_root: Path,
+        sandbox_controller: SandboxController,
+        profile_name: str,
+        restrict_builtins: bool,
+    ) -> None:
         super().__init__(name=name, params=params)
         self.workspace_root = workspace_root
+        self.sandbox_controller = sandbox_controller
+        self.profile_name = profile_name
         self.restrict_builtins = restrict_builtins
 
     async def execute(self) -> ToolExecutionResult:
@@ -96,73 +57,169 @@ class CodeExecInvocation(ToolInvocation[CodeExecParams]):
         if effective_timeout <= 0:
             return _error("Timeout must be positive")
 
-        manager = multiprocessing.Manager()
-        result_dict = manager.dict()
-        result_dict["success"] = False
-        result_dict["stdout"] = ""
-        result_dict["stderr"] = ""
-        result_dict["error"] = ""
-
-        proc = multiprocessing.Process(
-            target=_execute_in_process,
-            args=(self.params.code, result_dict, self.restrict_builtins),
+        request = SandboxExecRequest(
+            tool_name=self.name,
+            profile_name=self.profile_name,
+            mode="exec_argv",
+            argv=self._build_argv(),
+            workspace_root=self.workspace_root.resolve(),
+            cwd=self.workspace_root.resolve(),
+            stdin_bytes=self.params.code.encode("utf-8"),
+            timeout_seconds=effective_timeout,
+            correlation_id=uuid.uuid4().hex,
         )
-        proc.start()
-        proc.join(timeout=effective_timeout)
+        return await self._run(request, effective_timeout)
 
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=2.0)
-            if proc.is_alive():
-                proc.kill()
-                proc.join(timeout=1.0)
-            return _success(
-                f"[Execution timed out after {effective_timeout:.0f}s]\n"
-                + self._truncate(dict(result_dict).get("stdout", ""))
+    async def _run(
+        self,
+        request: SandboxExecRequest,
+        timeout: float,
+    ) -> ToolExecutionResult:
+        try:
+            exec_result = await self.sandbox_controller.run(request)
+        except SandboxUnavailableError:
+            return self._with_request_audit(_error("sandbox profile unavailable"))
+        except SandboxConfigurationError:
+            return self._with_request_audit(_error("sandbox configuration unavailable"))
+        except SandboxPolicyError:
+            return self._with_request_audit(_error("sandbox policy blocked execution"))
+        except SandboxLaunchError:
+            return self._with_request_audit(_error("sandbox failed to launch command"))
+        except Exception:
+            return self._with_request_audit(_error("sandbox execution failed"))
+
+        if exec_result.completion_state == "output_limit_exceeded":
+            error = OUTPUT_LIMIT_ERROR.format(stream=exec_result.output_limit_stream)
+            return self._with_audit(
+                _success(
+                    f"[error]\n{error}",
+                    data={"success": False, "error": error},
+                ),
+                exec_result,
             )
 
-        stdout = dict(result_dict).get("stdout", "")
-        stderr = dict(result_dict).get("stderr", "")
-        error = dict(result_dict).get("error", "")
-        success_flag = dict(result_dict).get("success", False)
+        if exec_result.timed_out:
+            return self._with_audit(
+                _success(f"[Execution timed out after {timeout:.0f}s]"),
+                exec_result,
+            )
 
-        stdout = self._truncate(stdout)
-        stderr = self._truncate(stderr)
+        stdout = self._truncate(
+            exec_result.stdout.decode("utf-8", errors="replace")
+            if exec_result.stdout
+            else ""
+        )
+        stderr = self._truncate(
+            exec_result.stderr.decode("utf-8", errors="replace")
+            if exec_result.stderr
+            else ""
+        )
+
+        if exec_result.exit_code == 0:
+            parts = []
+            if stdout:
+                parts.append(stdout)
+            if stderr:
+                parts.append(f"[stderr]\n{stderr}")
+            if not parts:
+                parts.append("[No output]")
+            return self._with_audit(
+                _success("\n".join(parts), data={"success": True}),
+                exec_result,
+            )
+
+        error = self._failure_error_text(exec_result, stderr)
 
         parts = []
         if stdout:
             parts.append(stdout)
-        if stderr:
-            parts.append(f"[stderr]\n{stderr}")
         if error:
             parts.append(f"[error]\n{error}")
         if not parts:
             parts.append("[No output]")
 
-        output = "\n".join(parts)
-        if not success_flag:
-            return ToolExecutionResult(status="success", content=output,
-                                       data={"success": False, "error": error})
-        return _success(output, data={"success": True})
+        return self._with_audit(
+            _success(
+                "\n".join(parts),
+                data={"success": False, "error": error},
+            ),
+            exec_result,
+        )
+
+    def _build_argv(self) -> tuple[str, ...]:
+        return (
+            str(Path(sys.executable).resolve()),
+            "-I",
+            "-S",
+            "-c",
+            _code_runner.build_bootstrap(self.restrict_builtins),
+        )
+
+    def _failure_error_text(self, exec_result, stderr: str) -> str:
+        if stderr:
+            return stderr
+        if exec_result.exit_code is not None:
+            return f"Python exited with code {exec_result.exit_code}"
+        if exec_result.signal:
+            return f"Python exited due to {exec_result.signal}"
+        return "Python exited unexpectedly"
+
+    def _with_audit(
+        self,
+        result: ToolExecutionResult,
+        exec_result,
+    ) -> ToolExecutionResult:
+        result.audit.update(
+            {
+                "sandbox_backend": exec_result.backend_name,
+                "sandbox_profile": exec_result.profile_name,
+                "unsafe_fallback_used": exec_result.unsafe_fallback_used,
+            }
+        )
+        return result
+
+    def _with_request_audit(self, result: ToolExecutionResult) -> ToolExecutionResult:
+        result.audit.update(
+            {
+                "sandbox_backend": self.sandbox_controller.backend_name,
+                "sandbox_profile": self.profile_name,
+                "unsafe_fallback_used": self.sandbox_controller.mode
+                == "host_unsafe_dev_only",
+            }
+        )
+        return result
 
     def _truncate(self, text: str) -> str:
         if len(text) <= MAX_OUTPUT_CHARS:
             return text
         keep_each = MAX_OUTPUT_CHARS // 2
         removed = len(text) - MAX_OUTPUT_CHARS
-        return (text[:keep_each]
-                + f"\n... [output truncated: {removed} characters removed] ...\n"
-                + text[-keep_each:])
+        return (
+            text[:keep_each]
+            + TRUNCATION_MARKER.format(removed=removed)
+            + text[-keep_each:]
+        )
 
 
 class CodeExecToolBuilder(WorkspaceToolBuilder):
     name = "code_exec"
-    description = "Execute Python code in a sandboxed subprocess with timeout control."
+    description = "Execute Python code in a sandboxed interpreter with timeout control."
     parameters_schema = CodeExecParams
 
-    def __init__(self, workspace_root: str | Path | None = None, policy=None,
-                 restrict_builtins: bool = True) -> None:
+    def __init__(
+        self,
+        workspace_root: str | Path | None = None,
+        *,
+        sandbox_controller: SandboxController | None = None,
+        profile_name: str = "code_exec_python",
+        policy=None,
+        restrict_builtins: bool = True,
+    ) -> None:
+        if sandbox_controller is None:
+            raise ValueError("sandbox_controller is required")
         super().__init__(workspace_root=workspace_root, policy=policy)
+        self.sandbox_controller = sandbox_controller
+        self.profile_name = profile_name
         self.restrict_builtins = restrict_builtins
 
     def validate(self, params: dict) -> CodeExecParams:
@@ -173,6 +230,11 @@ class CodeExecToolBuilder(WorkspaceToolBuilder):
         return f"Run Python: {code[:80]}{'...' if len(code) > 80 else ''}"
 
     def build(self, params: CodeExecParams) -> ToolInvocation[CodeExecParams]:
-        return CodeExecInvocation(name=self.name, params=params,
-                                  workspace_root=self.workspace_root,
-                                  restrict_builtins=self.restrict_builtins)
+        return CodeExecInvocation(
+            name=self.name,
+            params=params,
+            workspace_root=self.workspace_root,
+            sandbox_controller=self.sandbox_controller,
+            profile_name=self.profile_name,
+            restrict_builtins=self.restrict_builtins,
+        )

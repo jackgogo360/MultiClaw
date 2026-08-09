@@ -6,6 +6,7 @@ import aiosqlite
 
 from multiclaw.memory.models import MemoryEntry
 from multiclaw.memory.protocol import MemoryProtocol
+from multiclaw.sqlite_utils import configure_sqlite_connection
 
 
 class SqliteMemory(MemoryProtocol):
@@ -18,6 +19,10 @@ class SqliteMemory(MemoryProtocol):
             Path(self._database_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._database_path)
         self._db.row_factory = aiosqlite.Row
+        await configure_sqlite_connection(
+            self._db,
+            enable_wal=self._database_path != ":memory:",
+        )
         await self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS memory_entries (

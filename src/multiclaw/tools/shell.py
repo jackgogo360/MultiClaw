@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any
-import os
-import signal
 import shlex
+import uuid
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
+from multiclaw.governance import (
+    SandboxConfigurationError,
+    SandboxController,
+    SandboxExecRequest,
+    SandboxLaunchError,
+    SandboxPolicyError,
+    SandboxUnavailableError,
+)
 from multiclaw.tools._common import (
     PathPolicy,
     WorkspaceToolBuilder,
@@ -25,6 +31,7 @@ DEFAULT_TIMEOUT = 120.0
 MAX_TIMEOUT = 600.0
 MAX_OUTPUT_CHARS = 30_000
 TRUNCATION_MARKER = "\n... [output truncated: {removed} characters removed] ...\n"
+OUTPUT_LIMIT_MARKER = "[Command exceeded output limit on {stream}]"
 
 DANGEROUS_PATTERNS = [
     "rm -rf /",
@@ -49,12 +56,16 @@ class ShellInvocation(ToolInvocation[ShellParams]):
         name: str,
         params: ShellParams,
         workspace_root: Path,
+        sandbox_controller: SandboxController,
+        profile_name: str,
         policy: PathPolicy,
         allowed_commands: list[str] | None,
         blocked_commands: list[str] | None,
     ) -> None:
         super().__init__(name=name, params=params)
         self.workspace_root = workspace_root
+        self.sandbox_controller = sandbox_controller
+        self.profile_name = profile_name
         self.policy = policy
         self.allowed_commands = allowed_commands
         self.blocked_commands = blocked_commands or []
@@ -81,80 +92,88 @@ class ShellInvocation(ToolInvocation[ShellParams]):
         if effective_timeout <= 0:
             return _error("Timeout must be positive")
 
-        return await self._run(self.params.command, work_dir, effective_timeout)
+        request = SandboxExecRequest(
+            tool_name=self.name,
+            profile_name=self.profile_name,
+            mode="shell_string",
+            command=self.params.command,
+            workspace_root=self.workspace_root.resolve(),
+            cwd=work_dir.resolve(),
+            timeout_seconds=effective_timeout,
+            correlation_id=uuid.uuid4().hex,
+        )
+        return await self._run(request, effective_timeout)
 
-    async def _run(self, command: str, cwd: Path, timeout: float) -> ToolExecutionResult:
-        env = self._build_env()
+    async def _run(
+        self,
+        request: SandboxExecRequest,
+        timeout: float,
+    ) -> ToolExecutionResult:
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(cwd),
-                env=env,
-                start_new_session=True,
-            )
-        except OSError as e:
-            return _error(f"Failed to start process: {e}")
+            exec_result = await self.sandbox_controller.run(request)
+        except SandboxUnavailableError:
+            return _error("sandbox profile unavailable")
+        except SandboxConfigurationError:
+            return _error("sandbox configuration unavailable")
+        except SandboxPolicyError:
+            return _error("sandbox policy blocked execution")
+        except SandboxLaunchError:
+            return _error("sandbox failed to launch command")
+        except Exception:
+            return _error("sandbox execution failed")
 
-        timed_out = False
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
+        if exec_result.completion_state == "output_limit_exceeded":
+            result = _success(
+                OUTPUT_LIMIT_MARKER.format(stream=exec_result.output_limit_stream),
+                data={"exit_code": -1},
             )
-        except asyncio.TimeoutError:
-            timed_out = True
-            stdout_bytes, stderr_bytes = await self._kill_process(proc, timeout)
+            result.audit.update(
+                {
+                    "sandbox_backend": exec_result.backend_name,
+                    "sandbox_profile": exec_result.profile_name,
+                    "unsafe_fallback_used": exec_result.unsafe_fallback_used,
+                }
+            )
+            return result
 
-        stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
-        stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
+        stdout = (
+            exec_result.stdout.decode("utf-8", errors="replace")
+            if exec_result.stdout
+            else ""
+        )
+        stderr = (
+            exec_result.stderr.decode("utf-8", errors="replace")
+            if exec_result.stderr
+            else ""
+        )
         stdout = self._truncate_output(stdout)
         stderr = self._truncate_output(stderr)
-        exit_code = proc.returncode if proc.returncode is not None else -1
+        exit_code = (
+            exec_result.exit_code if exec_result.exit_code is not None else -1
+        )
 
         output_parts = []
-        if timed_out:
+        if exec_result.timed_out:
             output_parts.append(f"[Command timed out after {timeout:.0f}s]")
         if stdout:
             output_parts.append(stdout)
         if stderr:
             output_parts.append(f"[stderr]\n{stderr}")
-        if not timed_out:
+        if not exec_result.timed_out:
             output_parts.append(f"[exit code: {exit_code}]")
 
         output = "\n".join(output_parts)
-        return _success(output, data={"exit_code": exit_code})
-
-    async def _kill_process(self, proc, timeout: float) -> tuple[bytes, bytes]:
-        pgid = None
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (OSError, ProcessLookupError):
-            pass
-        try:
-            if pgid:
-                os.killpg(pgid, signal.SIGTERM)
-            else:
-                proc.terminate()
-        except (OSError, ProcessLookupError):
-            pass
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=2.0)
-            return stdout or b"", stderr or b""
-        except asyncio.TimeoutError:
-            pass
-        try:
-            if pgid:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                proc.kill()
-        except (OSError, ProcessLookupError):
-            pass
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=2.0)
-            return stdout or b"", stderr or b""
-        except asyncio.TimeoutError:
-            return b"", b""
+        # Compatibility: timed out shell runs stay "success" so callers keep
+        # using content/data rather than treating timeouts as scheduler errors.
+        result = _success(output, data={"exit_code": exit_code})
+        result.audit.update(
+            {
+                "sandbox_backend": exec_result.backend_name,
+                "sandbox_profile": exec_result.profile_name,
+                "unsafe_fallback_used": exec_result.unsafe_fallback_used,
+            }
+        )
+        return result
 
     def _truncate_output(self, text: str) -> str:
         if len(text) <= MAX_OUTPUT_CHARS:
@@ -172,27 +191,17 @@ class ShellInvocation(ToolInvocation[ShellParams]):
         for pattern in DANGEROUS_PATTERNS:
             if pattern in cmd_lower:
                 return f"Blocked dangerous command pattern: {pattern}"
+        try:
+            first_token = shlex.split(command)[0]
+        except ValueError:
+            first_token = command.split()[0] if command.split() else ""
         if self.blocked_commands:
-            try:
-                first_token = shlex.split(command)[0]
-            except ValueError:
-                first_token = command.split()[0] if command.split() else ""
             if first_token in self.blocked_commands:
                 return f"Command '{first_token}' is blocked by policy"
+        if self.allowed_commands:
+            if first_token not in self.allowed_commands:
+                return f"Command '{first_token}' is not allowed by policy"
         return None
-
-    def _build_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        sensitive_keys = [
-            "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "API_KEY", "SECRET_KEY", "PASSWORD",
-        ]
-        for key in list(env.keys()):
-            for sensitive in sensitive_keys:
-                if sensitive in key.upper():
-                    del env[key]
-                    break
-        return env
-
 
 class ShellToolBuilder(WorkspaceToolBuilder):
     name = "shell"
@@ -202,11 +211,18 @@ class ShellToolBuilder(WorkspaceToolBuilder):
     def __init__(
         self,
         workspace_root: str | Path | None = None,
+        *,
+        sandbox_controller: SandboxController | None = None,
+        profile_name: str = "shell_workspace",
         policy: PathPolicy | None = None,
         allowed_commands: list[str] | None = None,
         blocked_commands: list[str] | None = None,
     ) -> None:
+        if sandbox_controller is None:
+            raise ValueError("sandbox_controller is required")
         super().__init__(workspace_root=workspace_root, policy=policy)
+        self.sandbox_controller = sandbox_controller
+        self.profile_name = profile_name
         self.allowed_commands = allowed_commands
         self.blocked_commands = blocked_commands or []
 
@@ -222,6 +238,8 @@ class ShellToolBuilder(WorkspaceToolBuilder):
             name=self.name,
             params=params,
             workspace_root=self.workspace_root,
+            sandbox_controller=self.sandbox_controller,
+            profile_name=self.profile_name,
             policy=self.policy,
             allowed_commands=self.allowed_commands,
             blocked_commands=self.blocked_commands,

@@ -5,6 +5,7 @@ from pathlib import Path
 import aiosqlite
 
 from multiclaw.session.models import ChatSession, InvalidSessionTitleError, SessionStatus
+from multiclaw.sqlite_utils import configure_sqlite_connection
 
 
 class SqliteSessionStore:
@@ -16,6 +17,7 @@ class SqliteSessionStore:
         Path(self._database_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self._database_path)
         self._db.row_factory = aiosqlite.Row
+        await configure_sqlite_connection(self._db)
         await self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS chat_sessions (

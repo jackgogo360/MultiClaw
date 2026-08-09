@@ -1,13 +1,48 @@
 from multiclaw.governance.audit import InMemoryAuditLogger
 from multiclaw.governance.models import AuditLog, PermissionDecision
 from multiclaw.governance.permission import PermissionChecker
-from multiclaw.governance.sandbox import ProcessSandbox, SandboxTimeoutError
+from multiclaw.governance.sandbox import (
+    ExecutionGuard,
+    ExecutionTimeoutError,
+    HostUnsafeBackend,
+    SandboxBackend,
+    SandboxConfigurationError,
+    SandboxController,
+    SandboxEnvironment,
+    SandboxExecRequest,
+    SandboxExecResult,
+    SandboxLaunchError,
+    SandboxPolicyError,
+    SandboxProcessRunner,
+    SandboxProbeResult,
+    SandboxProfilePolicy,
+    SandboxReadiness,
+    SandboxUnavailableError,
+    SandboxedLaunchSpec,
+    build_sandbox_environment,
+)
 
 __all__ = [
     "AuditLog",
+    "ExecutionGuard",
+    "ExecutionTimeoutError",
+    "HostUnsafeBackend",
     "InMemoryAuditLogger",
     "PermissionChecker",
     "PermissionDecision",
-    "ProcessSandbox",
-    "SandboxTimeoutError",
+    "SandboxBackend",
+    "SandboxConfigurationError",
+    "SandboxController",
+    "SandboxEnvironment",
+    "SandboxExecRequest",
+    "SandboxExecResult",
+    "SandboxLaunchError",
+    "SandboxPolicyError",
+    "SandboxProcessRunner",
+    "SandboxProbeResult",
+    "SandboxProfilePolicy",
+    "SandboxReadiness",
+    "SandboxUnavailableError",
+    "SandboxedLaunchSpec",
+    "build_sandbox_environment",
 ]

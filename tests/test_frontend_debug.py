@@ -3,60 +3,56 @@ import subprocess
 from pathlib import Path
 
 
-def test_frontend_debug_logging_can_be_enabled_by_query_string():
-    html_path = Path("src/multiclaw/static/index.html").resolve()
+def _find_typescript_module() -> Path:
+    for parent in [Path.cwd().resolve(), *Path.cwd().resolve().parents]:
+        candidate = parent / "frontend" / "node_modules" / "typescript" / "lib" / "typescript.js"
+        if candidate.exists():
+            return candidate
+    raise AssertionError("typescript compiler API not found")
+
+
+def test_should_log_chat_debug_for_localhost_only_by_default():
+    module_path = Path("frontend/src/chat-debug.ts").resolve()
+    typescript_path = _find_typescript_module().resolve()
     node_script = f"""
-const fs = require('fs');
-const vm = require('vm');
+import fs from 'node:fs';
+import ts from {typescript_path.as_uri()!r};
 
-const html = fs.readFileSync({json.dumps(str(html_path))}, 'utf8');
-const start = html.indexOf("const msgs = document.getElementById('messages');");
-const end = html.indexOf("// ---- textarea auto-resize ----");
-if (start === -1 || end === -1 || end <= start) {{
-  throw new Error('failed to locate debug script snippet');
-}}
-const snippet = html.slice(start, end);
-
-const logs = [];
-const consoleMock = {{
-  info: (...args) => logs.push(args),
-  error: (...args) => logs.push(['error', ...args]),
-}};
-
-const messages = {{ appendChild() {{}}, scrollTop: 0, scrollHeight: 0 }};
-const input = {{ addEventListener() {{}}, focus() {{}}, style: {{}} }};
-const btn = {{}};
-const document = {{
-  getElementById(id) {{
-    if (id === 'messages') return messages;
-    if (id === 'input') return input;
-    if (id === 'send-btn') return btn;
-    return null;
+const source = fs.readFileSync({json.dumps(str(module_path))}, 'utf8');
+const transpiled = ts.transpileModule(source, {{
+  compilerOptions: {{
+    module: ts.ModuleKind.ES2020,
+    target: ts.ScriptTarget.ES2020,
   }},
+}});
+const moduleUrl = `data:text/javascript;base64,${{Buffer.from(transpiled.outputText).toString('base64')}}`;
+const {{ shouldLogChatDebug }} = await import(moduleUrl);
+
+const results = {{
+  localhost: shouldLogChatDebug({{
+    hostname: 'localhost',
+    search: '',
+    debugFlag: null,
+  }}),
+  production: shouldLogChatDebug({{
+    hostname: 'example.com',
+    search: '',
+    debugFlag: null,
+  }}),
 }};
 
-const context = {{
-  console: consoleMock,
-  document,
-  location: {{ search: '?debug=1' }},
-  localStorage: {{ getItem() {{ return null; }} }},
-  Date,
-  URLSearchParams,
-}};
-
-vm.createContext(context);
-vm.runInContext(snippet, context);
-context.debugLog('approval_required', {{ request_id: 'req-1' }});
-process.stdout.write(JSON.stringify(logs));
+process.stdout.write(JSON.stringify(results));
 """
 
     result = subprocess.run(
-        ["node", "-e", node_script],
+        ["node", "--input-type=module", "-e", node_script],
         capture_output=True,
         text=True,
         check=False,
     )
 
     assert result.returncode == 0, result.stderr
-    logs = json.loads(result.stdout)
-    assert logs, "expected debug log output when ?debug=1 is set"
+    assert json.loads(result.stdout) == {
+        "localhost": True,
+        "production": False,
+    }

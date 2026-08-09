@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 import os
 import tomllib
+import warnings
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,15 +37,80 @@ class MemorySettings(BaseModel):
     recent_turns: int = 2
     context_history_ratio: float = 0.5
     include_legacy_memory_in_retrieval: bool = False
+    progressive_context_enabled: bool = False
+    context_response_reserve_tokens: int = Field(default=4096, ge=256)
+    context_l1_ratio: float = Field(default=0.6, gt=0.0, lt=1.0)
+
+
+class SandboxProfileNames(BaseModel):
+    shell: str = "shell_workspace"
+    code_exec: str = "code_exec_python"
+    mcp_stdio: str = "mcp_stdio_local"
+
+
+class MacOSSandboxSettings(BaseModel):
+    seatbelt_profile_dir: str = ""
+
+
+class LinuxSandboxSettings(BaseModel):
+    nsjail_path: str = "/usr/bin/nsjail"
+    nsjail_config_dir: str = ""
+
+
+class SandboxSettings(BaseModel):
+    mode: Literal["auto", "host_unsafe_dev_only"] = "auto"
+    backend_probe_on_startup: bool = True
+    unsafe_fallback_requires_debug: Literal[True] = True
+    write_protected_workspace_paths: list[str] = Field(default_factory=lambda: [".git"])
+    read_hidden_workspace_paths: list[str] = Field(default_factory=lambda: [".env", ".env.*"])
+    profiles: SandboxProfileNames = Field(default_factory=SandboxProfileNames)
+    macos: MacOSSandboxSettings = Field(default_factory=MacOSSandboxSettings)
+    linux: LinuxSandboxSettings = Field(default_factory=LinuxSandboxSettings)
 
 
 class GovernanceSettings(BaseModel):
-    sandbox_mode: str = "process"
+    sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     audit_enabled: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_sandbox_mode(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        migrated = dict(data)
+        legacy_mode = migrated.pop("sandbox_mode", None)
+        if legacy_mode is None:
+            return migrated
+
+        if "sandbox" in migrated:
+            raise ValueError("governance.sandbox_mode cannot be combined with governance.sandbox")
+
+        if legacy_mode == "process":
+            warnings.warn(
+                "governance.sandbox_mode='process' is deprecated; using governance.sandbox.mode='auto'",
+                DeprecationWarning,
+                stacklevel=5,
+            )
+            migrated["sandbox"] = {"mode": "auto"}
+            return migrated
+
+        raise ValueError(
+            f"Unsupported governance.sandbox_mode {legacy_mode!r}; use governance.sandbox.mode instead"
+        )
+
+
+class ToolSettings(BaseModel):
+    parallel_read_only_enabled: bool = False
+    parallel_max_concurrency: int = Field(default=4, ge=1, le=16)
+    web_fetch_allow_private_networks: bool = False
 
 
 class AgentSettings(BaseModel):
-    max_tool_rounds: int = 6
+    max_tool_rounds: int = 10
+    resilience_enabled: bool = False
+    no_progress_repeat_limit: int = Field(default=3, ge=2, le=10)
+    reflection_max_attempts: int = Field(default=1, ge=0, le=3)
     system_prompt: str = (
         "You are MultiClaw, an AI assistant with access to tools. "
         "You are powered by a large language model. "
@@ -66,11 +133,27 @@ class SkillSettings(BaseModel):
     user_dir: str = ""
 
 
+class McpSettings(BaseModel):
+    enabled: bool = True
+    config_path: str = ""
+
+
 class AuthSettings(BaseModel):
     jwt_secret: str = ""
 
 
+class EmailSettings(BaseModel):
+    provider: Literal["brevo", "resend"] = "brevo"
+
+
 class BrevoSettings(BaseModel):
+    api_key: str = ""
+    sender_email: str = ""
+    sender_name: str = "MultiClaw"
+    mock: bool = False
+
+
+class ResendSettings(BaseModel):
     api_key: str = ""
     sender_email: str = ""
     sender_name: str = "MultiClaw"
@@ -88,10 +171,14 @@ class Settings(BaseSettings):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
+    tools: ToolSettings = Field(default_factory=ToolSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
     skill: SkillSettings = Field(default_factory=SkillSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
+    email: EmailSettings = Field(default_factory=EmailSettings)
     brevo: BrevoSettings = Field(default_factory=BrevoSettings)
+    resend: ResendSettings = Field(default_factory=ResendSettings)
+    mcp: McpSettings = Field(default_factory=McpSettings)
 
     def __init__(self, _config_file: str | None = None, **kwargs: Any):
         config_path = Path(_config_file) if _config_file else Path("multiclaw.toml")
@@ -99,6 +186,12 @@ class Settings(BaseSettings):
             toml_kwargs = self._build_toml_kwargs(config_path)
             kwargs = self._apply_env_overrides(toml_kwargs) | kwargs
         super().__init__(**kwargs)
+
+    @model_validator(mode="after")
+    def validate_unsafe_sandbox_mode_requires_debug(self) -> "Settings":
+        if self.governance.sandbox.mode == "host_unsafe_dev_only" and not self.app.debug:
+            raise ValueError("governance.sandbox.mode='host_unsafe_dev_only' requires app.debug=true")
+        return self
 
     @staticmethod
     def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
@@ -119,6 +212,7 @@ class Settings(BaseSettings):
 
     @staticmethod
     def _coerce_env_value(value: str) -> Any:
+        stripped = value.strip()
         lower = value.lower()
         if lower in ("true", "false"):
             return lower == "true"
@@ -126,7 +220,13 @@ class Settings(BaseSettings):
             return int(value)
         except ValueError:
             pass
+        if stripped.startswith("[") or stripped.startswith("{"):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                pass
         return value
+
     def _build_toml_kwargs(self, path: Path) -> dict[str, Any]:
         with open(path, "rb") as f:
             data = tomllib.load(f)
@@ -147,12 +247,20 @@ class Settings(BaseSettings):
             result["memory"] = data["memory"]
         if "governance" in data:
             result["governance"] = data["governance"]
+        if "tools" in data:
+            result["tools"] = data["tools"]
         if "agent" in data:
             result["agent"] = data["agent"]
         if "skills" in data:
             result["skill"] = data["skills"]
         if "auth" in data:
             result["auth"] = data["auth"]
+        if "email" in data:
+            result["email"] = data["email"]
         if "brevo" in data:
             result["brevo"] = data["brevo"]
+        if "resend" in data:
+            result["resend"] = data["resend"]
+        if "mcp" in data:
+            result["mcp"] = data["mcp"]
         return result

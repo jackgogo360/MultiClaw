@@ -57,10 +57,12 @@ class Skill:
 
     @property
     def keyword_triggers(self) -> list[str]:
-        keywords = []
+        keywords = [self.name]
         for t in self.triggers:
             if t.type == TriggerType.KEYWORD:
-                keywords.extend(t.keywords)
+                for keyword in t.keywords:
+                    if keyword not in keywords:
+                        keywords.append(keyword)
         return keywords
 
     def format_metadata(self) -> str:
