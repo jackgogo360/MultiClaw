@@ -4,6 +4,8 @@ import time
 
 import pytest
 from sqlalchemy import select, text
+from multiclaw.config.settings import DatabaseSettings
+from multiclaw.storage import Database
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -34,3 +36,26 @@ async def test_uow_rollback_is_atomic(database):
 
     async with database.connect() as conn:
         assert await conn.scalar(text("SELECT COUNT(*) FROM atomic_probe")) == 0
+
+
+@pytest.mark.asyncio
+async def test_file_sqlite_creates_missing_parent_directories(tmp_path):
+    database_path = tmp_path / "nested" / "deeper" / "engine.db"
+    database = Database.create(
+        DatabaseSettings(
+            driver="sqlite",
+            url=f"sqlite+aiosqlite:///{database_path}",
+        )
+    )
+
+    try:
+        async with database.connect() as conn:
+            assert await conn.scalar(select(database.dialect.db_now_ms())) is not None
+
+        async with database.write_transaction() as conn:
+            await conn.execute(text("CREATE TABLE nested_probe (id INTEGER PRIMARY KEY)"))
+    finally:
+        await database.dispose()
+
+    assert database_path.parent.exists()
+    assert database_path.exists()
