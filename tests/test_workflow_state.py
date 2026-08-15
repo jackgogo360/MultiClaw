@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -31,6 +32,7 @@ from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     ApprovalRecord,
     ApprovalStatus,
+    CheckpointPhase,
     ExecutionStatus,
     InvalidTransitionError,
     LeaseConflictError,
@@ -164,6 +166,33 @@ async def _fetch_execution_state(
         )
         row = result.mappings().one()
     return str(row["execution_status"]), int(row["version"])
+
+
+async def _checkpoint_rows(database: Database, context: TenantContext) -> list[dict[str, object]]:
+    async with database.connect() as conn:
+        result = await conn.execute(
+            select(
+                execution_checkpoints.c.phase,
+                execution_checkpoints.c.checkpoint_seq,
+                execution_checkpoints.c.payload_json,
+            )
+            .where(
+                execution_checkpoints.c.tenant_id == context.tenant_id,
+                execution_checkpoints.c.workspace_id == context.workspace_id,
+                execution_checkpoints.c.session_id == context.session_id,
+                execution_checkpoints.c.run_id == context.run_id,
+            )
+            .order_by(execution_checkpoints.c.checkpoint_seq.asc())
+        )
+        rows = result.mappings().all()
+    return [
+        {
+            "phase": str(row["phase"]),
+            "checkpoint_seq": int(row["checkpoint_seq"]),
+            "payload": json.loads(str(row["payload_json"])),
+        }
+        for row in rows
+    ]
 
 
 @dataclass(slots=True, frozen=True)
@@ -484,6 +513,210 @@ async def test_checkpoint_insert_requires_current_lease(workflow_database: Datab
             )
         )
     assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_start_run_with_checkpoint_rolls_back_when_checkpoint_insert_fails(
+    workflow_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    run_context = await _create_run_context(workflow_database, suffix="-start-rollback")
+    coordinator = _coordinator(workflow_database)
+
+    from multiclaw.storage.repositories.workflow import WorkflowRepository
+
+    async def fail_insert(self, lease, **kwargs):
+        del lease, kwargs
+        raise RuntimeError("checkpoint insert failed")
+
+    monkeypatch.setattr(WorkflowRepository, "_insert_checkpoint", fail_insert)
+
+    with pytest.raises(RuntimeError, match="checkpoint insert failed"):
+        await coordinator.start_run_with_checkpoint(run_context, "runtime")
+
+    assert await coordinator.get_run(run_context) is None
+    assert await _checkpoint_rows(workflow_database, run_context) == []
+
+
+@pytest.mark.asyncio
+async def test_finish_run_with_checkpoint_rolls_back_terminal_transition_when_checkpoint_insert_fails(
+    workflow_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    run_context = await _create_run_context(workflow_database, suffix="-finish-rollback")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(run_context, "runtime")
+
+    from multiclaw.storage.repositories.workflow import WorkflowRepository
+
+    original_insert = WorkflowRepository._insert_checkpoint
+
+    async def fail_terminal_insert(self, lease, **kwargs):
+        if kwargs.get("phase") == CheckpointPhase.RUN_TERMINAL.value:
+            raise RuntimeError("terminal checkpoint insert failed")
+        return await original_insert(self, lease, **kwargs)
+
+    monkeypatch.setattr(WorkflowRepository, "_insert_checkpoint", fail_terminal_insert)
+
+    with pytest.raises(RuntimeError, match="terminal checkpoint insert failed"):
+        await coordinator.finish_run_with_checkpoint(lease, RunStatus.COMPLETED)
+
+    record = await coordinator.get_run(run_context)
+    assert record is not None
+    assert record.status is RunStatus.RUNNING
+    checkpoints = await _checkpoint_rows(workflow_database, run_context)
+    assert [row["phase"] for row in checkpoints] == [CheckpointPhase.RUN_STARTED.value]
+
+
+@pytest.mark.asyncio
+async def test_execution_dispatching_checkpoint_rejects_invalid_phase_status(workflow_database: Database):
+    run_context = await _create_run_context(workflow_database, suffix="-dispatch-invalid-status")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run(run_context, "runtime")
+    execution_id = await _seed_execution(workflow_database, lease, status=ExecutionStatus.NOT_STARTED)
+
+    with pytest.raises(InvalidTransitionError):
+        await coordinator.checkpoint(
+            lease,
+            CheckpointPhase.EXECUTION_DISPATCHING,
+            {
+                "run_id": run_context.run_id,
+                "execution_id": execution_id,
+                "tool_call_id": f"call-{execution_id}",
+                "recovery_strategy": "idempotent_retry",
+                "input_hash": "1" * 64,
+                "input_ref": f"tool_execution:{execution_id}:input_payload_json",
+                "idempotency_key": "idem-1",
+                "dispatch_cursor": "cursor-dispatch-invalid",
+                "cursor": "cursor-dispatch-invalid",
+            },
+            execution_id=execution_id,
+            execution_expected_status=ExecutionStatus.NOT_STARTED,
+            execution_expected_version=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_execution_dispatching_checkpoint_accepts_allowed_status_and_detects_version_conflict(
+    workflow_database: Database,
+):
+    run_context = await _create_run_context(workflow_database, suffix="-dispatch-valid")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run(run_context, "runtime")
+    execution_id = await _seed_execution(workflow_database, lease, status=ExecutionStatus.EXECUTING)
+
+    await coordinator.checkpoint(
+        lease,
+        CheckpointPhase.EXECUTION_DISPATCHING,
+        {
+            "run_id": run_context.run_id,
+            "execution_id": execution_id,
+            "tool_call_id": f"call-{execution_id}",
+            "recovery_strategy": "idempotent_retry",
+            "input_hash": "1" * 64,
+            "input_ref": f"tool_execution:{execution_id}:input_payload_json",
+            "idempotency_key": "idem-1",
+            "dispatch_cursor": "cursor-dispatch-valid",
+            "cursor": "cursor-dispatch-valid",
+        },
+        execution_id=execution_id,
+        execution_expected_status=ExecutionStatus.EXECUTING,
+        execution_expected_version=1,
+    )
+
+    with pytest.raises(VersionConflictError):
+        await coordinator.checkpoint(
+            lease,
+            CheckpointPhase.EXECUTION_DISPATCHING,
+            {
+                "run_id": run_context.run_id,
+                "execution_id": execution_id,
+                "tool_call_id": f"call-{execution_id}",
+                "recovery_strategy": "idempotent_retry",
+                "input_hash": "1" * 64,
+                "input_ref": f"tool_execution:{execution_id}:input_payload_json",
+                "idempotency_key": "idem-1",
+                "dispatch_cursor": "cursor-dispatch-version",
+                "cursor": "cursor-dispatch-version",
+            },
+            execution_id=execution_id,
+            execution_expected_status=ExecutionStatus.EXECUTING,
+            execution_expected_version=2,
+        )
+
+
+@pytest.mark.asyncio
+async def test_execution_result_observed_checkpoint_rejects_invalid_phase_status(workflow_database: Database):
+    run_context = await _create_run_context(workflow_database, suffix="-result-invalid-status")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run(run_context, "runtime")
+    execution_id = await _seed_execution(workflow_database, lease, status=ExecutionStatus.EXECUTING)
+
+    with pytest.raises(InvalidTransitionError):
+        await coordinator.checkpoint(
+            lease,
+            CheckpointPhase.EXECUTION_RESULT_OBSERVED,
+            {
+                "run_id": run_context.run_id,
+                "execution_id": execution_id,
+                "result_status": ExecutionStatus.EXECUTING.value,
+                "result_digest": "2" * 64,
+                "result_ref": "workspace://results/current.json",
+                "resume_cursor": "cursor-result-invalid",
+                "cursor": "cursor-result-invalid",
+            },
+            execution_id=execution_id,
+            execution_expected_status=ExecutionStatus.EXECUTING,
+            execution_expected_version=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_execution_result_observed_checkpoint_accepts_terminal_status_and_respects_stale_fence(
+    workflow_database: Database,
+):
+    run_context = await _create_run_context(workflow_database, suffix="-result-valid")
+    coordinator = _coordinator(workflow_database)
+    first = await coordinator.start_run(run_context, "runtime-1")
+    execution_id = await _seed_execution(workflow_database, first, status=ExecutionStatus.SUCCEEDED)
+
+    await _expire_lease_with_db_clock(workflow_database, run_context)
+    current = await coordinator.acquire_run(run_context, "runtime-2")
+
+    with pytest.raises(StaleFenceError):
+        await coordinator.checkpoint(
+            first,
+            CheckpointPhase.EXECUTION_RESULT_OBSERVED,
+            {
+                "run_id": run_context.run_id,
+                "execution_id": execution_id,
+                "result_status": ExecutionStatus.SUCCEEDED.value,
+                "result_digest": "3" * 64,
+                "result_ref": "workspace://results/final.json",
+                "resume_cursor": "cursor-result-stale",
+                "cursor": "cursor-result-stale",
+            },
+            execution_id=execution_id,
+            execution_expected_status=ExecutionStatus.SUCCEEDED,
+            execution_expected_version=1,
+        )
+
+    await coordinator.checkpoint(
+        current,
+        CheckpointPhase.EXECUTION_RESULT_OBSERVED,
+        {
+            "run_id": run_context.run_id,
+            "execution_id": execution_id,
+            "result_status": ExecutionStatus.SUCCEEDED.value,
+            "result_digest": "3" * 64,
+            "result_ref": "workspace://results/final.json",
+            "resume_cursor": "cursor-result-valid",
+            "cursor": "cursor-result-valid",
+        },
+        execution_id=execution_id,
+        execution_expected_status=ExecutionStatus.SUCCEEDED,
+        execution_expected_version=1,
+    )
 
 
 @pytest.mark.asyncio

@@ -462,6 +462,14 @@ class WorkflowRepository:
         row = result.mappings().first()
         return None if row is None else self._checkpoint_from_row(row)
 
+    async def get_next_checkpoint_seq(self, context: TenantContext) -> int:
+        max_seq = await self._conn.scalar(
+            select(func.max(execution_checkpoints.c.checkpoint_seq)).where(
+                _checkpoint_scope_predicate(context)
+            )
+        )
+        return int(max_seq or 0) + 1
+
     async def get_live_lease(self, context: TenantContext, lease_owner: str) -> RunLease | None:
         result = await self._conn.execute(
             select(
@@ -614,12 +622,7 @@ class WorkflowRepository:
             if expected_execution_version is not None and execution.version != expected_execution_version:
                 raise VersionConflictError("execution version conflict")
         if checkpoint_seq is None:
-            max_seq = await self._conn.scalar(
-                select(func.max(execution_checkpoints.c.checkpoint_seq)).where(
-                    _checkpoint_scope_predicate(lease.context)
-                )
-            )
-            checkpoint_seq = int(max_seq or 0) + 1
+            checkpoint_seq = await self.get_next_checkpoint_seq(lease.context)
         await self._conn.execute(
             insert(execution_checkpoints).values(
                 checkpoint_id=checkpoint_id,

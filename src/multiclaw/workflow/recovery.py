@@ -180,6 +180,31 @@ class RecoveryService:
             reason=outcome.reason,
         )
 
+    async def validate_live_run(self, context: TenantContext) -> RecoveryOutcome:
+        checkpoint = await self._latest_checkpoint(context)
+        if checkpoint is None:
+            return RecoveryOutcome(
+                status=RunStatus.BLOCKED_CORRUPT,
+                executions_started=0,
+                reason="missing checkpoint",
+            )
+
+        try:
+            phase, payload = decode_checkpoint(checkpoint)
+            return await self._classify(context, checkpoint, phase, payload)
+        except IncompatibleCheckpointError as error:
+            return RecoveryOutcome(
+                status=RunStatus.BLOCKED_INCOMPATIBLE,
+                executions_started=0,
+                reason=str(error),
+            )
+        except CorruptCheckpointError as error:
+            return RecoveryOutcome(
+                status=RunStatus.BLOCKED_CORRUPT,
+                executions_started=0,
+                reason=str(error),
+            )
+
     async def _classify(
         self,
         context: TenantContext,

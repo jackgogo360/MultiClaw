@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
@@ -30,6 +31,25 @@ from multiclaw.workflow.models import (
     WorkflowRuntimeCounters,
 )
 
+PHASE_ALLOWED_EXECUTION_STATUSES: dict[CheckpointPhase, frozenset[ExecutionStatus]] = {
+    CheckpointPhase.EXECUTION_DISPATCHING: frozenset(
+        {
+            ExecutionStatus.REPLAYING,
+            ExecutionStatus.EXECUTING,
+        }
+    ),
+    CheckpointPhase.EXECUTION_RESULT_OBSERVED: frozenset(
+        {
+            ExecutionStatus.SUCCEEDED,
+            ExecutionStatus.FAILED_RETRYABLE,
+            ExecutionStatus.FAILED_TERMINAL,
+            ExecutionStatus.UNCERTAIN,
+            ExecutionStatus.BLOCKED_INCOMPATIBLE,
+            ExecutionStatus.BLOCKED_CORRUPT,
+        }
+    ),
+}
+
 
 class WorkflowCoordinator:
     def __init__(
@@ -54,6 +74,37 @@ class WorkflowCoordinator:
                 context,
                 runtime_instance_id=runtime_instance_id,
             )
+
+    async def start_run_with_checkpoint(self, context: TenantContext, runtime_instance_id: str) -> RunLease:
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            await repository._lock_tenant(context.tenant_id)
+            active_runs = await repository.count_active_runs(context.tenant_id)
+            if active_runs >= self._settings.runtime.max_concurrent_runs_per_tenant:
+                raise TenantRunQuotaError("tenant run quota exceeded")
+
+            lease = await repository._create_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+            )
+            record = await repository.get_run(context)
+            if record is None:
+                raise RuntimeError("run record missing after creation")
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.RUN_STARTED,
+                {
+                    "tenant_id": context.tenant_id,
+                    "workspace_id": context.workspace_id,
+                    "session_id": context.session_id,
+                    "run_id": context.run_id,
+                    "started_at_ms": record.created_at,
+                    "model_cursor": self._run_started_cursor(context),
+                    "cursor": self._run_started_cursor(context),
+                },
+                checkpoint_seq=1,
+            )
+            return lease
 
     async def acquire_run(self, context: TenantContext, runtime_instance_id: str) -> RunLease:
         async with self._write_connection() as conn:
@@ -99,6 +150,42 @@ class WorkflowCoordinator:
             transitioned = await repository._transition_run(lease, target)
             if transitioned is None:
                 raise StaleFenceError("run lease is stale")
+            return transitioned
+
+    async def finish_run_with_checkpoint(self, lease: RunLease, target: RunStatus) -> RunLease:
+        if target not in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED_TERMINAL,
+            RunStatus.CANCELLED,
+            RunStatus.BLOCKED_CORRUPT,
+            RunStatus.BLOCKED_INCOMPATIBLE,
+        }:
+            raise InvalidTransitionError(f"{target.value} is not a terminal run status")
+
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            if target is RunStatus.COMPLETED and await repository.has_nonterminal_execution(lease.context):
+                raise InvalidTransitionError("run cannot complete while executions are nonterminal")
+            transitioned = await repository._transition_run(lease, target)
+            if transitioned is None:
+                raise StaleFenceError("run lease is stale")
+
+            record = await repository.get_run(lease.context)
+            if record is None or record.finished_at is None:
+                raise RuntimeError("terminal run record missing finished_at")
+
+            next_seq = await repository.get_next_checkpoint_seq(lease.context)
+            await self._scoped(conn).checkpoint(
+                transitioned,
+                CheckpointPhase.RUN_TERMINAL,
+                {
+                    "run_id": lease.context.run_id,
+                    "terminal_status": target.value,
+                    "finished_at_ms": record.finished_at,
+                    "final_digest": self._terminal_digest(lease.context.run_id, target, record.finished_at),
+                },
+                checkpoint_seq=next_seq,
+            )
             return transitioned
 
     async def decide_approval(
@@ -275,6 +362,9 @@ class WorkflowCoordinator:
             self._settings.workflow.lease_ttl_ms,
         )
 
+    def _scoped(self, conn) -> "WorkflowCoordinator":
+        return WorkflowCoordinator(self._database, settings=self._settings, connection=conn)
+
     @staticmethod
     def _validate_checkpoint_scope(
         lease: RunLease,
@@ -326,6 +416,21 @@ class WorkflowCoordinator:
                 raise InvalidTransitionError("execution checkpoint version is required with status guard")
             if execution_expected_version is not None and execution_expected_status is None:
                 raise InvalidTransitionError("execution checkpoint status is required with version guard")
+            allowed_statuses = PHASE_ALLOWED_EXECUTION_STATUSES[phase]
+            if execution_expected_status not in allowed_statuses:
+                allowed = ", ".join(status.value for status in sorted(allowed_statuses, key=lambda item: item.value))
+                raise InvalidTransitionError(
+                    f"{phase.value} checkpoints require execution status in {{{allowed}}}"
+                )
             return approval_id, resolved_execution_id
 
         return approval_id, execution_id
+
+    @staticmethod
+    def _run_started_cursor(context: TenantContext) -> str:
+        return f"run:{context.run_id}:model_inference"
+
+    @staticmethod
+    def _terminal_digest(run_id: str, target: RunStatus, finished_at_ms: int) -> str:
+        payload = f"{run_id}:{target.value}:{finished_at_ms}".encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
