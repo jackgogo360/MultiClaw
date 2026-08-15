@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+import threading
 
 import pytest
 
@@ -172,21 +173,38 @@ async def test_same_tenant_concurrent_acquire_uses_single_create_lock(contexts, 
 async def test_pool_evicts_only_safe_idle_runtime(pool, contexts, clock):
     idle = await pool.acquire(contexts.a)
     active = await pool.acquire(contexts.b)
-    active.active_executing_run_count = 1
+    active_run = active.begin_run()
 
     clock.advance(pool.idle_ttl_ms + 1)
 
-    assert await pool.evict_idle(clock.now_ms()) == 1
-    assert await pool.peek(contexts.a.tenant_id) is None
-    assert await pool.peek(contexts.b.tenant_id) is active
+    try:
+        assert await pool.evict_idle(clock.now_ms()) == 1
+        assert await pool.peek(contexts.a.tenant_id) is None
+        assert await pool.peek(contexts.b.tenant_id) is active
+    finally:
+        active_run.close()
 
 
 @pytest.mark.asyncio
-async def test_pool_evicts_awaiting_user_runtime_when_no_tool_is_executing(pool, contexts, clock):
+async def test_pool_does_not_evict_uncheckpointed_awaiting_user_runtime(pool, contexts, clock):
     runtime = await pool.acquire(contexts.a)
-    runtime.active_run_count = 1
-    runtime.awaiting_user_run_count = 1
-    runtime.active_tool_execution_count = 0
+    run = runtime.begin_run()
+    run.mark_awaiting_user(checkpoint_persisted=False)
+
+    clock.advance(pool.idle_ttl_ms + 1)
+
+    try:
+        assert await pool.evict_idle(clock.now_ms()) == 0
+        assert await pool.peek(contexts.a.tenant_id) is runtime
+    finally:
+        run.close()
+
+
+@pytest.mark.asyncio
+async def test_pool_evicts_checkpoint_safe_awaiting_user_runtime(pool, contexts, clock):
+    runtime = await pool.acquire(contexts.a)
+    run = runtime.begin_run()
+    run.mark_awaiting_user(checkpoint_persisted=True)
 
     clock.advance(pool.idle_ttl_ms + 1)
 
@@ -199,10 +217,13 @@ async def test_pool_returns_capacity_error_when_no_runtime_is_evictable(pool_at_
     from multiclaw.runtime.pool import RuntimeCapacityError
 
     resident = await pool_at_capacity.acquire(contexts.a)
-    resident.active_executing_run_count = 1
+    run = resident.begin_run()
 
-    with pytest.raises(RuntimeCapacityError) as error:
-        await pool_at_capacity.acquire(contexts.b)
+    try:
+        with pytest.raises(RuntimeCapacityError) as error:
+            await pool_at_capacity.acquire(contexts.b)
+    finally:
+        run.close()
 
     assert error.value.retry_after_seconds >= 1
 
@@ -288,3 +309,138 @@ async def test_pool_close_attempts_all_runtimes_and_preserves_primary_failure(cl
     assert second.calls == 1
     assert error.value.__notes__
     assert any("tenant-b" in note and "second close failed" in note for note in error.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_close_during_create_closes_new_runtime_and_acquire_fails(contexts, clock):
+    from multiclaw.runtime.pool import RuntimePool
+
+    created_runtime = None
+    create_started = asyncio.Event()
+    release_create = asyncio.Event()
+
+    class BlockingFactory(FakeRuntimeFactory):
+        async def create(self, context: TenantContext):
+            nonlocal created_runtime
+            create_started.set()
+            await release_create.wait()
+            created_runtime = await super().create(context)
+            return created_runtime
+
+    pool = RuntimePool(
+        factory=BlockingFactory(clock),
+        max_resident_tenants=1,
+        idle_ttl_ms=5_000,
+        clock=clock,
+    )
+
+    acquire_task = asyncio.create_task(pool.acquire(contexts.a))
+    await create_started.wait()
+    close_task = asyncio.create_task(pool.close())
+    release_create.set()
+
+    with pytest.raises(RuntimeError, match="runtime pool is closed"):
+        await asyncio.wait_for(acquire_task, timeout=3)
+    await asyncio.wait_for(close_task, timeout=3)
+
+    assert created_runtime is not None
+    assert created_runtime.mcp_manager.stop_calls == 1
+    assert await pool.peek(contexts.a.tenant_id) is None
+
+
+@pytest.mark.asyncio
+async def test_acquire_waiting_on_tenant_lock_fails_after_close(contexts, clock):
+    from multiclaw.runtime.pool import RuntimePool
+
+    pool = RuntimePool(
+        factory=FakeRuntimeFactory(clock),
+        max_resident_tenants=2,
+        idle_ttl_ms=5_000,
+        clock=clock,
+    )
+
+    tenant_lock = pool._create_locks.setdefault(contexts.a.tenant_id, asyncio.Lock())
+    await tenant_lock.acquire()
+    acquire_task = asyncio.create_task(pool.acquire(contexts.a))
+    await asyncio.sleep(0)
+
+    close_task = asyncio.create_task(pool.close())
+    await asyncio.sleep(0)
+    tenant_lock.release()
+
+    with pytest.raises(RuntimeError, match="runtime pool is closed"):
+        await asyncio.wait_for(acquire_task, timeout=3)
+    await asyncio.wait_for(close_task, timeout=3)
+
+
+@pytest.mark.asyncio
+async def test_existing_runtime_fast_path_avoids_tenant_capacity_lock_inversion(contexts, clock):
+    from multiclaw.runtime.pool import RuntimeCapacityError, RuntimePool
+
+    pool = RuntimePool(
+        factory=FakeRuntimeFactory(clock),
+        max_resident_tenants=1,
+        idle_ttl_ms=5_000,
+        clock=clock,
+    )
+    existing = await pool.acquire(contexts.a)
+    clock.advance(pool.idle_ttl_ms + 1)
+
+    tenant_lock = pool._create_locks.setdefault(contexts.a.tenant_id, asyncio.Lock())
+    await tenant_lock.acquire()
+
+    acquire_existing = asyncio.create_task(pool.acquire(contexts.a))
+    await asyncio.sleep(0)
+    acquire_other = asyncio.create_task(pool.acquire(contexts.b))
+    await asyncio.sleep(0)
+
+    tenant_lock.release()
+
+    returned = await asyncio.wait_for(acquire_existing, timeout=3)
+    assert returned is existing
+    assert returned.last_used_at_ms == clock.now_ms()
+    with pytest.raises(RuntimeCapacityError):
+        await asyncio.wait_for(acquire_other, timeout=3)
+    assert await pool.peek(contexts.a.tenant_id) is existing
+
+
+@pytest.mark.asyncio
+async def test_runtime_execution_lease_tracks_tool_and_checkpoint_state(clock):
+    runtime = _build_runtime_types()(
+        tenant_id="tenant-a",
+        runtime_instance_id="runtime-1",
+        workspace_root=Path("/tmp/runtime-tests/tenant-a/workspace-a"),
+        agent=SimpleNamespace(),
+        event_bus=EventBus(),
+        event_router=FakeEventRouter(),
+        scheduler=SimpleNamespace(),
+        registry=FakeRegistry(),
+        skill_manager=FakeSkillManager(),
+        mcp_manager=FakeMcpManager(),
+        sandbox_controller=None,
+        sandbox_readiness=None,
+        last_used_at_ms=clock.now_ms(),
+    )
+
+    run = runtime.begin_run()
+    run.mark_tool_execution_started()
+    run.mark_tool_execution_finished()
+    run.mark_awaiting_user(checkpoint_persisted=True)
+
+    assert runtime.active_run_count == 1
+    assert runtime.awaiting_user_run_count == 1
+    assert runtime.checkpointed_awaiting_user_run_count == 1
+    assert runtime.active_executing_run_count == 0
+    assert runtime.active_tool_execution_count == 0
+
+    run.close()
+
+    assert runtime.active_run_count == 0
+    assert runtime.awaiting_user_run_count == 0
+    assert runtime.checkpointed_awaiting_user_run_count == 0
+    assert runtime.active_executing_run_count == 0
+
+
+def test_threading_event_sanity():
+    event = threading.Event()
+    assert event.is_set() is False
