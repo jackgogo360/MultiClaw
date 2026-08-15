@@ -50,6 +50,48 @@ class FakeEventRouter:
         return None
 
 
+class _FailOnce:
+    def __init__(self, label: str, *, fail_first: bool = False) -> None:
+        self.label = label
+        self.fail_first = fail_first
+        self.calls = 0
+
+    def _maybe_fail(self) -> None:
+        self.calls += 1
+        if self.fail_first and self.calls == 1:
+            raise RuntimeError(f"{self.label} failed")
+
+
+class RetryCloseManager(_FailOnce):
+    def stop(self) -> None:
+        self._maybe_fail()
+
+
+class RetryCloseSkillManager(_FailOnce):
+    def close(self) -> None:
+        self._maybe_fail()
+
+
+class RetryCloseRegistry(_FailOnce):
+    def clear(self) -> None:
+        self._maybe_fail()
+
+
+class RetryCloseEventRouter(_FailOnce):
+    def clear(self) -> None:
+        self._maybe_fail()
+
+
+class RetryCloseSecret(_FailOnce):
+    def close(self) -> None:
+        self._maybe_fail()
+
+
+class RetryCloseController(_FailOnce):
+    def close(self) -> None:
+        self._maybe_fail()
+
+
 @dataclass
 class RuntimeContexts:
     a: TenantContext
@@ -350,7 +392,7 @@ async def test_close_during_create_closes_new_runtime_and_acquire_fails(contexts
 
 @pytest.mark.asyncio
 async def test_acquire_waiting_on_tenant_lock_fails_after_close(contexts, clock):
-    from multiclaw.runtime.pool import RuntimePool
+    from multiclaw.runtime.pool import RuntimePool, _TenantLockEntry
 
     pool = RuntimePool(
         factory=FakeRuntimeFactory(clock),
@@ -359,7 +401,8 @@ async def test_acquire_waiting_on_tenant_lock_fails_after_close(contexts, clock)
         clock=clock,
     )
 
-    tenant_lock = pool._create_locks.setdefault(contexts.a.tenant_id, asyncio.Lock())
+    tenant_lock = asyncio.Lock()
+    pool._tenant_locks[contexts.a.tenant_id] = _TenantLockEntry(lock=tenant_lock, users=0)
     await tenant_lock.acquire()
     acquire_task = asyncio.create_task(pool.acquire(contexts.a))
     await asyncio.sleep(0)
@@ -375,7 +418,7 @@ async def test_acquire_waiting_on_tenant_lock_fails_after_close(contexts, clock)
 
 @pytest.mark.asyncio
 async def test_existing_runtime_fast_path_avoids_tenant_capacity_lock_inversion(contexts, clock):
-    from multiclaw.runtime.pool import RuntimeCapacityError, RuntimePool
+    from multiclaw.runtime.pool import RuntimeCapacityError, RuntimePool, _TenantLockEntry
 
     pool = RuntimePool(
         factory=FakeRuntimeFactory(clock),
@@ -386,7 +429,8 @@ async def test_existing_runtime_fast_path_avoids_tenant_capacity_lock_inversion(
     existing = await pool.acquire(contexts.a)
     clock.advance(pool.idle_ttl_ms + 1)
 
-    tenant_lock = pool._create_locks.setdefault(contexts.a.tenant_id, asyncio.Lock())
+    tenant_lock = asyncio.Lock()
+    pool._tenant_locks[contexts.a.tenant_id] = _TenantLockEntry(lock=tenant_lock, users=0)
     await tenant_lock.acquire()
 
     acquire_existing = asyncio.create_task(pool.acquire(contexts.a))
@@ -439,6 +483,231 @@ async def test_runtime_execution_lease_tracks_tool_and_checkpoint_state(clock):
     assert runtime.awaiting_user_run_count == 0
     assert runtime.checkpointed_awaiting_user_run_count == 0
     assert runtime.active_executing_run_count == 0
+
+
+def test_begin_run_rejects_unavailable_runtime(clock):
+    runtime = _build_runtime_types()(
+        tenant_id="tenant-a",
+        runtime_instance_id="runtime-1",
+        workspace_root=Path("/tmp/runtime-tests/tenant-a/workspace-a"),
+        agent=SimpleNamespace(),
+        event_bus=EventBus(),
+        event_router=FakeEventRouter(),
+        scheduler=SimpleNamespace(),
+        registry=FakeRegistry(),
+        skill_manager=FakeSkillManager(),
+        mcp_manager=FakeMcpManager(),
+        sandbox_controller=None,
+        sandbox_readiness=None,
+        last_used_at_ms=clock.now_ms(),
+        clock=clock,
+    )
+
+    runtime.mark_unavailable()
+
+    with pytest.raises(RuntimeError, match="runtime is unavailable"):
+        runtime.begin_run()
+
+
+@pytest.mark.asyncio
+async def test_runtime_execution_lease_refreshes_last_used_from_injected_clock(clock):
+    runtime = _build_runtime_types()(
+        tenant_id="tenant-a",
+        runtime_instance_id="runtime-1",
+        workspace_root=Path("/tmp/runtime-tests/tenant-a/workspace-a"),
+        agent=SimpleNamespace(),
+        event_bus=EventBus(),
+        event_router=FakeEventRouter(),
+        scheduler=SimpleNamespace(),
+        registry=FakeRegistry(),
+        skill_manager=FakeSkillManager(),
+        mcp_manager=FakeMcpManager(),
+        sandbox_controller=None,
+        sandbox_readiness=None,
+        last_used_at_ms=clock.now_ms(),
+        clock=clock,
+    )
+
+    clock.advance(500)
+    run = runtime.begin_run()
+    assert runtime.last_used_at_ms == clock.now_ms()
+
+    clock.advance(750)
+    run.close()
+
+    assert runtime.last_used_at_ms == clock.now_ms()
+    assert runtime.can_evict(runtime.last_used_at_ms + 5_000, 5_000) is False
+
+
+@pytest.mark.asyncio
+async def test_tenant_runtime_close_retries_only_failed_phases(clock):
+    runtime = _build_runtime_types()(
+        tenant_id="tenant-a",
+        runtime_instance_id="runtime-1",
+        workspace_root=Path("/tmp/runtime-tests/tenant-a/workspace-a"),
+        agent=SimpleNamespace(),
+        event_bus=EventBus(),
+        event_router=RetryCloseEventRouter("event-router"),
+        scheduler=SimpleNamespace(),
+        registry=RetryCloseRegistry("registry", fail_first=True),
+        skill_manager=RetryCloseSkillManager("skill-manager"),
+        mcp_manager=RetryCloseManager("mcp-manager", fail_first=True),
+        sandbox_controller=RetryCloseController("sandbox-controller", fail_first=True),
+        sandbox_readiness=None,
+        last_used_at_ms=clock.now_ms(),
+        secret_handles=[
+            RetryCloseSecret("secret-ok"),
+            RetryCloseSecret("secret-retry", fail_first=True),
+        ],
+        clock=clock,
+    )
+
+    with pytest.raises(RuntimeError, match="mcp-manager failed") as error:
+        await runtime.close()
+
+    assert runtime.mcp_manager.calls == 1
+    assert runtime.skill_manager.calls == 1
+    assert runtime.registry.calls == 1
+    assert runtime.event_router.calls == 1
+    assert runtime.sandbox_controller.calls == 1
+    assert len(runtime.secret_handles) == 1
+    assert error.value.__notes__
+    assert any("registry failed" in note for note in error.value.__notes__)
+    assert any("secret-retry failed" in note for note in error.value.__notes__)
+    assert any("sandbox-controller failed" in note for note in error.value.__notes__)
+
+    await runtime.close()
+    await runtime.close()
+
+    assert runtime.mcp_manager.calls == 2
+    assert runtime.skill_manager.calls == 1
+    assert runtime.registry.calls == 2
+    assert runtime.event_router.calls == 1
+    assert runtime.sandbox_controller.calls == 2
+    assert len(runtime.secret_handles) == 0
+
+
+@pytest.mark.asyncio
+async def test_pool_reclaims_tenant_lock_entries_after_rejected_tenants(clock):
+    from multiclaw.runtime.pool import RuntimeCapacityError, RuntimePool
+
+    pool = RuntimePool(
+        factory=FakeRuntimeFactory(clock),
+        max_resident_tenants=1,
+        idle_ttl_ms=5_000,
+        clock=clock,
+    )
+    resident = await pool.acquire(TenantContext("tenant-a", "workspace-a"))
+    run = resident.begin_run()
+
+    try:
+        for index in range(50):
+            with pytest.raises(RuntimeCapacityError):
+                await pool.acquire(TenantContext(f"tenant-{index+1}", "workspace-a"))
+    finally:
+        run.close()
+
+    assert len(pool._tenant_locks) == 0
+
+
+@pytest.mark.asyncio
+async def test_revoke_keeps_failed_runtime_resident_and_retryable(clock, contexts):
+    from multiclaw.runtime.pool import RuntimePool, RuntimeUnavailableError
+
+    runtime = _build_runtime_types()(
+        tenant_id=contexts.a.tenant_id,
+        runtime_instance_id="runtime-1",
+        workspace_root=Path("/tmp/runtime-tests/tenant-a/workspace-a"),
+        agent=SimpleNamespace(),
+        event_bus=EventBus(),
+        event_router=RetryCloseEventRouter("event-router"),
+        scheduler=SimpleNamespace(),
+        registry=RetryCloseRegistry("registry"),
+        skill_manager=RetryCloseSkillManager("skill-manager"),
+        mcp_manager=RetryCloseManager("mcp-manager", fail_first=True),
+        sandbox_controller=RetryCloseController("sandbox-controller"),
+        sandbox_readiness=None,
+        last_used_at_ms=clock.now_ms(),
+        clock=clock,
+    )
+    pool = RuntimePool(
+        factory=FakeRuntimeFactory(clock),
+        max_resident_tenants=2,
+        idle_ttl_ms=5_000,
+        clock=clock,
+    )
+    pool._runtimes[contexts.a.tenant_id] = runtime
+
+    with pytest.raises(RuntimeError, match="mcp-manager failed"):
+        await pool.revoke(contexts.a.tenant_id)
+
+    assert await pool.peek(contexts.a.tenant_id) is runtime
+    with pytest.raises(RuntimeUnavailableError):
+        await pool.acquire(contexts.a)
+
+    await pool.revoke(contexts.a.tenant_id)
+
+    assert await pool.peek(contexts.a.tenant_id) is None
+    assert runtime.mcp_manager.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_pool_close_retries_failed_runtimes_without_reclosing_successes(clock):
+    from multiclaw.runtime.pool import RuntimePool
+
+    success = _build_runtime_types()(
+        tenant_id="tenant-a",
+        runtime_instance_id="runtime-a",
+        workspace_root=Path("/tmp/runtime-tests/tenant-a/workspace-a"),
+        agent=SimpleNamespace(),
+        event_bus=EventBus(),
+        event_router=RetryCloseEventRouter("event-router-a"),
+        scheduler=SimpleNamespace(),
+        registry=RetryCloseRegistry("registry-a"),
+        skill_manager=RetryCloseSkillManager("skill-manager-a"),
+        mcp_manager=RetryCloseManager("mcp-manager-a"),
+        sandbox_controller=RetryCloseController("sandbox-controller-a"),
+        sandbox_readiness=None,
+        last_used_at_ms=clock.now_ms(),
+        clock=clock,
+    )
+    retry = _build_runtime_types()(
+        tenant_id="tenant-b",
+        runtime_instance_id="runtime-b",
+        workspace_root=Path("/tmp/runtime-tests/tenant-b/workspace-a"),
+        agent=SimpleNamespace(),
+        event_bus=EventBus(),
+        event_router=RetryCloseEventRouter("event-router-b"),
+        scheduler=SimpleNamespace(),
+        registry=RetryCloseRegistry("registry-b"),
+        skill_manager=RetryCloseSkillManager("skill-manager-b"),
+        mcp_manager=RetryCloseManager("mcp-manager-b", fail_first=True),
+        sandbox_controller=RetryCloseController("sandbox-controller-b"),
+        sandbox_readiness=None,
+        last_used_at_ms=clock.now_ms(),
+        clock=clock,
+    )
+    pool = RuntimePool(
+        factory=FakeRuntimeFactory(clock),
+        max_resident_tenants=2,
+        idle_ttl_ms=5_000,
+        clock=clock,
+    )
+    pool._runtimes = {"tenant-a": success, "tenant-b": retry}
+
+    with pytest.raises(RuntimeError, match="mcp-manager-b failed"):
+        await pool.close()
+
+    assert await pool.peek("tenant-a") is None
+    assert await pool.peek("tenant-b") is retry
+    assert success.mcp_manager.calls == 1
+    assert retry.mcp_manager.calls == 1
+
+    await pool.close()
+
+    assert await pool.peek("tenant-b") is None
+    assert success.mcp_manager.calls == 1
+    assert retry.mcp_manager.calls == 2
 
 
 def test_threading_event_sanity():

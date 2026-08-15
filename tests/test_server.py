@@ -152,6 +152,42 @@ def test_chat_without_session_emits_session_event(migrated_database):
     assert '"id":"' in body
 
 
+def test_chat_returns_retryable_503_when_runtime_pool_is_at_capacity(migrated_database, monkeypatch):
+    import multiclaw.server as server
+    from multiclaw.runtime.pool import RuntimeCapacityError
+
+    async def fail_acquire(context):
+        del context
+        raise RuntimeCapacityError(7)
+
+    with TestClient(server.app) as client:
+        client.cookies = _make_auth_cookie(server.app, migrated_database)
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", fail_acquire)
+        response = client.post("/api/chat", json={"message": "hello"})
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "7"
+    assert response.json() == {"detail": "runtime temporarily unavailable"}
+
+
+def test_approve_returns_retryable_503_when_runtime_pool_is_at_capacity(migrated_database, monkeypatch):
+    import multiclaw.server as server
+    from multiclaw.runtime.pool import RuntimeCapacityError
+
+    async def fail_acquire(context):
+        del context
+        raise RuntimeCapacityError(7)
+
+    with TestClient(server.app) as client:
+        client.cookies = _make_auth_cookie(server.app, migrated_database)
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", fail_acquire)
+        response = client.post("/api/approve", json={"request_id": "req-1", "approved": True})
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "7"
+    assert response.json() == {"detail": "runtime temporarily unavailable"}
+
+
 def test_chat_real_memory_path_does_not_lock_sqlite(migrated_database, monkeypatch):
     import multiclaw.server as server
 
@@ -1531,6 +1567,57 @@ def test_lifespan_probe_failure_preserves_primary_and_cleanup_notes(tmp_path, mo
         with TestClient(server_module.app):
             pass
 
+    assert error.value.__notes__
+    assert any("runtime_pool.close" in note and "runtime pool close failed" in note for note in error.value.__notes__)
+    assert any("database.dispose" in note and "database dispose failed" in note for note in error.value.__notes__)
+
+
+def test_lifespan_normal_shutdown_preserves_primary_and_calls_all_cleanup_in_order(tmp_path, monkeypatch):
+    import multiclaw.server as server_module
+
+    call_order: list[str] = []
+
+    class FakeDatabase:
+        async def dispose(self) -> None:
+            call_order.append("database.dispose")
+            raise RuntimeError("database dispose failed")
+
+    class FailingRuntimePool:
+        def __init__(self, *, factory, max_resident_tenants, idle_ttl_ms) -> None:
+            del factory, max_resident_tenants, idle_ttl_ms
+
+        async def close(self) -> None:
+            call_order.append("runtime_pool.close")
+            raise RuntimeError("runtime pool close failed")
+
+    fake_factory = SimpleNamespace(
+        settings=SimpleNamespace(
+            database=SimpleNamespace(path=str(tmp_path / "app.db")),
+            runtime=SimpleNamespace(max_resident_tenants=1, idle_ttl_seconds=1),
+        ),
+        database=FakeDatabase(),
+        workspace_resolver=SimpleNamespace(root=tmp_path),
+        probe_startup=lambda: (SimpleNamespace(ready=True), ()),
+        create=None,
+    )
+
+    async def fake_initialize(self) -> None:
+        self.jwt_secret = "secret"
+
+    async def fake_close(self) -> None:
+        call_order.append("auth_store.close")
+        raise RuntimeError("auth store close failed")
+
+    monkeypatch.setattr(server_module, "create_runtime_factory", lambda: fake_factory)
+    monkeypatch.setattr(server_module, "RuntimePool", FailingRuntimePool)
+    monkeypatch.setattr(server_module.AuthStore, "initialize", fake_initialize)
+    monkeypatch.setattr(server_module.AuthStore, "close", fake_close)
+
+    with pytest.raises(RuntimeError, match="auth store close failed") as error:
+        with TestClient(server_module.app):
+            pass
+
+    assert call_order == ["auth_store.close", "runtime_pool.close", "database.dispose"]
     assert error.value.__notes__
     assert any("runtime_pool.close" in note and "runtime pool close failed" in note for note in error.value.__notes__)
     assert any("database.dispose" in note and "database dispose failed" in note for note in error.value.__notes__)

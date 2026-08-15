@@ -181,6 +181,7 @@ class RuntimeFactory:
             sandbox_controller=sandbox_controller,
             sandbox_readiness=readiness,
             last_used_at_ms=self.clock.now_ms(),
+            clock=self.clock,
         )
 
     def probe_startup(self) -> tuple[SandboxReadiness, tuple[Any, ...]]:
