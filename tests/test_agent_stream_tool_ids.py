@@ -5,10 +5,12 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pydantic import BaseModel
 
+from multiclaw.agent.base import BaseAgent
 from multiclaw.agent.multiclaw import MultiClawAgent
 from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.agent.tool_batch import ToolBatchExecutor
 from multiclaw.context import ContextBuildReport, ContextBuildResult
+from multiclaw.events import AgentState, AgentStateEvent, EventBus
 from multiclaw.llm import LLMResponse
 from multiclaw.tenancy import TenantContext
 from multiclaw.tools import (
@@ -138,6 +140,29 @@ class _DummyDsmlRetryRouter:
             return
 
         yield {"type": "token", "content": "Final summary"}
+
+
+class _SequentialStreamRouter:
+    def __init__(self, stream_sequences) -> None:
+        self.stream_sequences = list(stream_sequences)
+        self.stream_calls: list[dict] = []
+
+    async def stream_completion(self, **kwargs):
+        self.stream_calls.append(kwargs)
+        events = self.stream_sequences.pop(0)
+        if isinstance(events, Exception):
+            raise events
+        for event in events:
+            yield event
+
+
+class _TokenThenBlockRouter:
+    def __init__(self) -> None:
+        self.block = asyncio.Event()
+
+    async def stream_completion(self, **_kwargs):
+        yield {"type": "token", "content": "partial"}
+        await self.block.wait()
 
 
 class _ScriptedParams(BaseModel):
@@ -660,6 +685,128 @@ async def test_handle_message_stream_forces_summary_when_reflection_generation_f
     assert router.stream_calls[-1]["tools"] is None
 
 
+@pytest.mark.asyncio
+async def test_handle_message_stream_resets_state_after_forced_summary_before_next_run():
+    router = _SequentialStreamRouter(
+        [
+            [
+                _tool_calls_event("call_1", {"query": "alpha"}),
+            ],
+            [{"type": "token", "content": "forced summary"}],
+            [{"type": "token", "content": "next run"}],
+        ]
+    )
+    agent, state_events = _build_stateful_stream_agent(
+        router=router,
+        registry=_single_tool_registry("web_search", ["search results"]),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=1,
+    )
+
+    first_events = []
+    async for event in agent.handle_message_stream("first", context=_stream_context("s1", "r1")):
+        first_events.append(event)
+
+    second_events = []
+    async for event in agent.handle_message_stream("second", context=_stream_context("s1", "r2")):
+        second_events.append(event)
+
+    assert next(event for event in first_events if event["type"] == "done") == {
+        "type": "done",
+        "content": "forced summary",
+        "data": {},
+    }
+    assert agent.state == AgentState.IDLE
+    assert [(event.from_state, event.to_state) for event in state_events[:3]] == [
+        (AgentState.IDLE, AgentState.THINKING),
+        (AgentState.THINKING, AgentState.ACTING),
+        (AgentState.ACTING, AgentState.IDLE),
+    ]
+    assert state_events[3].from_state == AgentState.IDLE
+    assert state_events[3].to_state == AgentState.THINKING
+    assert next(event for event in second_events if event["type"] == "done") == {
+        "type": "done",
+        "content": "next run",
+        "data": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_resets_state_after_timeout_before_next_run():
+    router = _SequentialStreamRouter(
+        [
+            asyncio.TimeoutError("boom"),
+            [{"type": "token", "content": "recovered"}],
+        ]
+    )
+    agent, state_events = _build_stateful_stream_agent(
+        router=router,
+        registry=ToolRegistry(),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=1,
+    )
+
+    first_events = []
+    async for event in agent.handle_message_stream("first", context=_stream_context("s1", "r1")):
+        first_events.append(event)
+
+    second_events = []
+    async for event in agent.handle_message_stream("second", context=_stream_context("s1", "r2")):
+        second_events.append(event)
+
+    assert next(event for event in first_events if event["type"] == "error") == {
+        "type": "error",
+        "content": "Request timed out: boom",
+    }
+    assert agent.state == AgentState.IDLE
+    assert state_events[0].from_state == AgentState.IDLE
+    assert state_events[0].to_state == AgentState.THINKING
+    assert state_events[1].from_state == AgentState.THINKING
+    assert state_events[1].to_state == AgentState.IDLE
+    assert state_events[2].from_state == AgentState.IDLE
+    assert state_events[2].to_state == AgentState.THINKING
+    assert next(event for event in second_events if event["type"] == "done") == {
+        "type": "done",
+        "content": "recovered",
+        "data": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_resets_state_after_generator_close():
+    router = _TokenThenBlockRouter()
+    agent, state_events = _build_stateful_stream_agent(
+        router=router,
+        registry=ToolRegistry(),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=1,
+    )
+
+    stream = agent.handle_message_stream("hello", context=_stream_context("s1", "r1"))
+    first = await anext(stream)
+    assert first == {"type": "token", "content": "partial"}
+
+    await stream.aclose()
+
+    assert agent.state == AgentState.IDLE
+    assert [(event.from_state, event.to_state) for event in state_events] == [
+        (AgentState.IDLE, AgentState.THINKING),
+        (AgentState.THINKING, AgentState.IDLE),
+    ]
+
+
 def _build_stub_stream_agent(
     *,
     router,
@@ -736,6 +883,9 @@ def _build_custom_stream_agent(
     agent.scheduler = scheduler
     agent.memory = _DummyMemory()
     agent.router = router
+    agent.state = AgentState.IDLE
+    agent.event_bus = EventBus()
+    agent.event_router = None
     agent.settings = SimpleNamespace(
         agent=SimpleNamespace(
             system_prompt="sys",
@@ -764,3 +914,39 @@ def _build_custom_stream_agent(
         side_effect=AssertionError("legacy per-call act path should not run")
     )
     return agent
+
+
+def _build_stateful_stream_agent(
+    *,
+    router,
+    registry: ToolRegistry,
+    scheduler,
+    parallel_enabled: bool,
+    resilience_enabled: bool,
+    repeat_limit: int,
+    max_reflections: int,
+    max_tool_rounds: int,
+):
+    agent = _build_custom_stream_agent(
+        router=router,
+        registry=registry,
+        scheduler=scheduler,
+        parallel_enabled=parallel_enabled,
+        resilience_enabled=resilience_enabled,
+        repeat_limit=repeat_limit,
+        max_reflections=max_reflections,
+        max_tool_rounds=max_tool_rounds,
+    )
+    event_bus = EventBus()
+    state_events: list[AgentStateEvent] = []
+
+    async def collect(event):
+        if isinstance(event, AgentStateEvent):
+            state_events.append(event)
+
+    event_bus.subscribe("agent.state_change", collect)
+    agent.event_bus = event_bus
+    agent.event_router = None
+    agent.state = AgentState.IDLE
+    agent.transition = BaseAgent.transition.__get__(agent, MultiClawAgent)
+    return agent, state_events

@@ -47,7 +47,15 @@ class EventRouter:
             handlers = list(self._handlers.get(key, ()))
         for _sub_id, handler in handlers:
             try:
-                await handler(self._clone_event(event))
+                delivery_event = self._clone_event(event)
+            except Exception:
+                logger.exception(
+                    "Error cloning scoped event for subscriber delivery: %s",
+                    event.event_type,
+                )
+                continue
+            try:
+                await handler(delivery_event)
             except Exception:
                 logger.exception(
                     "Error in scoped event handler for %s",
