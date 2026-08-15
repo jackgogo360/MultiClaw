@@ -224,7 +224,7 @@ class MCPClientManager:
             try:
                 self._tools_changed_callback(server_name, tools)
             except Exception:
-                logger.exception(
+                logging.getLogger().exception(
                     "Tools changed callback failed for server '%s'",
                     server_name,
                 )

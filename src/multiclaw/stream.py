@@ -3,6 +3,8 @@
 import json
 from typing import Any
 
+from multiclaw.events import ScopedEvent
+
 
 class DataStreamEncoder:
     """Encode AI SDK UIMessageChunk events as JSON SSE lines."""
@@ -119,6 +121,30 @@ class DataStreamEncoder:
         if part_id:
             payload["id"] = part_id
         return cls._event(payload)
+
+    @classmethod
+    def run_metadata(cls, session_id: str, run_id: str) -> str:
+        return cls.data_part(
+            "data-run",
+            {"session_id": session_id, "run_id": run_id},
+            transient=True,
+        )
+
+    @classmethod
+    def scoped_event(cls, event: ScopedEvent) -> str:
+        return cls.data_part(
+            "data-event",
+            {
+                "tenant_id": event.tenant_id,
+                "workspace_id": event.workspace_id,
+                "session_id": event.session_id,
+                "run_id": event.run_id,
+                "event_type": event.event_type,
+                "occurred_at_ms": event.occurred_at_ms,
+                "data": event.data,
+            },
+            transient=True,
+        )
 
     @classmethod
     def finish(cls, reason: str) -> str:

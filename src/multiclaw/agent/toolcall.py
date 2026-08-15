@@ -3,7 +3,7 @@ import logging
 from multiclaw.agent.models import Action, ActionType, Observation, ObservationType
 from multiclaw.agent.react import ReActAgent
 from multiclaw.config import Settings
-from multiclaw.events import EventBus
+from multiclaw.events import EventBus, EventRouter
 from multiclaw.llm import LLMResponse, ModelRouter
 from multiclaw.memory import MemoryProtocol
 from multiclaw.tools import CoreToolScheduler, ToolRegistry
@@ -20,8 +20,9 @@ class ToolCallAgent(ReActAgent):
         scheduler: CoreToolScheduler,
         memory: MemoryProtocol,
         event_bus: EventBus,
+        event_router: EventRouter | None = None,
     ) -> None:
-        super().__init__(memory=memory, event_bus=event_bus)
+        super().__init__(memory=memory, event_bus=event_bus, event_router=event_router)
         self.settings = settings
         self.router = router
         self.registry = registry

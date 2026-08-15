@@ -13,7 +13,7 @@ from multiclaw.agent.resilience import ResilienceAction, ResilienceController
 from multiclaw.agent.tool_batch import ToolBatchExecutor, ToolCallOutcome, ToolCallSpec
 from multiclaw.agent.toolcall import ToolCallAgent
 from multiclaw.config import Settings
-from multiclaw.events import AgentState, EventBus
+from multiclaw.events import AgentState, EventBus, EventRouter
 from multiclaw.llm import LLMResponse, ModelRouter
 from multiclaw.memory import MemoryEntry, MemoryProtocol
 from multiclaw.planner import Planner
@@ -79,6 +79,7 @@ class MultiClawAgent(ToolCallAgent):
         memory: MemoryProtocol,
         planner: Planner,
         event_bus: EventBus,
+        event_router: EventRouter | None = None,
         skill_manager: SkillManager | None = None,
     ) -> None:
         super().__init__(
@@ -88,6 +89,7 @@ class MultiClawAgent(ToolCallAgent):
             scheduler=scheduler,
             memory=memory,
             event_bus=event_bus,
+            event_router=event_router,
         )
         self.planner = planner
         self.context_builder = ContextBuilder(
@@ -200,12 +202,15 @@ class MultiClawAgent(ToolCallAgent):
     async def _execute_tool_batch(
         self,
         calls: list[dict[str, Any]],
+        *,
+        context: TenantContext | None = None,
     ) -> list[ToolCallOutcome]:
         if not calls:
             return []
-        await self.transition(AgentState.ACTING)
+        await self.transition(AgentState.ACTING, context=context)
         return await self._require_tool_batch_executor().execute(
-            self._build_tool_call_specs(calls)
+            self._build_tool_call_specs(calls),
+            context=context,
         )
 
     # ------------------------------------------------------------------
@@ -290,7 +295,7 @@ class MultiClawAgent(ToolCallAgent):
                 response.reasoning_content,
             )
             messages.append(assistant_msg)
-            outcomes = await self._execute_tool_batch(normalized_calls)
+            outcomes = await self._execute_tool_batch(normalized_calls, context=context)
             result_contents = [outcome.observation.content for outcome in outcomes]
 
             for outcome in outcomes:
@@ -422,7 +427,7 @@ class MultiClawAgent(ToolCallAgent):
             }
             return
 
-        await self.transition(AgentState.THINKING)
+        await self.transition(AgentState.THINKING, context=context)
 
         # --- Skill handling ---
         user_msg = user_input
@@ -526,7 +531,10 @@ class MultiClawAgent(ToolCallAgent):
                             reasoning,
                         )
                         messages.append(tool_calls_msg)
-                        outcomes = await self._execute_tool_batch(normalized_calls)
+                        outcomes = await self._execute_tool_batch(
+                            normalized_calls,
+                            context=context,
+                        )
                         result_contents: list[str] = []
 
                         for outcome in outcomes:
@@ -585,7 +593,7 @@ class MultiClawAgent(ToolCallAgent):
                         full_text,
                         next_turn_index + 1,
                     )
-                    await self.transition(AgentState.FINISHED)
+                    await self.transition(AgentState.FINISHED, context=context)
                     yield {"type": "done", "content": full_text, "data": {}}
                     return
 

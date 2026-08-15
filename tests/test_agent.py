@@ -208,7 +208,7 @@ class _BatchScheduler:
     async def can_run_concurrently(self, builder, raw_params: dict) -> bool:
         return builder.read_only
 
-    async def run(self, builder, raw_params: dict) -> ToolExecutionResult:
+    async def run(self, builder, raw_params: dict, **_kwargs) -> ToolExecutionResult:
         self.run_calls.append((builder.name, raw_params))
         params = builder.validate(raw_params)
         return await builder.build(params).execute()
