@@ -186,11 +186,12 @@ class RuntimeFactory:
     def probe_startup(self) -> tuple[SandboxReadiness, tuple[Any, ...]]:
         event_bus = EventBus()
         controller = self._sandbox_controller_factory(self.workspace_resolver.root, event_bus)
+        result: tuple[SandboxReadiness, tuple[Any, ...]] | None = None
         try:
             controller.initialize()
             readiness = controller.finalize_readiness()
             events = controller.drain_startup_events()
-            return readiness, events
+            result = (readiness, events)
         except BaseException as primary:
             try:
                 controller.close()
@@ -199,10 +200,9 @@ class RuntimeFactory:
                     f"controller.close failed: {type(error).__name__}: {error}"
                 )
             raise
-        try:
-            controller.close()
-        except BaseException:
-            raise
+        controller.close()
+        assert result is not None
+        return result
 
     def _build_agent(
         self,
