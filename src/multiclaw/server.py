@@ -804,6 +804,8 @@ async def chat(
         reasoning_part_id: str | None = None
         step_open = False
         pending_tool_results = 0
+        sub_id: str | None = None
+        stream_task: asyncio.Task | None = None
 
         def close_text_part() -> list[str]:
             nonlocal text_part_id
@@ -838,35 +840,35 @@ async def chat(
             step_open = False
             return [enc.finish_step()]
 
-        yield enc.start()
-        yield enc.data_part(
-            "data-session",
-            session.model_dump(mode="json"),
-            transient=True,
-        )
-        for chunk in open_step():
-            yield chunk
-
-        token_queue: asyncio.Queue[dict] = asyncio.Queue()
-        event_queue: asyncio.Queue[Event] = asyncio.Queue()
-
-        async def collector(event: Event):
-            await event_queue.put(event)
-
-        sub_id = runtime.event_bus.subscribe("*", collector)
-
-        async def run_stream():
-            try:
-                async for item in runtime.agent.handle_message_stream(message, context=session_context):
-                    await token_queue.put(item)
-            except Exception as exc:
-                logger.exception("stream error")
-                msg = _friendly_error(exc)
-                await token_queue.put({"type": "error", "content": msg})
-
-        stream_task = asyncio.create_task(run_stream())
-
         try:
+            yield enc.start()
+            yield enc.data_part(
+                "data-session",
+                session.model_dump(mode="json"),
+                transient=True,
+            )
+            for chunk in open_step():
+                yield chunk
+
+            token_queue: asyncio.Queue[dict] = asyncio.Queue()
+            event_queue: asyncio.Queue[Event] = asyncio.Queue()
+
+            async def collector(event: Event):
+                await event_queue.put(event)
+
+            sub_id = runtime.event_bus.subscribe("*", collector)
+
+            async def run_stream():
+                try:
+                    async for item in runtime.agent.handle_message_stream(message, context=session_context):
+                        await token_queue.put(item)
+                except Exception as exc:
+                    logger.exception("stream error")
+                    msg = _friendly_error(exc)
+                    await token_queue.put({"type": "error", "content": msg})
+
+            stream_task = asyncio.create_task(run_stream())
+
             while True:
                 token_count = 0
                 while True:
@@ -986,9 +988,11 @@ async def chat(
 
                 await asyncio.sleep(0.02)
         finally:
-            stream_task.cancel()
-            await asyncio.gather(stream_task, return_exceptions=True)
-            runtime.event_bus.unsubscribe(sub_id)
+            if stream_task is not None:
+                stream_task.cancel()
+                await asyncio.gather(stream_task, return_exceptions=True)
+            if sub_id is not None:
+                runtime.event_bus.unsubscribe(sub_id)
             run_lease.close()
             logger.info("SSE stream ended")
 
