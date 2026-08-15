@@ -5,11 +5,12 @@ from types import SimpleNamespace
 
 from pydantic import BaseModel
 
+from multiclaw.agent.base import BaseAgent
 from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.agent.tool_batch import ToolBatchExecutor
 from multiclaw.config import Settings
 from multiclaw.context import ContextBuildReport, ContextBuildResult
-from multiclaw.events import AgentState, EventBus
+from multiclaw.events import AgentState, AgentStateEvent, EventBus
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.llm import LLMResponse, ModelRouter, ToolCall
 from multiclaw.memory import MemoryEntry
@@ -891,6 +892,77 @@ class TestMultiClawAgent:
             set(message.keys()) <= {"role", "content"} for message in expected_messages
         )
 
+    @pytest.mark.asyncio
+    async def test_handle_message_resets_state_after_tool_round_before_next_run(self):
+        registry = ToolRegistry()
+        registry.register(EchoToolBuilder())
+        agent, state_events = _build_stateful_batch_agent(
+            completion_responses=[
+                _tool_batch_response(("call_1", "echo", {"text": "first"})),
+                LLMResponse(content="done-1"),
+                _tool_batch_response(("call_2", "echo", {"text": "second"})),
+                LLMResponse(content="done-2"),
+            ],
+            registry=registry,
+            scheduler=_BatchScheduler(),
+            parallel_enabled=True,
+        )
+
+        first = await agent.handle_message("hello-1", context=SESSION_CONTEXT)
+        second = await agent.handle_message("hello-2", context=SESSION_CONTEXT)
+
+        assert first == Observation(
+            type=ObservationType.USER_RESPONSE,
+            content="done-1",
+        )
+        assert agent.state == AgentState.IDLE
+        assert second == Observation(
+            type=ObservationType.USER_RESPONSE,
+            content="done-2",
+        )
+        assert [(event.from_state, event.to_state) for event in state_events] == [
+            (AgentState.IDLE, AgentState.ACTING),
+            (AgentState.ACTING, AgentState.IDLE),
+            (AgentState.IDLE, AgentState.ACTING),
+            (AgentState.ACTING, AgentState.IDLE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_handle_message_resets_state_after_forced_summary_before_next_run(self):
+        registry = ToolRegistry()
+        registry.register(EchoToolBuilder())
+        agent, state_events = _build_stateful_batch_agent(
+            completion_responses=[
+                _tool_batch_response(("call_1", "echo", {"text": "first"})),
+                LLMResponse(content="forced summary"),
+                _tool_batch_response(("call_2", "echo", {"text": "second"})),
+                LLMResponse(content="done-2"),
+            ],
+            registry=registry,
+            scheduler=_BatchScheduler(),
+            parallel_enabled=True,
+        )
+        agent.settings.agent.max_tool_rounds = 1
+
+        first = await agent.handle_message("hello-1", context=SESSION_CONTEXT)
+        second = await agent.handle_message("hello-2", context=SESSION_CONTEXT)
+
+        assert first == Observation(
+            type=ObservationType.USER_RESPONSE,
+            content="forced summary",
+        )
+        assert agent.state == AgentState.IDLE
+        assert second == Observation(
+            type=ObservationType.USER_RESPONSE,
+            content="done-2",
+        )
+        assert [(event.from_state, event.to_state) for event in state_events] == [
+            (AgentState.IDLE, AgentState.ACTING),
+            (AgentState.ACTING, AgentState.IDLE),
+            (AgentState.IDLE, AgentState.ACTING),
+            (AgentState.ACTING, AgentState.IDLE),
+        ]
+
     def test_constructor_wires_progressive_context_settings(self, test_config_path):
         from multiclaw.agent import MultiClawAgent
 
@@ -1096,6 +1168,42 @@ def _build_custom_batch_agent(
         side_effect=AssertionError("legacy per-call act path should not run")
     )
     return agent
+
+
+def _build_stateful_batch_agent(
+    *,
+    completion_responses: list[LLMResponse],
+    registry: ToolRegistry,
+    scheduler,
+    parallel_enabled: bool,
+    resilience_enabled: bool = False,
+    repeat_limit: int = 3,
+    max_reflections: int = 1,
+):
+    from multiclaw.agent.multiclaw import MultiClawAgent
+
+    agent = _build_custom_batch_agent(
+        completion_responses=completion_responses,
+        registry=registry,
+        scheduler=scheduler,
+        parallel_enabled=parallel_enabled,
+        resilience_enabled=resilience_enabled,
+        repeat_limit=repeat_limit,
+        max_reflections=max_reflections,
+    )
+    event_bus = EventBus()
+    state_events: list[AgentStateEvent] = []
+
+    async def collect(event):
+        if isinstance(event, AgentStateEvent):
+            state_events.append(event)
+
+    event_bus.subscribe("agent.state_change", collect)
+    agent.event_bus = event_bus
+    agent.event_router = None
+    agent.state = AgentState.IDLE
+    agent.transition = BaseAgent.transition.__get__(agent, MultiClawAgent)
+    return agent, state_events
 
 
 def _find_reflection_call(calls):

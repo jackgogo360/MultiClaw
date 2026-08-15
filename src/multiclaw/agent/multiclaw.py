@@ -232,116 +232,127 @@ class MultiClawAgent(ToolCallAgent):
                 type=ObservationType.USER_RESPONSE,
                 content=self.planner.summary(plan),
             )
+        try:
+            # --- Skill handling ---
+            user_msg = user_input
 
-        # --- Skill handling ---
-        user_msg = user_input
+            if user_input.startswith("/"):
+                parts = user_input[1:].split(None, 1)
+                skill_name = parts[0]
+                args = parts[1] if len(parts) > 1 else ""
+                self.skill_manager.invoke(skill_name, args)
+            else:
+                self.skill_manager.process_message(user_msg)
 
-        if user_input.startswith("/"):
-            parts = user_input[1:].split(None, 1)
-            skill_name = parts[0]
-            args = parts[1] if len(parts) > 1 else ""
-            self.skill_manager.invoke(skill_name, args)
-        else:
-            self.skill_manager.process_message(user_msg)
+            skill_prompts = self.skill_manager.get_active_skill_prompts()
 
-        skill_prompts = self.skill_manager.get_active_skill_prompts()
-
-        messages = await self._build_context(
-            ContextRequest(
-                system_prompt=self.settings.agent.system_prompt,
-                user_input=user_msg,
-                context=context,
-                context_window_limit=self.settings.memory.context_window_limit,
-                skill_prompts=skill_prompts,
+            messages = await self._build_context(
+                ContextRequest(
+                    system_prompt=self.settings.agent.system_prompt,
+                    user_input=user_msg,
+                    context=context,
+                    context_window_limit=self.settings.memory.context_window_limit,
+                    skill_prompts=skill_prompts,
+                )
             )
-        )
-        next_turn_index = await self._next_turn_index(context)
-        await self._save_chat_msg(context, "user", user_msg, next_turn_index)
-        tools = self.registry.to_openai_schemas()
-        max_rounds = self.settings.agent.max_tool_rounds
-        controller = self._build_resilience_controller()
+            next_turn_index = await self._next_turn_index(context)
+            await self._save_chat_msg(context, "user", user_msg, next_turn_index)
+            tools = self.registry.to_openai_schemas()
+            max_rounds = self.settings.agent.max_tool_rounds
+            controller = self._build_resilience_controller()
 
-        for _ in range(max_rounds):
-            response: LLMResponse = await self.router.completion(
-                model=self.settings.llm.default_model,
-                messages=messages,
-                tools=tools,
+            for _ in range(max_rounds):
+                response: LLMResponse = await self.router.completion(
+                    model=self.settings.llm.default_model,
+                    messages=messages,
+                    tools=tools,
+                )
+
+                if not response.tool_calls:
+                    await self._save_chat_msg(
+                        context,
+                        "assistant",
+                        response.content,
+                        next_turn_index + 1,
+                    )
+                    return Observation(
+                        type=ObservationType.USER_RESPONSE,
+                        content=response.content,
+                    )
+
+                normalized_calls = self._normalize_tool_calls(response.tool_calls)
+                if controller is not None:
+                    call_decision = controller.observe_calls(normalized_calls)
+                    if call_decision.action == ResilienceAction.REFLECT:
+                        reflection = await self._attempt_reflection(
+                            messages, call_decision.reason
+                        )
+                        if reflection is None:
+                            break
+                        controller.mark_reflection_used()
+                        messages.append(self._build_reflection_feedback_msg(reflection))
+                        continue
+                    if call_decision.action == ResilienceAction.TERMINATE:
+                        break
+
+                assistant_msg = _build_assistant_tool_calls_msg(
+                    normalized_calls,
+                    response.reasoning_content,
+                )
+                messages.append(assistant_msg)
+                outcomes = await self._execute_tool_batch(normalized_calls, context=context)
+                result_contents = [outcome.observation.content for outcome in outcomes]
+
+                for outcome in outcomes:
+                    messages.append(
+                        _build_tool_result_msg(
+                            outcome.call_id,
+                            outcome.observation.content,
+                        )
+                    )
+                    await self.remember(context, outcome.observation.content, "tool_result")
+
+                if controller is not None:
+                    result_decision = controller.observe_results(result_contents)
+                    if result_decision.action == ResilienceAction.REFLECT:
+                        reflection = await self._attempt_reflection(
+                            messages, result_decision.reason
+                        )
+                        if reflection is None:
+                            break
+                        controller.mark_reflection_used()
+                        messages.append(self._build_reflection_feedback_msg(reflection))
+                        continue
+                    if result_decision.action == ResilienceAction.TERMINATE:
+                        break
+
+            # Max rounds exceeded — force a final summary without tools
+            logger.warning(
+                "max tool rounds (%d) exceeded for session=%s, forcing final summary with %d messages",
+                max_rounds, context.session_id, len(messages),
             )
-
-            if not response.tool_calls:
-                await self._save_chat_msg(context, "assistant", response.content, next_turn_index + 1)
+            try:
+                full_text = await self._generate_final_summary(
+                    messages,
+                    self._collect_completion_text_response,
+                )
+                await self._save_chat_msg(context, "assistant", full_text, next_turn_index + 1)
                 return Observation(
                     type=ObservationType.USER_RESPONSE,
-                    content=response.content,
+                    content=full_text,
                 )
-
-            normalized_calls = self._normalize_tool_calls(response.tool_calls)
-            if controller is not None:
-                call_decision = controller.observe_calls(normalized_calls)
-                if call_decision.action == ResilienceAction.REFLECT:
-                    reflection = await self._attempt_reflection(
-                        messages, call_decision.reason
-                    )
-                    if reflection is None:
-                        break
-                    controller.mark_reflection_used()
-                    messages.append(self._build_reflection_feedback_msg(reflection))
-                    continue
-                if call_decision.action == ResilienceAction.TERMINATE:
-                    break
-
-            assistant_msg = _build_assistant_tool_calls_msg(
-                normalized_calls,
-                response.reasoning_content,
-            )
-            messages.append(assistant_msg)
-            outcomes = await self._execute_tool_batch(normalized_calls, context=context)
-            result_contents = [outcome.observation.content for outcome in outcomes]
-
-            for outcome in outcomes:
-                messages.append(
-                    _build_tool_result_msg(
-                        outcome.call_id,
-                        outcome.observation.content,
-                    )
+            except Exception:
+                logger.exception("final summary failed")
+                return Observation(
+                    type=ObservationType.ERROR,
+                    content="I wasn't able to complete this task within the allowed rounds.",
                 )
-                await self.remember(context, outcome.observation.content, "tool_result")
-
-            if controller is not None:
-                result_decision = controller.observe_results(result_contents)
-                if result_decision.action == ResilienceAction.REFLECT:
-                    reflection = await self._attempt_reflection(
-                        messages, result_decision.reason
-                    )
-                    if reflection is None:
-                        break
-                    controller.mark_reflection_used()
-                    messages.append(self._build_reflection_feedback_msg(reflection))
-                    continue
-                if result_decision.action == ResilienceAction.TERMINATE:
-                    break
-
-        # Max rounds exceeded — force a final summary without tools
-        logger.warning(
-            "max tool rounds (%d) exceeded for session=%s, forcing final summary with %d messages",
-            max_rounds, context.session_id, len(messages),
-        )
-        try:
-            full_text = await self._generate_final_summary(
-                messages,
-                self._collect_completion_text_response,
-            )
-            await self._save_chat_msg(context, "assistant", full_text, next_turn_index + 1)
-            return Observation(
-                type=ObservationType.USER_RESPONSE,
-                content=full_text,
-            )
-        except Exception:
-            logger.exception("final summary failed")
-            return Observation(
-                type=ObservationType.ERROR,
-                content="I wasn't able to complete this task within the allowed rounds.",
-            )
+        finally:
+            if self.state != AgentState.IDLE:
+                try:
+                    await self.transition(AgentState.IDLE, context=context)
+                except BaseException:
+                    logger.exception("failed to reset agent state after non-stream run termination")
 
     # ------------------------------------------------------------------
     # streaming path
