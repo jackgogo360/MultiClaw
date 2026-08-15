@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
@@ -123,3 +124,31 @@ async def test_upgrade_to_head_has_no_metadata_diff_against_core_schema(tmp_path
         await database.dispose()
 
     assert diffs == []
+
+
+@pytest.mark.asyncio
+async def test_alembic_upgrade_does_not_disable_existing_module_loggers(
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'logging.db'}"
+    logger = logging.getLogger("multiclaw.mcp.transport.stdio")
+    original_disabled = logger.disabled
+    original_propagate = logger.propagate
+    original_handlers = list(logger.handlers)
+
+    logger.disabled = False
+    logger.propagate = True
+
+    try:
+        await asyncio.to_thread(command.upgrade, alembic_config(database_url=database_url), "head")
+        logger.addHandler(caplog.handler)
+        with caplog.at_level("DEBUG"):
+            logger.debug("sentinel debug message")
+
+        assert logger.disabled is False
+        assert "sentinel debug message" in caplog.text
+    finally:
+        logger.disabled = original_disabled
+        logger.propagate = original_propagate
+        logger.handlers[:] = original_handlers
