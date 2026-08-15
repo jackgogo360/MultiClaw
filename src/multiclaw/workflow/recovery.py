@@ -30,7 +30,9 @@ from multiclaw.workflow.models import (
     RecoveryAction,
     RecoveryOutcome,
     RecoveryStrategy,
+    TERMINAL_RUN_STATUSES,
     RunStartedPayload,
+    RunRecord,
     RunStatus,
     RunTerminalPayload,
 )
@@ -143,6 +145,13 @@ class RecoveryService:
         self._settings = settings or Settings(_config_file="/nonexistent")
 
     async def recover(self, context: TenantContext, runtime_instance_id: str) -> RecoveryOutcome:
+        run = await self._run(context)
+        if run is None:
+            return RecoveryOutcome(
+                status=RunStatus.BLOCKED_CORRUPT,
+                executions_started=0,
+                reason="missing run",
+            )
         checkpoint = await self._latest_checkpoint(context)
         if checkpoint is None:
             return RecoveryOutcome(
@@ -167,6 +176,13 @@ class RecoveryService:
                 reason=str(error),
             )
 
+        if run.status in TERMINAL_RUN_STATUSES:
+            return RecoveryOutcome(
+                action=RecoveryAction.TERMINAL_NOOP,
+                status=run.status,
+                executions_started=0,
+            )
+
         if outcome.action is RecoveryAction.TERMINAL_NOOP:
             return outcome
 
@@ -181,6 +197,13 @@ class RecoveryService:
         )
 
     async def validate_live_run(self, context: TenantContext) -> RecoveryOutcome:
+        run = await self._run(context)
+        if run is None:
+            return RecoveryOutcome(
+                status=RunStatus.BLOCKED_CORRUPT,
+                executions_started=0,
+                reason="missing run",
+            )
         checkpoint = await self._latest_checkpoint(context)
         if checkpoint is None:
             return RecoveryOutcome(
@@ -203,6 +226,13 @@ class RecoveryService:
                 status=RunStatus.BLOCKED_CORRUPT,
                 executions_started=0,
                 reason=str(error),
+            )
+
+        if run.status in TERMINAL_RUN_STATUSES:
+            return RecoveryOutcome(
+                action=RecoveryAction.TERMINAL_NOOP,
+                status=run.status,
+                executions_started=0,
             )
 
     async def _classify(
@@ -303,6 +333,11 @@ class RecoveryService:
         async with self._database.connect() as conn:
             repository = self._repository(conn)
             return await repository.get_latest_checkpoint(context)
+
+    async def _run(self, context: TenantContext) -> RunRecord | None:
+        async with self._database.connect() as conn:
+            repository = self._repository(conn)
+            return await repository.get_run(context)
 
     async def _approval(self, context: TenantContext, approval_id: str):
         async with self._database.connect() as conn:

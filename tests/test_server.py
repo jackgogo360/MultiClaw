@@ -2553,6 +2553,71 @@ async def test_chat_validation_exception_cleans_up_failed_run_without_stream_sta
 
 
 @pytest.mark.asyncio
+async def test_chat_validation_cleanup_fallback_terminal_row_recovery_is_terminal_noop(
+    migrated_database,
+    monkeypatch,
+):
+    import multiclaw.server as server
+    from multiclaw.storage.repositories.workflow import WorkflowRepository
+    from multiclaw.workflow.recovery import RecoveryService
+
+    original_insert = WorkflowRepository._insert_checkpoint
+    captured: dict[str, object] = {}
+
+    class FakeRecoveryService:
+        async def validate_live_run(self, context):
+            captured["validated_context"] = context
+            raise RuntimeError("validation fallback cleanup")
+
+    async def fail_terminal_checkpoint(self, lease, **kwargs):
+        if kwargs.get("phase") == CheckpointPhase.RUN_TERMINAL.value:
+            raise RuntimeError("terminal checkpoint insert failed")
+        return await original_insert(self, lease, **kwargs)
+
+    monkeypatch.setattr(WorkflowRepository, "_insert_checkpoint", fail_terminal_checkpoint)
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "validation-fallback-terminal@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(request_context):
+            runtime = await original_acquire(request_context)
+
+            async def fail_if_started(*args, **kwargs):
+                raise AssertionError("stream handler should not start after validation cleanup fallback")
+
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fail_if_started)
+            captured["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        monkeypatch.setattr(server, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
+        request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
+
+        with pytest.raises(RuntimeError, match="validation fallback cleanup"):
+            async with TenantUnitOfWork(server.app.state.database, context) as uow:
+                await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+
+    run_context = await _latest_run_context(migrated_database, context)
+    assert await _run_status(migrated_database, run_context) == RunStatus.FAILED_TERMINAL.value
+    checkpoints = await _checkpoint_rows(migrated_database, run_context)
+    assert [row["phase"] for row in checkpoints] == [CheckpointPhase.RUN_STARTED.value]
+
+    outcome = await RecoveryService(migrated_database).recover(run_context, "runtime-2")
+    assert outcome.action is not None
+    assert outcome.action.value == "terminal_noop"
+    assert outcome.status == RunStatus.FAILED_TERMINAL
+    assert outcome.executions_started == 0
+    assert outcome.lease is None
+
+
+@pytest.mark.asyncio
 async def test_chat_stale_stream_aborts_after_foreign_takeover_progress_and_does_not_reacquire(
     migrated_database,
     monkeypatch,
