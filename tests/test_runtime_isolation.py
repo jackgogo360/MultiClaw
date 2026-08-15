@@ -97,3 +97,65 @@ async def test_runtime_factory_scopes_skill_discovery_to_each_workspace(tmp_path
     finally:
         await asyncio.gather(runtime_a.close(), runtime_b.close())
         await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_closes_partial_runtime_resources_when_create_fails(tmp_path: Path):
+    from multiclaw.runtime.factory import RuntimeFactory
+
+    class TrackingController(ReadyRecordingSandboxController):
+        def __init__(self, *, workspace_root: Path) -> None:
+            super().__init__(workspace_root=workspace_root)
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            super().close()
+
+    class TrackingManager:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    captured: dict[str, object] = {}
+
+    class FailingFactory(RuntimeFactory):
+        def _build_mcp_manager(self, workspace_root, event_bus, registry, sandbox_controller):
+            del workspace_root, event_bus, registry, sandbox_controller
+            manager = TrackingManager()
+            captured["manager"] = manager
+            return manager
+
+        def _build_agent(self, context, registry, scheduler, event_bus, skill_manager):
+            del context, registry, scheduler, event_bus, skill_manager
+            raise RuntimeError("agent assembly failed")
+
+    settings = _settings_for_runtime(tmp_path).model_copy(update={"mcp": McpSettings(enabled=True)})
+    database = Database.create(settings.database)
+    resolver = WorkspaceResolver(tmp_path)
+    controllers: list[TrackingController] = []
+
+    def controller_factory(workspace_root: Path, event_bus):
+        del event_bus
+        controller = TrackingController(workspace_root=workspace_root)
+        controllers.append(controller)
+        return controller
+
+    factory = FailingFactory(
+        settings=settings,
+        database=database,
+        workspace_resolver=resolver,
+        sandbox_controller_factory=controller_factory,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="agent assembly failed"):
+            await factory.create(TenantContext("tenant-a", "workspace-a"))
+    finally:
+        await database.dispose()
+
+    assert len(controllers) == 1
+    assert controllers[0].close_calls == 1
+    assert captured["manager"].stop_calls == 1

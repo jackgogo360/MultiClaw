@@ -51,15 +51,25 @@ class RuntimePool:
         lock = self._create_locks.setdefault(context.tenant_id, asyncio.Lock())
         async with lock:
             runtime = self._runtimes.get(context.tenant_id)
-            if runtime is None:
-                async with self._capacity_lock:
-                    runtime = self._runtimes.get(context.tenant_id)
-                    if runtime is None:
-                        await self._ensure_capacity()
-                        runtime = await self._factory.create(context)
-                        self._runtimes[context.tenant_id] = runtime
-            runtime.last_used_at_ms = self._clock.now_ms()
-            return runtime
+            if runtime is not None:
+                if self._closed:
+                    raise RuntimeError("runtime pool is closed")
+                runtime.last_used_at_ms = self._clock.now_ms()
+                return runtime
+
+            async with self._capacity_lock:
+                if self._closed:
+                    raise RuntimeError("runtime pool is closed")
+                runtime = self._runtimes.get(context.tenant_id)
+                if runtime is None:
+                    await self._ensure_capacity()
+                    runtime = await self._factory.create(context)
+                    if self._closed:
+                        await runtime.close()
+                        raise RuntimeError("runtime pool is closed")
+                    self._runtimes[context.tenant_id] = runtime
+                runtime.last_used_at_ms = self._clock.now_ms()
+                return runtime
 
     async def peek(self, tenant_id: str) -> TenantRuntime | None:
         return self._runtimes.get(tenant_id)
@@ -75,19 +85,37 @@ class RuntimePool:
         timestamp = self._clock.now_ms() if now_ms is None else now_ms
         evicted = 0
         for tenant_id, runtime in list(self._runtimes.items()):
-            if not runtime.can_evict(timestamp, self.idle_ttl_ms):
-                continue
-            await self.revoke(tenant_id)
-            evicted += 1
+            if await self._evict_if_safe(tenant_id, runtime, timestamp):
+                evicted += 1
         return evicted
+
+    async def _evict_if_safe(
+        self,
+        tenant_id: str,
+        expected_runtime: TenantRuntime,
+        timestamp: int,
+    ) -> bool:
+        lock = self._create_locks.setdefault(tenant_id, asyncio.Lock())
+        async with lock:
+            current = self._runtimes.get(tenant_id)
+            if current is not expected_runtime:
+                return False
+            if not current.can_evict(timestamp, self.idle_ttl_ms):
+                return False
+            runtime = self._runtimes.pop(tenant_id, None)
+        if runtime is None:
+            return False
+        await runtime.close()
+        return True
 
     async def close(self) -> None:
         async with self._close_lock:
             if self._closed:
                 return
             self._closed = True
-            runtimes = list(self._runtimes.items())
-            self._runtimes.clear()
+            async with self._capacity_lock:
+                runtimes = list(self._runtimes.items())
+                self._runtimes.clear()
         primary: BaseException | None = None
 
         for tenant_id, runtime in runtimes:

@@ -124,26 +124,42 @@ class RuntimeFactory:
         workspace_root = self.workspace_resolver.resolve(context, create=True)
         event_bus = EventBus()
         event_router = EventRouter()
-        sandbox_controller = self._sandbox_controller_factory(workspace_root, event_bus)
-        sandbox_controller.initialize()
+        sandbox_controller = None
+        skill_manager = None
+        registry = None
+        mcp_manager = None
+        try:
+            sandbox_controller = self._sandbox_controller_factory(workspace_root, event_bus)
+            sandbox_controller.initialize()
 
-        skill_manager = SkillManager(
-            project_root=workspace_root,
-            max_active=self.settings.skill.max_active,
-        )
-        if self.settings.skill.enabled:
-            skill_manager.discover()
+            skill_manager = SkillManager(
+                project_root=workspace_root,
+                max_active=self.settings.skill.max_active,
+            )
+            if self.settings.skill.enabled:
+                skill_manager.discover()
 
-        registry = self._build_registry(workspace_root, event_bus, sandbox_controller)
-        mcp_manager = self._build_mcp_manager(
-            workspace_root,
-            event_bus,
-            registry,
-            sandbox_controller,
-        )
-        readiness = sandbox_controller.finalize_readiness()
-        scheduler = self._build_scheduler(event_bus)
-        agent = self._build_agent(context, registry, scheduler, event_bus, skill_manager)
+            registry = self._build_registry(workspace_root, event_bus, sandbox_controller)
+            mcp_manager = self._build_mcp_manager(
+                workspace_root,
+                event_bus,
+                registry,
+                sandbox_controller,
+            )
+            readiness = sandbox_controller.finalize_readiness()
+            scheduler = self._build_scheduler(event_bus)
+            agent = self._build_agent(context, registry, scheduler, event_bus, skill_manager)
+        except BaseException:
+            if mcp_manager is not None:
+                mcp_manager.stop()
+            if skill_manager is not None:
+                skill_manager.close()
+            if registry is not None:
+                registry.clear()
+            event_router.clear()
+            if sandbox_controller is not None:
+                sandbox_controller.close()
+            raise
 
         agent.database = self.database
         agent.mcp_manager = mcp_manager

@@ -479,15 +479,18 @@ def create_runtime_factory(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    runtime_factory = create_runtime_factory()
-    runtime_pool = RuntimePool(
-        factory=runtime_factory,
-        max_resident_tenants=runtime_factory.settings.runtime.max_resident_tenants,
-        idle_ttl_ms=runtime_factory.settings.runtime.idle_ttl_seconds * 1000,
-    )
-    readiness, startup_events = runtime_factory.probe_startup()
-    auth_store = AuthStore(runtime_factory.settings.database.path)
+    runtime_factory = None
+    runtime_pool = None
+    auth_store = None
     try:
+        runtime_factory = create_runtime_factory()
+        runtime_pool = RuntimePool(
+            factory=runtime_factory,
+            max_resident_tenants=runtime_factory.settings.runtime.max_resident_tenants,
+            idle_ttl_ms=runtime_factory.settings.runtime.idle_ttl_seconds * 1000,
+        )
+        auth_store = AuthStore(runtime_factory.settings.database.path)
+        readiness, startup_events = runtime_factory.probe_startup()
         await auth_store.initialize()
         app.state.auth_store = auth_store
         app.state.database = runtime_factory.database
@@ -499,30 +502,36 @@ async def lifespan(app: FastAPI):
         app.state.sandbox_startup_events = startup_events
     except BaseException as primary:
         try:
-            try:
-                await auth_store.close()
-            except BaseException as error:
-                _note_startup_cleanup_error(primary, "auth_store.close", error)
-            try:
-                await runtime_pool.close()
-            except BaseException as error:
-                _note_startup_cleanup_error(primary, "runtime_pool.close", error)
-            try:
-                await runtime_factory.database.dispose()
-            except BaseException as error:
-                _note_startup_cleanup_error(primary, "database.dispose", error)
+            if auth_store is not None:
+                try:
+                    await auth_store.close()
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "auth_store.close", error)
+            if runtime_pool is not None:
+                try:
+                    await runtime_pool.close()
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "runtime_pool.close", error)
+            if runtime_factory is not None:
+                try:
+                    await runtime_factory.database.dispose()
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "database.dispose", error)
         finally:
             raise primary
     try:
         yield
     finally:
         try:
-            await auth_store.close()
+            if auth_store is not None:
+                await auth_store.close()
         finally:
             try:
-                await runtime_pool.close()
+                if runtime_pool is not None:
+                    await runtime_pool.close()
             finally:
-                await runtime_factory.database.dispose()
+                if runtime_factory is not None:
+                    await runtime_factory.database.dispose()
 
 
 app = FastAPI(title="MultiClaw", lifespan=lifespan)
@@ -733,6 +742,7 @@ async def chat(
 
     async def event_stream():
         logger.info("SSE stream started, message=%r, session=%r", message[:80], session.id)
+        run_lease = runtime.begin_run()
         enc = DataStreamEncoder()
         text_part_id: str | None = None
         reasoning_part_id: str | None = None
@@ -841,6 +851,7 @@ async def chat(
                         for chunk in close_open_parts():
                             yield chunk
                         pending_tool_results += 1
+                        run_lease.mark_tool_execution_started()
                         tool_call_id = item.get("call_id") or uuid4().hex
                         yield enc.tool_input_available(
                             tool_call_id,
@@ -860,6 +871,7 @@ async def chat(
                             )
                         if pending_tool_results > 0:
                             pending_tool_results -= 1
+                            run_lease.mark_tool_execution_finished()
                         if pending_tool_results == 0:
                             for chunk in close_step():
                                 yield chunk
@@ -919,7 +931,9 @@ async def chat(
                 await asyncio.sleep(0.02)
         finally:
             stream_task.cancel()
+            await asyncio.gather(stream_task, return_exceptions=True)
             runtime.event_bus.unsubscribe(sub_id)
+            run_lease.close()
             logger.info("SSE stream ended")
 
     return StreamingResponse(

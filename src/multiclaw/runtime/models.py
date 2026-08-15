@@ -28,6 +28,79 @@ class EventRouter:
         self._routes.clear()
 
 
+class RuntimeExecutionLease:
+    def __init__(self, runtime: TenantRuntime) -> None:
+        self._runtime = runtime
+        self._closed = False
+        self._executing = True
+        self._awaiting_user = False
+        self._checkpoint_persisted = False
+        self._active_tool_executions = 0
+
+        runtime.active_run_count += 1
+        runtime.active_executing_run_count += 1
+
+    def mark_tool_execution_started(self) -> None:
+        if self._closed:
+            return
+        self._active_tool_executions += 1
+        self._runtime.active_tool_execution_count += 1
+
+    def mark_tool_execution_finished(self) -> None:
+        if self._closed or self._active_tool_executions == 0:
+            return
+        self._active_tool_executions -= 1
+        self._runtime.active_tool_execution_count = max(
+            0,
+            self._runtime.active_tool_execution_count - 1,
+        )
+
+    def mark_awaiting_user(self, *, checkpoint_persisted: bool) -> None:
+        if self._closed or self._awaiting_user:
+            return
+        if self._executing:
+            self._runtime.active_executing_run_count = max(
+                0,
+                self._runtime.active_executing_run_count - 1,
+            )
+            self._executing = False
+        self._runtime.awaiting_user_run_count += 1
+        self._awaiting_user = True
+        if checkpoint_persisted:
+            self._runtime.checkpointed_awaiting_user_run_count += 1
+            self._checkpoint_persisted = True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        if self._awaiting_user:
+            self._runtime.awaiting_user_run_count = max(
+                0,
+                self._runtime.awaiting_user_run_count - 1,
+            )
+            if self._checkpoint_persisted:
+                self._runtime.checkpointed_awaiting_user_run_count = max(
+                    0,
+                    self._runtime.checkpointed_awaiting_user_run_count - 1,
+                )
+        elif self._executing:
+            self._runtime.active_executing_run_count = max(
+                0,
+                self._runtime.active_executing_run_count - 1,
+            )
+
+        if self._active_tool_executions:
+            self._runtime.active_tool_execution_count = max(
+                0,
+                self._runtime.active_tool_execution_count - self._active_tool_executions,
+            )
+            self._active_tool_executions = 0
+
+        self._runtime.active_run_count = max(0, self._runtime.active_run_count - 1)
+
+
 @dataclass(slots=True)
 class TenantRuntime:
     tenant_id: str
@@ -46,6 +119,7 @@ class TenantRuntime:
     secret_handles: list[SecretHandle] = field(default_factory=list)
     active_run_count: int = 0
     awaiting_user_run_count: int = 0
+    checkpointed_awaiting_user_run_count: int = 0
     active_executing_run_count: int = 0
     active_tool_execution_count: int = 0
     _closed: bool = field(default=False, init=False, repr=False)
@@ -61,9 +135,13 @@ class TenantRuntime:
         if self.active_run_count == 0:
             return True
         return (
-            self.active_run_count == self.awaiting_user_run_count
+            self.active_run_count == self.checkpointed_awaiting_user_run_count
             and self.active_tool_execution_count == 0
         )
+
+    def begin_run(self) -> RuntimeExecutionLease:
+        self.last_used_at_ms = max(self.last_used_at_ms, 0)
+        return RuntimeExecutionLease(self)
 
     async def close(self) -> None:
         if self._closed:

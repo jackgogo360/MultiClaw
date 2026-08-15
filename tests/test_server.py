@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1459,6 +1460,82 @@ def test_lifespan_preserves_primary_error_when_database_dispose_fails(tmp_path, 
     )
 
 
+def test_lifespan_probe_failure_closes_pool_before_disposing_database(tmp_path, monkeypatch):
+    import multiclaw.server as server_module
+
+    call_order: list[str] = []
+
+    class FakeDatabase:
+        async def dispose(self) -> None:
+            call_order.append("database.dispose")
+
+    class FakeRuntimePool:
+        def __init__(self, *, factory, max_resident_tenants, idle_ttl_ms) -> None:
+            del factory, max_resident_tenants, idle_ttl_ms
+
+        async def close(self) -> None:
+            call_order.append("runtime_pool.close")
+
+    class FakeFactory:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(
+                database=SimpleNamespace(path=str(tmp_path / "app.db")),
+                runtime=SimpleNamespace(max_resident_tenants=1, idle_ttl_seconds=1),
+            )
+            self.database = FakeDatabase()
+            self.workspace_resolver = SimpleNamespace(root=tmp_path)
+
+        def probe_startup(self):
+            raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(server_module, "create_runtime_factory", lambda: FakeFactory())
+    monkeypatch.setattr(server_module, "RuntimePool", FakeRuntimePool)
+
+    with pytest.raises(RuntimeError, match="probe failed"):
+        with TestClient(server_module.app):
+            pass
+
+    assert call_order == ["runtime_pool.close", "database.dispose"]
+
+
+def test_lifespan_probe_failure_preserves_primary_and_cleanup_notes(tmp_path, monkeypatch):
+    import multiclaw.server as server_module
+
+    class FakeDatabase:
+        async def dispose(self) -> None:
+            raise RuntimeError("database dispose failed")
+
+    class FailingRuntimePool:
+        def __init__(self, *, factory, max_resident_tenants, idle_ttl_ms) -> None:
+            del factory, max_resident_tenants, idle_ttl_ms
+
+        async def close(self) -> None:
+            raise RuntimeError("runtime pool close failed")
+
+    class FakeFactory:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(
+                database=SimpleNamespace(path=str(tmp_path / "app.db")),
+                runtime=SimpleNamespace(max_resident_tenants=1, idle_ttl_seconds=1),
+            )
+            self.database = FakeDatabase()
+            self.workspace_resolver = SimpleNamespace(root=tmp_path)
+
+        def probe_startup(self):
+            raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(server_module, "create_runtime_factory", lambda: FakeFactory())
+    monkeypatch.setattr(server_module, "RuntimePool", FailingRuntimePool)
+
+    with pytest.raises(RuntimeError, match="probe failed") as error:
+        with TestClient(server_module.app):
+            pass
+
+    assert error.value.__notes__
+    assert any("runtime_pool.close" in note and "runtime pool close failed" in note for note in error.value.__notes__)
+    assert any("database.dispose" in note and "database dispose failed" in note for note in error.value.__notes__)
+
+
 def test_create_runtime_factory_passes_configured_mcp_profile_name(tmp_path, monkeypatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "true")
@@ -1644,3 +1721,151 @@ def test_create_runtime_factory_wires_web_fetch_private_network_flag(
     assert web_fetch_builder.allow_private_networks is expected
     asyncio.run(runtime.close())
     asyncio.run(factory.database.dispose())
+
+
+def test_chat_runtime_signal_blocks_idle_eviction_until_stream_finishes(migrated_database, monkeypatch):
+    import multiclaw.server as server
+
+    started = threading.Event()
+    release = threading.Event()
+    holder: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context):
+        del user_input, context
+        started.set()
+        await asyncio.to_thread(release.wait)
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app) as client:
+        client.cookies = _make_auth_cookie(server.app, migrated_database)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            holder["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+
+        response_box: dict[str, object] = {}
+
+        def run_request() -> None:
+            response_box["response"] = client.post("/api/chat", json={"message": "hello"})
+
+        request_thread = threading.Thread(target=run_request)
+        request_thread.start()
+        assert started.wait(timeout=3)
+        runtime = holder["runtime"]
+        assert runtime.active_executing_run_count == 1
+        assert runtime.active_run_count == 1
+        assert runtime.can_evict(runtime.last_used_at_ms + server.app.state.runtime_pool.idle_ttl_ms + 1, server.app.state.runtime_pool.idle_ttl_ms) is False
+
+        release.set()
+        request_thread.join(timeout=5)
+
+        assert request_thread.is_alive() is False
+        assert runtime.active_executing_run_count == 0
+        assert runtime.active_run_count == 0
+        assert response_box["response"].status_code == 200
+
+
+def test_chat_runtime_signal_resets_after_stream_error(migrated_database, monkeypatch):
+    import multiclaw.server as server
+
+    started = threading.Event()
+    holder: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context):
+        del user_input, context
+        started.set()
+        raise RuntimeError("boom")
+        yield  # pragma: no cover
+
+    with TestClient(server.app) as client:
+        client.cookies = _make_auth_cookie(server.app, migrated_database)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            holder["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        response = client.post("/api/chat", json={"message": "hello"})
+
+    assert started.is_set() is True
+    runtime = holder["runtime"]
+    assert runtime.active_executing_run_count == 0
+    assert runtime.active_run_count == 0
+    assert response.status_code == 200
+    assert '"type":"error"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_chat_runtime_signal_resets_after_client_disconnect(migrated_database, monkeypatch):
+    import multiclaw.server as server
+    from multiclaw.storage.uow import TenantUnitOfWork
+
+    started = threading.Event()
+    cancelled = threading.Event()
+    holder: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context):
+        del user_input, context
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app) as client:
+        original_acquire = server.app.state.runtime_pool.acquire
+        user_id, _ = await _seed_user(migrated_database, "disconnect@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            holder["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request(
+            {
+                "type": "http",
+                "app": server.app,
+                "method": "POST",
+                "path": "/api/chat",
+                "headers": [],
+            }
+        )
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await server.chat(
+                server.ChatRequest(message="hello"),
+                request,
+                context,
+                uow,
+            )
+            await anext(response.body_iterator)
+            await anext(response.body_iterator)
+            await anext(response.body_iterator)
+            pending_chunk = asyncio.create_task(anext(response.body_iterator))
+            assert await asyncio.to_thread(started.wait, 3)
+            pending_chunk.cancel()
+            await asyncio.gather(pending_chunk, return_exceptions=True)
+            await response.body_iterator.aclose()
+
+        assert await asyncio.to_thread(cancelled.wait, 3)
+
+    runtime = holder["runtime"]
+    assert runtime.active_executing_run_count == 0
+    assert runtime.active_run_count == 0
