@@ -425,8 +425,10 @@ class MultiClawAgent(ToolCallAgent):
         context: TenantContext,
         run_lease: RunLease | None = None,
         run_lease_handle: RunLeaseHandle | None = None,
+        workflow_continuation=None,
+        workflow_recovery=None,
     ) -> AsyncIterator[dict[str, Any]]:
-        del run_lease, run_lease_handle
+        del run_lease, workflow_recovery
         logger.info("handle_message_stream: %r", user_input[:80])
 
         if user_input.startswith("plan:"):
@@ -603,11 +605,12 @@ class MultiClawAgent(ToolCallAgent):
                             full_text = reasoning_text
                             yield {"type": "token", "content": full_text}
                         logger.info("streaming complete, text_len=%d", len(full_text))
-                        await self._save_chat_msg(
-                            context,
-                            "assistant",
-                            full_text,
-                            next_turn_index + 1,
+                        await self._persist_stream_assistant_output(
+                            context=context,
+                            content=full_text,
+                            turn_index=next_turn_index + 1,
+                            run_lease_handle=run_lease_handle,
+                            workflow_continuation=workflow_continuation,
                         )
                         await self.transition(AgentState.FINISHED, context=context)
                         yield {"type": "done", "content": full_text, "data": {}}
@@ -640,11 +643,12 @@ class MultiClawAgent(ToolCallAgent):
                     self._collect_plain_text_response,
                 )
                 if full_text:
-                    await self._save_chat_msg(
-                        context,
-                        "assistant",
-                        full_text,
-                        next_turn_index + 1,
+                    await self._persist_stream_assistant_output(
+                        context=context,
+                        content=full_text,
+                        turn_index=next_turn_index + 1,
+                        run_lease_handle=run_lease_handle,
+                        workflow_continuation=workflow_continuation,
                     )
                     yield {"type": "token", "content": full_text}
                 yield {"type": "done", "content": full_text, "data": {}}
@@ -686,4 +690,28 @@ class MultiClawAgent(ToolCallAgent):
                 session_id=context.session_id,
                 turn_index=turn_index,
             ),
+        )
+
+    async def _persist_stream_assistant_output(
+        self,
+        *,
+        context: TenantContext,
+        content: str,
+        turn_index: int,
+        run_lease_handle: RunLeaseHandle | None,
+        workflow_continuation,
+    ) -> None:
+        if workflow_continuation is not None and run_lease_handle is not None:
+            await workflow_continuation.persist_assistant_output(
+                context=context,
+                run_lease_handle=run_lease_handle,
+                content=content,
+                turn_index=turn_index,
+            )
+            return
+        await self._save_chat_msg(
+            context,
+            "assistant",
+            content,
+            turn_index,
         )

@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -20,6 +21,7 @@ from multiclaw.tools import (
     ToolRegistry,
     ToolStatus,
 )
+from multiclaw.workflow.models import RunLease, RunLeaseHandle
 
 
 class _DummySkillManager:
@@ -165,6 +167,13 @@ class _TokenThenBlockRouter:
         await self.block.wait()
 
 
+@dataclass
+class _PersistedAssistantOutput:
+    message_id: str
+    output_digest: str
+    model_cursor: str
+
+
 class _ScriptedParams(BaseModel):
     query: str | None = None
     label: str | None = None
@@ -289,6 +298,75 @@ async def test_handle_message_stream_uses_context_build_with_report_and_only_pro
     ]
     assert mock_info.call_count >= 1
     assert all(set(message.keys()) <= {"role", "content"} for message in expected_messages)
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_uses_injected_workflow_continuation_for_assistant_output():
+    router = _QueuedStreamRouter(
+        stream_sequences=[[{"type": "token", "content": "streamed"}]]
+    )
+    agent = _build_custom_stream_agent(
+        router=router,
+        registry=ToolRegistry(),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=1,
+    )
+    run_context = _stream_context()
+    lease = RunLease(
+        context=run_context,
+        lease_owner="runtime-1",
+        fencing_token=1,
+        version=1,
+        lease_expires_at=12345,
+    )
+    lease_handle = RunLeaseHandle(lease)
+    persisted: dict[str, object] = {}
+
+    class FakeWorkflowContinuation:
+        async def persist_assistant_output(
+            self,
+            *,
+            context,
+            run_lease_handle,
+            content,
+            turn_index,
+        ):
+            persisted["context"] = context
+            persisted["run_lease_handle"] = run_lease_handle
+            persisted["content"] = content
+            persisted["turn_index"] = turn_index
+            return _PersistedAssistantOutput(
+                message_id="msg-1",
+                output_digest="a" * 64,
+                model_cursor="cursor-1",
+            )
+
+    events = []
+    async for event in agent.handle_message_stream(
+        "hello",
+        context=run_context,
+        run_lease_handle=lease_handle,
+        workflow_continuation=FakeWorkflowContinuation(),
+    ):
+        events.append(event)
+
+    assert next(event for event in events if event["type"] == "done") == {
+        "type": "done",
+        "content": "streamed",
+        "data": {},
+    }
+    assert persisted == {
+        "context": run_context,
+        "run_lease_handle": lease_handle,
+        "content": "streamed",
+        "turn_index": 2,
+    }
+    agent._save_chat_msg.assert_any_await(run_context, "user", "hello", 1)
+    assert agent._save_chat_msg.await_count == 1
 
 
 @pytest.mark.asyncio
