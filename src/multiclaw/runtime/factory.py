@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -149,16 +150,15 @@ class RuntimeFactory:
             readiness = sandbox_controller.finalize_readiness()
             scheduler = self._build_scheduler(event_bus)
             agent = self._build_agent(context, registry, scheduler, event_bus, skill_manager)
-        except BaseException:
-            if mcp_manager is not None:
-                mcp_manager.stop()
-            if skill_manager is not None:
-                skill_manager.close()
-            if registry is not None:
-                registry.clear()
-            event_router.clear()
-            if sandbox_controller is not None:
-                sandbox_controller.close()
+        except BaseException as primary:
+            self._cleanup_create_failure(
+                primary,
+                mcp_manager=mcp_manager,
+                skill_manager=skill_manager,
+                registry=registry,
+                event_router=event_router,
+                sandbox_controller=sandbox_controller,
+            )
             raise
 
         agent.database = self.database
@@ -186,13 +186,23 @@ class RuntimeFactory:
     def probe_startup(self) -> tuple[SandboxReadiness, tuple[Any, ...]]:
         event_bus = EventBus()
         controller = self._sandbox_controller_factory(self.workspace_resolver.root, event_bus)
-        controller.initialize()
         try:
+            controller.initialize()
             readiness = controller.finalize_readiness()
             events = controller.drain_startup_events()
             return readiness, events
-        finally:
+        except BaseException as primary:
+            try:
+                controller.close()
+            except BaseException as error:
+                primary.add_note(
+                    f"controller.close failed: {type(error).__name__}: {error}"
+                )
+            raise
+        try:
             controller.close()
+        except BaseException:
+            raise
 
     def _build_agent(
         self,
@@ -324,3 +334,48 @@ class RuntimeFactory:
             event_bus=event_bus,
             runner=SandboxProcessRunner(),
         )
+
+    def _cleanup_create_failure(
+        self,
+        primary: BaseException,
+        *,
+        mcp_manager: MCPClientManager | None,
+        skill_manager: SkillManager | None,
+        registry: ToolRegistry | None,
+        event_router: EventRouter,
+        sandbox_controller: SandboxController | None,
+    ) -> None:
+        self._run_cleanup_phase(primary, "mcp_manager.stop", self._sync_cleanup, mcp_manager, "stop")
+        self._run_cleanup_phase(primary, "skill_manager.close", self._sync_cleanup, skill_manager, "close")
+        self._run_cleanup_phase(primary, "registry.clear", self._sync_cleanup, registry, "clear")
+        self._run_cleanup_phase(primary, "event_router.clear", self._sync_cleanup, event_router, "clear")
+        self._run_cleanup_phase(
+            primary,
+            "sandbox_controller.close",
+            self._sync_cleanup,
+            sandbox_controller,
+            "close",
+        )
+
+    def _run_cleanup_phase(
+        self,
+        primary: BaseException,
+        phase: str,
+        cleanup: Callable[..., Any],
+        *args: Any,
+    ) -> None:
+        try:
+            cleanup(*args)
+        except BaseException as error:
+            primary.add_note(f"{phase} failed: {type(error).__name__}: {error}")
+
+    @staticmethod
+    def _sync_cleanup(owner: Any, method_name: str) -> None:
+        if owner is None:
+            return
+        method = getattr(owner, method_name, None)
+        if method is None:
+            return
+        result = method()
+        if inspect.isawaitable(result):
+            raise RuntimeError(f"{method_name} returned awaitable during sync cleanup")
