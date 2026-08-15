@@ -642,16 +642,6 @@ class MultiClawAgent(ToolCallAgent):
                     messages,
                     self._collect_plain_text_response,
                 )
-                if full_text:
-                    await self._persist_stream_assistant_output(
-                        context=context,
-                        content=full_text,
-                        turn_index=next_turn_index + 1,
-                        run_lease_handle=run_lease_handle,
-                        workflow_continuation=workflow_continuation,
-                    )
-                    yield {"type": "token", "content": full_text}
-                yield {"type": "done", "content": full_text, "data": {}}
             except Exception:
                 logger.exception("final summary failed")
                 yield {
@@ -659,6 +649,17 @@ class MultiClawAgent(ToolCallAgent):
                     "content": "I wasn't able to complete this task within the allowed rounds.",
                     "data": {},
                 }
+                return
+            if full_text:
+                await self._persist_stream_assistant_output(
+                    context=context,
+                    content=full_text,
+                    turn_index=next_turn_index + 1,
+                    run_lease_handle=run_lease_handle,
+                    workflow_continuation=workflow_continuation,
+                )
+                yield {"type": "token", "content": full_text}
+            yield {"type": "done", "content": full_text, "data": {}}
         finally:
             if self.state != AgentState.IDLE:
                 try:
