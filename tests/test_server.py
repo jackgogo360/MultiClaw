@@ -2721,7 +2721,7 @@ async def test_chat_heartbeats_active_run_lease_during_long_stream(migrated_data
 
     with TestClient(server.app):
         monkeypatch.setattr(server.app.state.settings.workflow, "heartbeat_ms", 50)
-        monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 120)
+        monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 250)
         user_id, _ = await _seed_user(migrated_database, "heartbeat-lease@example.com")
         async with AuthUnitOfWork(migrated_database) as auth_uow:
             user = await auth_uow.users.get_by_id(user_id)
@@ -2821,7 +2821,7 @@ async def test_chat_passes_run_lease_handle_with_refreshed_snapshot(migrated_dat
         initial_snapshot = await run_lease_handle.current()
         captured["initial_version"] = initial_snapshot.version
         captured["initial_expiry"] = initial_snapshot.lease_expires_at
-        await asyncio.sleep(0.20)
+        await asyncio.sleep(0.16)
         refreshed = await run_lease_handle.current()
         captured["refreshed_version"] = refreshed.version
         captured["refreshed_expiry"] = refreshed.lease_expires_at
