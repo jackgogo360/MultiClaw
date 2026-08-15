@@ -1,5 +1,6 @@
 import pytest
 from pydantic import ValidationError
+from unittest.mock import patch
 
 from multiclaw.tenancy import TenantContext
 
@@ -100,6 +101,37 @@ async def test_event_router_isolates_payload_between_handlers_and_source_event()
 
     assert seen == [{"value": 1}]
     assert source.data == {"outer": {"value": 1}}
+
+
+@pytest.mark.asyncio
+async def test_event_router_clone_failure_does_not_report_handler_failure():
+    from multiclaw.events import EventRouter, EventScope, ScopedEvent
+
+    class Uncopyable:
+        def __deepcopy__(self, memo):
+            del memo
+            raise RuntimeError("cannot clone")
+
+    router = EventRouter()
+    scope = EventScope(tenant_id="t", workspace_id="w", session_id="s", run_id="r")
+    seen: list[ScopedEvent] = []
+
+    async def collect(event: ScopedEvent) -> None:
+        seen.append(event)
+
+    router.subscribe(scope, collect)
+    event = ScopedEvent.from_scope(
+        scope,
+        "tool.completed",
+        {"bad": Uncopyable()},
+    )
+
+    with patch("multiclaw.events.router.logger.exception") as mock_exception:
+        await router.publish(event)
+
+    assert seen == []
+    mock_exception.assert_called_once()
+    assert mock_exception.call_args.args[0] != "Error in scoped event handler for %s"
 
 
 def test_event_scope_requires_non_empty_non_wildcard_fields():
