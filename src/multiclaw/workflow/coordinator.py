@@ -257,10 +257,10 @@ class WorkflowCoordinator:
         execution_id: str | None = None,
         execution_expected_status: ExecutionStatus | None = None,
         execution_expected_version: int | None = None,
-    ) -> None:
+    ) -> int:
         async with self._write_connection() as conn:
             repository = self._repository(conn)
-            inserted = await repository._insert_checkpoint(
+            inserted_seq = await repository._insert_checkpoint(
                 lease,
                 checkpoint_id=checkpoint_id,
                 checkpoint_seq=checkpoint_seq,
@@ -273,8 +273,9 @@ class WorkflowCoordinator:
                 expected_execution_status=execution_expected_status,
                 expected_execution_version=execution_expected_version,
             )
-            if not inserted:
+            if inserted_seq is None:
                 raise StaleFenceError("run lease is stale")
+            return inserted_seq
 
     async def checkpoint(
         self,
@@ -306,7 +307,7 @@ class WorkflowCoordinator:
             max_bytes=self._settings.workflow.max_checkpoint_payload_bytes,
         )
         resolved_checkpoint_id = checkpoint_id or str(uuid4())
-        await self.write_checkpoint(
+        persisted_checkpoint_seq = await self.write_checkpoint(
             lease,
             checkpoint_id=resolved_checkpoint_id,
             checkpoint_seq=checkpoint_seq,
@@ -319,12 +320,7 @@ class WorkflowCoordinator:
             execution_expected_status=execution_expected_status,
             execution_expected_version=execution_expected_version,
         )
-        if checkpoint_seq is None:
-            async with self._database.connect() as conn:
-                latest = await self._repository(conn).get_latest_checkpoint(lease.context)
-                if latest is None:
-                    raise RuntimeError("checkpoint write did not persist")
-                checkpoint_seq = latest.checkpoint_seq
+        checkpoint_seq = persisted_checkpoint_seq
         return CheckpointWrite(
             checkpoint_id=resolved_checkpoint_id,
             checkpoint_seq=checkpoint_seq,

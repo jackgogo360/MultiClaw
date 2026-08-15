@@ -516,6 +516,39 @@ async def test_checkpoint_insert_requires_current_lease(workflow_database: Datab
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_returns_inserted_seq_inside_bound_transaction(workflow_database: Database):
+    run_context = await _create_run_context(workflow_database, suffix="-seq-bound")
+
+    async with workflow_database.write_transaction() as conn:
+        coordinator = WorkflowCoordinator(
+            workflow_database,
+            settings=Settings(_config_file="/nonexistent"),
+            connection=conn,
+        )
+        lease = await coordinator.start_run_with_checkpoint(run_context, "runtime")
+        second = await coordinator.checkpoint(
+            lease,
+            CheckpointPhase.MODEL_OUTPUT_COMMITTED,
+            {
+                "run_id": run_context.run_id,
+                "message_id": str(uuid4()),
+                "output_digest": "f" * 64,
+                "model_cursor": "cursor-bound-seq",
+                "cursor": "cursor-bound-seq",
+            },
+        )
+        latest = await coordinator._repository(conn).get_latest_checkpoint(run_context)
+
+        assert latest is not None
+        assert second.checkpoint_seq == 2
+        assert latest.checkpoint_seq == 2
+        assert second.checkpoint_seq == latest.checkpoint_seq
+
+    checkpoints = await _checkpoint_rows(workflow_database, run_context)
+    assert [row["checkpoint_seq"] for row in checkpoints] == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_start_run_with_checkpoint_rolls_back_when_checkpoint_insert_fails(
     workflow_database: Database,
     monkeypatch: pytest.MonkeyPatch,

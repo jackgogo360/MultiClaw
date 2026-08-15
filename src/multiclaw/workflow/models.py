@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum, StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from multiclaw.tenancy.context import TenantContext
 
@@ -85,7 +85,7 @@ class RunStartedPayload(CheckpointPayload):
     workspace_id: str = UUID_FIELD
     session_id: str = UUID_FIELD
     run_id: str = UUID_FIELD
-    started_at_ms: int
+    started_at_ms: StrictInt
     model_cursor: str = CURSOR_FIELD
     next_step: Literal["model_inference"] = "model_inference"
     cursor: str = CURSOR_FIELD
@@ -116,7 +116,7 @@ class AwaitingApprovalPayload(CheckpointPayload):
     run_id: str = UUID_FIELD
     approval_id: str = UUID_FIELD
     tool_call_id: str = TOOL_CALL_ID_FIELD
-    approval_expires_at_ms: int
+    approval_expires_at_ms: StrictInt
     resume_cursor: str = CURSOR_FIELD
     next_step: Literal["approval_resolution"] = "approval_resolution"
     cursor: str = CURSOR_FIELD
@@ -170,7 +170,7 @@ class ExecutionResultObservedPayload(CheckpointPayload):
 class RunTerminalPayload(CheckpointPayload):
     run_id: str = UUID_FIELD
     terminal_status: RunStatus
-    finished_at_ms: int
+    finished_at_ms: StrictInt
     final_digest: str = DIGEST_FIELD
     next_step: None = None
     cursor: None = None

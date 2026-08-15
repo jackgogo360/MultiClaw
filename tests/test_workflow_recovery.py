@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 from alembic import command
+from pydantic import ValidationError
 from sqlalchemy import insert, select, text, update
 
 from multiclaw.cli import alembic_config
@@ -19,8 +20,8 @@ from multiclaw.storage.schema import execution_checkpoints
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
-from multiclaw.workflow.models import CheckpointPhase, RunStatus, StaleFenceError
-from multiclaw.workflow.recovery import RecoveryService
+from multiclaw.workflow.models import CheckpointPhase, CorruptCheckpointError, RunStatus, StaleFenceError
+from multiclaw.workflow.recovery import RecoveryService, validate_phase_payload
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -227,3 +228,30 @@ async def test_unsupported_checkpoint_schema_blocks_incompatible(workflow_databa
 
     assert outcome.status == RunStatus.BLOCKED_INCOMPATIBLE
     assert outcome.executions_started == 0
+
+
+def test_checkpoint_timestamp_fields_reject_string_coercion() -> None:
+    with pytest.raises(CorruptCheckpointError):
+        validate_phase_payload(
+            CheckpointPhase.RUN_STARTED,
+            {
+                "tenant_id": "00000000-0000-0000-0000-000000000001",
+                "workspace_id": "00000000-0000-0000-0000-000000000002",
+                "session_id": "00000000-0000-0000-0000-000000000003",
+                "run_id": "00000000-0000-0000-0000-000000000004",
+                "started_at_ms": "123",
+                "model_cursor": "cursor-1",
+                "cursor": "cursor-1",
+            },
+        )
+
+    with pytest.raises(CorruptCheckpointError):
+        validate_phase_payload(
+            CheckpointPhase.RUN_TERMINAL,
+            {
+                "run_id": "00000000-0000-0000-0000-000000000004",
+                "terminal_status": RunStatus.COMPLETED.value,
+                "finished_at_ms": "456",
+                "final_digest": "a" * 64,
+            },
+        )
