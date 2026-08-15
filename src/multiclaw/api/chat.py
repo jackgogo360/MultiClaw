@@ -6,6 +6,7 @@ from typing import Any
 from multiclaw.events import ScopedEvent
 from multiclaw.stream import DataStreamEncoder
 from multiclaw.workflow.coordinator import WorkflowCoordinator
+from multiclaw.workflow.recovery import RecoveryService
 from multiclaw.workflow.models import RunLease, RunLeaseHandle
 
 
@@ -27,6 +28,10 @@ def encode_scoped_event(event: ScopedEvent) -> str:
 
 def build_workflow_coordinator(database, settings, *, connection=None) -> WorkflowCoordinator:
     return WorkflowCoordinator(database, settings=settings, connection=connection)
+
+
+def build_workflow_recovery_service(database, settings) -> RecoveryService:
+    return RecoveryService(database, settings=settings)
 
 
 def stream_accepts_run_lease(handler) -> bool:
@@ -54,6 +59,7 @@ async def iterate_message_stream(
     context,
     run_lease: RunLease,
     run_lease_handle: RunLeaseHandle,
+    workflow_recovery=None,
 ):
     signature = inspect.signature(handler)
     kwargs = {"context": context}
@@ -61,5 +67,7 @@ async def iterate_message_stream(
         kwargs["run_lease"] = run_lease
     if _accepts_keyword(signature, "run_lease_handle"):
         kwargs["run_lease_handle"] = run_lease_handle
+    if _accepts_keyword(signature, "workflow_recovery") and workflow_recovery is not None:
+        kwargs["workflow_recovery"] = workflow_recovery
     async for item in handler(user_input, **kwargs):
         yield item

@@ -129,6 +129,7 @@ from multiclaw.auth.middleware import AuthMiddleware
 from multiclaw.auth.router import router as auth_router
 from multiclaw.api.chat import (
     build_workflow_coordinator,
+    build_workflow_recovery_service,
     encode_run_metadata,
     encode_scoped_event,
     encode_session_metadata,
@@ -136,7 +137,7 @@ from multiclaw.api.chat import (
 )
 from multiclaw.api.dependencies import current_user, tenant_context, tenant_uow
 from multiclaw.stream import DataStreamEncoder
-from multiclaw.workflow.models import RunLeaseHandle, RunStatus, TenantRunQuotaError
+from multiclaw.workflow.models import RecoveryAction, RunLeaseHandle, RunStatus, TenantRunQuotaError
 
 
 # ---------------------------------------------------------------------------
@@ -802,10 +803,22 @@ async def chat(
         request.app.state.settings,
         connection=uow.conn,
     )
+    workflow_recovery = build_workflow_recovery_service(
+        request.app.state.database,
+        request.app.state.settings,
+    )
     workflow_lease = None
     try:
-        workflow_lease = await workflow.start_run(run_context, runtime.runtime_instance_id)
+        workflow_lease = await workflow.start_run_with_checkpoint(
+            run_context,
+            runtime.runtime_instance_id,
+        )
         await uow.commit()
+        live_recovery = await workflow_recovery.validate_live_run(run_context)
+        if live_recovery.action is not RecoveryAction.RESUME_MODEL:
+            raise RuntimeError(
+                f"live workflow checkpoint validation failed: {live_recovery.reason or live_recovery.status}"
+            )
     except TenantRunQuotaError as error:
         raise HTTPException(status_code=429, detail=str(error)) from error
     try:
@@ -815,7 +828,7 @@ async def chat(
             await build_workflow_coordinator(
                 request.app.state.database,
                 request.app.state.settings,
-            ).finish_run(workflow_lease, RunStatus.CANCELLED)
+            ).finish_run_with_checkpoint(workflow_lease, RunStatus.CANCELLED)
         if str(error) == "runtime is unavailable":
             raise RuntimeUnavailableError(
                 request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
@@ -844,7 +857,7 @@ async def chat(
                 lambda lease: build_workflow_coordinator(
                     request.app.state.database,
                     request.app.state.settings,
-                ).finish_run(lease, status)
+                ).finish_run_with_checkpoint(lease, status)
             )
             terminal_persisted = True
 
@@ -941,6 +954,7 @@ async def chat(
                         context=run_context,
                         run_lease=await workflow_lease_handle.current(),
                         run_lease_handle=workflow_lease_handle,
+                        workflow_recovery=workflow_recovery,
                     ):
                         await token_queue.put(item)
                 except Exception as exc:
@@ -1112,7 +1126,7 @@ async def chat(
                 await build_workflow_coordinator(
                     request.app.state.database,
                     request.app.state.settings,
-                ).finish_run(workflow_lease, RunStatus.CANCELLED)
+                ).finish_run_with_checkpoint(workflow_lease, RunStatus.CANCELLED)
             except Exception:
                 logger.exception("failed to cancel run after streaming setup error")
         run_lease.close()
