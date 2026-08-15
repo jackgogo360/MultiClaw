@@ -2,6 +2,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import jwt
 import pytest
@@ -127,6 +128,28 @@ def test_chat_without_session_emits_session_event(migrated_database):
     body = response.text
     assert '"type":"data-session"' in body
     assert '"id":"' in body
+
+
+def test_chat_real_memory_path_does_not_lock_sqlite(migrated_database, monkeypatch):
+    import multiclaw.server as server
+
+    async def fake_stream_completion(*, model, messages, tools):
+        del model, messages, tools
+        yield {"type": "token", "content": "assistant reply"}
+
+    with TestClient(server.app) as client:
+        client.cookies = _make_auth_cookie(server.app, migrated_database)
+        monkeypatch.setattr(server.agent.router, "stream_completion", fake_stream_completion)
+
+        response = client.post("/api/chat", json={"message": "hello from user"})
+        sessions = client.get("/api/sessions").json()
+        session_id = sessions[0]["id"]
+        messages = client.get(f"/api/sessions/{session_id}/messages").json()
+
+    assert response.status_code == 200
+    assert "database is locked" not in response.text
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert [message["content"] for message in messages] == ["hello from user", "assistant reply"]
 
 
 def test_chat_rejects_archived_session(migrated_database):
@@ -1221,6 +1244,61 @@ def test_lifespan_still_closes_controller_when_mcp_stop_fails(tmp_path, monkeypa
     assert manager.stop_calls == 1
     assert controller.close_calls == 1
     assert str(tmp_path) not in caplog.text
+
+
+def test_lifespan_disposes_database_when_auth_store_initialize_fails(tmp_path, monkeypatch):
+    import multiclaw.server as server_module
+
+    class FakeDatabase:
+        def __init__(self) -> None:
+            self.dispose_calls = 0
+
+        async def dispose(self) -> None:
+            self.dispose_calls += 1
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def drain_startup_events(self) -> tuple[Event, ...]:
+            return ()
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    fake_database = FakeDatabase()
+    fake_controller = FakeController()
+    fake_manager = FakeManager()
+
+    fake_agent = SimpleNamespace(
+        settings=SimpleNamespace(database=SimpleNamespace(path=str(tmp_path / "app.db"))),
+        database=fake_database,
+        sandbox_readiness=SimpleNamespace(),
+        workspace_root=tmp_path,
+        sandbox_controller=fake_controller,
+        mcp_manager=fake_manager,
+    )
+
+    async def _boom(self) -> None:
+        raise RuntimeError("auth store init failed")
+
+    monkeypatch.setattr(server_module, "create_agent", lambda *, sandbox_controller=None: fake_agent)
+    monkeypatch.setattr(server_module.AuthStore, "initialize", _boom)
+
+    with pytest.raises(RuntimeError, match="auth store init failed"):
+        with TestClient(server_module.app):
+            pass
+
+    assert fake_database.dispose_calls == 1
+    assert fake_controller.close_calls == 1
+    assert fake_manager.stop_calls == 1
 
 
 def test_create_agent_passes_configured_mcp_profile_name(tmp_path, monkeypatch):

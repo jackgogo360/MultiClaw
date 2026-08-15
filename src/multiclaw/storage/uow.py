@@ -24,19 +24,25 @@ def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException
 
 
 class _BaseUnitOfWork(Generic[SelfType]):
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, *, read_only: bool = False) -> None:
         self._database = database
+        self._read_only = read_only
         self.conn: AsyncConnection | None = None
         self._tx: AsyncTransaction | None = None
 
     async def __aenter__(self: SelfType) -> SelfType:
         try:
             self.conn = await self._database.engine.connect()
-            self._tx = await self._database.dialect.begin_write(self.conn)
+            if not self._read_only:
+                self._tx = await self._database.dialect.begin_write(self.conn)
             self._bind_repositories()
             return self
         except BaseException as primary:
-            await self._cleanup_after_failure(primary=primary, rollback_phase="rollback", close_phase="close")
+            await self._cleanup_after_failure(
+                primary=primary,
+                rollback_phase="rollback" if self._tx is not None else None,
+                close_phase="close",
+            )
             self.conn = None
             self._tx = None
             raise primary
@@ -93,12 +99,21 @@ class _BaseUnitOfWork(Generic[SelfType]):
 
     async def _close_without_primary(self) -> None:
         if self.conn is not None:
+            if (
+                self._read_only
+                and hasattr(self.conn, "in_transaction")
+                and self.conn.in_transaction()
+            ):
+                await self.conn.rollback()
             await self.conn.close()
 
 
 class AuthUnitOfWork(_BaseUnitOfWork["AuthUnitOfWork"]):
     users: AuthUserRepository
     verification_codes: VerificationCodeRepository
+
+    def __init__(self, database: Database, *, read_only: bool = False) -> None:
+        super().__init__(database, read_only=read_only)
 
     def _bind_repositories(self) -> None:
         assert self.conn is not None

@@ -20,8 +20,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if token and hasattr(request.app.state, "database"):
             try:
                 payload = jwt.decode(token, store.jwt_secret, algorithms=["HS256"])
-                subject = str(payload["sub"])
-                token_auth_epoch = int(payload["auth_epoch"])
+                subject = _validated_subject(payload["sub"])
+                token_auth_epoch = _validated_auth_epoch(payload["auth_epoch"])
             except (
                 jwt.ExpiredSignatureError,
                 jwt.InvalidTokenError,
@@ -31,7 +31,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             ):
                 payload = None
             else:
-                async with AuthUnitOfWork(request.app.state.database) as uow:
+                async with AuthUnitOfWork(request.app.state.database, read_only=True) as uow:
                     current_user = await uow.users.get_by_id(subject)
                 if current_user is not None and current_user.auth_epoch == token_auth_epoch:
                     user = current_user
@@ -66,3 +66,15 @@ def _user_payload(user: UserRecord | None) -> dict[str, str] | None:
     if user is None:
         return None
     return {"id": user.id, "email": user.email}
+
+
+def _validated_subject(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("sub must be a non-empty string")
+    return value
+
+
+def _validated_auth_epoch(value: object) -> int:
+    if type(value) is not int:
+        raise ValueError("auth_epoch must be an exact int")
+    return value

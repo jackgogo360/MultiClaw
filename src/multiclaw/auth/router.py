@@ -13,6 +13,7 @@ from multiclaw.auth.models import (
 )
 from multiclaw.auth.store import MAX_SENDS_PER_DAY, AuthStore
 from multiclaw.config import Settings
+from multiclaw.storage.uow import AuthUnitOfWork
 
 logger = logging.getLogger("multiclaw")
 router = APIRouter(prefix="/auth")
@@ -26,12 +27,14 @@ def _get_settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
-def _make_jwt(user_id: str, email: str, secret: str) -> str:
+def _make_jwt(*, user_id: str, auth_epoch: int, secret: str) -> str:
+    now = int(datetime.now(timezone.utc).timestamp())
     return jwt.encode(
         {
             "sub": user_id,
-            "email": email,
-            "exp": datetime.now(timezone.utc) + timedelta(days=10),
+            "auth_epoch": auth_epoch,
+            "iat": now,
+            "exp": now + int(timedelta(days=10).total_seconds()),
         },
         secret,
         algorithm="HS256",
@@ -80,16 +83,22 @@ async def verify(body: VerifyRequest, request: Request, response: Response):
         raise HTTPException(status_code=422, detail="Invalid code format")
 
     store = _get_store(request)
-    vc = await store.find_latest_unused_code(email)
-    if vc is None or vc.code != code:
+    vc = await store.find_latest_unused_code(email, code)
+    if vc is None:
         raise HTTPException(
             status_code=401, detail="Invalid or expired verification code"
         )
 
-    await store.mark_code_used(vc.id)
-    user = await store.get_or_create_user(email)
+    async with AuthUnitOfWork(request.app.state.database) as uow:
+        user = await uow.users.create_user_with_default_workspace(email)
 
-    token = _make_jwt(user.id, user.email, store.jwt_secret)
+    await store.mark_code_used(vc.id)
+
+    token = _make_jwt(
+        user_id=user.id,
+        auth_epoch=user.auth_epoch,
+        secret=store.jwt_secret,
+    )
     response.set_cookie(
         key="token",
         value=token,

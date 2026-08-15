@@ -620,17 +620,40 @@ def create_agent(
 async def lifespan(app: FastAPI):
     global agent
     agent = create_agent()
-    auth_store = AuthStore(agent.settings.database.path)
-    await auth_store.initialize()
-    app.state.auth_store = auth_store
-    app.state.database = agent.database
-    app.state.settings = agent.settings
-    app.state.sandbox_readiness = agent.sandbox_readiness
-    app.state.workspace_root = getattr(agent, "workspace_root", None)
     sandbox_controller = getattr(agent, "sandbox_controller", None)
-    if sandbox_controller is not None:
-        for event in sandbox_controller.drain_startup_events():
-            await shared_bus.publish(event)
+    auth_store = AuthStore(agent.settings.database.path)
+    try:
+        await auth_store.initialize()
+        app.state.auth_store = auth_store
+        app.state.database = agent.database
+        app.state.settings = agent.settings
+        app.state.sandbox_readiness = agent.sandbox_readiness
+        app.state.workspace_root = getattr(agent, "workspace_root", None)
+        if sandbox_controller is not None:
+            for event in sandbox_controller.drain_startup_events():
+                await shared_bus.publish(event)
+    except BaseException:
+        try:
+            await auth_store.close()
+        finally:
+            try:
+                if hasattr(agent, "mcp_manager") and agent.mcp_manager:
+                    try:
+                        agent.mcp_manager.stop()
+                    except Exception:
+                        logger.warning("MCP manager shutdown failed; details redacted")
+            finally:
+                try:
+                    await agent.database.dispose()
+                finally:
+                    if sandbox_controller is not None:
+                        try:
+                            sandbox_controller.close()
+                        except Exception:
+                            logger.warning(
+                                "Sandbox controller reported residual startup state during shutdown; details redacted"
+                            )
+        raise
     try:
         yield
     finally:
@@ -827,7 +850,7 @@ async def get_session_messages(
 async def chat(
     req: ChatRequest,
     context: TenantContext = Depends(tenant_context),
-    uow: TenantUnitOfWork = Depends(tenant_uow),
+    uow: TenantUnitOfWork = Depends(tenant_uow, scope="function"),
 ):
     """SSE streaming — real token streaming from LLM with state events."""
     message = _resolve_chat_message(req)

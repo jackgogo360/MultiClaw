@@ -169,6 +169,23 @@ async def _seed_identity(
     )
 
 
+async def _get_user_row(database: Database, email: str) -> dict[str, object]:
+    async with database.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT id, email, auth_epoch, default_workspace_id, status
+                    FROM users
+                    WHERE email = :email
+                    """
+                ),
+                {"email": email},
+            )
+        ).mappings().one()
+    return dict(row)
+
+
 @pytest.fixture
 def user_a_cookie(client: TestClient, migrated_database: Database) -> SeededIdentity:
     secret = client.app.state.auth_store.jwt_secret
@@ -207,6 +224,42 @@ def test_request_tenant_ignores_spoofed_headers_and_body(client: TestClient, use
     assert response.status_code == 200
     assert response.json()["tenant_id"] == user_a_cookie.tenant_id
     assert response.json()["workspace_id"] == user_a_cookie.workspace_id
+
+
+def test_real_login_cookie_uses_current_db_auth_epoch_and_authenticates_protected_routes(
+    client: TestClient,
+    migrated_database: Database,
+):
+    email = "verify-flow@example.com"
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+
+    send_response = client.post(
+        "/auth/send-code",
+        json={"email": email},
+    )
+    verify_response = client.post(
+        "/auth/verify",
+        json={"email": email, "code": "654321"},
+    )
+    me_response = client.get("/auth/me")
+    sessions_response = client.get("/api/sessions")
+
+    assert send_response.status_code == 200
+    assert verify_response.status_code == 200
+    assert me_response.status_code == 200
+    assert sessions_response.status_code == 200
+
+    persisted_user = asyncio.run(_get_user_row(migrated_database, email))
+    token = client.cookies.get("token")
+    assert token is not None
+    payload = jwt.decode(token, client.app.state.auth_store.jwt_secret, algorithms=["HS256"])
+
+    assert payload["sub"] == persisted_user["id"]
+    assert payload["auth_epoch"] == persisted_user["auth_epoch"]
+    assert "iat" in payload
+    assert "exp" in payload
+    assert me_response.json() == {"email": email, "user_id": persisted_user["id"]}
 
 
 def test_foreign_session_id_is_404_and_does_not_create_session(client: TestClient, two_users: TwoUsers):
@@ -323,6 +376,52 @@ def test_no_token_requests_stay_401(client: TestClient):
     response = client.get("/api/sessions")
     assert response.status_code == 401
     assert response.json() == {"detail": "Unauthorized"}
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"sub": "tenant-id", "auth_epoch": True},
+        {"sub": "tenant-id", "auth_epoch": "0"},
+        {"sub": "tenant-id", "auth_epoch": 0.5},
+        {"sub": 123, "auth_epoch": 0},
+        {"sub": "", "auth_epoch": 0},
+    ],
+)
+def test_malformed_signed_claims_are_401(
+    client: TestClient,
+    user_a_cookie: SeededIdentity,
+    claims: dict[str, object],
+):
+    token = jwt.encode(
+        {
+            **claims,
+            "exp": datetime.now(timezone.utc) + timedelta(days=1),
+        },
+        client.app.state.auth_store.jwt_secret,
+        algorithm="HS256",
+    )
+
+    response = client.get("/api/sessions", cookies={"token": token})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
+
+
+def test_auth_me_does_not_acquire_write_lock_for_authenticated_lookup(
+    client: TestClient,
+    user_a_cookie: SeededIdentity,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def _unexpected_begin_write(_connection):
+        raise AssertionError("begin_write should not be called")
+
+    monkeypatch.setattr(client.app.state.database.dialect, "begin_write", _unexpected_begin_write)
+
+    response = client.get("/auth/me", cookies=user_a_cookie.cookie)
+
+    assert response.status_code == 200
+    assert response.json() == {"email": user_a_cookie.email, "user_id": user_a_cookie.tenant_id}
 
 
 def test_missing_auth_epoch_is_401_before_scope_resolution(client: TestClient, migrated_database: Database):
