@@ -24,6 +24,7 @@ from multiclaw.mcp.types import (
 from multiclaw.mcp.types import ToolInfo
 from multiclaw.storage import Database
 from multiclaw.storage.uow import AuthUnitOfWork
+from multiclaw.tenancy import TenantContext, WorkspaceResolver
 from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.shell import ShellToolBuilder
 from sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
@@ -84,6 +85,26 @@ def _make_auth_cookie(app, database: Database, *, email: str = "test@example.com
     return {"token": token}
 
 
+def _make_runtime_factory(
+    server_module,
+    tmp_path: Path,
+    *,
+    controller_factory=None,
+    mcp_manager_factory=None,
+):
+    database = Database.create(DatabaseSettings(driver="sqlite", url=_sqlite_url(tmp_path)))
+    return server_module.create_runtime_factory(
+        database=database,
+        workspace_resolver=WorkspaceResolver(tmp_path),
+        sandbox_controller_factory=controller_factory,
+        mcp_manager_factory=mcp_manager_factory or server_module.MCPClientManager,
+    )
+
+
+def _create_runtime(factory, tenant_id: str = "tenant-a", workspace_id: str = "workspace-a"):
+    return asyncio.run(factory.create(TenantContext(tenant_id, workspace_id)))
+
+
 def test_sessions_endpoint_lists_created_sessions(migrated_database):
     from multiclaw.server import app
 
@@ -139,7 +160,14 @@ def test_chat_real_memory_path_does_not_lock_sqlite(migrated_database, monkeypat
 
     with TestClient(server.app) as client:
         client.cookies = _make_auth_cookie(server.app, migrated_database)
-        monkeypatch.setattr(server.agent.router, "stream_completion", fake_stream_completion)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent.router, "stream_completion", fake_stream_completion)
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
 
         response = client.post("/api/chat", json={"message": "hello from user"})
         sessions = client.get("/api/sessions").json()
@@ -150,6 +178,13 @@ def test_chat_real_memory_path_does_not_lock_sqlite(migrated_database, monkeypat
     assert "database is locked" not in response.text
     assert [message["role"] for message in messages] == ["user", "assistant"]
     assert [message["content"] for message in messages] == ["hello from user", "assistant reply"]
+
+
+def test_server_module_no_longer_exports_process_global_runtime_symbols():
+    import multiclaw.server as server_module
+
+    assert not hasattr(server_module, "agent")
+    assert not hasattr(server_module, "shared_bus")
 
 
 def test_chat_rejects_archived_session(migrated_database):
@@ -371,14 +406,13 @@ def test_health_ready_is_public_and_uses_app_state(tmp_path, monkeypatch):
 
     import multiclaw.server as server_module
 
-    real_create_agent = server_module.create_agent
     controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
-
-    def _create_agent(*, sandbox_controller=None):
-        del sandbox_controller
-        return real_create_agent(sandbox_controller=controller)
-
-    monkeypatch.setattr(server_module, "create_agent", _create_agent)
+    factory = _make_runtime_factory(
+        server_module,
+        tmp_path,
+        controller_factory=lambda workspace_root, event_bus: controller,
+    )
+    monkeypatch.setattr(server_module, "create_runtime_factory", lambda: factory)
 
     with TestClient(server_module.app) as client:
         response = client.get("/health/ready")
@@ -396,14 +430,13 @@ def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch,
 
     import multiclaw.server as server_module
 
-    real_create_agent = server_module.create_agent
     controller = _LeakyUnavailableSandboxController(tmp_path)
-
-    def _create_agent(*, sandbox_controller=None):
-        del sandbox_controller
-        return real_create_agent(sandbox_controller=controller)
-
-    monkeypatch.setattr(server_module, "create_agent", _create_agent)
+    factory = _make_runtime_factory(
+        server_module,
+        tmp_path,
+        controller_factory=lambda workspace_root, event_bus: controller,
+    )
+    monkeypatch.setattr(server_module, "create_runtime_factory", lambda: factory)
 
     with caplog.at_level("INFO"):
         with TestClient(server_module.app) as client:
@@ -1266,44 +1299,47 @@ def test_register_mcp_tools_keeps_distinct_blocked_capabilities_for_colliding_se
     assert all(len(name) > len("mcp_stdio_a_") for name in skipped)
 
 
-def test_lifespan_still_closes_controller_when_mcp_stop_fails(tmp_path, monkeypatch, caplog):
+def test_lifespan_still_disposes_database_when_runtime_pool_close_fails(tmp_path, monkeypatch):
     import multiclaw.server as server_module
 
-    class FakeController(ReadyRecordingSandboxController):
+    class FakeDatabase:
         def __init__(self) -> None:
-            super().__init__(workspace_root=tmp_path)
+            self.dispose_calls = 0
+
+        async def dispose(self) -> None:
+            self.dispose_calls += 1
+
+    class FakeFactory:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(
+                database=SimpleNamespace(path=str(tmp_path / "app.db")),
+                runtime=SimpleNamespace(max_resident_tenants=1, idle_ttl_seconds=1),
+            )
+            self.database = FakeDatabase()
+            self.workspace_resolver = SimpleNamespace(root=tmp_path)
+
+        def probe_startup(self):
+            return SimpleNamespace(ready=True), ()
+
+    class FailingRuntimePool:
+        def __init__(self, *, factory, max_resident_tenants, idle_ttl_ms) -> None:
+            del max_resident_tenants, idle_ttl_ms
+            self.factory = factory
             self.close_calls = 0
 
-        def close(self) -> None:
+        async def close(self) -> None:
             self.close_calls += 1
+            raise RuntimeError("pool close failed")
 
-    class FakeManager:
-        def __init__(self) -> None:
-            self.stop_calls = 0
+    fake_factory = FakeFactory()
+    monkeypatch.setattr(server_module, "create_runtime_factory", lambda: fake_factory)
+    monkeypatch.setattr(server_module, "RuntimePool", FailingRuntimePool)
 
-        def stop(self) -> None:
-            self.stop_calls += 1
-            raise RuntimeError(f"stop leaked path {tmp_path}")
-
-    controller = FakeController()
-    manager = FakeManager()
-    real_create_agent = server_module.create_agent
-
-    def _create_agent(*, sandbox_controller=None):
-        del sandbox_controller
-        runtime_agent = real_create_agent(sandbox_controller=controller)
-        runtime_agent.mcp_manager = manager
-        return runtime_agent
-
-    monkeypatch.setattr(server_module, "create_agent", _create_agent)
-
-    with caplog.at_level("WARNING"):
+    with pytest.raises(RuntimeError, match="pool close failed"):
         with TestClient(server_module.app):
             pass
 
-    assert manager.stop_calls == 1
-    assert controller.close_calls == 1
-    assert str(tmp_path) not in caplog.text
+    assert fake_factory.database.dispose_calls == 1
 
 
 def test_lifespan_disposes_database_when_auth_store_initialize_fails(tmp_path, monkeypatch):
@@ -1316,40 +1352,22 @@ def test_lifespan_disposes_database_when_auth_store_initialize_fails(tmp_path, m
         async def dispose(self) -> None:
             self.dispose_calls += 1
 
-    class FakeController:
-        def __init__(self) -> None:
-            self.close_calls = 0
-
-        def drain_startup_events(self) -> tuple[Event, ...]:
-            return ()
-
-        def close(self) -> None:
-            self.close_calls += 1
-
-    class FakeManager:
-        def __init__(self) -> None:
-            self.stop_calls = 0
-
-        def stop(self) -> None:
-            self.stop_calls += 1
-
     fake_database = FakeDatabase()
-    fake_controller = FakeController()
-    fake_manager = FakeManager()
-
-    fake_agent = SimpleNamespace(
-        settings=SimpleNamespace(database=SimpleNamespace(path=str(tmp_path / "app.db"))),
+    fake_factory = SimpleNamespace(
+        settings=SimpleNamespace(
+            database=SimpleNamespace(path=str(tmp_path / "app.db")),
+            runtime=SimpleNamespace(max_resident_tenants=1, idle_ttl_seconds=1),
+        ),
         database=fake_database,
-        sandbox_readiness=SimpleNamespace(),
-        workspace_root=tmp_path,
-        sandbox_controller=fake_controller,
-        mcp_manager=fake_manager,
+        workspace_resolver=SimpleNamespace(root=tmp_path),
+        probe_startup=lambda: (SimpleNamespace(), ()),
+        create=None,
     )
 
     async def _boom(self) -> None:
         raise RuntimeError("auth store init failed")
 
-    monkeypatch.setattr(server_module, "create_agent", lambda *, sandbox_controller=None: fake_agent)
+    monkeypatch.setattr(server_module, "create_runtime_factory", lambda: fake_factory)
     monkeypatch.setattr(server_module.AuthStore, "initialize", _boom)
 
     with pytest.raises(RuntimeError, match="auth store init failed"):
@@ -1357,8 +1375,6 @@ def test_lifespan_disposes_database_when_auth_store_initialize_fails(tmp_path, m
             pass
 
     assert fake_database.dispose_calls == 1
-    assert fake_controller.close_calls == 1
-    assert fake_manager.stop_calls == 1
 
 
 def test_lifespan_preserves_primary_error_when_auth_store_close_fails(tmp_path, monkeypatch):
@@ -1371,33 +1387,16 @@ def test_lifespan_preserves_primary_error_when_auth_store_close_fails(tmp_path, 
         async def dispose(self) -> None:
             self.dispose_calls += 1
 
-    class FakeController:
-        def __init__(self) -> None:
-            self.close_calls = 0
-
-        def drain_startup_events(self) -> tuple[Event, ...]:
-            return ()
-
-        def close(self) -> None:
-            self.close_calls += 1
-
-    class FakeManager:
-        def __init__(self) -> None:
-            self.stop_calls = 0
-
-        def stop(self) -> None:
-            self.stop_calls += 1
-
     fake_database = FakeDatabase()
-    fake_controller = FakeController()
-    fake_manager = FakeManager()
-    fake_agent = SimpleNamespace(
-        settings=SimpleNamespace(database=SimpleNamespace(path=str(tmp_path / "app.db"))),
+    fake_factory = SimpleNamespace(
+        settings=SimpleNamespace(
+            database=SimpleNamespace(path=str(tmp_path / "app.db")),
+            runtime=SimpleNamespace(max_resident_tenants=1, idle_ttl_seconds=1),
+        ),
         database=fake_database,
-        sandbox_readiness=SimpleNamespace(),
-        workspace_root=tmp_path,
-        sandbox_controller=fake_controller,
-        mcp_manager=fake_manager,
+        workspace_resolver=SimpleNamespace(root=tmp_path),
+        probe_startup=lambda: (SimpleNamespace(), ()),
+        create=None,
     )
 
     async def _boom(self) -> None:
@@ -1406,7 +1405,7 @@ def test_lifespan_preserves_primary_error_when_auth_store_close_fails(tmp_path, 
     async def _close_boom(self) -> None:
         raise RuntimeError("auth store close failed")
 
-    monkeypatch.setattr(server_module, "create_agent", lambda *, sandbox_controller=None: fake_agent)
+    monkeypatch.setattr(server_module, "create_runtime_factory", lambda: fake_factory)
     monkeypatch.setattr(server_module.AuthStore, "initialize", _boom)
     monkeypatch.setattr(server_module.AuthStore, "close", _close_boom)
 
@@ -1415,8 +1414,6 @@ def test_lifespan_preserves_primary_error_when_auth_store_close_fails(tmp_path, 
             pass
 
     assert fake_database.dispose_calls == 1
-    assert fake_controller.close_calls == 1
-    assert fake_manager.stop_calls == 1
     assert exc_info.value.__notes__
     assert any("auth_store.close" in note and "auth store close failed" in note for note in exc_info.value.__notes__)
 
@@ -1432,39 +1429,22 @@ def test_lifespan_preserves_primary_error_when_database_dispose_fails(tmp_path, 
             self.dispose_calls += 1
             raise RuntimeError("database dispose failed")
 
-    class FakeController:
-        def __init__(self) -> None:
-            self.close_calls = 0
-
-        def drain_startup_events(self) -> tuple[Event, ...]:
-            return ()
-
-        def close(self) -> None:
-            self.close_calls += 1
-
-    class FakeManager:
-        def __init__(self) -> None:
-            self.stop_calls = 0
-
-        def stop(self) -> None:
-            self.stop_calls += 1
-
     fake_database = FakeDatabase()
-    fake_controller = FakeController()
-    fake_manager = FakeManager()
-    fake_agent = SimpleNamespace(
-        settings=SimpleNamespace(database=SimpleNamespace(path=str(tmp_path / "app.db"))),
+    fake_factory = SimpleNamespace(
+        settings=SimpleNamespace(
+            database=SimpleNamespace(path=str(tmp_path / "app.db")),
+            runtime=SimpleNamespace(max_resident_tenants=1, idle_ttl_seconds=1),
+        ),
         database=fake_database,
-        sandbox_readiness=SimpleNamespace(),
-        workspace_root=tmp_path,
-        sandbox_controller=fake_controller,
-        mcp_manager=fake_manager,
+        workspace_resolver=SimpleNamespace(root=tmp_path),
+        probe_startup=lambda: (SimpleNamespace(), ()),
+        create=None,
     )
 
     async def _boom(self) -> None:
         raise RuntimeError("auth store init failed")
 
-    monkeypatch.setattr(server_module, "create_agent", lambda *, sandbox_controller=None: fake_agent)
+    monkeypatch.setattr(server_module, "create_runtime_factory", lambda: fake_factory)
     monkeypatch.setattr(server_module.AuthStore, "initialize", _boom)
 
     with pytest.raises(RuntimeError, match="auth store init failed") as exc_info:
@@ -1472,8 +1452,6 @@ def test_lifespan_preserves_primary_error_when_database_dispose_fails(tmp_path, 
             pass
 
     assert fake_database.dispose_calls == 1
-    assert fake_controller.close_calls == 1
-    assert fake_manager.stop_calls == 1
     assert exc_info.value.__notes__
     assert any(
         "database.dispose" in note and "database dispose failed" in note
@@ -1481,7 +1459,7 @@ def test_lifespan_preserves_primary_error_when_database_dispose_fails(tmp_path, 
     )
 
 
-def test_create_agent_passes_configured_mcp_profile_name(tmp_path, monkeypatch):
+def test_create_runtime_factory_passes_configured_mcp_profile_name(tmp_path, monkeypatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "true")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
@@ -1501,16 +1479,23 @@ def test_create_agent_passes_configured_mcp_profile_name(tmp_path, monkeypatch):
 
     monkeypatch.setattr(server_module, "_register_mcp_tools", _register_stub)
     try:
-        server_module.create_agent(
-            sandbox_controller=ReadyRecordingSandboxController(workspace_root=tmp_path)
+        factory = _make_runtime_factory(
+            server_module,
+            tmp_path,
+            controller_factory=lambda workspace_root, event_bus: ReadyRecordingSandboxController(
+                workspace_root=workspace_root
+            ),
         )
+        runtime = _create_runtime(factory)
     finally:
         monkeypatch.setattr(server_module, "_register_mcp_tools", real_register)
+        asyncio.run(runtime.close())
+        asyncio.run(factory.database.dispose())
 
     assert captured["mcp_profile_name"] == "custom_mcp_profile"
 
 
-def test_create_agent_injects_sandbox_context_into_mcp_manager(tmp_path, monkeypatch):
+def test_create_runtime_factory_injects_sandbox_context_into_mcp_manager(tmp_path, monkeypatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "true")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
@@ -1524,6 +1509,7 @@ def test_create_agent_injects_sandbox_context_into_mcp_manager(tmp_path, monkeyp
             captured["sandbox_controller"] = sandbox_controller
             captured["workspace_root"] = workspace_root
             captured["kwargs"] = kwargs
+            self.stop_calls = 0
 
         def set_tools_changed_callback(self, callback) -> None:
             self._callback = callback
@@ -1535,19 +1521,29 @@ def test_create_agent_injects_sandbox_context_into_mcp_manager(tmp_path, monkeyp
         def get_server_states(self):
             return {}
 
-    monkeypatch.setattr(server_module, "MCPClientManager", FakeManager)
+        def stop(self) -> None:
+            self.stop_calls += 1
+
     monkeypatch.setattr(server_module, "load_mcp_config", lambda path=None: {})
     monkeypatch.setattr(server_module, "load_mcp_tools_config", lambda path=None: {})
 
     controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
-    agent = server_module.create_agent(sandbox_controller=controller)
+    factory = _make_runtime_factory(
+        server_module,
+        tmp_path,
+        controller_factory=lambda workspace_root, event_bus: controller,
+        mcp_manager_factory=FakeManager,
+    )
+    runtime = _create_runtime(factory)
 
     assert captured["sandbox_controller"] is controller
-    assert captured["workspace_root"] == agent.workspace_root
-    assert agent.mcp_manager is not None
+    assert captured["workspace_root"] == runtime.workspace_root
+    assert runtime.mcp_manager is not None
+    asyncio.run(runtime.close())
+    asyncio.run(factory.database.dispose())
 
 
-def test_create_agent_passes_configured_shell_profile_and_controller(tmp_path, monkeypatch):
+def test_create_runtime_factory_passes_configured_shell_profile_and_controller(tmp_path, monkeypatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
@@ -1562,16 +1558,22 @@ def test_create_agent_passes_configured_shell_profile_and_controller(tmp_path, m
         def is_profile_ready(self, profile_name: str) -> bool:
             return profile_name in {"custom_shell_profile", "code_exec_python"}
 
-    controller = ProfileController(workspace_root=tmp_path)
-    agent = server_module.create_agent(sandbox_controller=controller)
-    shell_builder = agent.registry.get("shell")
+    factory = _make_runtime_factory(
+        server_module,
+        tmp_path,
+        controller_factory=lambda workspace_root, event_bus: ProfileController(workspace_root=workspace_root),
+    )
+    runtime = _create_runtime(factory)
+    shell_builder = runtime.registry.get("shell")
 
     assert isinstance(shell_builder, ShellToolBuilder)
-    assert shell_builder.sandbox_controller is controller
+    assert shell_builder.sandbox_controller is runtime.sandbox_controller
     assert shell_builder.profile_name == "custom_shell_profile"
+    asyncio.run(runtime.close())
+    asyncio.run(factory.database.dispose())
 
 
-def test_create_agent_passes_configured_code_exec_profile_and_controller(tmp_path, monkeypatch):
+def test_create_runtime_factory_passes_configured_code_exec_profile_and_controller(tmp_path, monkeypatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
@@ -1586,13 +1588,19 @@ def test_create_agent_passes_configured_code_exec_profile_and_controller(tmp_pat
         def is_profile_ready(self, profile_name: str) -> bool:
             return profile_name in {"shell_workspace", "custom_code_profile"}
 
-    controller = ProfileController(workspace_root=tmp_path)
-    agent = server_module.create_agent(sandbox_controller=controller)
-    code_exec_builder = agent.registry.get("code_exec")
+    factory = _make_runtime_factory(
+        server_module,
+        tmp_path,
+        controller_factory=lambda workspace_root, event_bus: ProfileController(workspace_root=workspace_root),
+    )
+    runtime = _create_runtime(factory)
+    code_exec_builder = runtime.registry.get("code_exec")
 
     assert isinstance(code_exec_builder, CodeExecToolBuilder)
-    assert code_exec_builder.sandbox_controller is controller
+    assert code_exec_builder.sandbox_controller is runtime.sandbox_controller
     assert code_exec_builder.profile_name == "custom_code_profile"
+    asyncio.run(runtime.close())
+    asyncio.run(factory.database.dispose())
 
 
 @pytest.mark.parametrize(
@@ -1602,7 +1610,7 @@ def test_create_agent_passes_configured_code_exec_profile_and_controller(tmp_pat
         ("true", True),
     ],
 )
-def test_create_agent_wires_web_fetch_private_network_flag(
+def test_create_runtime_factory_wires_web_fetch_private_network_flag(
     tmp_path,
     monkeypatch,
     allow_private_networks,
@@ -1619,11 +1627,20 @@ def test_create_agent_wires_web_fetch_private_network_flag(
             allow_private_networks,
         )
 
-    from multiclaw.server import create_agent
     from multiclaw.tools.web_fetch import WebFetchToolBuilder
+    import multiclaw.server as server_module
 
-    agent = create_agent()
-    web_fetch_builder = agent.registry.get("web_fetch")
+    factory = _make_runtime_factory(
+        server_module,
+        tmp_path,
+        controller_factory=lambda workspace_root, event_bus: ReadyRecordingSandboxController(
+            workspace_root=workspace_root
+        ),
+    )
+    runtime = _create_runtime(factory)
+    web_fetch_builder = runtime.registry.get("web_fetch")
 
     assert isinstance(web_fetch_builder, WebFetchToolBuilder)
     assert web_fetch_builder.allow_private_networks is expected
+    asyncio.run(runtime.close())
+    asyncio.run(factory.database.dispose())

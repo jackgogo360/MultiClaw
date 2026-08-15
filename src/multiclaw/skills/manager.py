@@ -116,3 +116,8 @@ class SkillManager:
             if skill.body:
                 results.append((skill.name, skill.format_instructions()))
         return results
+
+    def close(self) -> None:
+        for skill in list(self._skills.values()):
+            self._activator.deactivate(skill)
+        self._skills.clear()

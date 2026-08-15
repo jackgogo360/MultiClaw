@@ -88,40 +88,20 @@ def _note_startup_cleanup_error(primary: BaseException, phase: str, error: BaseE
     primary.add_note(f"{phase} cleanup failed: {type(error).__name__}: {error}")
 
 
-from multiclaw.agent import MultiClawAgent
 from multiclaw.config import Settings
 from multiclaw.events import Event, EventBus
 from multiclaw.governance import (
-    ExecutionGuard,
-    InMemoryAuditLogger,
-    PermissionChecker,
     SandboxController,
-    SandboxProcessRunner,
     SandboxReadiness,
 )
-from multiclaw.governance.sandbox.manager import SandboxManager
-from multiclaw.llm import ModelRouter
-from multiclaw.memory import MemoryEntry, MemoryProtocol
-from multiclaw.planner import Planner
 from multiclaw.session import SessionStatus
+from multiclaw.runtime import RuntimeFactory, RuntimePool
 from multiclaw.storage import Database
 from multiclaw.storage.uow import TenantUnitOfWork
-from multiclaw.tenancy import TenantContext
+from multiclaw.tenancy import TenantContext, WorkspaceResolver
 from multiclaw.tools import (
-    CoreToolScheduler,
     ToolRegistry,
 )
-from multiclaw.tools.code_exec import CodeExecToolBuilder
-from multiclaw.tools.edit_file import EditFileToolBuilder, UndoEditToolBuilder
-from multiclaw.tools.find_dir import FindDirToolBuilder
-from multiclaw.tools.glob import GlobToolBuilder
-from multiclaw.tools.grep import GrepToolBuilder
-from multiclaw.tools.list_dir import ListDirToolBuilder
-from multiclaw.tools.read_file import ReadFileToolBuilder
-from multiclaw.tools.shell import ShellToolBuilder
-from multiclaw.tools.web_fetch import WebFetchToolBuilder
-from multiclaw.tools.web_search import WebSearchToolBuilder
-from multiclaw.tools.write_file import WriteFileToolBuilder
 from multiclaw.mcp import (
     MCPClientManager,
     MCPToolBuilder,
@@ -149,9 +129,6 @@ from multiclaw.stream import DataStreamEncoder
 # ---------------------------------------------------------------------------
 # Agent factory
 # ---------------------------------------------------------------------------
-
-agent: MultiClawAgent
-shared_bus: EventBus
 _PUBLIC_SECRET_PATTERN = re.compile(
     r"(?:ghp_[A-Za-z0-9_]{1,255}|sk-[A-Za-z0-9_]{1,255}|Bearer\s+\S+"
     r"|token=[^\s&,;\"']{1,255}|key=[^\s&,;\"']{1,255})",
@@ -164,48 +141,6 @@ _PUBLIC_AUTHORIZATION_PATTERN = re.compile(
     r"(?i)\bAuthorization\s*:\s*Bearer\s+[^\s,;]+"
 )
 _PUBLIC_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
-
-
-class _DatabaseBackedMemory(MemoryProtocol):
-    def __init__(self, database: Database) -> None:
-        self._database = database
-
-    async def save(self, context: TenantContext, entry: MemoryEntry) -> MemoryEntry:
-        async with TenantUnitOfWork(self._database, context) as uow:
-            return await uow.memory.save(entry)
-
-    async def query(
-        self,
-        context: TenantContext,
-        query: str,
-        top_k: int,
-        entry_type: str | None = None,
-    ) -> list[MemoryEntry]:
-        async with TenantUnitOfWork(self._database, context) as uow:
-            return await uow.memory.query(query, top_k, entry_type)
-
-    async def recent(
-        self,
-        context: TenantContext,
-        limit: int,
-        entry_type: str | None = None,
-    ) -> list[MemoryEntry]:
-        async with TenantUnitOfWork(self._database, context) as uow:
-            return await uow.memory.recent(limit, entry_type)
-
-    async def context(
-        self,
-        context: TenantContext,
-        max_chars: int,
-        limit: int,
-        entry_type: str | None = None,
-    ) -> list[MemoryEntry]:
-        async with TenantUnitOfWork(self._database, context) as uow:
-            return await uow.memory.context(max_chars, limit, entry_type)
-
-    async def forget(self, context: TenantContext, entry_id: str) -> None:
-        async with TenantUnitOfWork(self._database, context) as uow:
-            await uow.memory.forget(entry_id)
 
 
 def _sanitize_mcp_namespace(name: str) -> str:
@@ -488,144 +423,53 @@ def _mcp_transport_capability_prefix(config: object) -> str:
     if isinstance(config, WebSocketServerConfig):
         return "mcp_websocket"
     return "mcp_unknown"
+def _resolve_config_path() -> Path | None:
+    candidates = (
+        Path(__file__).resolve().parent.parent.parent / "multiclaw.toml",
+        Path(__file__).resolve().parent.parent / "multiclaw.toml",
+        Path("multiclaw.toml"),
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
-def create_agent(
+def _resolve_workspace_root(settings: Settings, config_path: Path | None) -> Path:
+    base_root = config_path.resolve().parent if config_path is not None else Path.cwd().resolve()
+    configured = Path(settings.workspace.root)
+    workspace_root = configured if configured.is_absolute() else (base_root / configured)
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    return workspace_root.resolve()
+
+
+def create_runtime_factory(
     *,
-    sandbox_controller: SandboxController | None = None,
-) -> MultiClawAgent:
-    global shared_bus
-    shared_bus = EventBus()
-
-    config_path = Path(__file__).resolve().parent.parent.parent / "multiclaw.toml"
-    if not config_path.exists():
-        config_path = Path(__file__).resolve().parent.parent / "multiclaw.toml"
-    if not config_path.exists():
-        config_path = Path("multiclaw.toml")
-
-    settings = Settings(_config_file=str(config_path) if config_path.exists() else None)
-    workspace_root = config_path.resolve().parent if config_path.exists() else Path.cwd().resolve()
-
-    from multiclaw.skills import SkillManager
-
-    skill_manager = SkillManager(
-        project_root=workspace_root,
-        max_active=settings.skill.max_active if hasattr(settings, 'skill') else 5,
+    settings: Settings | None = None,
+    database: Database | None = None,
+    workspace_resolver: WorkspaceResolver | None = None,
+    sandbox_controller_factory=None,
+    mcp_manager_factory: type[MCPClientManager] = MCPClientManager,
+) -> RuntimeFactory:
+    config_path = _resolve_config_path()
+    resolved_settings = settings or Settings(
+        _config_file=str(config_path) if config_path is not None else None
     )
-    if settings.skill.enabled if hasattr(settings, 'skill') else True:
-        skill_manager.discover()
-
-    if sandbox_controller is None:
-        sandbox_controller = SandboxManager.create(
-            settings=settings.governance.sandbox,
-            debug=settings.app.debug,
-            workspace_root=workspace_root,
-            event_bus=shared_bus,
-            runner=SandboxProcessRunner(),
-        )
-    sandbox_controller.initialize()
-
-    registry = ToolRegistry()
-    read_builder = ReadFileToolBuilder(workspace_root)
-    edit_builder = EditFileToolBuilder(workspace_root)
-    registry.register(read_builder)
-    registry.register(WriteFileToolBuilder(workspace_root, read_builder))
-    registry.register(edit_builder)
-    registry.register(UndoEditToolBuilder(workspace_root, edit_builder))
-    registry.register(GlobToolBuilder(workspace_root))
-    registry.register(ListDirToolBuilder(workspace_root))
-    registry.register(GrepToolBuilder(workspace_root))
-    registry.register(FindDirToolBuilder(workspace_root))
-    if sandbox_controller.is_profile_ready(settings.governance.sandbox.profiles.shell):
-        registry.register(
-            ShellToolBuilder(
-                workspace_root,
-                sandbox_controller=sandbox_controller,
-                profile_name=settings.governance.sandbox.profiles.shell,
-            )
-        )
-    else:
-        _record_blocked_capability_safely(
-            sandbox_controller,
-            name="shell",
-            reason=f"sandbox profile {settings.governance.sandbox.profiles.shell!r} is not ready",
-            workspace_root=workspace_root,
-        )
-    if sandbox_controller.is_profile_ready(settings.governance.sandbox.profiles.code_exec):
-        registry.register(
-            CodeExecToolBuilder(
-                workspace_root,
-                sandbox_controller=sandbox_controller,
-                profile_name=settings.governance.sandbox.profiles.code_exec,
-            )
-        )
-    else:
-        _record_blocked_capability_safely(
-            sandbox_controller,
-            name="code_exec",
-            reason=f"sandbox profile {settings.governance.sandbox.profiles.code_exec!r} is not ready",
-            workspace_root=workspace_root,
-        )
-    registry.register(
-        WebFetchToolBuilder(
-            workspace_root,
-            allow_private_networks=settings.tools.web_fetch_allow_private_networks,
-        )
+    resolved_database = database or Database.create(resolved_settings.database)
+    resolved_workspace_resolver = workspace_resolver or WorkspaceResolver(
+        _resolve_workspace_root(resolved_settings, config_path)
     )
-    registry.register(WebSearchToolBuilder(workspace_root))
-
-    # Register MCP tools if enabled
-    mcp_manager = None
-    if settings.mcp.enabled:
-        mcp_manager = MCPClientManager(
-            sandbox_controller=sandbox_controller,
-            workspace_root=workspace_root,
-        )
-        _register_mcp_tools(
-            registry=registry,
-            mcp_manager=mcp_manager,
-            config_path=(
-                settings.mcp.config_path if settings.mcp.config_path else None
-            ),
-            sandbox_controller=sandbox_controller,
-            workspace_root=workspace_root,
-            mcp_profile_name=settings.governance.sandbox.profiles.mcp_stdio,
-        )
-
-    readiness = sandbox_controller.finalize_readiness()
-
-    scheduler = CoreToolScheduler(
-        permission_checker=PermissionChecker(
-            guarded_tools={
-                "write_file",
-                "edit_file",
-                "undo_edit",
-                "shell",
-                "code_exec",
-            }
+    return RuntimeFactory(
+        settings=resolved_settings,
+        database=resolved_database,
+        workspace_resolver=resolved_workspace_resolver,
+        sandbox_controller_factory=sandbox_controller_factory,
+        mcp_manager_factory=mcp_manager_factory,
+        mcp_tool_registrar=_register_mcp_tools,
+        config_path=(
+            resolved_settings.mcp.config_path if resolved_settings.mcp.config_path else None
         ),
-        execution_guard=ExecutionGuard(),
-        audit_logger=InMemoryAuditLogger(),
-        event_bus=shared_bus,
     )
-    database = Database.create(settings.database)
-
-    runtime_agent = MultiClawAgent(
-        settings=settings,
-        router=ModelRouter(settings),
-        registry=registry,
-        scheduler=scheduler,
-        memory=_DatabaseBackedMemory(database),
-        planner=Planner(),
-        event_bus=shared_bus,
-        skill_manager=skill_manager,
-    )
-    runtime_agent.database = database
-    runtime_agent.mcp_manager = mcp_manager
-    runtime_agent.sandbox_controller = sandbox_controller
-    runtime_agent.sandbox_readiness = readiness
-    runtime_agent.workspace_root = workspace_root
-    return runtime_agent
 
 
 # ---------------------------------------------------------------------------
@@ -635,20 +479,24 @@ def create_agent(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global agent
-    agent = create_agent()
-    sandbox_controller = getattr(agent, "sandbox_controller", None)
-    auth_store = AuthStore(agent.settings.database.path)
+    runtime_factory = create_runtime_factory()
+    runtime_pool = RuntimePool(
+        factory=runtime_factory,
+        max_resident_tenants=runtime_factory.settings.runtime.max_resident_tenants,
+        idle_ttl_ms=runtime_factory.settings.runtime.idle_ttl_seconds * 1000,
+    )
+    readiness, startup_events = runtime_factory.probe_startup()
+    auth_store = AuthStore(runtime_factory.settings.database.path)
     try:
         await auth_store.initialize()
         app.state.auth_store = auth_store
-        app.state.database = agent.database
-        app.state.settings = agent.settings
-        app.state.sandbox_readiness = agent.sandbox_readiness
-        app.state.workspace_root = getattr(agent, "workspace_root", None)
-        if sandbox_controller is not None:
-            for event in sandbox_controller.drain_startup_events():
-                await shared_bus.publish(event)
+        app.state.database = runtime_factory.database
+        app.state.runtime_pool = runtime_pool
+        app.state.workspace_resolver = runtime_factory.workspace_resolver
+        app.state.settings = runtime_factory.settings
+        app.state.sandbox_readiness = readiness
+        app.state.workspace_root = runtime_factory.workspace_resolver.root
+        app.state.sandbox_startup_events = startup_events
     except BaseException as primary:
         try:
             try:
@@ -656,48 +504,25 @@ async def lifespan(app: FastAPI):
             except BaseException as error:
                 _note_startup_cleanup_error(primary, "auth_store.close", error)
             try:
-                if hasattr(agent, "mcp_manager") and agent.mcp_manager:
-                    try:
-                        agent.mcp_manager.stop()
-                    except Exception as error:
-                        _note_startup_cleanup_error(primary, "mcp_manager.stop", error)
-                        logger.warning("MCP manager shutdown failed; details redacted")
+                await runtime_pool.close()
             except BaseException as error:
-                _note_startup_cleanup_error(primary, "mcp_manager.stop", error)
+                _note_startup_cleanup_error(primary, "runtime_pool.close", error)
             try:
-                await agent.database.dispose()
+                await runtime_factory.database.dispose()
             except BaseException as error:
                 _note_startup_cleanup_error(primary, "database.dispose", error)
-            if sandbox_controller is not None:
-                try:
-                    sandbox_controller.close()
-                except Exception as error:
-                    _note_startup_cleanup_error(primary, "sandbox_controller.close", error)
-                    logger.warning(
-                        "Sandbox controller reported residual startup state during shutdown; details redacted"
-                    )
         finally:
             raise primary
     try:
         yield
     finally:
         try:
-            if hasattr(agent, "mcp_manager") and agent.mcp_manager:
-                try:
-                    agent.mcp_manager.stop()
-                except Exception:
-                    logger.warning("MCP manager shutdown failed; details redacted")
+            await auth_store.close()
         finally:
             try:
-                await app.state.database.dispose()
+                await runtime_pool.close()
             finally:
-                if sandbox_controller is not None:
-                    try:
-                        sandbox_controller.close()
-                    except Exception:
-                        logger.warning(
-                            "Sandbox controller reported residual startup state during shutdown; details redacted"
-                        )
+                await runtime_factory.database.dispose()
 
 
 app = FastAPI(title="MultiClaw", lifespan=lifespan)
@@ -785,9 +610,13 @@ async def health_ready(request: Request):
 
 
 @api.post("/approve")
-async def approve(req: ApproveRequest, user=Depends(current_user)):
-    del user
-    ok = agent.scheduler.resolve_approval(req.request_id, req.approved)
+async def approve(
+    req: ApproveRequest,
+    request: Request,
+    context: TenantContext = Depends(tenant_context),
+):
+    runtime = await request.app.state.runtime_pool.acquire(context)
+    ok = runtime.scheduler.resolve_approval(req.request_id, req.approved)
     return {"ok": ok}
 
 
@@ -873,6 +702,7 @@ async def get_session_messages(
 @api.post("/chat")
 async def chat(
     req: ChatRequest,
+    request: Request,
     context: TenantContext = Depends(tenant_context),
     uow: TenantUnitOfWork = Depends(tenant_uow, scope="function"),
 ):
@@ -899,6 +729,7 @@ async def chat(
     session = await uow.sessions.touch_message(session.id, message)
     assert session is not None
     session_context = context.for_session(session.id)
+    runtime = await request.app.state.runtime_pool.acquire(session_context)
 
     async def event_stream():
         logger.info("SSE stream started, message=%r, session=%r", message[:80], session.id)
@@ -956,11 +787,11 @@ async def chat(
         async def collector(event: Event):
             await event_queue.put(event)
 
-        sub_id = shared_bus.subscribe("*", collector)
+        sub_id = runtime.event_bus.subscribe("*", collector)
 
         async def run_stream():
             try:
-                async for item in agent.handle_message_stream(message, context=session_context):
+                async for item in runtime.agent.handle_message_stream(message, context=session_context):
                     await token_queue.put(item)
             except Exception as exc:
                 logger.exception("stream error")
@@ -1088,7 +919,7 @@ async def chat(
                 await asyncio.sleep(0.02)
         finally:
             stream_task.cancel()
-            shared_bus.unsubscribe(sub_id)
+            runtime.event_bus.unsubscribe(sub_id)
             logger.info("SSE stream ended")
 
     return StreamingResponse(

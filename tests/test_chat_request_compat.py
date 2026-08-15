@@ -71,7 +71,14 @@ def test_chat_accepts_ai_sdk_message_shape(migrated_database, monkeypatch):
 
     with TestClient(server.app) as client:
         client.cookies = _make_auth_cookie(server.app, migrated_database)
-        monkeypatch.setattr(server.agent, "handle_message_stream", fake_handle_message_stream)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
 
         response = client.post(
             "/api/chat",
@@ -106,7 +113,14 @@ def test_chat_accepts_id_alias_for_existing_current_scope_session(migrated_datab
         assert created.status_code == 200
         session_id = created.json()["id"]
 
-        monkeypatch.setattr(server.agent, "handle_message_stream", fake_handle_message_stream)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
         before = client.get("/api/sessions").json()
         response = client.post(
             "/api/chat",
@@ -135,7 +149,14 @@ def test_chat_accepts_text_parts_from_ai_sdk_messages(migrated_database, monkeyp
 
     with TestClient(server.app) as client:
         client.cookies = _make_auth_cookie(server.app, migrated_database)
-        monkeypatch.setattr(server.agent, "handle_message_stream", fake_handle_message_stream)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
 
         response = client.post(
             "/api/chat",
@@ -168,7 +189,14 @@ def test_chat_stream_emits_step_boundaries_for_tool_rounds(migrated_database, mo
 
     with TestClient(server.app) as client:
         client.cookies = _make_auth_cookie(server.app, migrated_database)
-        monkeypatch.setattr(server.agent, "handle_message_stream", fake_handle_message_stream)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
 
         response = client.post(
             "/api/chat",

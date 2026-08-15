@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -224,13 +225,31 @@ class TestToolRegistry:
         monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
         monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
         monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
-        from multiclaw.server import create_agent
+        from multiclaw.config.settings import DatabaseSettings, McpSettings, Settings, SkillSettings
+        from multiclaw.runtime.factory import RuntimeFactory
+        from multiclaw.storage import Database
+        from multiclaw.tenancy import TenantContext, WorkspaceResolver
 
-        agent = create_agent(
-            sandbox_controller=ReadyRecordingSandboxController(workspace_root=tmp_path)
+        settings = Settings(
+            database=DatabaseSettings(
+                driver="sqlite",
+                url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
+            ),
+            mcp=McpSettings(enabled=False),
+            skill=SkillSettings(enabled=False),
+        )
+        database = Database.create(settings.database)
+        factory = RuntimeFactory(
+            settings=settings,
+            database=database,
+            workspace_resolver=WorkspaceResolver(tmp_path),
+            sandbox_controller_factory=lambda workspace_root, event_bus: ReadyRecordingSandboxController(
+                workspace_root=workspace_root
+            ),
         )
 
-        assert [tool.name for tool in agent.registry.list_all()] == [
+        runtime = asyncio.run(factory.create(TenantContext("tenant-a", "workspace-a")))
+        assert [tool.name for tool in runtime.registry.list_all()] == [
             "code_exec",
             "edit_file",
             "find_dir",
@@ -244,22 +263,45 @@ class TestToolRegistry:
             "web_search",
             "write_file",
         ]
+        asyncio.run(runtime.close())
+        asyncio.run(database.dispose())
 
     def test_runtime_registry_skips_unready_execution_tools(self, monkeypatch, tmp_path):
         monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
         monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
         monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
-        from multiclaw.server import create_agent
+        from multiclaw.config.settings import DatabaseSettings, McpSettings, Settings, SkillSettings
+        from multiclaw.runtime.factory import RuntimeFactory
+        from multiclaw.storage import Database
+        from multiclaw.tenancy import TenantContext, WorkspaceResolver
 
-        agent = create_agent(sandbox_controller=UnavailableSandboxController())
-        names = [tool.name for tool in agent.registry.list_all()]
+        settings = Settings(
+            database=DatabaseSettings(
+                driver="sqlite",
+                url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
+            ),
+            mcp=McpSettings(enabled=False),
+            skill=SkillSettings(enabled=False),
+        )
+        database = Database.create(settings.database)
+        factory = RuntimeFactory(
+            settings=settings,
+            database=database,
+            workspace_resolver=WorkspaceResolver(tmp_path),
+            sandbox_controller_factory=lambda workspace_root, event_bus: UnavailableSandboxController(),
+        )
+
+        runtime = asyncio.run(factory.create(TenantContext("tenant-a", "workspace-a")))
+        names = [tool.name for tool in runtime.registry.list_all()]
 
         assert "shell" not in names
         assert "code_exec" not in names
         assert "read_file" in names
         assert "web_fetch" in names
-        assert agent.sandbox_readiness.ready is False
-        assert agent.sandbox_controller is not None
+        assert runtime.sandbox_readiness.ready is False
+        assert runtime.sandbox_controller is not None
+        asyncio.run(runtime.close())
+        asyncio.run(database.dispose())
 
 
 class TestCoreToolScheduler:
