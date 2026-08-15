@@ -34,6 +34,7 @@ from multiclaw.workflow.models import (
 
 Dialect = SQLiteDialect | MySQLDialect
 ACTIVE_RUN_STATUSES = (RunStatus.RUNNING.value, RunStatus.AWAITING_USER.value, RunStatus.RESUMING.value)
+TAKEOVER_ELIGIBLE_STATUSES = {RunStatus.RUNNING, RunStatus.AWAITING_USER, RunStatus.RESUMING}
 
 
 def current_lease_predicate(lease: RunLease, dialect: Dialect) -> ColumnElement[bool]:
@@ -237,6 +238,10 @@ class WorkflowRepository:
         current = await self.get_run(context)
         if current is None:
             return None
+        if current.status not in TAKEOVER_ELIGIBLE_STATUSES:
+            raise InvalidTransitionError(
+                f"cannot acquire terminal run: {current.status.value}"
+            )
         if current.lease_expires_at is None:
             return None
 
