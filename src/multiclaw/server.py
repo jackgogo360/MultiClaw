@@ -128,6 +128,7 @@ from multiclaw.auth.store import AuthStore
 from multiclaw.auth.middleware import AuthMiddleware
 from multiclaw.auth.router import router as auth_router
 from multiclaw.api.chat import (
+    build_workflow_continuation_service,
     build_workflow_coordinator,
     build_workflow_recovery_service,
     encode_run_metadata,
@@ -803,6 +804,10 @@ async def chat(
         request.app.state.settings,
         connection=uow.conn,
     )
+    workflow_continuation = build_workflow_continuation_service(
+        request.app.state.database,
+        request.app.state.settings,
+    )
     workflow_recovery = build_workflow_recovery_service(
         request.app.state.database,
         request.app.state.settings,
@@ -955,6 +960,7 @@ async def chat(
                         run_lease=await workflow_lease_handle.current(),
                         run_lease_handle=workflow_lease_handle,
                         workflow_recovery=workflow_recovery,
+                        workflow_continuation=workflow_continuation,
                     ):
                         await token_queue.put(item)
                 except Exception as exc:

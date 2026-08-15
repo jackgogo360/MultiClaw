@@ -1,10 +1,12 @@
 import asyncio
+import hashlib
 import json
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import jwt
@@ -28,7 +30,7 @@ from multiclaw.mcp.types import (
 from multiclaw.mcp.types import ToolInfo
 from multiclaw.api.chat import iterate_message_stream
 from multiclaw.storage import Database
-from multiclaw.storage.schema import agent_runs, execution_checkpoints, tool_executions
+from multiclaw.storage.schema import agent_runs, execution_checkpoints, memory_entries, tool_executions
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
 from multiclaw.workflow.models import CheckpointPhase, RunLease, RunLeaseHandle, RunStatus
@@ -102,6 +104,85 @@ async def _run_status(database: Database, context: TenantContext) -> str | None:
     return None if status is None else str(status)
 
 
+async def _assistant_chat_messages(database: Database, context: TenantContext) -> list[dict[str, object]]:
+    async with database.connect() as conn:
+        result = await conn.execute(
+            select(
+                memory_entries.c.id,
+                memory_entries.c.role,
+                memory_entries.c.content,
+                memory_entries.c.created_at,
+                memory_entries.c.turn_index,
+            )
+            .where(
+                memory_entries.c.tenant_id == context.tenant_id,
+                memory_entries.c.workspace_id == context.workspace_id,
+                memory_entries.c.session_id == context.session_id,
+                memory_entries.c.type == "chat_message",
+                memory_entries.c.role == "assistant",
+            )
+            .order_by(
+                memory_entries.c.created_at.asc(),
+                memory_entries.c.turn_index.asc(),
+                memory_entries.c.id.asc(),
+            )
+        )
+        rows = result.mappings().all()
+    return [
+        {
+            "id": str(row["id"]),
+            "role": str(row["role"]),
+            "content": str(row["content"]),
+            "created_at": int(row["created_at"]),
+            "turn_index": int(row["turn_index"]),
+        }
+        for row in rows
+    ]
+
+
+class _StaticReportContextBuilder:
+    def __init__(self, messages: list[dict[str, str]]) -> None:
+        self.messages = messages
+
+    async def build_with_report(self, _request):
+        return SimpleNamespace(
+            messages=self.messages,
+            report=SimpleNamespace(
+                used_tokens_by_level={"L0": 1, "L1": 0, "L2": 0},
+                dropped_by_level={"L0": 0, "L1": 0, "L2": 0},
+                limit_tokens=1000,
+                reserved_response_tokens=0,
+            ),
+        )
+
+
+class _QueuedStreamRouter:
+    def __init__(self, stream_sequences, completion_responses=None) -> None:
+        self.stream_sequences = list(stream_sequences)
+        self.completion_responses = list(completion_responses or [])
+
+    async def stream_completion(self, **_kwargs):
+        events = self.stream_sequences.pop(0)
+        for event in events:
+            yield event
+
+    async def completion(self, **_kwargs):
+        if not self.completion_responses:
+            raise AssertionError("unexpected completion call")
+        response = self.completion_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def _decode_sse_messages(body: str) -> list[dict]:
+    payloads: list[dict] = []
+    for line in body.splitlines():
+        if line.startswith("data: "):
+            payloads.append(json.loads(line[6:]))
+    return payloads
+
+
 @pytest.fixture
 def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "sqlite")
@@ -143,6 +224,7 @@ async def test_iterate_message_stream_passes_lease_surfaces_to_kwargs_handler():
         lease_expires_at=12345,
     )
     lease_handle = RunLeaseHandle(lease)
+    workflow_continuation = object()
     captured: dict[str, object] = {}
 
     async def handler(user_input: str, **kwargs):
@@ -158,6 +240,7 @@ async def test_iterate_message_stream_passes_lease_surfaces_to_kwargs_handler():
             context=context,
             run_lease=lease,
             run_lease_handle=lease_handle,
+            workflow_continuation=workflow_continuation,
         )
     ]
 
@@ -166,6 +249,7 @@ async def test_iterate_message_stream_passes_lease_surfaces_to_kwargs_handler():
     assert captured["context"] == context
     assert captured["run_lease"] == lease
     assert captured["run_lease_handle"] is lease_handle
+    assert captured["workflow_continuation"] is workflow_continuation
 
 
 def _make_runtime_factory(
@@ -2278,6 +2362,265 @@ async def test_chat_invokes_live_recovery_validation_before_stream_iteration(mig
     assert validation_called.is_set() is True
     assert captured["validated_context"] == captured["handler_context"]
     assert captured["validated_phases"] == [CheckpointPhase.RUN_STARTED.value]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_persists_assistant_output_and_model_checkpoint_before_done(
+    migrated_database,
+    monkeypatch,
+):
+    import multiclaw.server as server
+    from multiclaw.storage.repositories.workflow import WorkflowRepository
+
+    checkpoint_started = asyncio.Event()
+    release_checkpoint = asyncio.Event()
+    captured: dict[str, object] = {}
+    original_insert = WorkflowRepository._insert_checkpoint
+
+    async def gated_insert(self, lease, **kwargs):
+        if kwargs.get("phase") == CheckpointPhase.MODEL_OUTPUT_COMMITTED.value:
+            checkpoint_started.set()
+            await release_checkpoint.wait()
+        return await original_insert(self, lease, **kwargs)
+
+    monkeypatch.setattr(WorkflowRepository, "_insert_checkpoint", gated_insert)
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "assistant-output@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(request_context):
+            runtime = await original_acquire(request_context)
+            runtime.agent.context_builder = _StaticReportContextBuilder(
+                [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hello"},
+                ]
+            )
+            runtime.agent.router = _QueuedStreamRouter(
+                stream_sequences=[[{"type": "token", "content": "streamed reply"}]]
+            )
+            captured["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+
+        chunks: list[str] = []
+
+        async def consume() -> None:
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+
+        consume_task = asyncio.create_task(consume())
+        await checkpoint_started.wait()
+
+        run_event = next(
+            json.loads(chunk[6:])
+            for chunk in chunks
+            if chunk.startswith("data: ") and '"type":"data-run"' in chunk
+        )
+        run_context = context.for_run(
+            run_event["data"]["session_id"],
+            run_event["data"]["run_id"],
+        )
+        assert await _assistant_chat_messages(migrated_database, run_context) == []
+        assert [row["phase"] for row in await _checkpoint_rows(migrated_database, run_context)] == [
+            CheckpointPhase.RUN_STARTED.value
+        ]
+        assert not any('"type":"finish"' in chunk for chunk in chunks)
+
+        release_checkpoint.set()
+        await consume_task
+
+    assistant_messages = await _assistant_chat_messages(migrated_database, run_context)
+    checkpoints = await _checkpoint_rows(migrated_database, run_context)
+    assistant_message = assistant_messages[-1]
+    model_checkpoint = next(
+        row for row in checkpoints if row["phase"] == CheckpointPhase.MODEL_OUTPUT_COMMITTED.value
+    )
+    assert assistant_message["content"] == "streamed reply"
+    assert model_checkpoint["payload"]["message_id"] == assistant_message["id"]
+    assert model_checkpoint["payload"]["output_digest"] == hashlib.sha256(
+        assistant_message["content"].encode("utf-8")
+    ).hexdigest()
+    assert model_checkpoint["payload"]["cursor"] == model_checkpoint["payload"]["model_cursor"]
+    assert any('"type":"finish"' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_chat_forced_summary_persists_assistant_output_and_model_checkpoint_before_done(
+    migrated_database,
+    monkeypatch,
+):
+    import multiclaw.server as server
+    from multiclaw.storage.repositories.workflow import WorkflowRepository
+
+    checkpoint_started = asyncio.Event()
+    release_checkpoint = asyncio.Event()
+    original_insert = WorkflowRepository._insert_checkpoint
+
+    async def gated_insert(self, lease, **kwargs):
+        if kwargs.get("phase") == CheckpointPhase.MODEL_OUTPUT_COMMITTED.value:
+            checkpoint_started.set()
+            await release_checkpoint.wait()
+        return await original_insert(self, lease, **kwargs)
+
+    monkeypatch.setattr(WorkflowRepository, "_insert_checkpoint", gated_insert)
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "forced-summary-output@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(request_context):
+            runtime = await original_acquire(request_context)
+            runtime.agent.context_builder = _StaticReportContextBuilder(
+                [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hello"},
+                ]
+            )
+            runtime.agent.router = _QueuedStreamRouter(
+                stream_sequences=[
+                    [
+                        {
+                            "type": "tool_calls",
+                            "calls": [{"id": "call-1", "name": "web_search", "arguments": {"query": "hello"}}],
+                            "reasoning_content": "",
+                        }
+                    ],
+                    [{"type": "token", "content": "forced summary"}],
+                ]
+            )
+            runtime.agent._execute_tool_batch = AsyncMock(
+                return_value=[
+                    SimpleNamespace(
+                        call_id="call-1",
+                        name="web_search",
+                        observation=SimpleNamespace(content="tool result"),
+                    )
+                ]
+            )
+            runtime.agent.settings.agent.max_tool_rounds = 1
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+
+        chunks: list[str] = []
+
+        async def consume() -> None:
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+
+        consume_task = asyncio.create_task(consume())
+        await checkpoint_started.wait()
+
+        run_event = next(
+            json.loads(chunk[6:])
+            for chunk in chunks
+            if chunk.startswith("data: ") and '"type":"data-run"' in chunk
+        )
+        run_context = context.for_run(
+            run_event["data"]["session_id"],
+            run_event["data"]["run_id"],
+        )
+        assert await _assistant_chat_messages(migrated_database, run_context) == []
+        assert [row["phase"] for row in await _checkpoint_rows(migrated_database, run_context)] == [
+            CheckpointPhase.RUN_STARTED.value
+        ]
+        assert not any('"type":"finish"' in chunk for chunk in chunks)
+
+        release_checkpoint.set()
+        await consume_task
+
+    assistant_messages = await _assistant_chat_messages(migrated_database, run_context)
+    checkpoints = await _checkpoint_rows(migrated_database, run_context)
+    assistant_message = assistant_messages[-1]
+    model_checkpoint = next(
+        row for row in checkpoints if row["phase"] == CheckpointPhase.MODEL_OUTPUT_COMMITTED.value
+    )
+    assert assistant_message["content"] == "forced summary"
+    assert model_checkpoint["payload"]["message_id"] == assistant_message["id"]
+    assert model_checkpoint["payload"]["output_digest"] == hashlib.sha256(b"forced summary").hexdigest()
+    assert model_checkpoint["payload"]["cursor"] == model_checkpoint["payload"]["model_cursor"]
+    assert any('"type":"finish"' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_chat_model_output_checkpoint_failure_rolls_back_assistant_message_and_blocks_success(
+    migrated_database,
+    monkeypatch,
+):
+    import multiclaw.server as server
+    from multiclaw.storage.repositories.workflow import WorkflowRepository
+
+    original_insert = WorkflowRepository._insert_checkpoint
+
+    async def fail_model_output_insert(self, lease, **kwargs):
+        if kwargs.get("phase") == CheckpointPhase.MODEL_OUTPUT_COMMITTED.value:
+            raise RuntimeError("model checkpoint failed")
+        return await original_insert(self, lease, **kwargs)
+
+    monkeypatch.setattr(WorkflowRepository, "_insert_checkpoint", fail_model_output_insert)
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "assistant-output-failure@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(request_context):
+            runtime = await original_acquire(request_context)
+            runtime.agent.context_builder = _StaticReportContextBuilder(
+                [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hello"},
+                ]
+            )
+            runtime.agent.router = _QueuedStreamRouter(
+                stream_sequences=[[{"type": "token", "content": "streamed reply"}]]
+            )
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+
+        body = "".join([chunk async for chunk in response.body_iterator])
+
+    payloads = _decode_sse_messages(body)
+    run_event = next(payload for payload in payloads if payload["type"] == "data-run")
+    run_context = context.for_run(run_event["data"]["session_id"], run_event["data"]["run_id"])
+    assert await _assistant_chat_messages(migrated_database, run_context) == []
+    assert [row["phase"] for row in await _checkpoint_rows(migrated_database, run_context)] == [
+        CheckpointPhase.RUN_STARTED.value,
+        CheckpointPhase.RUN_TERMINAL.value,
+    ]
+    assert await _run_status(migrated_database, run_context) == RunStatus.FAILED_TERMINAL.value
+    assert '"type":"finish"' not in body
+    assert '"type":"error"' in body
 
 
 @pytest.mark.asyncio
