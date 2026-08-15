@@ -22,7 +22,12 @@ class BaseAgent(ABC):
         await self.event_bus.publish(event)
 
     async def remember(self, context: TenantContext, content: str, entry_type: str) -> None:
-        await self.memory.save(context, MemoryEntry(content=content, type=entry_type))
+        if context.session_id is None:
+            raise ValueError("session_id is required for agent memory entries")
+        await self.memory.save(
+            context,
+            MemoryEntry(content=content, type=entry_type, session_id=context.session_id),
+        )
 
     @abstractmethod
     async def handle_message(self, user_input: str, *, context: TenantContext) -> Observation:

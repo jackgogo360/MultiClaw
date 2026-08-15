@@ -98,7 +98,10 @@ class SessionRepository:
                 chat_sessions.c.tenant_id == self._context.tenant_id,
                 chat_sessions.c.workspace_id == self._context.workspace_id,
             )
-            .order_by(func.coalesce(chat_sessions.c.last_message_at, chat_sessions.c.created_at).desc())
+            .order_by(
+                func.coalesce(chat_sessions.c.last_message_at, chat_sessions.c.created_at).desc(),
+                chat_sessions.c.id.asc(),
+            )
         )
         if not include_archived:
             query = query.where(chat_sessions.c.status == SessionStatus.ACTIVE.value)
@@ -155,15 +158,16 @@ class SessionRepository:
                 memory_entries.c.workspace_id == self._context.workspace_id,
                 memory_entries.c.session_id == session_id,
                 memory_entries.c.type == "chat_message",
+                memory_entries.c.role.in_(("user", "assistant")),
             )
-            .order_by(memory_entries.c.created_at.desc(), memory_entries.c.turn_index.desc())
+            .order_by(
+                memory_entries.c.created_at.desc(),
+                memory_entries.c.turn_index.desc(),
+                memory_entries.c.id.desc(),
+            )
             .limit(limit)
         )
-        rows = [
-            row
-            for row in result.mappings().all()
-            if str(row["role"]) in {"user", "assistant"}
-        ]
+        rows = list(result.mappings().all())
         rows.reverse()
         return [
             {
