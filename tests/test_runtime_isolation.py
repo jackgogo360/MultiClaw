@@ -319,3 +319,66 @@ def test_runtime_factory_probe_startup_preserves_initialize_failure_with_close_n
     assert controller.close_calls == 1
     assert error.value.__notes__
     assert any("close failed" in note for note in error.value.__notes__)
+
+
+def test_runtime_factory_probe_startup_closes_controller_after_success(tmp_path: Path):
+    from multiclaw.runtime.factory import RuntimeFactory
+
+    class TrackingController(ReadyRecordingSandboxController):
+        def __init__(self, *, workspace_root: Path) -> None:
+            super().__init__(workspace_root=workspace_root)
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            super().close()
+
+    settings = _settings_for_runtime(tmp_path)
+    database = Database.create(settings.database)
+    controller = TrackingController(workspace_root=tmp_path)
+    factory = RuntimeFactory(
+        settings=settings,
+        database=database,
+        workspace_resolver=WorkspaceResolver(tmp_path),
+        sandbox_controller_factory=lambda workspace_root, event_bus: controller,
+    )
+
+    try:
+        readiness, events = factory.probe_startup()
+    finally:
+        asyncio.run(database.dispose())
+
+    assert readiness.ready is True
+    assert events == ()
+    assert controller.close_calls == 1
+
+
+def test_runtime_factory_probe_startup_raises_close_failure_after_success(tmp_path: Path):
+    from multiclaw.runtime.factory import RuntimeFactory
+
+    class CloseFailsController(ReadyRecordingSandboxController):
+        def __init__(self, *, workspace_root: Path) -> None:
+            super().__init__(workspace_root=workspace_root)
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("close failed")
+
+    settings = _settings_for_runtime(tmp_path)
+    database = Database.create(settings.database)
+    controller = CloseFailsController(workspace_root=tmp_path)
+    factory = RuntimeFactory(
+        settings=settings,
+        database=database,
+        workspace_resolver=WorkspaceResolver(tmp_path),
+        sandbox_controller_factory=lambda workspace_root, event_bus: controller,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="close failed"):
+            factory.probe_startup()
+    finally:
+        asyncio.run(database.dispose())
+
+    assert controller.close_calls == 1
