@@ -1991,6 +1991,77 @@ async def test_chat_passes_db_run_lease_to_stream_handler(migrated_database, mon
     assert runtime.active_run_count == 0
 
 
+@pytest.mark.asyncio
+async def test_chat_heartbeats_active_run_lease_during_long_stream(migrated_database, monkeypatch):
+    import multiclaw.server as server
+    from multiclaw.storage.uow import TenantUnitOfWork
+    from multiclaw.workflow.coordinator import WorkflowCoordinator
+    from multiclaw.workflow.models import LeaseConflictError
+
+    release = asyncio.Event()
+    captured: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context, run_lease):
+        del user_input
+        captured["context"] = context
+        captured["run_lease"] = run_lease
+        await release.wait()
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app):
+        monkeypatch.setattr(server.app.state.settings.workflow, "heartbeat_ms", 50)
+        monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 120)
+        user_id, _ = await _seed_user(migrated_database, "heartbeat-lease@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request(
+            {
+                "type": "http",
+                "app": server.app,
+                "method": "POST",
+                "path": "/api/chat",
+                "headers": [],
+            }
+        )
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await server.chat(
+                server.ChatRequest(message="hello"),
+                request,
+                context,
+                uow,
+            )
+
+        async def consume() -> None:
+            async for _ in response.body_iterator:
+                pass
+
+        consume_task = asyncio.create_task(consume())
+        for _ in range(30):
+            if "context" in captured:
+                break
+            await asyncio.sleep(0.02)
+
+        coordinator = WorkflowCoordinator(server.app.state.database, settings=server.app.state.settings)
+        await asyncio.sleep(0.25)
+        with pytest.raises(LeaseConflictError):
+            await coordinator.acquire_run(captured["context"], "runtime-2")
+
+        release.set()
+        await consume_task
+
+
 def test_chat_returns_retryable_503_when_begin_run_rejects_unavailable_runtime(migrated_database, monkeypatch):
     import multiclaw.server as server
 
