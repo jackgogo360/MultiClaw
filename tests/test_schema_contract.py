@@ -212,6 +212,11 @@ def test_core_metadata_matches_schema_contract():
             assert foreign_key.ondelete in {"RESTRICT", "NO ACTION", None}
             assert foreign_key.onupdate in {"RESTRICT", "NO ACTION", None}
 
+    assert metadata.tables["tool_executions"].c.schema_version.server_default is None
+    assert metadata.tables["execution_checkpoints"].c.schema_version.server_default is None
+    assert metadata.tables["agent_runs"].c.schema_version.server_default is not None
+    assert metadata.tables["agent_runs"].c.version.server_default is not None
+
     assert any(
         fk.column_keys == ["id", "default_workspace_id"]
         and [element.column.name for element in fk.elements] == ["tenant_id", "id"]
@@ -437,6 +442,15 @@ async def test_sqlite_baseline_introspection_exposes_expected_constraints(tmp_pa
             tool_execution_indexes = await conn.run_sync(
                 lambda sync_conn: inspect(sync_conn).get_indexes("tool_executions")
             )
+            tool_execution_columns = await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_columns("tool_executions")
+            )
+            execution_checkpoint_columns = await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_columns("execution_checkpoints")
+            )
+            agent_run_columns = await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_columns("agent_runs")
+            )
             create_statements = await conn.execute(
                 text(
                     """
@@ -471,6 +485,18 @@ async def test_sqlite_baseline_introspection_exposes_expected_constraints(tmp_pa
             "ix_tool_executions_tenant_id_workspace_id_session_id_run_id",
             "ix_tool_executions_tenant_id_workspace_id_session_id_run_id_approval_id",
         }
+        assert next(
+            column for column in tool_execution_columns if column["name"] == "schema_version"
+        )["default"] is None
+        assert next(
+            column for column in execution_checkpoint_columns if column["name"] == "schema_version"
+        )["default"] is None
+        assert next(
+            column for column in agent_run_columns if column["name"] == "schema_version"
+        )["default"] is not None
+        assert next(
+            column for column in agent_run_columns if column["name"] == "version"
+        )["default"] is not None
         assert "CONSTRAINT fk_users_id_default_workspace_id_workspaces" in ddl
         assert "CONSTRAINT fk_tool_executions_tenant_id_workspace_id_session_id_run_id_agent_runs" in ddl
     finally:

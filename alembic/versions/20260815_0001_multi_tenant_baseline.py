@@ -348,7 +348,7 @@ def upgrade() -> None:
         sa.Column("external_request_id", sa.String(length=255), nullable=True),
         sa.Column("result_ref", sa.String(length=255), nullable=True),
         sa.Column("result_digest", sa.String(length=64), nullable=True),
-        sa.Column("schema_version", sa.Integer(), server_default="1", nullable=False),
+        sa.Column("schema_version", sa.Integer(), nullable=False),
         sa.Column("version", sa.BigInteger(), nullable=False),
         sa.Column("created_at", sa.BigInteger(), nullable=False),
         sa.Column("updated_at", sa.BigInteger(), nullable=False),
@@ -420,7 +420,7 @@ def upgrade() -> None:
         sa.Column("checkpoint_seq", sa.BigInteger(), nullable=False),
         sa.Column("payload_json", _payload_type(), nullable=False),
         sa.Column("payload_hash", sa.String(length=64), nullable=False),
-        sa.Column("schema_version", sa.Integer(), server_default="1", nullable=False),
+        sa.Column("schema_version", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.BigInteger(), nullable=False),
         sa.ForeignKeyConstraint(
             ["tenant_id", "workspace_id", "session_id", "run_id"],
