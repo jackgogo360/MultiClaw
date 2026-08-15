@@ -1917,6 +1917,80 @@ async def test_chat_establishes_run_lease_before_first_stream_iteration(migrated
     assert runtime.active_run_count == 0
 
 
+@pytest.mark.asyncio
+async def test_chat_passes_db_run_lease_to_stream_handler(migrated_database, monkeypatch):
+    import multiclaw.server as server
+    from multiclaw.storage.uow import TenantUnitOfWork
+
+    release = asyncio.Event()
+    captured: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context, run_lease):
+        del user_input
+        captured["context"] = context
+        captured["run_lease"] = run_lease
+        async with TenantUnitOfWork(server.app.state.database, context) as verify:
+            persisted = await verify.workflow.get_run(context)
+            assert persisted is not None
+            assert persisted.lease_owner == run_lease.lease_owner
+            assert persisted.fencing_token == run_lease.fencing_token
+        await release.wait()
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "db-run-lease@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            captured["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request(
+            {
+                "type": "http",
+                "app": server.app,
+                "method": "POST",
+                "path": "/api/chat",
+                "headers": [],
+            }
+        )
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await server.chat(
+                server.ChatRequest(message="hello"),
+                request,
+                context,
+                uow,
+            )
+            body: list[str] = []
+
+            async def consume() -> None:
+                async for chunk in response.body_iterator:
+                    body.append(chunk)
+
+            consume_task = asyncio.create_task(consume())
+            for _ in range(30):
+                if "run_lease" in captured:
+                    break
+                await asyncio.sleep(0.05)
+            release.set()
+            await consume_task
+            assert '"type":"error"' not in "".join(body)
+
+    runtime = captured["runtime"]
+    assert "run_lease" in captured
+    assert runtime.active_executing_run_count == 0
+    assert runtime.active_run_count == 0
+
+
 def test_chat_returns_retryable_503_when_begin_run_rejects_unavailable_runtime(migrated_database, monkeypatch):
     import multiclaw.server as server
 
@@ -1935,6 +2009,50 @@ def test_chat_returns_retryable_503_when_begin_run_rejects_unavailable_runtime(m
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "900"
     assert response.json() == {"detail": "runtime temporarily unavailable"}
+
+
+def test_chat_returns_429_when_tenant_run_quota_is_exhausted(migrated_database, monkeypatch):
+    import multiclaw.server as server
+
+    started = threading.Event()
+    release = threading.Event()
+    responses: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context, run_lease=None):
+        del user_input, context, run_lease
+        started.set()
+        await asyncio.to_thread(release.wait)
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app) as client:
+        client.cookies = _make_auth_cookie(server.app, migrated_database)
+        monkeypatch.setattr(server.app.state.settings.runtime, "max_concurrent_runs_per_tenant", 1)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+
+        def first_request() -> None:
+            responses["first"] = client.post("/api/chat", json={"message": "first"})
+
+        request_thread = threading.Thread(target=first_request)
+        request_thread.start()
+        assert started.wait(timeout=3)
+
+        second = client.post("/api/chat", json={"message": "second"})
+        responses["second"] = second
+
+        release.set()
+        request_thread.join(timeout=5)
+        assert request_thread.is_alive() is False
+
+    first = responses["first"]
+    assert first.status_code == 200
+    assert second.status_code == 429
 
 
 def test_chat_runtime_signal_resets_after_stream_error(migrated_database, monkeypatch):

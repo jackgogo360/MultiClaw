@@ -1,0 +1,395 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from sqlalchemy import and_, func, insert, select, update
+from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.sql.elements import ColumnElement
+
+from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
+from multiclaw.storage.schema import agent_runs, approval_requests, tool_executions, users
+from multiclaw.tenancy.context import TenantContext
+from multiclaw.workflow.models import (
+    ApprovalRecord,
+    ApprovalStatus,
+    ExecutionStatus,
+    InvalidTransitionError,
+    LEGAL_APPROVAL_TRANSITIONS,
+    LEGAL_RUN_TRANSITIONS,
+    TERMINAL_EXECUTION_STATUSES,
+    RunLease,
+    RunRecord,
+    RunStatus,
+)
+
+
+Dialect = SQLiteDialect | MySQLDialect
+ACTIVE_RUN_STATUSES = (RunStatus.RUNNING.value, RunStatus.AWAITING_USER.value, RunStatus.RESUMING.value)
+
+
+def current_lease_predicate(lease: RunLease, dialect: Dialect) -> ColumnElement[bool]:
+    return and_(
+        agent_runs.c.tenant_id == lease.context.tenant_id,
+        agent_runs.c.workspace_id == lease.context.workspace_id,
+        agent_runs.c.session_id == lease.context.session_id,
+        agent_runs.c.run_id == lease.context.run_id,
+        agent_runs.c.lease_owner == lease.lease_owner,
+        agent_runs.c.fencing_token == lease.fencing_token,
+        agent_runs.c.version == lease.version,
+        agent_runs.c.lease_expires_at > dialect.db_now_ms(),
+    )
+
+
+def _context_predicate(context: TenantContext) -> ColumnElement[bool]:
+    return and_(
+        agent_runs.c.tenant_id == context.tenant_id,
+        agent_runs.c.workspace_id == context.workspace_id,
+        agent_runs.c.session_id == context.session_id,
+        agent_runs.c.run_id == context.run_id,
+    )
+
+
+def _approval_scope_predicate(context: TenantContext, approval_id: str) -> ColumnElement[bool]:
+    return and_(
+        approval_requests.c.tenant_id == context.tenant_id,
+        approval_requests.c.workspace_id == context.workspace_id,
+        approval_requests.c.session_id == context.session_id,
+        approval_requests.c.run_id == context.run_id,
+        approval_requests.c.approval_id == approval_id,
+    )
+
+
+@dataclass(slots=True)
+class WorkflowRepository:
+    _conn: AsyncConnection
+    _dialect: Dialect
+    _heartbeat_ms: int
+    _lease_ttl_ms: int
+
+    async def lock_tenant(self, tenant_id: str) -> None:
+        if self._dialect.name != "mysql":
+            return
+        await self._conn.execute(
+            select(users.c.id).where(users.c.id == tenant_id).with_for_update()
+        )
+
+    async def get_run(self, context: TenantContext) -> RunRecord | None:
+        result = await self._conn.execute(
+            select(
+                agent_runs.c.tenant_id,
+                agent_runs.c.workspace_id,
+                agent_runs.c.session_id,
+                agent_runs.c.run_id,
+                agent_runs.c.run_status,
+                agent_runs.c.runtime_instance_id,
+                agent_runs.c.lease_owner,
+                agent_runs.c.fencing_token,
+                agent_runs.c.lease_expires_at,
+                agent_runs.c.heartbeat_at,
+                agent_runs.c.version,
+                agent_runs.c.created_at,
+                agent_runs.c.updated_at,
+                agent_runs.c.finished_at,
+            )
+            .where(_context_predicate(context))
+            .limit(1)
+        )
+        row = result.mappings().first()
+        return None if row is None else self._run_from_row(row)
+
+    async def count_active_runs(self, tenant_id: str) -> int:
+        result = await self._conn.execute(
+            select(func.count())
+            .select_from(agent_runs)
+            .where(
+                agent_runs.c.tenant_id == tenant_id,
+                agent_runs.c.run_status.in_(ACTIVE_RUN_STATUSES),
+            )
+        )
+        return int(result.scalar_one())
+
+    async def create_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+    ) -> RunLease:
+        now_ms = self._dialect.db_now_ms()
+        await self._conn.execute(
+            insert(agent_runs).values(
+                run_id=context.run_id,
+                tenant_id=context.tenant_id,
+                workspace_id=context.workspace_id,
+                session_id=context.session_id,
+                run_status=RunStatus.RUNNING.value,
+                runtime_instance_id=runtime_instance_id,
+                lease_owner=runtime_instance_id,
+                fencing_token=1,
+                lease_expires_at=now_ms + self._lease_ttl_ms,
+                heartbeat_at=now_ms,
+                schema_version=1,
+                version=1,
+                created_at=now_ms,
+                updated_at=now_ms,
+                finished_at=None,
+            )
+        )
+        return await self.require_lease(context, runtime_instance_id, 1, 1)
+
+    async def require_lease(
+        self,
+        context: TenantContext,
+        lease_owner: str,
+        fencing_token: int,
+        version: int,
+    ) -> RunLease:
+        result = await self._conn.execute(
+            select(
+                agent_runs.c.lease_owner,
+                agent_runs.c.fencing_token,
+                agent_runs.c.version,
+                agent_runs.c.lease_expires_at,
+            )
+            .where(
+                agent_runs.c.tenant_id == context.tenant_id,
+                agent_runs.c.workspace_id == context.workspace_id,
+                agent_runs.c.session_id == context.session_id,
+                agent_runs.c.run_id == context.run_id,
+                agent_runs.c.lease_owner == lease_owner,
+                agent_runs.c.fencing_token == fencing_token,
+                agent_runs.c.version == version,
+            )
+            .limit(1)
+        )
+        row = result.mappings().one()
+        return RunLease(
+            context=context,
+            lease_owner=str(row["lease_owner"]),
+            fencing_token=int(row["fencing_token"]),
+            version=int(row["version"]),
+            lease_expires_at=int(row["lease_expires_at"]),
+        )
+
+    async def take_over_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+    ) -> RunLease | None:
+        await self._dialect.lock_run(self._conn, context)
+        current = await self.get_run(context)
+        if current is None:
+            return None
+        if current.lease_expires_at is None:
+            return None
+
+        now_ms = self._dialect.db_now_ms()
+        result = await self._conn.execute(
+            update(agent_runs)
+            .where(
+                _context_predicate(context),
+                agent_runs.c.lease_expires_at <= now_ms,
+            )
+            .values(
+                runtime_instance_id=runtime_instance_id,
+                lease_owner=runtime_instance_id,
+                fencing_token=agent_runs.c.fencing_token + 1,
+                version=agent_runs.c.version + 1,
+                heartbeat_at=now_ms,
+                lease_expires_at=now_ms + self._lease_ttl_ms,
+                updated_at=now_ms,
+            )
+        )
+        if result.rowcount != 1:
+            return None
+        return await self.require_lease(
+            context,
+            runtime_instance_id,
+            current.fencing_token + 1,
+            current.version + 1,
+        )
+
+    async def refresh_lease(self, lease: RunLease) -> RunLease | None:
+        now_ms = self._dialect.db_now_ms()
+        result = await self._conn.execute(
+            update(agent_runs)
+            .where(current_lease_predicate(lease, self._dialect))
+            .values(
+                heartbeat_at=now_ms,
+                lease_expires_at=now_ms + self._lease_ttl_ms,
+                updated_at=now_ms,
+                version=agent_runs.c.version + 1,
+            )
+        )
+        if result.rowcount != 1:
+            return None
+        return await self.require_lease(
+            lease.context,
+            lease.lease_owner,
+            lease.fencing_token,
+            lease.version + 1,
+        )
+
+    async def transition_run(self, lease: RunLease, target: RunStatus) -> RunLease | None:
+        await self._dialect.lock_run(self._conn, lease.context)
+        current = await self.get_run(lease.context)
+        if current is None:
+            return None
+        self._validate_run_transition(current, lease, target)
+
+        now_ms = self._dialect.db_now_ms()
+        values = {
+            "run_status": target.value,
+            "updated_at": now_ms,
+            "heartbeat_at": now_ms,
+            "lease_expires_at": now_ms + self._lease_ttl_ms,
+            "version": agent_runs.c.version + 1,
+        }
+        if target in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED_TERMINAL,
+            RunStatus.CANCELLED,
+            RunStatus.BLOCKED_CORRUPT,
+            RunStatus.BLOCKED_INCOMPATIBLE,
+        }:
+            values["finished_at"] = now_ms
+
+        result = await self._conn.execute(
+            update(agent_runs)
+            .where(current_lease_predicate(lease, self._dialect))
+            .values(**values)
+        )
+        if result.rowcount != 1:
+            return None
+        return await self.require_lease(
+            lease.context,
+            lease.lease_owner,
+            lease.fencing_token,
+            lease.version + 1,
+        )
+
+    async def has_nonterminal_execution(self, context: TenantContext) -> bool:
+        result = await self._conn.execute(
+            select(func.count())
+            .select_from(tool_executions)
+            .where(
+                tool_executions.c.tenant_id == context.tenant_id,
+                tool_executions.c.workspace_id == context.workspace_id,
+                tool_executions.c.session_id == context.session_id,
+                tool_executions.c.run_id == context.run_id,
+                tool_executions.c.execution_status.not_in(
+                    tuple(status.value for status in TERMINAL_EXECUTION_STATUSES)
+                ),
+            )
+        )
+        return int(result.scalar_one()) > 0
+
+    async def get_approval(self, context: TenantContext, approval_id: str) -> ApprovalRecord | None:
+        result = await self._conn.execute(
+            select(
+                approval_requests.c.approval_id,
+                approval_requests.c.tool_call_id,
+                approval_requests.c.approval_status,
+                approval_requests.c.requested_at,
+                approval_requests.c.resolved_at,
+                approval_requests.c.expires_at,
+                approval_requests.c.version,
+            )
+            .where(_approval_scope_predicate(context, approval_id))
+            .limit(1)
+        )
+        row = result.mappings().first()
+        return None if row is None else self._approval_from_row(context, row)
+
+    async def mark_approval_expired(self, context: TenantContext, approval_id: str, version: int) -> bool:
+        now_ms = self._dialect.db_now_ms()
+        result = await self._conn.execute(
+            update(approval_requests)
+            .where(
+                _approval_scope_predicate(context, approval_id),
+                approval_requests.c.approval_status == ApprovalStatus.AWAITING_USER.value,
+                approval_requests.c.version == version,
+                approval_requests.c.expires_at <= now_ms,
+            )
+            .values(
+                approval_status=ApprovalStatus.EXPIRED.value,
+                resolved_at=now_ms,
+                version=approval_requests.c.version + 1,
+            )
+        )
+        return result.rowcount == 1
+
+    async def resolve_approval(
+        self,
+        context: TenantContext,
+        approval_id: str,
+        *,
+        approved: bool,
+        version: int,
+    ) -> ApprovalRecord | None:
+        target = ApprovalStatus.APPROVED if approved else ApprovalStatus.REJECTED
+        now_ms = self._dialect.db_now_ms()
+        result = await self._conn.execute(
+            update(approval_requests)
+            .where(
+                _approval_scope_predicate(context, approval_id),
+                approval_requests.c.approval_status == ApprovalStatus.AWAITING_USER.value,
+                approval_requests.c.version == version,
+                approval_requests.c.expires_at > now_ms,
+            )
+            .values(
+                approval_status=target.value,
+                resolved_at=now_ms,
+                version=approval_requests.c.version + 1,
+            )
+        )
+        if result.rowcount != 1:
+            return None
+        resolved = await self.get_approval(context, approval_id)
+        assert resolved is not None
+        return resolved
+
+    def _validate_run_transition(self, current: RunRecord, lease: RunLease, target: RunStatus) -> None:
+        if current.lease_owner != lease.lease_owner or current.fencing_token != lease.fencing_token:
+            raise InvalidTransitionError("run lease no longer current")
+        if current.version != lease.version:
+            raise InvalidTransitionError("run version no longer current")
+        source = current.status
+        allowed = LEGAL_RUN_TRANSITIONS.get(source, frozenset())
+        if target not in allowed:
+            raise InvalidTransitionError(f"illegal run transition: {source.value} -> {target.value}")
+
+    @staticmethod
+    def _run_from_row(row) -> RunRecord:
+        context = TenantContext(
+            tenant_id=str(row["tenant_id"]),
+            workspace_id=str(row["workspace_id"]),
+            session_id=str(row["session_id"]),
+            run_id=str(row["run_id"]),
+        )
+        return RunRecord(
+            context=context,
+            status=RunStatus(str(row["run_status"])),
+            runtime_instance_id=None if row["runtime_instance_id"] is None else str(row["runtime_instance_id"]),
+            lease_owner=None if row["lease_owner"] is None else str(row["lease_owner"]),
+            fencing_token=int(row["fencing_token"]),
+            lease_expires_at=None if row["lease_expires_at"] is None else int(row["lease_expires_at"]),
+            heartbeat_at=None if row["heartbeat_at"] is None else int(row["heartbeat_at"]),
+            version=int(row["version"]),
+            created_at=int(row["created_at"]),
+            updated_at=int(row["updated_at"]),
+            finished_at=None if row["finished_at"] is None else int(row["finished_at"]),
+        )
+
+    @staticmethod
+    def _approval_from_row(context: TenantContext, row) -> ApprovalRecord:
+        return ApprovalRecord(
+            context=context,
+            approval_id=str(row["approval_id"]),
+            tool_call_id=str(row["tool_call_id"]),
+            status=ApprovalStatus(str(row["approval_status"])),
+            requested_at=int(row["requested_at"]),
+            resolved_at=None if row["resolved_at"] is None else int(row["resolved_at"]),
+            expires_at=int(row["expires_at"]),
+            version=int(row["version"]),
+        )

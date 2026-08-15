@@ -13,6 +13,7 @@ from multiclaw.storage.repositories.auth import (
 )
 from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.repositories.sessions import SessionRepository
+from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.tenancy.context import TenantContext
 
 
@@ -79,6 +80,11 @@ class _BaseUnitOfWork(Generic[SelfType]):
     def _bind_repositories(self) -> None:
         raise NotImplementedError
 
+    async def commit(self) -> None:
+        if self._tx is None or not self._tx.is_active:
+            return
+        await self._tx.commit()
+
     async def _cleanup_after_failure(
         self,
         *,
@@ -126,6 +132,7 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
     workspaces: WorkspaceRepository
     sessions: SessionRepository
     memory: MemoryRepository
+    workflow: WorkflowRepository
 
     def __init__(self, database: Database, context: TenantContext) -> None:
         super().__init__(database)
@@ -137,3 +144,9 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
         self.workspaces = WorkspaceRepository(self.conn, self._database.dialect, self._context)
         self.sessions = SessionRepository(self.conn, self._context, self._database.dialect)
         self.memory = MemoryRepository(self.conn, self._context, self._database.dialect)
+        self.workflow = WorkflowRepository(
+            self.conn,
+            self._database.dialect,
+            5000,
+            20000,
+        )
