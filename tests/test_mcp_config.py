@@ -263,6 +263,61 @@ def test_load_mcp_config_marks_auto_workspace_config_untrusted(
     assert loaded["demo"].config_trust == "workspace_untrusted"
 
 
+def test_load_mcp_config_searches_from_workspace_root_not_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "tenant-a" / "workspace-a"
+    workspace.mkdir(parents=True)
+    _write_mcp_config(workspace / ".mcp.json", {"demo": {"command": "/usr/bin/env"}})
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [tmp_path / "home" / ".mcp.json"],
+    )
+
+    loaded = load_mcp_config(search_parents=True, workspace_root=workspace.resolve())
+
+    assert isinstance(loaded["demo"], StdioServerConfig)
+    assert loaded["demo"].config_source == "auto_workspace"
+    assert loaded["demo"].config_trust == "workspace_untrusted"
+
+
+@pytest.mark.parametrize("workspace_has_config", [False, True])
+def test_load_mcp_config_ignores_process_cwd_default_config_when_workspace_root_is_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_has_config: bool,
+) -> None:
+    workspace = tmp_path / "tenant-a" / "workspace-a"
+    workspace.mkdir(parents=True)
+    if workspace_has_config:
+        _write_mcp_config(workspace / ".mcp.json", {"workspace": {"command": "/usr/bin/env"}})
+
+    attacker_cwd = tmp_path / "attacker"
+    attacker_cwd.mkdir()
+    _write_mcp_config(attacker_cwd / ".mcp.json", {"attacker": {"command": "/bin/echo"}})
+    monkeypatch.chdir(attacker_cwd)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [tmp_path / "home" / ".mcp.json", Path(".mcp.json")],
+    )
+
+    loaded = load_mcp_config(search_parents=True, workspace_root=workspace.resolve())
+
+    assert "attacker" not in loaded
+    if workspace_has_config:
+        assert isinstance(loaded["workspace"], StdioServerConfig)
+        assert loaded["workspace"].config_source == "auto_workspace"
+        assert loaded["workspace"].config_trust == "workspace_untrusted"
+    else:
+        assert loaded == {}
+
+
 def test_load_mcp_config_marks_explicit_outside_path_trusted(
     tmp_path: Path,
 ) -> None:

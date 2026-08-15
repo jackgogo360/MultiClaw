@@ -200,7 +200,7 @@ def test_create_transport_builds_sandboxed_stdio_launch_spec_with_controlled_gra
     controller = SandboxManager.create(
         settings=SandboxSettings(),
         debug=False,
-        workspace_root=workspace,
+        workspace_root=workspace / ".",
         backend_override=backend,
         platform_name="Linux",
     )
@@ -224,6 +224,8 @@ def test_create_transport_builds_sandboxed_stdio_launch_spec_with_controlled_gra
     assert request.profile_name == "mcp_stdio_local"
     assert request.mode == "exec_argv"
     assert request.argv == (str(executable.resolve()), "--serve")
+    assert request.workspace_root == workspace.resolve()
+    assert request.cwd == workspace.resolve()
     assert request.allowed_secret_env == frozenset({"API_TOKEN"})
     assert request.read_only_paths == ()
 

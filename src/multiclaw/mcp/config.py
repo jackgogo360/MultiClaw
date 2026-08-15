@@ -123,7 +123,10 @@ def load_mcp_config(
         )
 
     configs: dict[str, ServerConfig] = {}
-    for candidate in _find_config_file_candidates(search_parents):
+    for candidate in _find_config_file_candidates(
+        search_parents,
+        workspace_root=canonical_workspace_root,
+    ):
         try:
             file_configs = _load_from_file(
                 candidate.path,
@@ -142,23 +145,34 @@ def _find_config_files(search_parents: bool) -> list[Path]:
     return [candidate.path for candidate in _find_config_file_candidates(search_parents)]
 
 
-def _find_config_file_candidates(search_parents: bool) -> list[_ConfigPathCandidate]:
+def _find_config_file_candidates(
+    search_parents: bool,
+    *,
+    workspace_root: Path | None = None,
+) -> list[_ConfigPathCandidate]:
     found = []
     for p in DEFAULT_CONFIG_PATHS:
+        if workspace_root is not None and not p.is_absolute():
+            continue
         if p.exists():
             source: Literal["auto_home", "auto_workspace"] = (
                 "auto_home" if p == DEFAULT_CONFIG_PATHS[0] else "auto_workspace"
             )
             found.append(_ConfigPathCandidate(path=p, source=source))
 
-    if search_parents:
-        cwd = Path.cwd()
-        for parent in [cwd, *cwd.parents]:
-            candidate = parent / ".mcp.json"
-            if candidate.exists() and all(existing.path != candidate for existing in found):
-                found.append(_ConfigPathCandidate(path=candidate, source="auto_workspace"))
-            if (parent / ".git").exists():
-                break
+    if workspace_root is not None:
+        candidate = workspace_root / ".mcp.json"
+        if candidate.exists() and all(existing.path != candidate for existing in found):
+            found.append(_ConfigPathCandidate(path=candidate, source="auto_workspace"))
+    elif search_parents:
+        if workspace_root is None:
+            cwd = Path.cwd()
+            for parent in [cwd, *cwd.parents]:
+                candidate = parent / ".mcp.json"
+                if candidate.exists() and all(existing.path != candidate for existing in found):
+                    found.append(_ConfigPathCandidate(path=candidate, source="auto_workspace"))
+                if (parent / ".git").exists():
+                    break
     return found
 
 
@@ -313,9 +327,10 @@ def _expand_env_vars(data: Any) -> Any:
     return data
 
 
-def _canonical_workspace_root(workspace_root: str | Path | None) -> Path:
-    candidate = Path.cwd() if workspace_root is None else Path(workspace_root)
-    return candidate.resolve(strict=True)
+def _canonical_workspace_root(workspace_root: str | Path | None) -> Path | None:
+    if workspace_root is None:
+        return None
+    return Path(workspace_root).resolve(strict=True)
 
 
 def _classify_config_trust(
