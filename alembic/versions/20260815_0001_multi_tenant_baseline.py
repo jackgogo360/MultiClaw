@@ -137,7 +137,7 @@ def upgrade() -> None:
         sa.Column("purge_requested_at", sa.BigInteger(), nullable=True),
         sa.CheckConstraint(
             "status IN ('active', 'disabled', 'pending_purge')",
-            name="ck_users_users_status_valid",
+            name=sa.schema.conv("ck_users_users_status_valid"),
         ),
         sa.PrimaryKeyConstraint("id", name="pk_users"),
         sa.UniqueConstraint("email", name="uq_users_email"),
@@ -156,7 +156,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.BigInteger(), nullable=False),
         sa.CheckConstraint(
             "status IN ('active', 'disabled', 'pending_purge')",
-            name="ck_workspaces_workspaces_status_valid",
+            name=sa.schema.conv("ck_workspaces_workspaces_status_valid"),
         ),
         sa.ForeignKeyConstraint(
             ["tenant_id"],
@@ -263,7 +263,7 @@ def upgrade() -> None:
                 "'blocked_incompatible', 'blocked_corrupt', 'cancelled'"
                 ")"
             ),
-            name="ck_agent_runs_agent_runs_run_status_valid",
+            name=sa.schema.conv("ck_agent_runs_agent_runs_run_status_valid"),
         ),
         sa.ForeignKeyConstraint(
             ["tenant_id", "workspace_id", "session_id"],
@@ -299,7 +299,7 @@ def upgrade() -> None:
         sa.Column("version", sa.BigInteger(), nullable=False),
         sa.CheckConstraint(
             "approval_status IN ('awaiting_user', 'approved', 'rejected', 'expired')",
-            name="ck_approval_requests_approval_requests_status_valid",
+            name=sa.schema.conv("ck_approval_requests_approval_requests_status_valid"),
         ),
         sa.ForeignKeyConstraint(
             ["tenant_id", "workspace_id", "session_id", "run_id"],
@@ -360,11 +360,11 @@ def upgrade() -> None:
                 "'failed_terminal', 'uncertain', 'blocked_incompatible', 'blocked_corrupt'"
                 ")"
             ),
-            name="ck_tool_executions_tool_executions_status_valid",
+            name=sa.schema.conv("ck_tool_executions_tool_executions_status_valid"),
         ),
         sa.CheckConstraint(
             "recovery_strategy IN ('read_only_replay', 'idempotent_retry', 'manual_uncertain')",
-            name="ck_tool_executions_tool_executions_recovery_strategy_valid",
+            name=sa.schema.conv("ck_tool_executions_tool_executions_recovery_strategy_valid"),
         ),
         sa.ForeignKeyConstraint(
             ["tenant_id", "workspace_id", "session_id", "run_id"],
@@ -491,15 +491,15 @@ def upgrade() -> None:
         sa.Column("rotated_at", sa.BigInteger(), nullable=True),
         sa.CheckConstraint(
             "key_provider_name = 'deployment-keyring'",
-            name="ck_user_secrets_user_secrets_key_provider_name_fixed",
+            name=sa.schema.conv("ck_user_secrets_user_secrets_key_provider_name_fixed"),
         ),
         sa.CheckConstraint(
             "format_version = 1",
-            name="ck_user_secrets_user_secrets_format_version_fixed",
+            name=sa.schema.conv("ck_user_secrets_user_secrets_format_version_fixed"),
         ),
         sa.CheckConstraint(
             "algorithm = 'AES-256-GCM'",
-            name="ck_user_secrets_user_secrets_algorithm_fixed",
+            name=sa.schema.conv("ck_user_secrets_user_secrets_algorithm_fixed"),
         ),
         sa.ForeignKeyConstraint(
             ["tenant_id"],
@@ -615,7 +615,7 @@ def upgrade() -> None:
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.CheckConstraint(
             "status IN ('scheduled', 'running')",
-            name="ck_deletion_jobs_deletion_jobs_status_valid",
+            name=sa.schema.conv("ck_deletion_jobs_deletion_jobs_status_valid"),
         ),
         sa.ForeignKeyConstraint(
             ["tenant_id"],
@@ -640,7 +640,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.BigInteger(), nullable=False),
         sa.CheckConstraint(
             "purpose IN ('login', 'deletion_recovery')",
-            name="ck_verification_codes_verification_codes_purpose_valid",
+            name=sa.schema.conv("ck_verification_codes_verification_codes_purpose_valid"),
         ),
         sa.PrimaryKeyConstraint("id", name="pk_verification_codes"),
         **_table_kwargs(),
