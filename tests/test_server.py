@@ -1,11 +1,16 @@
+import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import jwt
 import pytest
+from alembic import command
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from multiclaw.cli import alembic_config
+from multiclaw.config.settings import DatabaseSettings
 from multiclaw.events import Event
 from multiclaw.governance.sandbox.models import SandboxProbeResult, SandboxReadiness
 from multiclaw.mcp.types import (
@@ -16,18 +21,60 @@ from multiclaw.mcp.types import (
     WebSocketServerConfig,
 )
 from multiclaw.mcp.types import ToolInfo
+from multiclaw.storage import Database
+from multiclaw.storage.uow import AuthUnitOfWork
 from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.shell import ShellToolBuilder
 from sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
 
 
-def _make_auth_cookie(app) -> dict:
-    """Generate a valid JWT cookie for test requests."""
+class _RecordHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+def _sqlite_url(tmp_path: Path) -> str:
+    return f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+
+
+async def _create_database(tmp_path: Path) -> Database:
+    database_url = _sqlite_url(tmp_path)
+    await asyncio.to_thread(command.upgrade, alembic_config(database_url=database_url), "head")
+    return Database.create(DatabaseSettings(driver="sqlite", url=database_url))
+
+
+async def _seed_user(database: Database, email: str) -> tuple[str, int]:
+    async with AuthUnitOfWork(database) as uow:
+        user = await uow.users.create_user_with_default_workspace(email)
+        return user.id, user.auth_epoch
+
+
+@pytest.fixture
+def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "sqlite")
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_DATABASE__URL", _sqlite_url(tmp_path))
+    monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    database = asyncio.run(_create_database(tmp_path))
+    try:
+        yield database
+    finally:
+        asyncio.run(database.dispose())
+
+
+def _make_auth_cookie(app, database: Database, *, email: str = "test@example.com") -> dict:
     secret = app.state.auth_store.jwt_secret
+    user_id, auth_epoch = asyncio.run(_seed_user(database, email))
     token = jwt.encode(
         {
-            "sub": "test-user-id",
-            "email": "test@example.com",
+            "sub": user_id,
+            "email": email,
+            "auth_epoch": auth_epoch,
             "exp": datetime.now(timezone.utc) + timedelta(days=1),
         },
         secret,
@@ -36,12 +83,11 @@ def _make_auth_cookie(app) -> dict:
     return {"token": token}
 
 
-def test_sessions_endpoint_lists_created_sessions(tmp_path, monkeypatch):
-    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+def test_sessions_endpoint_lists_created_sessions(migrated_database):
     from multiclaw.server import app
 
     with TestClient(app) as client:
-        client.cookies = _make_auth_cookie(app)
+        client.cookies = _make_auth_cookie(app, migrated_database)
         created = client.post("/api/sessions", json={"title": "Alpha"}).json()
         listed = client.get("/api/sessions").json()
 
@@ -49,12 +95,11 @@ def test_sessions_endpoint_lists_created_sessions(tmp_path, monkeypatch):
     assert [session["id"] for session in listed] == [created["id"]]
 
 
-def test_session_lifecycle_endpoints(tmp_path, monkeypatch):
-    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+def test_session_lifecycle_endpoints(migrated_database):
     from multiclaw.server import app
 
     with TestClient(app) as client:
-        client.cookies = _make_auth_cookie(app)
+        client.cookies = _make_auth_cookie(app, migrated_database)
         created = client.post("/api/sessions", json={"title": "Alpha"}).json()
         renamed = client.patch(
             f"/api/sessions/{created['id']}",
@@ -72,12 +117,11 @@ def test_session_lifecycle_endpoints(tmp_path, monkeypatch):
     assert restored["status"] == "active"
 
 
-def test_chat_without_session_emits_session_event(tmp_path, monkeypatch):
-    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+def test_chat_without_session_emits_session_event(migrated_database):
     from multiclaw.server import app
 
     with TestClient(app) as client:
-        client.cookies = _make_auth_cookie(app)
+        client.cookies = _make_auth_cookie(app, migrated_database)
         response = client.post("/api/chat", json={"message": "hello"})
 
     body = response.text
@@ -85,12 +129,11 @@ def test_chat_without_session_emits_session_event(tmp_path, monkeypatch):
     assert '"id":"' in body
 
 
-def test_chat_rejects_archived_session(tmp_path, monkeypatch):
-    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+def test_chat_rejects_archived_session(migrated_database):
     from multiclaw.server import app
 
     with TestClient(app) as client:
-        client.cookies = _make_auth_cookie(app)
+        client.cookies = _make_auth_cookie(app, migrated_database)
         created = client.post("/api/sessions", json={"title": "Alpha"}).json()
         client.post(f"/api/sessions/{created['id']}/archive")
         response = client.post(
@@ -101,12 +144,11 @@ def test_chat_rejects_archived_session(tmp_path, monkeypatch):
     assert response.status_code == 409
 
 
-def test_delete_session_endpoint(tmp_path, monkeypatch):
-    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+def test_delete_session_endpoint(migrated_database):
     from multiclaw.server import app
 
     with TestClient(app) as client:
-        client.cookies = _make_auth_cookie(app)
+        client.cookies = _make_auth_cookie(app, migrated_database)
         created = client.post("/api/sessions", json={"title": "Alpha"}).json()
         response = client.delete(f"/api/sessions/{created['id']}")
 
@@ -115,17 +157,16 @@ def test_delete_session_endpoint(tmp_path, monkeypatch):
 
     # Verify session is gone
     with TestClient(app) as client:
-        client.cookies = _make_auth_cookie(app)
+        client.cookies = _make_auth_cookie(app, migrated_database)
         listed = client.get("/api/sessions").json()
     assert created["id"] not in [s["id"] for s in listed]
 
 
-def test_get_messages_endpoint_returns_empty_for_new_session(tmp_path, monkeypatch):
-    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+def test_get_messages_endpoint_returns_empty_for_new_session(migrated_database):
     from multiclaw.server import app
 
     with TestClient(app) as client:
-        client.cookies = _make_auth_cookie(app)
+        client.cookies = _make_auth_cookie(app, migrated_database)
         created = client.post("/api/sessions", json={"title": "Alpha"}).json()
         sid = created["id"]
 
@@ -134,12 +175,11 @@ def test_get_messages_endpoint_returns_empty_for_new_session(tmp_path, monkeypat
         assert response.json() == []
 
 
-def test_get_messages_endpoint_respects_limit_param(tmp_path, monkeypatch):
-    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+def test_get_messages_endpoint_respects_limit_param(migrated_database):
     from multiclaw.server import app
 
     with TestClient(app) as client:
-        client.cookies = _make_auth_cookie(app)
+        client.cookies = _make_auth_cookie(app, migrated_database)
         created = client.post("/api/sessions", json={"title": "Alpha"}).json()
         sid = created["id"]
 
@@ -488,10 +528,9 @@ def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch
 def test_register_mcp_tools_skips_unready_stdio_but_keeps_remote(
     tmp_path,
     monkeypatch,
-    caplog,
 ):
     from multiclaw.mcp.types import ServerState, ServerStatus
-    from multiclaw.server import _register_mcp_tools
+    from multiclaw.server import _register_mcp_tools, logger as server_logger
     from multiclaw.tools.registry import ToolRegistry
 
     remote_tool = ToolInfo(
@@ -534,21 +573,29 @@ def test_register_mcp_tools_skips_unready_stdio_but_keeps_remote(
     )
     monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", lambda path=None: {})
 
+    info_calls: list[str] = []
+    real_info = server_logger.info
+
+    def _info(message, *args, **kwargs):
+        info_calls.append(message % args if args else message)
+        return real_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(server_logger, "info", _info)
+
     manager = FakeManager()
     registry = ToolRegistry()
-    with caplog.at_level("INFO"):
-        _register_mcp_tools(
-            registry=registry,
-            mcp_manager=manager,
-            config_path=None,
-            sandbox_controller=UnavailableSandboxController(),
-            workspace_root=tmp_path,
-            mcp_profile_name="mcp_stdio_local",
-        )
+    _register_mcp_tools(
+        registry=registry,
+        mcp_manager=manager,
+        config_path=None,
+        sandbox_controller=UnavailableSandboxController(),
+        workspace_root=tmp_path,
+        mcp_profile_name="mcp_stdio_local",
+    )
 
     assert list(manager.connected) == ["remote"]
     assert [builder.name for builder in registry.list_all()] == ["mcp__remote__search"]
-    assert "transport_remote_unsandboxed=true" in caplog.text
+    assert any("transport_remote_unsandboxed=true" in message for message in info_calls)
 
 
 def test_register_mcp_tools_skips_conservative_untrusted_stdio_before_connect(
@@ -583,7 +630,7 @@ def test_register_mcp_tools_skips_conservative_untrusted_stdio_before_connect(
 
     controller = ReadyRecordingSandboxController(workspace_root=tmp_path)
     manager = FakeManager()
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("WARNING", logger="multiclaw"):
         _register_mcp_tools(
             registry=ToolRegistry(),
             mcp_manager=manager,
@@ -871,9 +918,9 @@ def test_register_mcp_tools_skips_in_process_in_auto_mode(tmp_path, monkeypatch)
     )
 
 
-def test_register_mcp_tools_keeps_in_process_in_unsafe_mode(tmp_path, monkeypatch, caplog):
+def test_register_mcp_tools_keeps_in_process_in_unsafe_mode(tmp_path, monkeypatch):
     from multiclaw.mcp.types import ServerState, ServerStatus
-    from multiclaw.server import _register_mcp_tools
+    from multiclaw.server import _register_mcp_tools, logger as server_logger
     from multiclaw.tools.registry import ToolRegistry
 
     inproc_tool = ToolInfo(
@@ -919,23 +966,31 @@ def test_register_mcp_tools_keeps_in_process_in_unsafe_mode(tmp_path, monkeypatc
         workspace_root=tmp_path,
         mode="host_unsafe_dev_only",
     )
+    warning_calls: list[str] = []
+    real_warning = server_logger.warning
+
+    def _warning(message, *args, **kwargs):
+        warning_calls.append(message % args if args else message)
+        return real_warning(message, *args, **kwargs)
+
+    monkeypatch.setattr(server_logger, "warning", _warning)
+
     manager = FakeManager()
     registry = ToolRegistry()
-    with caplog.at_level("WARNING"):
-        _register_mcp_tools(
-            registry=registry,
-            mcp_manager=manager,
-            config_path=None,
-            sandbox_controller=controller,
-            workspace_root=tmp_path,
-            mcp_profile_name="mcp_stdio_local",
-        )
+    _register_mcp_tools(
+        registry=registry,
+        mcp_manager=manager,
+        config_path=None,
+        sandbox_controller=controller,
+        workspace_root=tmp_path,
+        mcp_profile_name="mcp_stdio_local",
+    )
 
     assert list(manager.connected) == ["local-inproc"]
     assert [builder.name for builder in registry.list_all()] == [
         "mcp__local-inproc__stat",
     ]
-    assert "unsafe" in caplog.text
+    assert any("unsafe" in message for message in warning_calls)
     assert controller.readiness.ready is True
     events = controller.drain_startup_events()
     assert [event.type for event in events] == ["sandbox.unsafe_fallback_used"]

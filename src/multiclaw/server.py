@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from collections.abc import Iterable
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, time
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
@@ -97,9 +97,12 @@ from multiclaw.governance import (
 )
 from multiclaw.governance.sandbox.manager import SandboxManager
 from multiclaw.llm import ModelRouter
-from multiclaw.memory import SqliteMemory
+from multiclaw.memory import MemoryEntry, MemoryProtocol
 from multiclaw.planner import Planner
-from multiclaw.session import SqliteSessionStore, SessionStatus
+from multiclaw.session import SessionStatus
+from multiclaw.storage import Database
+from multiclaw.storage.uow import TenantUnitOfWork
+from multiclaw.tenancy import TenantContext
 from multiclaw.tools import (
     CoreToolScheduler,
     ToolRegistry,
@@ -133,8 +136,9 @@ from multiclaw.mcp.types import (
 from uuid import uuid4
 
 from multiclaw.auth.store import AuthStore
-from multiclaw.auth.middleware import AuthMiddleware, require_auth
+from multiclaw.auth.middleware import AuthMiddleware
 from multiclaw.auth.router import router as auth_router
+from multiclaw.api.dependencies import current_user, tenant_context, tenant_uow
 from multiclaw.stream import DataStreamEncoder
 
 
@@ -156,6 +160,48 @@ _PUBLIC_AUTHORIZATION_PATTERN = re.compile(
     r"(?i)\bAuthorization\s*:\s*Bearer\s+[^\s,;]+"
 )
 _PUBLIC_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+
+
+class _DatabaseBackedMemory(MemoryProtocol):
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    async def save(self, context: TenantContext, entry: MemoryEntry) -> MemoryEntry:
+        async with TenantUnitOfWork(self._database, context) as uow:
+            return await uow.memory.save(entry)
+
+    async def query(
+        self,
+        context: TenantContext,
+        query: str,
+        top_k: int,
+        entry_type: str | None = None,
+    ) -> list[MemoryEntry]:
+        async with TenantUnitOfWork(self._database, context) as uow:
+            return await uow.memory.query(query, top_k, entry_type)
+
+    async def recent(
+        self,
+        context: TenantContext,
+        limit: int,
+        entry_type: str | None = None,
+    ) -> list[MemoryEntry]:
+        async with TenantUnitOfWork(self._database, context) as uow:
+            return await uow.memory.recent(limit, entry_type)
+
+    async def context(
+        self,
+        context: TenantContext,
+        max_chars: int,
+        limit: int,
+        entry_type: str | None = None,
+    ) -> list[MemoryEntry]:
+        async with TenantUnitOfWork(self._database, context) as uow:
+            return await uow.memory.context(max_chars, limit, entry_type)
+
+    async def forget(self, context: TenantContext, entry_id: str) -> None:
+        async with TenantUnitOfWork(self._database, context) as uow:
+            await uow.memory.forget(entry_id)
 
 
 def _sanitize_mcp_namespace(name: str) -> str:
@@ -545,18 +591,19 @@ def create_agent(
         audit_logger=InMemoryAuditLogger(),
         event_bus=shared_bus,
     )
+    database = Database.create(settings.database)
 
     runtime_agent = MultiClawAgent(
         settings=settings,
         router=ModelRouter(settings),
         registry=registry,
         scheduler=scheduler,
-        memory=SqliteMemory(settings.database.path),
+        memory=_DatabaseBackedMemory(database),
         planner=Planner(),
         event_bus=shared_bus,
         skill_manager=skill_manager,
     )
-    runtime_agent.session_store = SqliteSessionStore(settings.database.path)
+    runtime_agent.database = database
     runtime_agent.mcp_manager = mcp_manager
     runtime_agent.sandbox_controller = sandbox_controller
     runtime_agent.sandbox_readiness = readiness
@@ -576,6 +623,7 @@ async def lifespan(app: FastAPI):
     auth_store = AuthStore(agent.settings.database.path)
     await auth_store.initialize()
     app.state.auth_store = auth_store
+    app.state.database = agent.database
     app.state.settings = agent.settings
     app.state.sandbox_readiness = agent.sandbox_readiness
     app.state.workspace_root = getattr(agent, "workspace_root", None)
@@ -593,13 +641,16 @@ async def lifespan(app: FastAPI):
                 except Exception:
                     logger.warning("MCP manager shutdown failed; details redacted")
         finally:
-            if sandbox_controller is not None:
-                try:
-                    sandbox_controller.close()
-                except Exception:
-                    logger.warning(
-                        "Sandbox controller reported residual startup state during shutdown; details redacted"
-                    )
+            try:
+                await app.state.database.dispose()
+            finally:
+                if sandbox_controller is not None:
+                    try:
+                        sandbox_controller.close()
+                    except Exception:
+                        logger.warning(
+                            "Sandbox controller reported residual startup state during shutdown; details redacted"
+                        )
 
 
 app = FastAPI(title="MultiClaw", lifespan=lifespan)
@@ -613,6 +664,7 @@ api = APIRouter(prefix="/api")
 @app.middleware("http")
 async def log_http_requests(request, call_next):
     started = perf_counter()
+    request.state.request_started_at_ms = int(time() * 1000)
     try:
         response = await call_next(request)
     except Exception:
@@ -686,71 +738,97 @@ async def health_ready(request: Request):
 
 
 @api.post("/approve")
-async def approve(req: ApproveRequest, user: dict = Depends(require_auth)):
+async def approve(req: ApproveRequest, user=Depends(current_user)):
+    del user
     ok = agent.scheduler.resolve_approval(req.request_id, req.approved)
     return {"ok": ok}
 
 
 @api.get("/sessions")
-async def list_sessions(include_archived: bool = False, user: dict = Depends(require_auth)):
-    sessions = await agent.session_store.list_sessions(
-        include_archived=include_archived, user_id=user["id"]
-    )
+async def list_sessions(
+    include_archived: bool = False,
+    uow: TenantUnitOfWork = Depends(tenant_uow),
+):
+    sessions = await uow.sessions.list(include_archived=include_archived)
     return [session.model_dump(mode="json") for session in sessions]
 
 
 @api.post("/sessions")
-async def create_session(req: SessionCreateRequest, user: dict = Depends(require_auth)):
-    session = await agent.session_store.create(title=req.title, user_id=user["id"])
+async def create_session(
+    req: SessionCreateRequest,
+    uow: TenantUnitOfWork = Depends(tenant_uow),
+):
+    session = await uow.sessions.create(title=req.title)
     return session.model_dump(mode="json")
 
 
 @api.patch("/sessions/{session_id}")
-async def rename_session(session_id: str, req: SessionRenameRequest, user: dict = Depends(require_auth)):
-    session = await agent.session_store.get(session_id)
-    if session is None or session.user_id != user["id"]:
+async def rename_session(
+    session_id: str,
+    req: SessionRenameRequest,
+    uow: TenantUnitOfWork = Depends(tenant_uow),
+):
+    session = await uow.sessions.get(session_id)
+    if session is None:
         raise HTTPException(status_code=404, detail="session not found")
-    session = await agent.session_store.rename(session_id, req.title)
+    session = await uow.sessions.rename(session_id, req.title)
     return session.model_dump(mode="json")
 
 
 @api.post("/sessions/{session_id}/archive")
-async def archive_session(session_id: str, user: dict = Depends(require_auth)):
-    session = await agent.session_store.get(session_id)
-    if session is None or session.user_id != user["id"]:
+async def archive_session(
+    session_id: str,
+    uow: TenantUnitOfWork = Depends(tenant_uow),
+):
+    session = await uow.sessions.get(session_id)
+    if session is None:
         raise HTTPException(status_code=404, detail="session not found")
-    session = await agent.session_store.archive(session_id)
+    session = await uow.sessions.archive(session_id)
     return session.model_dump(mode="json")
 
 
 @api.post("/sessions/{session_id}/restore")
-async def restore_session(session_id: str, user: dict = Depends(require_auth)):
-    session = await agent.session_store.get(session_id)
-    if session is None or session.user_id != user["id"]:
+async def restore_session(
+    session_id: str,
+    uow: TenantUnitOfWork = Depends(tenant_uow),
+):
+    session = await uow.sessions.get(session_id)
+    if session is None:
         raise HTTPException(status_code=404, detail="session not found")
-    session = await agent.session_store.restore(session_id)
+    session = await uow.sessions.restore(session_id)
     return session.model_dump(mode="json")
 
 
 @api.delete("/sessions/{session_id}")
-async def delete_session(session_id: str, user: dict = Depends(require_auth)):
-    session = await agent.session_store.get(session_id)
-    if session is None or session.user_id != user["id"]:
+async def delete_session(
+    session_id: str,
+    uow: TenantUnitOfWork = Depends(tenant_uow),
+):
+    session = await uow.sessions.get(session_id)
+    if session is None:
         raise HTTPException(status_code=404, detail="session not found")
-    await agent.session_store.delete(session_id)
+    await uow.sessions.delete(session_id)
     return {"ok": True}
 
 
 @api.get("/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str, limit: int = 50, user: dict = Depends(require_auth)):
-    session = await agent.session_store.get(session_id)
-    if session is None or session.user_id != user["id"]:
+async def get_session_messages(
+    session_id: str,
+    limit: int = 50,
+    uow: TenantUnitOfWork = Depends(tenant_uow),
+):
+    session = await uow.sessions.get(session_id)
+    if session is None:
         raise HTTPException(status_code=404, detail="session not found")
-    return await agent.session_store.get_messages(session_id, limit)
+    return await uow.sessions.get_messages(session_id, limit)
 
 
 @api.post("/chat")
-async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
+async def chat(
+    req: ChatRequest,
+    context: TenantContext = Depends(tenant_context),
+    uow: TenantUnitOfWork = Depends(tenant_uow),
+):
     """SSE streaming — real token streaming from LLM with state events."""
     message = _resolve_chat_message(req)
     requested_session_id = req.session_id or req.id
@@ -758,16 +836,20 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
     # Resolve or create session
     session = None
     if requested_session_id:
-        session = await agent.session_store.get(requested_session_id)
-        if session is None or session.user_id != user["id"]:
-            session = None
-        elif session.status == SessionStatus.ARCHIVED:
+        session = await uow.sessions.get(requested_session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        if session.status == SessionStatus.ARCHIVED:
             raise HTTPException(status_code=409, detail="session is archived")
-    if session is None:
-        session = await agent.session_store.create(user_id=user["id"])
+    elif requested_session_id is None and req.id is None:
+        session = await uow.sessions.create()
+    else:
+        raise HTTPException(status_code=404, detail="session not found")
 
     # Update session activity (title from first message)
-    session = await agent.session_store.touch_message(session.id, message)
+    session = await uow.sessions.touch_message(session.id, message)
+    assert session is not None
+    session_context = context.for_session(session.id)
 
     async def event_stream():
         logger.info("SSE stream started, message=%r, session=%r", message[:80], session.id)
@@ -829,7 +911,7 @@ async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
 
         async def run_stream():
             try:
-                async for item in agent.handle_message_stream(message, session_id=session.id):
+                async for item in agent.handle_message_stream(message, context=session_context):
                     await token_queue.put(item)
             except Exception as exc:
                 logger.exception("stream error")
