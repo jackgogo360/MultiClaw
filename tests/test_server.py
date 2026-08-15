@@ -2624,6 +2624,85 @@ async def test_chat_model_output_checkpoint_failure_rolls_back_assistant_message
 
 
 @pytest.mark.asyncio
+async def test_chat_forced_summary_checkpoint_failure_rolls_back_assistant_message_and_blocks_success(
+    migrated_database,
+    monkeypatch,
+):
+    import multiclaw.server as server
+    from multiclaw.storage.repositories.workflow import WorkflowRepository
+
+    original_insert = WorkflowRepository._insert_checkpoint
+
+    async def fail_model_output_insert(self, lease, **kwargs):
+        if kwargs.get("phase") == CheckpointPhase.MODEL_OUTPUT_COMMITTED.value:
+            raise RuntimeError("forced summary checkpoint failed")
+        return await original_insert(self, lease, **kwargs)
+
+    monkeypatch.setattr(WorkflowRepository, "_insert_checkpoint", fail_model_output_insert)
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "forced-summary-output-failure@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(request_context):
+            runtime = await original_acquire(request_context)
+            runtime.agent.context_builder = _StaticReportContextBuilder(
+                [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hello"},
+                ]
+            )
+            runtime.agent.router = _QueuedStreamRouter(
+                stream_sequences=[
+                    [
+                        {
+                            "type": "tool_calls",
+                            "calls": [{"id": "call-1", "name": "web_search", "arguments": {"query": "hello"}}],
+                            "reasoning_content": "",
+                        }
+                    ],
+                    [{"type": "token", "content": "forced summary"}],
+                ]
+            )
+            runtime.agent._execute_tool_batch = AsyncMock(
+                return_value=[
+                    SimpleNamespace(
+                        call_id="call-1",
+                        name="web_search",
+                        observation=SimpleNamespace(content="tool result"),
+                    )
+                ]
+            )
+            runtime.agent.settings.agent.max_tool_rounds = 1
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+
+        body = "".join([chunk async for chunk in response.body_iterator])
+
+    payloads = _decode_sse_messages(body)
+    run_event = next(payload for payload in payloads if payload["type"] == "data-run")
+    run_context = context.for_run(run_event["data"]["session_id"], run_event["data"]["run_id"])
+    assert await _assistant_chat_messages(migrated_database, run_context) == []
+    assert [row["phase"] for row in await _checkpoint_rows(migrated_database, run_context)] == [
+        CheckpointPhase.RUN_STARTED.value,
+        CheckpointPhase.RUN_TERMINAL.value,
+    ]
+    assert await _run_status(migrated_database, run_context) == RunStatus.FAILED_TERMINAL.value
+    assert '"type":"finish"' not in body
+    assert '"type":"error"' in body
+
+
+@pytest.mark.asyncio
 async def test_chat_heartbeats_active_run_lease_during_long_stream(migrated_database, monkeypatch):
     import multiclaw.server as server
     from multiclaw.storage.uow import TenantUnitOfWork

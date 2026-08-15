@@ -138,7 +138,14 @@ from multiclaw.api.chat import (
 )
 from multiclaw.api.dependencies import current_user, tenant_context, tenant_uow
 from multiclaw.stream import DataStreamEncoder
-from multiclaw.workflow.models import RecoveryAction, RunLeaseHandle, RunStatus, TenantRunQuotaError
+from multiclaw.workflow.models import (
+    LeaseConflictError,
+    RecoveryAction,
+    RunLeaseHandle,
+    RunStatus,
+    StaleFenceError,
+    TenantRunQuotaError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -858,13 +865,29 @@ async def chat(
             nonlocal terminal_persisted
             if terminal_persisted:
                 return
-            await workflow_lease_handle.refresh(
-                lambda lease: build_workflow_coordinator(
-                    request.app.state.database,
-                    request.app.state.settings,
-                ).finish_run_with_checkpoint(lease, status)
-            )
+            try:
+                await workflow_lease_handle.refresh(
+                    lambda lease: build_workflow_coordinator(
+                        request.app.state.database,
+                        request.app.state.settings,
+                    ).finish_run_with_checkpoint(lease, status)
+                )
+            except StaleFenceError:
+                reacquired = await _reacquire_current_run_lease()
+                await workflow_lease_handle.replace(reacquired)
+                await workflow_lease_handle.refresh(
+                    lambda lease: build_workflow_coordinator(
+                        request.app.state.database,
+                        request.app.state.settings,
+                    ).finish_run_with_checkpoint(lease, status)
+                )
             terminal_persisted = True
+
+        async def _reacquire_current_run_lease():
+            return await build_workflow_coordinator(
+                request.app.state.database,
+                request.app.state.settings,
+            ).acquire_run(run_context, runtime.runtime_instance_id)
 
         def close_text_part() -> list[str]:
             nonlocal text_part_id
@@ -988,6 +1011,14 @@ async def chat(
                                 request.app.state.settings,
                             ).heartbeat(lease)
                         )
+                    except StaleFenceError:
+                        try:
+                            reacquired = await _reacquire_current_run_lease()
+                        except Exception as exc:
+                            logger.exception("run lease heartbeat reacquire failed")
+                            await token_queue.put({"type": "error", "content": _friendly_error(exc)})
+                            return
+                        await workflow_lease_handle.replace(reacquired)
                     except Exception as exc:
                         logger.exception("run lease heartbeat failed")
                         await token_queue.put({"type": "error", "content": _friendly_error(exc)})
