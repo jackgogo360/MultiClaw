@@ -73,21 +73,18 @@ async def test_chat_streams_are_isolated_by_exact_run_scope(migrated_database, m
         original_acquire = server.app.state.runtime_pool.acquire
         shared_runtime = await original_acquire(context.for_session(session.id))
 
-        run_ids: list[str] = []
-        run_scopes: dict[str, EventScope] = {}
         labeled_scopes: dict[str, EventScope] = {}
         streams_ready = asyncio.Event()
         first_run_finished = asyncio.Event()
+        foreign_published = asyncio.Event()
 
         async def fake_handle_message_stream(user_input: str, *, context: TenantContext):
             assert context.session_id == session.id
             assert context.run_id is not None
 
-            run_ids.append(context.run_id)
             run_scope = EventScope.from_context(context)
-            run_scopes[context.run_id] = run_scope
             labeled_scopes[user_input] = run_scope
-            if len(run_ids) == 2:
+            if len(labeled_scopes) == 2:
                 streams_ready.set()
             await streams_ready.wait()
 
@@ -117,18 +114,18 @@ async def test_chat_streams_are_isolated_by_exact_run_scope(migrated_database, m
                 }
                 yield {"type": "done", "content": "first", "data": {}}
                 return
-
-                await first_run_finished.wait()
-                await shared_runtime.event_router.publish(
-                    ScopedEvent.from_scope(
-                        labeled_scopes["first"],
-                        "tool.completed",
-                        {
-                            "tool": "echo",
-                            "call_id": "foreign-after-first",
+            await first_run_finished.wait()
+            await shared_runtime.event_router.publish(
+                ScopedEvent.from_scope(
+                    labeled_scopes["first"],
+                    "tool.completed",
+                    {
+                        "tool": "echo",
+                        "call_id": "foreign-after-first",
                     },
                 )
             )
+            foreign_published.set()
             yield {
                 "type": "tool_call",
                 "call_id": f"call-{context.run_id}",
@@ -201,6 +198,7 @@ async def test_chat_streams_are_isolated_by_exact_run_scope(migrated_database, m
     assert run_meta_a["data"]["session_id"] == session.id
     assert run_meta_b["data"]["session_id"] == session.id
     assert run_meta_a["data"]["run_id"] != run_meta_b["data"]["run_id"]
+    assert foreign_published.is_set() is True
     assert {payload["data"]["run_id"] for payload in scoped_a} == {run_meta_a["data"]["run_id"]}
     assert {payload["data"]["run_id"] for payload in scoped_b} == {run_meta_b["data"]["run_id"]}
     assert "foreign-after-first" not in body_a

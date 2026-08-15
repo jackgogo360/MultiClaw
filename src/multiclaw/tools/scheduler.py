@@ -308,7 +308,12 @@ class CoreToolScheduler:
         context: TenantContext | None,
     ) -> None:
         await self.event_bus.publish(Event(type=event_type, data=data))
-        if self.event_router is not None and context is not None:
+        if (
+            self.event_router is not None
+            and context is not None
+            and context.session_id is not None
+            and context.run_id is not None
+        ):
             await self.event_router.publish(ScopedEvent.from_context(context, event_type, data))
 
     def _normalized_audit_fields(self, audit: dict[str, Any]) -> dict[str, str]:
