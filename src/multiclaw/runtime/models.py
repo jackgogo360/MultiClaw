@@ -220,20 +220,20 @@ class TenantRuntime:
                 else:
                     self._event_router_cleared = True
 
-            for handle in list(self.secret_handles):
+            remaining_handles: list[SecretHandle] = []
+            original_handles = list(self.secret_handles)
+            for index, handle in enumerate(original_handles):
                 closer = getattr(handle, "close", None)
                 if closer is None:
-                    self.secret_handles.remove(handle)
                     continue
                 try:
                     result = closer()
                     if inspect.isawaitable(result):
                         await result
                 except BaseException as error:
-                    index = self.secret_handles.index(handle)
+                    remaining_handles.append(handle)
                     _remember(error, f"secret_handles[{index}].close")
-                else:
-                    self.secret_handles.remove(handle)
+            self.secret_handles = remaining_handles
 
             if not self._sandbox_closed and self.sandbox_controller is not None:
                 try:
