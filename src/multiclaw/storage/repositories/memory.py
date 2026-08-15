@@ -54,7 +54,7 @@ class MemoryRepository:
             "created_at": now_ms,
             "metadata_json": row.metadata_json(),
         }
-        update_result = await self._full_scope_update(row.id, values)
+        update_result = await self._full_scope_update(row.id, row.session_id, values)
         if update_result.rowcount == 0:
             savepoint = await self._conn.begin_nested()
             try:
@@ -62,13 +62,13 @@ class MemoryRepository:
                 await savepoint.commit()
             except IntegrityError as primary:
                 await self._rollback_savepoint(savepoint, primary)
-                retry_result = await self._full_scope_update(row.id, values)
+                retry_result = await self._full_scope_update(row.id, row.session_id, values)
                 if retry_result.rowcount == 0:
                     raise primary
             except BaseException as primary:
                 await self._rollback_savepoint(savepoint, primary)
                 raise primary
-        saved = await self._get_row(row.id)
+        saved = await self._get_row(row.id, row.session_id)
         assert saved is not None
         return saved
 
@@ -178,7 +178,7 @@ class MemoryRepository:
         result = await self._conn.execute(query)
         return [MemoryEntry.from_row(row) for row in result.mappings().all()]
 
-    async def _get_row(self, entry_id: str) -> MemoryEntry | None:
+    async def _get_row(self, entry_id: str, target_session_id: str | None) -> MemoryEntry | None:
         result = await self._conn.execute(
             select(
                 memory_entries.c.id,
@@ -194,6 +194,7 @@ class MemoryRepository:
                 memory_entries.c.tenant_id == self._context.tenant_id,
                 memory_entries.c.workspace_id == self._context.workspace_id,
                 memory_entries.c.id == entry_id,
+                self._exact_scope_filter(target_session_id),
             )
             .limit(1)
         )
@@ -214,13 +215,19 @@ class MemoryRepository:
             raise ValueError("session_id must match the current context")
         return entry
 
-    async def _full_scope_update(self, entry_id: str, values: dict[str, object]):
+    async def _full_scope_update(
+        self,
+        entry_id: str,
+        target_session_id: str | None,
+        values: dict[str, object],
+    ):
         return await self._conn.execute(
             update(memory_entries)
             .where(
                 memory_entries.c.tenant_id == self._context.tenant_id,
                 memory_entries.c.workspace_id == self._context.workspace_id,
                 memory_entries.c.id == entry_id,
+                self._exact_scope_filter(target_session_id),
             )
             .values(**values)
         )
@@ -243,3 +250,8 @@ class MemoryRepository:
                 memory_entries.c.session_id.is_(None),
             )
         return memory_entries.c.session_id == self._context.session_id
+
+    def _exact_scope_filter(self, target_session_id: str | None):
+        if target_session_id is None:
+            return memory_entries.c.session_id.is_(None)
+        return memory_entries.c.session_id == target_session_id
