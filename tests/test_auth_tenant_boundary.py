@@ -186,6 +186,24 @@ async def _get_user_row(database: Database, email: str) -> dict[str, object]:
     return dict(row)
 
 
+async def _get_verification_rows(database: Database, email: str) -> list[dict[str, object]]:
+    async with database.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT id, email, code_digest, purpose, expires_at, used_at, created_at
+                    FROM verification_codes
+                    WHERE email = :email
+                    ORDER BY created_at ASC, id ASC
+                    """
+                ),
+                {"email": email},
+            )
+        ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 @pytest.fixture
 def user_a_cookie(client: TestClient, migrated_database: Database) -> SeededIdentity:
     secret = client.app.state.auth_store.jwt_secret
@@ -260,6 +278,36 @@ def test_real_login_cookie_uses_current_db_auth_epoch_and_authenticates_protecte
     assert "iat" in payload
     assert "exp" in payload
     assert me_response.json() == {"email": email, "user_id": persisted_user["id"]}
+
+
+def test_only_latest_unused_login_code_is_valid_in_frozen_layout(
+    client: TestClient,
+    migrated_database: Database,
+):
+    email = "stale-code@example.com"
+    store = client.app.state.auth_store
+    old_code = store.build_code(email, code="111111")
+    new_code = store.build_code(email, code="222222").model_copy(
+        update={
+            "created_at": old_code.created_at + timedelta(milliseconds=1),
+            "expires_at": old_code.expires_at + timedelta(milliseconds=1),
+        }
+    )
+    asyncio.run(store.save_code(old_code))
+    asyncio.run(store.save_code(new_code))
+
+    old_response = client.post("/auth/verify", json={"email": email, "code": "111111"})
+    rows_after_old = asyncio.run(_get_verification_rows(migrated_database, email))
+    me_after_old = client.get("/auth/me")
+    new_response = client.post("/auth/verify", json={"email": email, "code": "222222"})
+    rows_after_new = asyncio.run(_get_verification_rows(migrated_database, email))
+
+    assert old_response.status_code == 401
+    assert me_after_old.json() == {"email": None, "user_id": None}
+    assert [row["used_at"] for row in rows_after_old] == [None, None]
+    assert new_response.status_code == 200
+    assert rows_after_new[0]["used_at"] is None
+    assert rows_after_new[1]["used_at"] is not None
 
 
 def test_foreign_session_id_is_404_and_does_not_create_session(client: TestClient, two_users: TwoUsers):

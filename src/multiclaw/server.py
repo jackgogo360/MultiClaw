@@ -84,6 +84,10 @@ def _friendly_error(exc: Exception) -> str:
     return msg
 
 
+def _note_startup_cleanup_error(primary: BaseException, phase: str, error: BaseException) -> None:
+    primary.add_note(f"{phase} cleanup failed: {type(error).__name__}: {error}")
+
+
 from multiclaw.agent import MultiClawAgent
 from multiclaw.config import Settings
 from multiclaw.events import Event, EventBus
@@ -632,28 +636,35 @@ async def lifespan(app: FastAPI):
         if sandbox_controller is not None:
             for event in sandbox_controller.drain_startup_events():
                 await shared_bus.publish(event)
-    except BaseException:
+    except BaseException as primary:
         try:
-            await auth_store.close()
-        finally:
+            try:
+                await auth_store.close()
+            except BaseException as error:
+                _note_startup_cleanup_error(primary, "auth_store.close", error)
             try:
                 if hasattr(agent, "mcp_manager") and agent.mcp_manager:
                     try:
                         agent.mcp_manager.stop()
-                    except Exception:
+                    except Exception as error:
+                        _note_startup_cleanup_error(primary, "mcp_manager.stop", error)
                         logger.warning("MCP manager shutdown failed; details redacted")
-            finally:
+            except BaseException as error:
+                _note_startup_cleanup_error(primary, "mcp_manager.stop", error)
+            try:
+                await agent.database.dispose()
+            except BaseException as error:
+                _note_startup_cleanup_error(primary, "database.dispose", error)
+            if sandbox_controller is not None:
                 try:
-                    await agent.database.dispose()
-                finally:
-                    if sandbox_controller is not None:
-                        try:
-                            sandbox_controller.close()
-                        except Exception:
-                            logger.warning(
-                                "Sandbox controller reported residual startup state during shutdown; details redacted"
-                            )
-        raise
+                    sandbox_controller.close()
+                except Exception as error:
+                    _note_startup_cleanup_error(primary, "sandbox_controller.close", error)
+                    logger.warning(
+                        "Sandbox controller reported residual startup state during shutdown; details redacted"
+                    )
+        finally:
+            raise primary
     try:
         yield
     finally:

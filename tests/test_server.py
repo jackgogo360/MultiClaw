@@ -1301,6 +1301,126 @@ def test_lifespan_disposes_database_when_auth_store_initialize_fails(tmp_path, m
     assert fake_manager.stop_calls == 1
 
 
+def test_lifespan_preserves_primary_error_when_auth_store_close_fails(tmp_path, monkeypatch):
+    import multiclaw.server as server_module
+
+    class FakeDatabase:
+        def __init__(self) -> None:
+            self.dispose_calls = 0
+
+        async def dispose(self) -> None:
+            self.dispose_calls += 1
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def drain_startup_events(self) -> tuple[Event, ...]:
+            return ()
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    fake_database = FakeDatabase()
+    fake_controller = FakeController()
+    fake_manager = FakeManager()
+    fake_agent = SimpleNamespace(
+        settings=SimpleNamespace(database=SimpleNamespace(path=str(tmp_path / "app.db"))),
+        database=fake_database,
+        sandbox_readiness=SimpleNamespace(),
+        workspace_root=tmp_path,
+        sandbox_controller=fake_controller,
+        mcp_manager=fake_manager,
+    )
+
+    async def _boom(self) -> None:
+        raise RuntimeError("auth store init failed")
+
+    async def _close_boom(self) -> None:
+        raise RuntimeError("auth store close failed")
+
+    monkeypatch.setattr(server_module, "create_agent", lambda *, sandbox_controller=None: fake_agent)
+    monkeypatch.setattr(server_module.AuthStore, "initialize", _boom)
+    monkeypatch.setattr(server_module.AuthStore, "close", _close_boom)
+
+    with pytest.raises(RuntimeError, match="auth store init failed") as exc_info:
+        with TestClient(server_module.app):
+            pass
+
+    assert fake_database.dispose_calls == 1
+    assert fake_controller.close_calls == 1
+    assert fake_manager.stop_calls == 1
+    assert exc_info.value.__notes__
+    assert any("auth_store.close" in note and "auth store close failed" in note for note in exc_info.value.__notes__)
+
+
+def test_lifespan_preserves_primary_error_when_database_dispose_fails(tmp_path, monkeypatch):
+    import multiclaw.server as server_module
+
+    class FakeDatabase:
+        def __init__(self) -> None:
+            self.dispose_calls = 0
+
+        async def dispose(self) -> None:
+            self.dispose_calls += 1
+            raise RuntimeError("database dispose failed")
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def drain_startup_events(self) -> tuple[Event, ...]:
+            return ()
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    class FakeManager:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    fake_database = FakeDatabase()
+    fake_controller = FakeController()
+    fake_manager = FakeManager()
+    fake_agent = SimpleNamespace(
+        settings=SimpleNamespace(database=SimpleNamespace(path=str(tmp_path / "app.db"))),
+        database=fake_database,
+        sandbox_readiness=SimpleNamespace(),
+        workspace_root=tmp_path,
+        sandbox_controller=fake_controller,
+        mcp_manager=fake_manager,
+    )
+
+    async def _boom(self) -> None:
+        raise RuntimeError("auth store init failed")
+
+    monkeypatch.setattr(server_module, "create_agent", lambda *, sandbox_controller=None: fake_agent)
+    monkeypatch.setattr(server_module.AuthStore, "initialize", _boom)
+
+    with pytest.raises(RuntimeError, match="auth store init failed") as exc_info:
+        with TestClient(server_module.app):
+            pass
+
+    assert fake_database.dispose_calls == 1
+    assert fake_controller.close_calls == 1
+    assert fake_manager.stop_calls == 1
+    assert exc_info.value.__notes__
+    assert any(
+        "database.dispose" in note and "database dispose failed" in note
+        for note in exc_info.value.__notes__
+    )
+
+
 def test_create_agent_passes_configured_mcp_profile_name(tmp_path, monkeypatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "true")
