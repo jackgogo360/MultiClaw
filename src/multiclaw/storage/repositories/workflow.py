@@ -18,7 +18,10 @@ from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import (
     ApprovalRecord,
     ApprovalStatus,
+    CheckpointPhase,
+    CheckpointRecord,
     ExecutionRecord,
+    ExecutionRecoveryRecord,
     ExecutionStatus,
     InvalidTransitionError,
     LEGAL_EXECUTION_TRANSITIONS,
@@ -28,6 +31,7 @@ from multiclaw.workflow.models import (
     RunLease,
     RunRecord,
     RunStatus,
+    VersionConflictError,
     WorkflowRuntimeCounters,
 )
 
@@ -66,6 +70,15 @@ def _approval_scope_predicate(context: TenantContext, approval_id: str) -> Colum
         approval_requests.c.session_id == context.session_id,
         approval_requests.c.run_id == context.run_id,
         approval_requests.c.approval_id == approval_id,
+    )
+
+
+def _checkpoint_scope_predicate(context: TenantContext) -> ColumnElement[bool]:
+    return and_(
+        execution_checkpoints.c.tenant_id == context.tenant_id,
+        execution_checkpoints.c.workspace_id == context.workspace_id,
+        execution_checkpoints.c.session_id == context.session_id,
+        execution_checkpoints.c.run_id == context.run_id,
     )
 
 
@@ -377,6 +390,37 @@ class WorkflowRepository:
         row = result.mappings().first()
         return None if row is None else self._execution_from_row(context, row)
 
+    async def get_execution_recovery(
+        self,
+        context: TenantContext,
+        execution_id: str,
+    ) -> ExecutionRecoveryRecord | None:
+        result = await self._conn.execute(
+            select(
+                tool_executions.c.execution_id,
+                tool_executions.c.approval_id,
+                tool_executions.c.tool_call_id,
+                tool_executions.c.execution_status,
+                tool_executions.c.recovery_strategy,
+                tool_executions.c.idempotency_key,
+                tool_executions.c.input_hash,
+                tool_executions.c.external_request_id,
+                tool_executions.c.result_ref,
+                tool_executions.c.result_digest,
+                tool_executions.c.version,
+            )
+            .where(
+                tool_executions.c.tenant_id == context.tenant_id,
+                tool_executions.c.workspace_id == context.workspace_id,
+                tool_executions.c.session_id == context.session_id,
+                tool_executions.c.run_id == context.run_id,
+                tool_executions.c.execution_id == execution_id,
+            )
+            .limit(1)
+        )
+        row = result.mappings().first()
+        return None if row is None else self._execution_recovery_from_row(context, row)
+
     async def get_approval(self, context: TenantContext, approval_id: str) -> ApprovalRecord | None:
         result = await self._conn.execute(
             select(
@@ -393,6 +437,57 @@ class WorkflowRepository:
         )
         row = result.mappings().first()
         return None if row is None else self._approval_from_row(context, row)
+
+    async def get_latest_checkpoint(self, context: TenantContext) -> CheckpointRecord | None:
+        result = await self._conn.execute(
+            select(
+                execution_checkpoints.c.checkpoint_id,
+                execution_checkpoints.c.tenant_id,
+                execution_checkpoints.c.workspace_id,
+                execution_checkpoints.c.session_id,
+                execution_checkpoints.c.run_id,
+                execution_checkpoints.c.approval_id,
+                execution_checkpoints.c.execution_id,
+                execution_checkpoints.c.phase,
+                execution_checkpoints.c.checkpoint_seq,
+                execution_checkpoints.c.payload_json,
+                execution_checkpoints.c.payload_hash,
+                execution_checkpoints.c.schema_version,
+                execution_checkpoints.c.created_at,
+            )
+            .where(_checkpoint_scope_predicate(context))
+            .order_by(execution_checkpoints.c.checkpoint_seq.desc())
+            .limit(1)
+        )
+        row = result.mappings().first()
+        return None if row is None else self._checkpoint_from_row(row)
+
+    async def get_live_lease(self, context: TenantContext, lease_owner: str) -> RunLease | None:
+        result = await self._conn.execute(
+            select(
+                agent_runs.c.lease_owner,
+                agent_runs.c.fencing_token,
+                agent_runs.c.version,
+                agent_runs.c.lease_expires_at,
+            )
+            .where(
+                _context_predicate(context),
+                agent_runs.c.lease_owner == lease_owner,
+                agent_runs.c.lease_expires_at.is_not(None),
+                agent_runs.c.lease_expires_at > self._dialect.db_now_ms(),
+            )
+            .limit(1)
+        )
+        row = result.mappings().first()
+        if row is None:
+            return None
+        return RunLease(
+            context=context,
+            lease_owner=str(row["lease_owner"]),
+            fencing_token=int(row["fencing_token"]),
+            version=int(row["version"]),
+            lease_expires_at=int(row["lease_expires_at"]),
+        )
 
     async def _mark_approval_expired(self, context: TenantContext, approval_id: str, version: int) -> bool:
         now_ms = self._dialect.db_now_ms()
@@ -495,17 +590,36 @@ class WorkflowRepository:
         lease: RunLease,
         *,
         checkpoint_id: str,
-        checkpoint_seq: int,
+        checkpoint_seq: int | None,
         phase: str,
         payload_json: str,
         payload_hash: str,
         schema_version: int,
         approval_id: str | None = None,
         execution_id: str | None = None,
+        expected_execution_status: ExecutionStatus | None = None,
+        expected_execution_version: int | None = None,
     ) -> bool:
         await self._dialect.lock_run(self._conn, lease.context)
         if not await self._has_current_lease(lease):
             return False
+        if execution_id is not None:
+            execution = await self.get_execution_recovery(lease.context, execution_id)
+            if execution is None:
+                raise VersionConflictError("execution record not found")
+            if approval_id != execution.approval_id:
+                raise VersionConflictError("execution approval scope conflict")
+            if expected_execution_status is not None and execution.status is not expected_execution_status:
+                raise VersionConflictError("execution status conflict")
+            if expected_execution_version is not None and execution.version != expected_execution_version:
+                raise VersionConflictError("execution version conflict")
+        if checkpoint_seq is None:
+            max_seq = await self._conn.scalar(
+                select(func.max(execution_checkpoints.c.checkpoint_seq)).where(
+                    _checkpoint_scope_predicate(lease.context)
+                )
+            )
+            checkpoint_seq = int(max_seq or 0) + 1
         await self._conn.execute(
             insert(execution_checkpoints).values(
                 checkpoint_id=checkpoint_id,
@@ -516,7 +630,7 @@ class WorkflowRepository:
                 approval_id=approval_id,
                 execution_id=execution_id,
                 phase=phase,
-                checkpoint_seq=checkpoint_seq,
+                checkpoint_seq=int(checkpoint_seq),
                 payload_json=payload_json,
                 payload_hash=payload_hash,
                 schema_version=schema_version,
@@ -593,4 +707,43 @@ class WorkflowRepository:
             created_at=int(row["created_at"]),
             updated_at=int(row["updated_at"]),
             finished_at=None if row["finished_at"] is None else int(row["finished_at"]),
+        )
+
+    @staticmethod
+    def _execution_recovery_from_row(context: TenantContext, row) -> ExecutionRecoveryRecord:
+        execution_id = str(row["execution_id"])
+        return ExecutionRecoveryRecord(
+            context=context,
+            execution_id=execution_id,
+            approval_id=None if row["approval_id"] is None else str(row["approval_id"]),
+            tool_call_id=str(row["tool_call_id"]),
+            status=ExecutionStatus(str(row["execution_status"])),
+            recovery_strategy=RecoveryStrategy(str(row["recovery_strategy"])),
+            idempotency_key=None if row["idempotency_key"] is None else str(row["idempotency_key"]),
+            input_hash=str(row["input_hash"]),
+            input_ref=f"tool_execution:{execution_id}:input_payload_json",
+            external_request_id=None
+            if row["external_request_id"] is None
+            else str(row["external_request_id"]),
+            result_ref=None if row["result_ref"] is None else str(row["result_ref"]),
+            result_digest=None if row["result_digest"] is None else str(row["result_digest"]),
+            version=int(row["version"]),
+        )
+
+    @staticmethod
+    def _checkpoint_from_row(row) -> CheckpointRecord:
+        return CheckpointRecord(
+            checkpoint_id=str(row["checkpoint_id"]),
+            tenant_id=str(row["tenant_id"]),
+            workspace_id=str(row["workspace_id"]),
+            session_id=str(row["session_id"]),
+            run_id=str(row["run_id"]),
+            approval_id=None if row["approval_id"] is None else str(row["approval_id"]),
+            execution_id=None if row["execution_id"] is None else str(row["execution_id"]),
+            phase=str(row["phase"]),
+            checkpoint_seq=int(row["checkpoint_seq"]),
+            payload_json=str(row["payload_json"]),
+            payload_hash=str(row["payload_hash"]),
+            schema_version=int(row["schema_version"]),
+            created_at=int(row["created_at"]),
         )

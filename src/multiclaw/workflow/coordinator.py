@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -10,6 +11,12 @@ from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import (
     ApprovalRecord,
+    AwaitingApprovalPayload,
+    CheckpointPayload,
+    CheckpointPhase,
+    CheckpointWrite,
+    ExecutionDispatchingPayload,
+    ExecutionResultObservedPayload,
     ExecutionRecord,
     ExecutionStatus,
     InvalidTransitionError,
@@ -154,13 +161,15 @@ class WorkflowCoordinator:
         lease: RunLease,
         *,
         checkpoint_id: str,
-        checkpoint_seq: int,
+        checkpoint_seq: int | None,
         phase: str,
         payload_json: str,
         payload_hash: str,
         schema_version: int,
         approval_id: str | None = None,
         execution_id: str | None = None,
+        execution_expected_status: ExecutionStatus | None = None,
+        execution_expected_version: int | None = None,
     ) -> None:
         async with self._write_connection() as conn:
             repository = self._repository(conn)
@@ -174,9 +183,69 @@ class WorkflowCoordinator:
                 schema_version=schema_version,
                 approval_id=approval_id,
                 execution_id=execution_id,
+                expected_execution_status=execution_expected_status,
+                expected_execution_version=execution_expected_version,
             )
             if not inserted:
                 raise StaleFenceError("run lease is stale")
+
+    async def checkpoint(
+        self,
+        lease: RunLease,
+        phase: CheckpointPhase | str,
+        payload: CheckpointPayload | dict,
+        *,
+        checkpoint_id: str | None = None,
+        checkpoint_seq: int | None = None,
+        approval_id: str | None = None,
+        execution_id: str | None = None,
+        execution_expected_status: ExecutionStatus | None = None,
+        execution_expected_version: int | None = None,
+    ) -> CheckpointWrite:
+        from multiclaw.workflow.recovery import encode_checkpoint_payload, validate_phase_payload
+
+        normalized_phase, validated_payload = validate_phase_payload(phase, payload)
+        resolved_approval_id, resolved_execution_id = self._validate_checkpoint_scope(
+            lease,
+            normalized_phase,
+            validated_payload,
+            approval_id=approval_id,
+            execution_id=execution_id,
+            execution_expected_status=execution_expected_status,
+            execution_expected_version=execution_expected_version,
+        )
+        encoded = encode_checkpoint_payload(
+            validated_payload,
+            max_bytes=self._settings.workflow.max_checkpoint_payload_bytes,
+        )
+        resolved_checkpoint_id = checkpoint_id or str(uuid4())
+        await self.write_checkpoint(
+            lease,
+            checkpoint_id=resolved_checkpoint_id,
+            checkpoint_seq=checkpoint_seq,
+            phase=normalized_phase.value,
+            payload_json=encoded.payload_json,
+            payload_hash=encoded.payload_hash,
+            schema_version=encoded.schema_version,
+            approval_id=resolved_approval_id,
+            execution_id=resolved_execution_id,
+            execution_expected_status=execution_expected_status,
+            execution_expected_version=execution_expected_version,
+        )
+        if checkpoint_seq is None:
+            async with self._database.connect() as conn:
+                latest = await self._repository(conn).get_latest_checkpoint(lease.context)
+                if latest is None:
+                    raise RuntimeError("checkpoint write did not persist")
+                checkpoint_seq = latest.checkpoint_seq
+        return CheckpointWrite(
+            checkpoint_id=resolved_checkpoint_id,
+            checkpoint_seq=checkpoint_seq,
+            phase=normalized_phase,
+            payload_json=encoded.payload_json,
+            payload_hash=encoded.payload_hash,
+            schema_version=encoded.schema_version,
+        )
 
     async def get_run(self, context: TenantContext) -> RunRecord | None:
         async with self._write_connection() as conn:
@@ -205,3 +274,58 @@ class WorkflowCoordinator:
             self._settings.workflow.heartbeat_ms,
             self._settings.workflow.lease_ttl_ms,
         )
+
+    @staticmethod
+    def _validate_checkpoint_scope(
+        lease: RunLease,
+        phase: CheckpointPhase,
+        payload: CheckpointPayload,
+        *,
+        approval_id: str | None,
+        execution_id: str | None,
+        execution_expected_status: ExecutionStatus | None,
+        execution_expected_version: int | None,
+    ) -> tuple[str | None, str | None]:
+        if payload.run_id != lease.context.run_id:
+            raise InvalidTransitionError("checkpoint payload run_id does not match active run")
+
+        if phase is CheckpointPhase.RUN_STARTED:
+            run_started = payload
+            assert hasattr(run_started, "tenant_id")
+            if run_started.tenant_id != lease.context.tenant_id:
+                raise InvalidTransitionError("checkpoint payload tenant_id does not match active run")
+            if run_started.workspace_id != lease.context.workspace_id:
+                raise InvalidTransitionError("checkpoint payload workspace_id does not match active run")
+            if run_started.session_id != lease.context.session_id:
+                raise InvalidTransitionError("checkpoint payload session_id does not match active run")
+            return None, None
+
+        if phase is CheckpointPhase.AWAITING_APPROVAL:
+            awaiting_approval = payload if isinstance(payload, AwaitingApprovalPayload) else None
+            assert awaiting_approval is not None
+            if execution_id is not None:
+                raise InvalidTransitionError("awaiting_approval checkpoints cannot include execution_id")
+            if approval_id is not None and approval_id != awaiting_approval.approval_id:
+                raise InvalidTransitionError("checkpoint approval_id does not match payload")
+            return awaiting_approval.approval_id, None
+
+        if phase in {
+            CheckpointPhase.EXECUTION_DISPATCHING,
+            CheckpointPhase.EXECUTION_RESULT_OBSERVED,
+        }:
+            resolved_execution_id = (
+                payload.execution_id
+                if isinstance(payload, ExecutionDispatchingPayload | ExecutionResultObservedPayload)
+                else None
+            )
+            if resolved_execution_id is None:
+                raise InvalidTransitionError("execution checkpoint payload is missing execution_id")
+            if execution_id is not None and execution_id != resolved_execution_id:
+                raise InvalidTransitionError("checkpoint execution_id does not match payload")
+            if execution_expected_status is not None and execution_expected_version is None:
+                raise InvalidTransitionError("execution checkpoint version is required with status guard")
+            if execution_expected_version is not None and execution_expected_status is None:
+                raise InvalidTransitionError("execution checkpoint status is required with version guard")
+            return approval_id, resolved_execution_id
+
+        return approval_id, execution_id
