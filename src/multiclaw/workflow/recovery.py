@@ -214,7 +214,7 @@ class RecoveryService:
 
         try:
             phase, payload = decode_checkpoint(checkpoint)
-            return await self._classify(context, checkpoint, phase, payload)
+            outcome = await self._classify(context, checkpoint, phase, payload)
         except IncompatibleCheckpointError as error:
             return RecoveryOutcome(
                 status=RunStatus.BLOCKED_INCOMPATIBLE,
@@ -234,6 +234,8 @@ class RecoveryService:
                 status=run.status,
                 executions_started=0,
             )
+
+        return outcome
 
     async def _classify(
         self,

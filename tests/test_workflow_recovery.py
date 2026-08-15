@@ -248,6 +248,35 @@ async def test_terminal_run_with_latest_run_started_checkpoint_is_terminal_noop(
 
 
 @pytest.mark.asyncio
+async def test_validate_live_run_matches_recover_for_terminal_run_with_latest_run_started_checkpoint(
+    workflow_database: Database,
+):
+    run_context = await _create_run_context(
+        workflow_database,
+        suffix="-validate-terminal-run-started",
+    )
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(run_context, "runtime-1")
+    await coordinator.finish_run(lease, RunStatus.FAILED_TERMINAL)
+    await _expire_run_lease_with_db_clock(workflow_database, run_context)
+
+    recover_outcome = await RecoveryService(workflow_database).recover(run_context, "runtime-2")
+    validate_outcome = await RecoveryService(workflow_database).validate_live_run(run_context)
+
+    assert recover_outcome.action is not None
+    assert recover_outcome.action.value == "terminal_noop"
+    assert recover_outcome.status == RunStatus.FAILED_TERMINAL
+    assert recover_outcome.executions_started == 0
+    assert recover_outcome.lease is None
+
+    assert validate_outcome.action is not None
+    assert validate_outcome.action.value == "terminal_noop"
+    assert validate_outcome.status == RunStatus.FAILED_TERMINAL
+    assert validate_outcome.executions_started == 0
+    assert validate_outcome.lease is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "terminal_status",
     (
