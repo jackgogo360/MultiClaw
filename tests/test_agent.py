@@ -9,7 +9,7 @@ from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.agent.tool_batch import ToolBatchExecutor
 from multiclaw.config import Settings
 from multiclaw.context import ContextBuildReport, ContextBuildResult
-from multiclaw.events import EventBus
+from multiclaw.events import AgentState, EventBus
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.llm import LLMResponse, ModelRouter, ToolCall
 from multiclaw.memory import MemoryEntry
@@ -1069,6 +1069,9 @@ def _build_custom_batch_agent(
     agent.scheduler = scheduler
     agent.memory = _StubMemory()
     agent.router = SimpleNamespace(completion=AsyncMock(side_effect=completion_responses))
+    agent.state = AgentState.IDLE
+    agent.event_bus = EventBus()
+    agent.event_router = None
     agent.settings = SimpleNamespace(
         **_stub_settings(
             resilience_enabled=resilience_enabled,
