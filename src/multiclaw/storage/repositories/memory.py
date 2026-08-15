@@ -15,6 +15,10 @@ from multiclaw.tenancy.context import TenantContext
 Dialect = SQLiteDialect | MySQLDialect
 
 
+def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException) -> None:
+    primary.add_note(f"{phase} cleanup failed: {type(error).__name__}: {error}")
+
+
 def _terms(value: str) -> set[str]:
     return set(re.findall(r"\w+", value.lower()))
 
@@ -37,7 +41,6 @@ class MemoryRepository:
 
     async def save(self, entry: MemoryEntry) -> MemoryEntry:
         row = self._prepare_entry(entry)
-        existing = await self._get_row(row.id)
         now_ms = self._dialect.db_now_ms()
         values = {
             "id": row.id,
@@ -51,21 +54,20 @@ class MemoryRepository:
             "created_at": now_ms,
             "metadata_json": row.metadata_json(),
         }
-        try:
-            if existing is None:
+        update_result = await self._full_scope_update(row.id, values)
+        if update_result.rowcount == 0:
+            savepoint = await self._conn.begin_nested()
+            try:
                 await self._conn.execute(insert(memory_entries).values(**values))
-            else:
-                await self._conn.execute(
-                    update(memory_entries)
-                    .where(
-                        memory_entries.c.tenant_id == self._context.tenant_id,
-                        memory_entries.c.workspace_id == self._context.workspace_id,
-                        memory_entries.c.id == row.id,
-                    )
-                    .values(**values)
-                )
-        except IntegrityError:
-            raise
+                await savepoint.commit()
+            except IntegrityError as primary:
+                await self._rollback_savepoint(savepoint, primary)
+                retry_result = await self._full_scope_update(row.id, values)
+                if retry_result.rowcount == 0:
+                    raise primary
+            except BaseException as primary:
+                await self._rollback_savepoint(savepoint, primary)
+                raise primary
         saved = await self._get_row(row.id)
         assert saved is not None
         return saved
@@ -165,7 +167,11 @@ class MemoryRepository:
                 memory_entries.c.metadata_json,
             )
             .where(*filters)
-            .order_by(memory_entries.c.created_at.desc(), memory_entries.c.turn_index.desc())
+            .order_by(
+                memory_entries.c.created_at.desc(),
+                memory_entries.c.turn_index.desc(),
+                memory_entries.c.id.desc(),
+            )
         )
         if limit is not None:
             query = query.limit(limit)
@@ -202,7 +208,31 @@ class MemoryRepository:
             if session_id != self._context.session_id:
                 raise ValueError("session_id must match the current context")
             return entry.model_copy(update={"session_id": session_id})
-        return entry.model_copy(update={"session_id": None})
+        if entry.session_id is None:
+            return entry
+        if self._context.session_id is None or entry.session_id != self._context.session_id:
+            raise ValueError("session_id must match the current context")
+        return entry
+
+    async def _full_scope_update(self, entry_id: str, values: dict[str, object]):
+        return await self._conn.execute(
+            update(memory_entries)
+            .where(
+                memory_entries.c.tenant_id == self._context.tenant_id,
+                memory_entries.c.workspace_id == self._context.workspace_id,
+                memory_entries.c.id == entry_id,
+            )
+            .values(**values)
+        )
+
+    async def _rollback_savepoint(self, savepoint, primary: BaseException) -> None:
+        if not savepoint.is_active:
+            return
+        try:
+            await savepoint.rollback()
+        except BaseException as error:
+            _note_cleanup_error(primary, "savepoint rollback", error)
+            raise primary
 
     def _visibility_filter(self, *, include_long_term: bool):
         if self._context.session_id is None:

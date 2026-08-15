@@ -211,11 +211,14 @@ async def test_scoped_session_delete_messages_limit_and_order(
         await session_memory.save(MemoryEntry(content="Hi", type="chat_message", role="assistant", turn_index=2))
         await session_memory.save(MemoryEntry(content="tool output", type="chat_message", role="tool", turn_index=3))
         await session_memory.save(MemoryEntry(content="Question", type="chat_message", role="user", turn_index=4))
+        await session_memory.save(
+            MemoryEntry(content="Answer", type="chat_message", role="assistant", turn_index=5)
+        )
         await other_workspace_memory.save(MemoryEntry(content="Foreign", type="note"))
         limited = await uow.sessions.get_messages(created.id, limit=3)
 
-    assert [message["role"] for message in limited] == ["assistant", "user"]
-    assert [message["content"] for message in limited] == ["Hi", "Question"]
+    assert [message["role"] for message in limited] == ["assistant", "user", "assistant"]
+    assert [message["content"] for message in limited] == ["Hi", "Question", "Answer"]
 
     async with TenantUnitOfWork(scoped_database, context) as cleanup:
         root_memory = cleanup.memory
@@ -244,7 +247,9 @@ async def test_scoped_memory_save_query_recent_context_and_forget(
         secondary_memory = MemoryRepository(uow.conn, secondary, scoped_database.dialect)
 
         long_term = await uow.memory.save(MemoryEntry(content="workspace memory alpha", type="note"))
-        await uow.memory.save(MemoryEntry(content="workspace note alpha", type="note", session_id=session.id))
+        await session_memory.save(
+            MemoryEntry(content="workspace note alpha", type="note", session_id=session.id)
+        )
         await session_memory.save(
             MemoryEntry(content="older chat", type="chat_message", role="user", turn_index=1)
         )
@@ -255,7 +260,7 @@ async def test_scoped_memory_save_query_recent_context_and_forget(
         await secondary_memory.save(MemoryEntry(content="workspace memory beta", type="note"))
 
         query_results = await session_memory.query("memory alpha", top_k=5)
-        recent_results = await session_memory.recent(limit=3)
+        recent_results = await session_memory.recent(limit=3, entry_type="chat_message")
         context_results = await session_memory.context(max_chars=12, limit=3)
         await session_memory.forget(long_term.id)
 
@@ -267,9 +272,69 @@ async def test_scoped_memory_save_query_recent_context_and_forget(
     assert [entry.content for entry in context_results] == ["latest chat"]
 
     async with TenantUnitOfWork(scoped_database, context) as verify:
-        assert [entry.content for entry in await verify.memory.query("alpha", top_k=5)] == [
-            "workspace note alpha"
+        assert await verify.memory.query("alpha", top_k=5) == []
+
+
+@pytest.mark.asyncio
+async def test_non_chat_session_scoped_memory_stays_session_local_and_deletes_with_session(
+    scoped_database: Database,
+    scoped_contexts: dict[str, TenantContext],
+) -> None:
+    context = scoped_contexts["primary"]
+
+    async with TenantUnitOfWork(scoped_database, context) as uow:
+        session_a = await uow.sessions.create("Alpha")
+        session_b = await uow.sessions.create("Beta")
+        repo_a = MemoryRepository(uow.conn, context.for_session(session_a.id), scoped_database.dialect)
+        repo_b = MemoryRepository(uow.conn, context.for_session(session_b.id), scoped_database.dialect)
+
+        await repo_a.save(
+            MemoryEntry(content="session note alpha", type="note", session_id=session_a.id)
+        )
+        await uow.memory.save(MemoryEntry(content="workspace longterm alpha", type="note"))
+
+        assert [entry.content for entry in await repo_a.query("alpha", top_k=5)] == [
+            "workspace longterm alpha",
+            "session note alpha",
         ]
+        assert [entry.content for entry in await repo_b.query("alpha", top_k=5)] == [
+            "workspace longterm alpha"
+        ]
+        assert [entry.content for entry in await repo_a.recent(limit=5)] == ["session note alpha"]
+        assert await repo_b.recent(limit=5) == []
+
+        await uow.sessions.delete(session_a.id)
+        assert [entry.content for entry in await repo_a.query("alpha", top_k=5)] == [
+            "workspace longterm alpha"
+        ]
+        assert [entry.content for entry in await repo_b.query("alpha", top_k=5)] == [
+            "workspace longterm alpha"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_longterm_memory_is_shared_within_workspace_but_not_across_workspaces(
+    scoped_database: Database,
+    scoped_contexts: dict[str, TenantContext],
+) -> None:
+    primary = scoped_contexts["primary"]
+    sibling = scoped_contexts["sibling"]
+    secondary = scoped_contexts["secondary"]
+
+    async with TenantUnitOfWork(scoped_database, primary) as uow:
+        session = await uow.sessions.create("Alpha")
+        await uow.memory.save(MemoryEntry(content="workspace longterm alpha", type="note"))
+        assert [entry.content for entry in await MemoryRepository(
+            uow.conn,
+            primary.for_session(session.id),
+            scoped_database.dialect,
+        ).query("alpha", top_k=5)] == ["workspace longterm alpha"]
+
+    async with TenantUnitOfWork(scoped_database, sibling) as uow:
+        assert await uow.memory.query("alpha", top_k=5) == []
+
+    async with TenantUnitOfWork(scoped_database, secondary) as uow:
+        assert await uow.memory.query("alpha", top_k=5) == []
 
 
 @pytest.mark.asyncio
@@ -300,6 +365,16 @@ async def test_memory_save_rejects_foreign_or_missing_session_scope(
                     turn_index=1,
                     session_id=other_session.id,
                 )
+            )
+
+        with pytest.raises(ValueError, match="session_id"):
+            await uow.memory.save(
+                MemoryEntry(content="foreign session note", type="note", session_id=session.id)
+            )
+
+        with pytest.raises(ValueError, match="session_id"):
+            await session_memory.save(
+                MemoryEntry(content="wrong session note", type="note", session_id=other_session.id)
             )
 
         with pytest.raises(IntegrityError):
@@ -352,6 +427,141 @@ async def test_scoped_repositories_roll_back_within_uow(
     async with TenantUnitOfWork(scoped_database, context) as verify:
         assert await verify.sessions.list(include_archived=True) == []
         assert await verify.memory.query("persist", top_k=5) == []
+
+
+@pytest.mark.asyncio
+async def test_memory_duplicate_save_updates_same_scope_and_rejects_foreign_scope_without_poisoning_tx(
+    scoped_database: Database,
+    scoped_contexts: dict[str, TenantContext],
+) -> None:
+    primary = scoped_contexts["primary"]
+    sibling = scoped_contexts["sibling"]
+
+    entry_id = str(uuid4())
+
+    async with TenantUnitOfWork(scoped_database, primary) as uow:
+        original = await uow.memory.save(
+            MemoryEntry(id=entry_id, content="first value", type="note")
+        )
+        updated = await uow.memory.save(
+            MemoryEntry(id=entry_id, content="second value", type="note")
+        )
+        assert original.id == updated.id == entry_id
+        assert [entry.content for entry in await uow.memory.query("value", top_k=5)] == [
+            "second value"
+        ]
+
+    async with TenantUnitOfWork(scoped_database, primary) as verify:
+        foreign_repo = MemoryRepository(verify.conn, sibling, scoped_database.dialect)
+
+        with pytest.raises(IntegrityError):
+            await foreign_repo.save(
+                MemoryEntry(id=entry_id, content="foreign overwrite", type="note")
+            )
+
+        still_there = await verify.memory.query("value", top_k=5)
+        after_error = await verify.memory.save(MemoryEntry(content="tx still usable", type="note"))
+
+    assert [entry.content for entry in still_there] == ["second value"]
+    assert after_error.content == "tx still usable"
+
+
+@pytest.mark.asyncio
+async def test_memory_duplicate_save_latest_value_wins_across_uow_retries(
+    scoped_database: Database,
+    scoped_contexts: dict[str, TenantContext],
+) -> None:
+    context = scoped_contexts["primary"]
+    entry_id = str(uuid4())
+
+    async with TenantUnitOfWork(scoped_database, context) as first:
+        await first.memory.save(MemoryEntry(id=entry_id, content="initial", type="note"))
+
+    async with TenantUnitOfWork(scoped_database, context) as second:
+        latest = await second.memory.save(MemoryEntry(id=entry_id, content="latest", type="note"))
+
+    async with TenantUnitOfWork(scoped_database, context) as verify:
+        matches = await verify.memory.query("latest", top_k=5)
+        row_count = await verify.conn.scalar(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM memory_entries
+                WHERE tenant_id = :tenant_id AND workspace_id = :workspace_id AND id = :entry_id
+                """
+            ),
+            {
+                "tenant_id": context.tenant_id,
+                "workspace_id": context.workspace_id,
+                "entry_id": entry_id,
+            },
+        )
+
+    assert latest.content == "latest"
+    assert row_count == 1
+    assert [entry.content for entry in matches] == ["latest"]
+
+
+@pytest.mark.asyncio
+async def test_session_and_memory_ordering_is_deterministic_when_timestamps_tie(
+    scoped_database: Database,
+    scoped_contexts: dict[str, TenantContext],
+) -> None:
+    context = scoped_contexts["primary"]
+
+    async with TenantUnitOfWork(scoped_database, context) as uow:
+        session_a = await uow.sessions.create("Alpha")
+        session_b = await uow.sessions.create("Beta")
+        await uow.conn.execute(
+            text(
+                """
+                UPDATE chat_sessions
+                SET created_at = 1000, updated_at = 1000, last_message_at = 1000
+                WHERE id IN (:a, :b)
+                """
+            ).bindparams(a=session_a.id, b=session_b.id)
+        )
+
+        repo = MemoryRepository(uow.conn, context.for_session(session_a.id), scoped_database.dialect)
+        message_a = await repo.save(
+            MemoryEntry(content="match", type="chat_message", role="user", turn_index=1)
+        )
+        message_b = await repo.save(
+            MemoryEntry(content="match", type="chat_message", role="assistant", turn_index=1)
+        )
+        note_a = await repo.save(
+            MemoryEntry(content="match", type="note", session_id=session_a.id)
+        )
+        note_b = await repo.save(
+            MemoryEntry(content="match", type="note", session_id=session_a.id)
+        )
+
+        await uow.conn.execute(
+            text(
+                """
+                UPDATE memory_entries
+                SET created_at = 2000, turn_index = 1
+                WHERE id IN (:message_a, :message_b, :note_a, :note_b)
+                """
+            ).bindparams(
+                message_a=message_a.id,
+                message_b=message_b.id,
+                note_a=note_a.id,
+                note_b=note_b.id,
+            )
+        )
+
+        listed_once = await uow.sessions.list(include_archived=True)
+        listed_twice = await uow.sessions.list(include_archived=True)
+        messages_once = await uow.sessions.get_messages(session_a.id, limit=10)
+        messages_twice = await uow.sessions.get_messages(session_a.id, limit=10)
+        query_once = await repo.query("match", top_k=10)
+        query_twice = await repo.query("match", top_k=10)
+
+    assert [session.id for session in listed_once] == [session.id for session in listed_twice]
+    assert [message["content"] for message in messages_once] == [message["content"] for message in messages_twice]
+    assert [message["role"] for message in messages_once] == [message["role"] for message in messages_twice]
+    assert [entry.id for entry in query_once] == [entry.id for entry in query_twice]
 
 
 def test_scoped_packages_remove_legacy_exports_and_modules() -> None:

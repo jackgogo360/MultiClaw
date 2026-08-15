@@ -46,6 +46,9 @@ class _ScopedMemoryFake:
             if session_id != context.session_id:
                 raise ValueError("session_id must match the current context")
             entry = entry.model_copy(update={"session_id": session_id})
+        elif entry.session_id is not None:
+            if context.session_id is None or entry.session_id != context.session_id:
+                raise ValueError("session_id must match the current context")
         self._entries.append((context, entry))
         return entry
 
@@ -316,6 +319,51 @@ class TestMultiClawAgent:
 
         assert len(matches) == 1
         assert matches[0].content == "remember this"
+
+    @pytest.mark.asyncio
+    async def test_tool_results_stay_in_session_scope_and_base_remember_rejects_missing_session(self, agent):
+        tool_call_response = Mock()
+        tool_call_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": '{"text": "scoped_tool_result"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ],
+        }
+        tool_call_response.raise_for_status = Mock()
+
+        final_response = Mock()
+        final_response.json.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "done"}}]
+        }
+        final_response.raise_for_status = Mock()
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.side_effect = [tool_call_response, final_response]
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            await agent.handle_message("echo local", context=SESSION_CONTEXT)
+
+        assert [entry.content for entry in await agent.memory.query(SESSION_CONTEXT, "scoped_tool_result", top_k=5)] == [
+            "scoped_tool_result"
+        ]
+        assert await agent.memory.query(OTHER_SESSION_CONTEXT, "scoped_tool_result", top_k=5) == []
+
+        with pytest.raises(ValueError, match="session_id"):
+            await agent.remember(ROOT_CONTEXT, "orphan tool result", "tool_result")
 
     @pytest.mark.asyncio
     async def test_injects_relevant_memory_before_user_message(self, agent):
