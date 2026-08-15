@@ -831,20 +831,22 @@ async def chat(
 ):
     """SSE streaming — real token streaming from LLM with state events."""
     message = _resolve_chat_message(req)
-    requested_session_id = req.session_id or req.id
+    has_session_id = req.session_id is not None
+    has_id_alias = req.id is not None
+    requested_session_id = req.session_id if has_session_id else req.id
 
     # Resolve or create session
     session = None
-    if requested_session_id:
+    if has_session_id or has_id_alias:
+        if not requested_session_id:
+            raise HTTPException(status_code=404, detail="session not found")
         session = await uow.sessions.get(requested_session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="session not found")
         if session.status == SessionStatus.ARCHIVED:
             raise HTTPException(status_code=409, detail="session is archived")
-    elif requested_session_id is None and req.id is None:
-        session = await uow.sessions.create()
     else:
-        raise HTTPException(status_code=404, detail="session not found")
+        session = await uow.sessions.create()
 
     # Update session activity (title from first message)
     session = await uow.sessions.touch_message(session.id, message)

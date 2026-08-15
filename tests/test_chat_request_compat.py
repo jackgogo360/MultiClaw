@@ -91,6 +91,38 @@ def test_chat_accepts_ai_sdk_message_shape(migrated_database, monkeypatch):
     assert captured[0][0] == "hello from sdk"
 
 
+def test_chat_accepts_id_alias_for_existing_current_scope_session(migrated_database, monkeypatch):
+    import multiclaw.server as server
+
+    captured: list[tuple[str, str | None]] = []
+
+    async def fake_handle_message_stream(user_input: str, *, context):
+        captured.append((user_input, context.session_id))
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app) as client:
+        client.cookies = _make_auth_cookie(server.app, migrated_database)
+        created = client.post("/api/sessions", json={"title": "Alias Target"})
+        assert created.status_code == 200
+        session_id = created.json()["id"]
+
+        monkeypatch.setattr(server.agent, "handle_message_stream", fake_handle_message_stream)
+        before = client.get("/api/sessions").json()
+        response = client.post(
+            "/api/chat",
+            json={
+                "id": session_id,
+                "messages": [{"role": "user", "content": "hello from alias"}],
+            },
+        )
+        after = client.get("/api/sessions").json()
+
+    assert response.status_code == 200
+    assert '"type":"data-session"' in response.text
+    assert captured == [("hello from alias", session_id)]
+    assert [session["id"] for session in after] == [session["id"] for session in before]
+
+
 def test_chat_accepts_text_parts_from_ai_sdk_messages(migrated_database, monkeypatch):
     import multiclaw.server as server
 
