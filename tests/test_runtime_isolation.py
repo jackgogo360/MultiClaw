@@ -2,10 +2,16 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from alembic import command
+from sqlalchemy import insert
 
+from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings, McpSettings, Settings, SkillSettings
 from multiclaw.storage import Database
+from multiclaw.storage.schema import agent_runs, chat_sessions, execution_checkpoints, workspaces
+from multiclaw.storage.uow import AuthUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
+from multiclaw.workflow.models import RunStatus
 
 from sandbox_fakes import ReadyRecordingSandboxController
 
@@ -19,6 +25,12 @@ def _settings_for_runtime(root: Path) -> Settings:
         mcp=McpSettings(enabled=False),
         skill=SkillSettings(enabled=True, max_active=3),
     )
+
+
+async def _create_migrated_runtime_database(root: Path) -> Database:
+    database_url = f"sqlite+aiosqlite:///{root / 'runtime.db'}"
+    await asyncio.to_thread(command.upgrade, alembic_config(database_url=database_url), "head")
+    return Database.create(DatabaseSettings(driver="sqlite", url=database_url))
 
 
 @pytest.mark.asyncio
@@ -382,3 +394,136 @@ def test_runtime_factory_probe_startup_raises_close_failure_after_success(tmp_pa
         asyncio.run(database.dispose())
 
     assert controller.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_reconciles_persisted_workflow_counters_without_double_counting(
+    tmp_path: Path,
+):
+    from multiclaw.runtime.factory import RuntimeFactory
+    from multiclaw.runtime.pool import RuntimePool
+
+    settings = _settings_for_runtime(tmp_path)
+    database = await _create_migrated_runtime_database(tmp_path)
+    resolver = WorkspaceResolver(tmp_path)
+    async with AuthUnitOfWork(database) as uow:
+        user_a = await uow.users.create_user_with_default_workspace("runtime-a@example.com")
+        user_b = await uow.users.create_user_with_default_workspace("runtime-b@example.com")
+    assert user_a.default_workspace_id is not None
+    assert user_b.default_workspace_id is not None
+    context = TenantContext(user_a.id, user_a.default_workspace_id)
+    other_workspace = "00000000-0000-0000-0000-0000000000bb"
+    other_tenant = user_b.id
+
+    async with database.write_transaction() as conn:
+        await conn.execute(
+            insert(workspaces).values(
+                id=other_workspace,
+                tenant_id=context.tenant_id,
+                slug="other",
+                name="Other",
+                status="active",
+                created_at=1,
+                updated_at=1,
+            )
+        )
+        for session_id, workspace_id, tenant_id, status in (
+            ("session-running", context.workspace_id, context.tenant_id, RunStatus.RUNNING.value),
+            ("session-awaiting", context.workspace_id, context.tenant_id, RunStatus.AWAITING_USER.value),
+            ("session-resuming", context.workspace_id, context.tenant_id, RunStatus.RESUMING.value),
+            ("session-completed", context.workspace_id, context.tenant_id, RunStatus.COMPLETED.value),
+            ("session-foreign-workspace", other_workspace, context.tenant_id, RunStatus.RUNNING.value),
+            ("session-foreign-tenant", user_b.default_workspace_id, other_tenant, RunStatus.RUNNING.value),
+        ):
+            await conn.execute(
+                insert(chat_sessions).values(
+                    id=session_id,
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                    title=session_id,
+                    status="active",
+                    created_at=1,
+                    updated_at=1,
+                    last_message_at=None,
+                    metadata_json="{}",
+                )
+            )
+        for run_id, session_id, workspace_id, tenant_id, status in (
+            ("run-running", "session-running", context.workspace_id, context.tenant_id, RunStatus.RUNNING.value),
+            ("run-awaiting", "session-awaiting", context.workspace_id, context.tenant_id, RunStatus.AWAITING_USER.value),
+            ("run-resuming", "session-resuming", context.workspace_id, context.tenant_id, RunStatus.RESUMING.value),
+            ("run-completed", "session-completed", context.workspace_id, context.tenant_id, RunStatus.COMPLETED.value),
+            ("run-foreign-workspace", "session-foreign-workspace", other_workspace, context.tenant_id, RunStatus.RUNNING.value),
+            ("run-foreign-tenant", "session-foreign-tenant", user_b.default_workspace_id, other_tenant, RunStatus.RUNNING.value),
+        ):
+            await conn.execute(
+                insert(agent_runs).values(
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    workspace_id=workspace_id,
+                    session_id=session_id,
+                    run_status=status,
+                    runtime_instance_id="seed-runtime",
+                    lease_owner="seed-runtime",
+                    fencing_token=1,
+                    lease_expires_at=9999999999999,
+                    heartbeat_at=1,
+                    schema_version=1,
+                    version=1,
+                    created_at=1,
+                    updated_at=1,
+                    finished_at=None if status != RunStatus.COMPLETED.value else 1,
+                )
+            )
+        await conn.execute(
+            insert(execution_checkpoints).values(
+                checkpoint_id="checkpoint-awaiting",
+                tenant_id=context.tenant_id,
+                workspace_id=context.workspace_id,
+                session_id="session-awaiting",
+                run_id="run-awaiting",
+                approval_id=None,
+                execution_id=None,
+                phase="run",
+                checkpoint_seq=1,
+                payload_json="{}",
+                payload_hash="6" * 64,
+                schema_version=1,
+                created_at=1,
+            )
+        )
+
+    factory = RuntimeFactory(
+        settings=settings,
+        database=database,
+        workspace_resolver=resolver,
+        sandbox_controller_factory=lambda workspace_root, event_bus: ReadyRecordingSandboxController(
+            workspace_root=workspace_root
+        ),
+    )
+    pool = RuntimePool(factory=factory, max_resident_tenants=2, idle_ttl_ms=5_000)
+
+    try:
+        first = await pool.acquire(context)
+        assert first.active_run_count == 3
+        assert first.active_executing_run_count == 2
+        assert first.awaiting_user_run_count == 1
+        assert first.checkpointed_awaiting_user_run_count == 1
+
+        again = await pool.acquire(context)
+        assert again is first
+        assert again.active_run_count == 3
+        assert again.active_executing_run_count == 2
+        assert again.awaiting_user_run_count == 1
+        assert again.checkpointed_awaiting_user_run_count == 1
+
+        await pool.revoke(context.tenant_id)
+        recreated = await pool.acquire(context)
+        assert recreated is not first
+        assert recreated.active_run_count == 3
+        assert recreated.active_executing_run_count == 2
+        assert recreated.awaiting_user_run_count == 1
+        assert recreated.checkpointed_awaiting_user_run_count == 1
+    finally:
+        await pool.close()
+        await database.dispose()

@@ -136,7 +136,7 @@ from multiclaw.api.chat import (
 )
 from multiclaw.api.dependencies import current_user, tenant_context, tenant_uow
 from multiclaw.stream import DataStreamEncoder
-from multiclaw.workflow.models import RunStatus, TenantRunQuotaError
+from multiclaw.workflow.models import RunLeaseHandle, RunStatus, TenantRunQuotaError
 
 
 # ---------------------------------------------------------------------------
@@ -832,17 +832,20 @@ async def chat(
         subscription = None
         stream_task: asyncio.Task | None = None
         heartbeat_task: asyncio.Task | None = None
-        current_workflow_lease = workflow_lease
+        assert workflow_lease is not None
+        workflow_lease_handle = RunLeaseHandle(workflow_lease)
         terminal_persisted = False
 
         async def persist_terminal(status: RunStatus) -> None:
-            nonlocal current_workflow_lease, terminal_persisted
-            if current_workflow_lease is None or terminal_persisted:
+            nonlocal terminal_persisted
+            if terminal_persisted:
                 return
-            current_workflow_lease = await build_workflow_coordinator(
-                request.app.state.database,
-                request.app.state.settings,
-            ).finish_run(current_workflow_lease, status)
+            await workflow_lease_handle.refresh(
+                lambda lease: build_workflow_coordinator(
+                    request.app.state.database,
+                    request.app.state.settings,
+                ).finish_run(lease, status)
+            )
             terminal_persisted = True
 
         def close_text_part() -> list[str]:
@@ -936,7 +939,8 @@ async def chat(
                         runtime.agent.handle_message_stream,
                         message,
                         context=run_context,
-                        run_lease=current_workflow_lease,
+                        run_lease=await workflow_lease_handle.current(),
+                        run_lease_handle=workflow_lease_handle,
                     ):
                         await token_queue.put(item)
                 except Exception as exc:
@@ -945,7 +949,6 @@ async def chat(
                     await token_queue.put({"type": "error", "content": msg})
 
             async def heartbeat_run_lease() -> None:
-                nonlocal current_workflow_lease
                 interval_seconds = max(
                     0.001,
                     request.app.state.settings.workflow.heartbeat_ms / 1000,
@@ -956,13 +959,15 @@ async def chat(
                         return
                     except asyncio.TimeoutError:
                         pass
-                    if current_workflow_lease is None or terminal_persisted:
+                    if terminal_persisted:
                         continue
                     try:
-                        current_workflow_lease = await build_workflow_coordinator(
-                            request.app.state.database,
-                            request.app.state.settings,
-                        ).heartbeat(current_workflow_lease)
+                        await workflow_lease_handle.refresh(
+                            lambda lease: build_workflow_coordinator(
+                                request.app.state.database,
+                                request.app.state.settings,
+                            ).heartbeat(lease)
+                        )
                     except Exception as exc:
                         logger.exception("run lease heartbeat failed")
                         await token_queue.put({"type": "error", "content": _friendly_error(exc)})
@@ -1081,14 +1086,13 @@ async def chat(
         finally:
             if heartbeat_task is not None:
                 heartbeat_stop.set()
-                heartbeat_task.cancel()
                 await asyncio.gather(heartbeat_task, return_exceptions=True)
             if stream_task is not None:
                 stream_task.cancel()
                 await asyncio.gather(stream_task, return_exceptions=True)
             if subscription is not None:
                 subscription.close()
-            if not terminal_persisted and current_workflow_lease is not None:
+            if not terminal_persisted:
                 try:
                     await persist_terminal(RunStatus.CANCELLED)
                 except Exception:

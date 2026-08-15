@@ -6,6 +6,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import exc as sa_exc
+
 from multiclaw.agent import MultiClawAgent
 from multiclaw.config import Settings
 from multiclaw.events import EventBus, EventRouter
@@ -24,6 +26,7 @@ from multiclaw.planner import Planner
 from multiclaw.runtime.models import RuntimeClock, TenantRuntime
 from multiclaw.skills import SkillManager
 from multiclaw.storage import Database
+from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
 from multiclaw.tools import CoreToolScheduler, ToolRegistry
@@ -174,8 +177,7 @@ class RuntimeFactory:
         agent.sandbox_controller = sandbox_controller
         agent.sandbox_readiness = readiness
         agent.workspace_root = workspace_root
-
-        return TenantRuntime(
+        runtime = TenantRuntime(
             tenant_id=context.tenant_id,
             runtime_instance_id=str(uuid.uuid4()),
             workspace_root=workspace_root,
@@ -191,6 +193,8 @@ class RuntimeFactory:
             last_used_at_ms=self.clock.now_ms(),
             clock=self.clock,
         )
+        runtime.apply_workflow_counters(await self._load_workflow_counters(context))
+        return runtime
 
     def probe_startup(self) -> tuple[SandboxReadiness, tuple[Any, ...]]:
         event_bus = EventBus()
@@ -304,6 +308,24 @@ class RuntimeFactory:
         )
         registry.register(WebSearchToolBuilder(workspace_root))
         return registry
+
+    async def _load_workflow_counters(self, context: TenantContext):
+        try:
+            async with self.database.connect() as conn:
+                repository = WorkflowRepository(
+                    conn,
+                    self.database.dialect,
+                    self.settings.workflow.heartbeat_ms,
+                    self.settings.workflow.lease_ttl_ms,
+                )
+                return await repository.get_runtime_counters(context)
+        except (sa_exc.OperationalError, sa_exc.ProgrammingError) as error:
+            message = str(error).lower()
+            if "no such table" in message or "doesn't exist" in message:
+                from multiclaw.workflow.models import WorkflowRuntimeCounters
+
+                return WorkflowRuntimeCounters()
+            raise
 
     def _build_mcp_manager(
         self,

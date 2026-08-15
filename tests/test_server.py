@@ -4,11 +4,13 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import jwt
 import pytest
 from alembic import command
 from fastapi.testclient import TestClient
+from sqlalchemy import insert
 from starlette.requests import Request
 
 from multiclaw.cli import alembic_config
@@ -24,6 +26,7 @@ from multiclaw.mcp.types import (
 )
 from multiclaw.mcp.types import ToolInfo
 from multiclaw.storage import Database
+from multiclaw.storage.schema import tool_executions
 from multiclaw.storage.uow import AuthUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
 from multiclaw.tools.code_exec import CodeExecToolBuilder
@@ -2060,6 +2063,224 @@ async def test_chat_heartbeats_active_run_lease_during_long_stream(migrated_data
 
         release.set()
         await consume_task
+
+
+@pytest.mark.asyncio
+async def test_chat_passes_run_lease_handle_with_refreshed_snapshot(migrated_database, monkeypatch):
+    import multiclaw.server as server
+    from multiclaw.storage.uow import TenantUnitOfWork
+    from multiclaw.workflow.coordinator import WorkflowCoordinator
+    from multiclaw.workflow.models import ExecutionStatus, StaleFenceError
+
+    release = asyncio.Event()
+    captured: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context, run_lease, run_lease_handle):
+        del user_input
+        coordinator = WorkflowCoordinator(server.app.state.database, settings=server.app.state.settings)
+        execution_id = str(uuid4())
+        async with TenantUnitOfWork(
+            server.app.state.database,
+            context,
+            workflow_settings=server.app.state.settings.workflow,
+        ) as uow:
+            await uow.conn.execute(
+                insert(tool_executions).values(
+                    execution_id=execution_id,
+                    tenant_id=context.tenant_id,
+                    workspace_id=context.workspace_id,
+                    session_id=context.session_id,
+                    run_id=context.run_id,
+                    approval_id=None,
+                    tool_call_id=f"call-{execution_id}",
+                    tool_name="echo",
+                    tool_kind="builtin",
+                    execution_status=ExecutionStatus.NOT_STARTED.value,
+                    recovery_strategy="idempotent_retry",
+                    idempotency_key=None,
+                    input_payload_json="{}",
+                    input_hash="3" * 64,
+                    external_request_id=None,
+                    result_ref=None,
+                    result_digest=None,
+                    schema_version=1,
+                    version=1,
+                    created_at=server.app.state.database.dialect.db_now_ms(),
+                    updated_at=server.app.state.database.dialect.db_now_ms(),
+                    finished_at=None,
+                )
+            )
+        initial_snapshot = await run_lease_handle.current()
+        captured["initial_version"] = initial_snapshot.version
+        captured["initial_expiry"] = initial_snapshot.lease_expires_at
+        await asyncio.sleep(0.20)
+        refreshed = await run_lease_handle.current()
+        captured["refreshed_version"] = refreshed.version
+        captured["refreshed_expiry"] = refreshed.lease_expires_at
+        with pytest.raises(StaleFenceError):
+            await coordinator.write_checkpoint(
+                run_lease,
+                checkpoint_id=str(uuid4()),
+                checkpoint_seq=1,
+                phase="run",
+                payload_json="{}",
+                payload_hash="4" * 64,
+                schema_version=1,
+            )
+        lease_after_transition = await run_lease_handle.use_current(
+            lambda lease: coordinator.transition_execution(
+                lease,
+                execution_id,
+                expected_status=ExecutionStatus.NOT_STARTED,
+                expected_version=1,
+                target=ExecutionStatus.REPLAYING,
+            )
+        )
+        lease_after_transition = await run_lease_handle.use_current(
+            lambda lease: coordinator.transition_execution(
+                lease,
+                execution_id,
+                expected_status=ExecutionStatus.REPLAYING,
+                expected_version=2,
+                target=ExecutionStatus.EXECUTING,
+            )
+        )
+        lease_after_transition = await run_lease_handle.use_current(
+            lambda lease: coordinator.transition_execution(
+                lease,
+                execution_id,
+                expected_status=ExecutionStatus.EXECUTING,
+                expected_version=3,
+                target=ExecutionStatus.SUCCEEDED,
+            )
+        )
+        await run_lease_handle.use_current(
+            lambda lease: coordinator.write_checkpoint(
+                lease,
+                checkpoint_id=str(uuid4()),
+                checkpoint_seq=2,
+                phase="run",
+                payload_json="{}",
+                payload_hash="5" * 64,
+                schema_version=1,
+                execution_id=execution_id,
+            )
+        )
+        captured["transitioned_version"] = lease_after_transition.version
+        release.set()
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app):
+        monkeypatch.setattr(server.app.state.settings.workflow, "heartbeat_ms", 50)
+        monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 120)
+        user_id, _ = await _seed_user(migrated_database, "handle-lease@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            captured["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request(
+            {
+                "type": "http",
+                "app": server.app,
+                "method": "POST",
+                "path": "/api/chat",
+                "headers": [],
+            }
+        )
+        async with TenantUnitOfWork(
+            server.app.state.database,
+            context,
+            workflow_settings=server.app.state.settings.workflow,
+        ) as uow:
+            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            body = [chunk async for chunk in response.body_iterator]
+
+    assert '"type":"error"' not in "".join(body)
+    assert captured["refreshed_version"] > captured["initial_version"]
+    assert captured["refreshed_expiry"] > captured["initial_expiry"]
+
+
+@pytest.mark.asyncio
+async def test_chat_client_cancel_stops_lease_heartbeat_updates(migrated_database, monkeypatch):
+    import multiclaw.server as server
+    from multiclaw.storage.uow import TenantUnitOfWork
+    from multiclaw.workflow.coordinator import WorkflowCoordinator
+    from multiclaw.workflow.models import RunStatus
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    captured: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context, run_lease_handle):
+        del user_input
+        captured["context"] = context
+        captured["run_lease_handle"] = run_lease_handle
+        started.set()
+        await release.wait()
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app):
+        monkeypatch.setattr(server.app.state.settings.workflow, "heartbeat_ms", 50)
+        monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 120)
+        user_id, _ = await _seed_user(migrated_database, "cancel-heartbeat@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
+        async with TenantUnitOfWork(
+            server.app.state.database,
+            context,
+            workflow_settings=server.app.state.settings.workflow,
+        ) as uow:
+            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+        async def consume() -> None:
+            async for _ in response.body_iterator:
+                pass
+
+        consume_task = asyncio.create_task(consume())
+        await started.wait()
+        initial_version = (await captured["run_lease_handle"].current()).version
+        await asyncio.sleep(0.18)
+        mid_version = (await captured["run_lease_handle"].current()).version
+        consume_task.cancel()
+        await asyncio.gather(consume_task, return_exceptions=True)
+        await response.body_iterator.aclose()
+        await asyncio.sleep(0.18)
+        final_snapshot = await captured["run_lease_handle"].current()
+        await asyncio.sleep(0.18)
+        stable_snapshot = await captured["run_lease_handle"].current()
+        release.set()
+
+    record = await WorkflowCoordinator(server.app.state.database, settings=server.app.state.settings).get_run(
+        captured["context"]
+    )
+    assert mid_version > initial_version
+    assert final_snapshot.version >= mid_version
+    assert stable_snapshot.version == final_snapshot.version
+    assert record is not None
+    assert record.status is RunStatus.CANCELLED
 
 
 def test_chat_returns_retryable_503_when_begin_run_rejects_unavailable_runtime(migrated_database, monkeypatch):

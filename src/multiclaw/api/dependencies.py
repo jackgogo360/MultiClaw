@@ -34,7 +34,11 @@ async def tenant_uow(
     request: Request,
     context: TenantContext = Depends(tenant_context),
 ) -> AsyncIterator[TenantUnitOfWork]:
-    async with TenantUnitOfWork(request.app.state.database, context) as uow:
+    async with TenantUnitOfWork(
+        request.app.state.database,
+        context,
+        workflow_settings=request.app.state.settings.workflow,
+    ) as uow:
         try:
             user = await uow.users.get_current()
             workspace = await uow.workspaces.get_current()
