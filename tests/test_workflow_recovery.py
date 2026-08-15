@@ -230,6 +230,70 @@ async def test_unsupported_checkpoint_schema_blocks_incompatible(workflow_databa
     assert outcome.executions_started == 0
 
 
+@pytest.mark.asyncio
+async def test_terminal_run_with_latest_run_started_checkpoint_is_terminal_noop(workflow_database: Database):
+    run_context = await _create_run_context(workflow_database, suffix="-terminal-run-started")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(run_context, "runtime-1")
+    await coordinator.finish_run(lease, RunStatus.FAILED_TERMINAL)
+    await _expire_run_lease_with_db_clock(workflow_database, run_context)
+
+    outcome = await RecoveryService(workflow_database).recover(run_context, "runtime-2")
+
+    assert outcome.action is not None
+    assert outcome.action.value == "terminal_noop"
+    assert outcome.status == RunStatus.FAILED_TERMINAL
+    assert outcome.executions_started == 0
+    assert outcome.lease is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    (
+        RunStatus.COMPLETED,
+        RunStatus.CANCELLED,
+        RunStatus.BLOCKED_CORRUPT,
+        RunStatus.BLOCKED_INCOMPATIBLE,
+    ),
+)
+async def test_terminal_run_statuses_override_latest_nonterminal_checkpoint(
+    workflow_database: Database,
+    terminal_status: RunStatus,
+):
+    run_context = await _create_run_context(
+        workflow_database,
+        suffix=f"-terminal-override-{terminal_status.value}",
+    )
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(run_context, "runtime-1")
+    await coordinator.finish_run(lease, terminal_status)
+    await _expire_run_lease_with_db_clock(workflow_database, run_context)
+
+    outcome = await RecoveryService(workflow_database).recover(run_context, "runtime-2")
+
+    assert outcome.action is not None
+    assert outcome.action.value == "terminal_noop"
+    assert outcome.status == terminal_status
+    assert outcome.executions_started == 0
+    assert outcome.lease is None
+
+
+@pytest.mark.asyncio
+async def test_active_run_started_checkpoint_still_resumes_model(workflow_database: Database):
+    run_context = await _create_run_context(workflow_database, suffix="-active-run-started")
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_run_with_checkpoint(run_context, "runtime-1")
+    await _expire_run_lease_with_db_clock(workflow_database, run_context)
+
+    outcome = await RecoveryService(workflow_database).recover(run_context, "runtime-2")
+
+    assert outcome.action is not None
+    assert outcome.action.value == "resume_model"
+    assert outcome.executions_started == 0
+    assert outcome.lease is not None
+
+
 def test_checkpoint_timestamp_fields_reject_string_coercion() -> None:
     with pytest.raises(CorruptCheckpointError):
         validate_phase_payload(
