@@ -168,13 +168,12 @@ class AuthStore:
                 SELECT * FROM verification_codes
                 WHERE email = ?
                   AND purpose = 'login'
-                  AND code_digest = ?
                   AND used_at IS NULL
                   AND expires_at > ?
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT 1
                 """,
-                (email, _code_digest(code), _to_epoch_ms(datetime.now(timezone.utc))),
+                (email, _to_epoch_ms(datetime.now(timezone.utc))),
             )
         else:
             cursor = await db.execute(
@@ -189,7 +188,10 @@ class AuthStore:
         row = await cursor.fetchone()
         if row is None:
             return None
-        if self._verification_codes_layout != "frozen" and row["code"] != code:
+        if self._verification_codes_layout == "frozen":
+            if not secrets.compare_digest(str(row["code_digest"]), _code_digest(code)):
+                return None
+        elif row["code"] != code:
             return None
         return VerificationCode(
             id=row["id"],
