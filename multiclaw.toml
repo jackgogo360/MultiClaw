@@ -3,23 +3,50 @@ name = "MultiClaw"
 version = "0.1.0"
 debug = true
 
+[deployment]
+profile = "standalone"
+
 [database]
-path = "data/multiclaw.db"
+driver = "sqlite"
+url = "sqlite+aiosqlite:///data/multiclaw.db"
+migration_mode = "validate"
+sqlite_busy_timeout_ms = 5000
+
+[workspace]
+root = "data/workspaces"
+
+[runtime]
+max_resident_tenants = 32
+idle_ttl_seconds = 900
+max_concurrent_runs_per_tenant = 2
+
+[workflow]
+heartbeat_ms = 5000
+lease_ttl_ms = 20000
+max_checkpoint_payload_bytes = 262144
+
+[secrets]
+allow_platform_fallback = false
+# Set MULTICLAW_SECRETS_KEYRING_B64 in the environment when needed.
+keyring_file = ""
+
+[deletion]
+retention_days = 7
 
 [llm]
 default_provider = "deepseek"
 default_model = "deepseek-v4-pro"
 
 [llm.providers.openai]
-api_key = "sk-your-key-here"
+api_key = ""
 base_url = "https://api.openai.com/v1"
 
 [llm.providers.anthropic]
-api_key = "sk-ant-your-key-here"
+api_key = ""
 base_url = "https://api.anthropic.com"
 
 [llm.providers.deepseek]
-api_key = "sk-f774c9e2f8d84e60b77e1f5dad0e54f2"
+api_key = ""
 base_url = "https://api.deepseek.com/v1"
 
 [llm.capability_tags]
@@ -48,18 +75,20 @@ max_tool_rounds = 10
 [auth]
 # jwt_secret is auto-generated and persisted in DB — leave empty
 jwt_secret = ""
+# Set MULTICLAW_AUTH_JWT_SIGNING_KEY in the environment when needed.
+jwt_signing_key_file = ""
 
 [email]
 provider = "resend"
 
 [brevo]
-api_key = "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"
+api_key = ""
 sender_email = "felixgogo360@gmail.com"
 sender_name = "MultiClaw"
 mock = true
 
 [resend]
-api_key = "re_8fKwesNy_NksESPrbQm5whhUvFQs7cjq2"
+api_key = ""
 sender_email = "multi-claw@mail.bigrouter.cc"
 sender_name = "MultiClaw"
 mock = false

@@ -3,8 +3,35 @@ name = "MultiClaw"
 version = "0.1.0"
 debug = false
 
+[deployment]
+profile = "standalone"
+
 [database]
-path = "data/multiclaw.db"
+driver = "sqlite"
+url = "sqlite+aiosqlite:///data/multiclaw.db"
+migration_mode = "validate"
+sqlite_busy_timeout_ms = 5000
+
+[workspace]
+root = "data/workspaces"
+
+[runtime]
+max_resident_tenants = 32
+idle_ttl_seconds = 900
+max_concurrent_runs_per_tenant = 2
+
+[workflow]
+heartbeat_ms = 5000
+lease_ttl_ms = 20000
+max_checkpoint_payload_bytes = 262144
+
+[secrets]
+allow_platform_fallback = false
+# Set MULTICLAW_SECRETS_KEYRING_B64 in the environment when needed.
+keyring_file = ""
+
+[deletion]
+retention_days = 7
 
 [llm]
 default_provider = "openai"
@@ -37,3 +64,21 @@ backend_probe_on_startup = true
 unsafe_fallback_requires_debug = true
 write_protected_workspace_paths = [".git"]
 read_hidden_workspace_paths = [".env", ".env.*"]
+
+[auth]
+# jwt_secret is auto-generated and persisted in DB — leave empty
+jwt_secret = ""
+# Set MULTICLAW_AUTH_JWT_SIGNING_KEY in the environment when needed.
+jwt_signing_key_file = ""
+
+[brevo]
+api_key = ""
+sender_email = ""
+sender_name = "MultiClaw"
+mock = false
+
+[resend]
+api_key = ""
+sender_email = ""
+sender_name = "MultiClaw"
+mock = false

@@ -8,8 +8,11 @@ version = "0.1.0"
 description = "MultiClaw Agent Runtime"
 requires-python = ">=3.12"
 dependencies = [
+    "aiomysql>=0.2,<1",
     "aiosqlite>=0.20",
+    "alembic>=1.13,<2",
     "anyio>=4.0.0",
+    "cryptography>=43,<47",
     "ddgs>=9.14.4",
     "html2text>=2025.4.15",
     "httpx>=0.27",
@@ -17,9 +20,13 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "PyJWT>=2.9",
+    "sqlalchemy>=2.0,<3",
     "trafilatura>=2.0.0",
     "websockets>=12.0",
 ]
+
+[project.scripts]
+multiclaw = "multiclaw.cli:main"
 
 [dependency-groups]
 dev = [
