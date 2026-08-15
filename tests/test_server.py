@@ -2035,3 +2035,61 @@ async def test_chat_runtime_signal_resets_after_client_disconnect(migrated_datab
     runtime = holder["runtime"]
     assert runtime.active_executing_run_count == 0
     assert runtime.active_run_count == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_runtime_signal_resets_when_client_closes_after_first_chunk(
+    migrated_database,
+    monkeypatch,
+):
+    import multiclaw.server as server
+    from multiclaw.storage.uow import TenantUnitOfWork
+
+    holder: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context):
+        del user_input, context
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "first-chunk-close@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            holder["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request(
+            {
+                "type": "http",
+                "app": server.app,
+                "method": "POST",
+                "path": "/api/chat",
+                "headers": [],
+            }
+        )
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await server.chat(
+                server.ChatRequest(message="hello"),
+                request,
+                context,
+                uow,
+            )
+            runtime = holder["runtime"]
+            assert runtime.active_executing_run_count == 1
+            assert runtime.active_run_count == 1
+            await anext(response.body_iterator)
+            await response.body_iterator.aclose()
+
+    runtime = holder["runtime"]
+    assert runtime.active_executing_run_count == 0
+    assert runtime.active_run_count == 0
