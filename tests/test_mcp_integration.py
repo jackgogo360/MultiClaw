@@ -409,3 +409,13 @@ def test_manager_without_sandbox_context_fails_closed_for_local_transports(
     assert connected == ["remote"]
     assert "sandbox controller context" in (states["local-stdio"].error or "")
     assert "sandbox controller context" in (states["local-inproc"].error or "")
+
+
+def test_manager_stop_is_idempotent_after_start() -> None:
+    manager = MCPClientManager()
+
+    manager.start()
+    manager.stop()
+    manager.stop()
+
+    assert manager._started is False

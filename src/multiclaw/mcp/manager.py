@@ -80,6 +80,10 @@ class MCPClientManager:
         if self._thread:
             self._thread.join(timeout=5.0)
         self._started = False
+        self._states.clear()
+        self._breakers.clear()
+        self._loop = None
+        self._thread = None
         logger.info("MCP event loop stopped")
 
     def connect_servers(self, configs: dict[str, ServerConfig]) -> dict[str, ServerState]:

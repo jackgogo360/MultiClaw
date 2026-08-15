@@ -33,6 +33,10 @@ class ToolRegistry:
         with self._lock:
             return [self._tools[name] for name in sorted(self._tools)]
 
+    def clear(self) -> None:
+        with self._lock:
+            self._tools.clear()
+
     def to_openai_schemas(self) -> list[dict]:
         schemas: list[dict] = []
         for builder in self.list_all():
