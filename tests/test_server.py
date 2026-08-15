@@ -548,6 +548,66 @@ def test_register_mcp_tools_installs_refresh_callback_before_connect(monkeypatch
     ]
 
 
+def test_register_mcp_tools_passes_workspace_root_to_tool_filter_loader(monkeypatch, tmp_path):
+    from multiclaw.mcp.types import ServerState, ServerStatus
+    from multiclaw.server import _register_mcp_tools
+    from multiclaw.tools.registry import ToolRegistry
+
+    captured: dict[str, object] = {}
+
+    class FakeManager:
+        def set_tools_changed_callback(self, callback) -> None:
+            captured["callback"] = callback
+
+        def connect_servers(self, configs):
+            captured["configs"] = configs
+            return {
+                "demo": ServerState(
+                    name="demo",
+                    config=object(),
+                    status=ServerStatus.CONNECTED,
+                    tools=[],
+                )
+            }
+
+        def get_server_states(self):
+            return {
+                "demo": ServerState(
+                    name="demo",
+                    config=object(),
+                    status=ServerStatus.CONNECTED,
+                    tools=[],
+                )
+            }
+
+    monkeypatch.setattr(
+        "multiclaw.server.load_mcp_config",
+        lambda path=None: {"demo": StdioServerConfig(command="echo")},
+    )
+
+    def fake_load_mcp_tools_config(path=None, *, search_parents=True, workspace_root=None):
+        captured["path"] = path
+        captured["search_parents"] = search_parents
+        captured["workspace_root"] = workspace_root
+        return {}
+
+    monkeypatch.setattr("multiclaw.server.load_mcp_tools_config", fake_load_mcp_tools_config)
+
+    workspace_root = tmp_path / "."
+    _register_mcp_tools(
+        registry=ToolRegistry(),
+        mcp_manager=FakeManager(),
+        config_path=None,
+        sandbox_controller=ReadyRecordingSandboxController(workspace_root=tmp_path),
+        workspace_root=workspace_root.resolve(),
+        mcp_profile_name="mcp_stdio_local",
+    )
+
+    assert captured["path"] is None
+    assert captured["search_parents"] is True
+    assert captured["workspace_root"] == workspace_root.resolve()
+
+
 def test_register_mcp_tools_skips_unready_stdio_but_keeps_remote(
     tmp_path,
     monkeypatch,
