@@ -114,8 +114,10 @@ class _FakeEngine:
 class _FakeDialect:
     def __init__(self, tx: _FakeTransaction) -> None:
         self._tx = tx
+        self.begin_write_calls = 0
 
     async def begin_write(self, _connection: _FakeConnection) -> _FakeTransaction:
+        self.begin_write_calls += 1
         return self._tx
 
     def db_now_ms(self) -> int:
@@ -341,6 +343,23 @@ async def test_auth_uow_exposes_only_unauthenticated_repositories(migrated_sqlit
 
         for forbidden in ("sessions", "memory", "secrets", "runs", "workflow", "workspaces"):
             assert not hasattr(uow, forbidden)
+
+
+@pytest.mark.asyncio
+async def test_auth_uow_read_only_skips_begin_write_and_closes_connection() -> None:
+    tx = _FakeTransaction()
+    conn = _FakeConnection()
+    database = _FakeDatabase(conn, tx)
+
+    async with AuthUnitOfWork(database, read_only=True) as uow:  # type: ignore[arg-type]
+        assert uow.conn is conn
+        assert database.dialect.begin_write_calls == 0
+        assert uow.users.connection is conn
+        assert uow.verification_codes.connection is conn
+
+    assert conn.close_calls == 1
+    assert tx.commit_calls == 0
+    assert tx.rollback_calls == 0
 
 
 @pytest.mark.asyncio

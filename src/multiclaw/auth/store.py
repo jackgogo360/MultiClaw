@@ -1,3 +1,4 @@
+import hashlib
 import random
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,7 @@ class AuthStore:
         self._database_path = database_path
         self._db: aiosqlite.Connection | None = None
         self.jwt_secret: str = ""
+        self._verification_codes_layout: str = "legacy"
 
     async def initialize(self) -> None:
         Path(self._database_path).parent.mkdir(parents=True, exist_ok=True)
@@ -75,6 +77,7 @@ class AuthStore:
             )
 
         await self._migrate_sessions()
+        await self._detect_verification_code_layout()
         await self._db.commit()
 
     async def _migrate_sessions(self) -> None:
@@ -92,6 +95,12 @@ class AuthStore:
                 "ALTER TABLE chat_sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"
             )
 
+    async def _detect_verification_code_layout(self) -> None:
+        assert self._db is not None
+        cursor = await self._db.execute("PRAGMA table_info(verification_codes)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        self._verification_codes_layout = "frozen" if "code_digest" in columns else "legacy"
+
     @staticmethod
     def build_code(email: str, code: str | None = None) -> VerificationCode:
         code_str = code or f"{random.randint(0, 999999):06d}"
@@ -105,54 +114,116 @@ class AuthStore:
 
     async def save_code(self, vc: VerificationCode) -> None:
         db = await self._ensure_db()
-        await db.execute(
-            """
-            INSERT INTO verification_codes (id, email, code, expires_at, used, created_at)
-            VALUES (?, ?, ?, ?, 0, ?)
-            """,
-            (vc.id, vc.email, vc.code, vc.expires_at.isoformat(), vc.created_at.isoformat()),
-        )
+        if self._verification_codes_layout == "frozen":
+            await db.execute(
+                """
+                INSERT INTO verification_codes (
+                    id, email, code_digest, purpose, expires_at, used_at, created_at
+                )
+                VALUES (?, ?, ?, 'login', ?, NULL, ?)
+                """,
+                (
+                    vc.id,
+                    vc.email,
+                    _code_digest(vc.code),
+                    _to_epoch_ms(vc.expires_at),
+                    _to_epoch_ms(vc.created_at),
+                ),
+            )
+        else:
+            await db.execute(
+                """
+                INSERT INTO verification_codes (id, email, code, expires_at, used, created_at)
+                VALUES (?, ?, ?, ?, 0, ?)
+                """,
+                (vc.id, vc.email, vc.code, vc.expires_at.isoformat(), vc.created_at.isoformat()),
+            )
         await db.commit()
 
     async def count_recent_sends(self, email: str) -> int:
         db = await self._ensure_db()
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM verification_codes WHERE email = ? AND created_at > ?",
-            (email, cutoff.isoformat()),
-        )
+        if self._verification_codes_layout == "frozen":
+            cursor = await db.execute(
+                """
+                SELECT COUNT(*)
+                FROM verification_codes
+                WHERE email = ? AND purpose = 'login' AND created_at > ?
+                """,
+                (email, _to_epoch_ms(cutoff)),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM verification_codes WHERE email = ? AND created_at > ?",
+                (email, cutoff.isoformat()),
+            )
         row = await cursor.fetchone()
         return row[0] if row else 0
 
-    async def find_latest_unused_code(self, email: str) -> VerificationCode | None:
+    async def find_latest_unused_code(self, email: str, code: str) -> VerificationCode | None:
         db = await self._ensure_db()
-        cursor = await db.execute(
-            """
-            SELECT * FROM verification_codes
-            WHERE email = ? AND used = 0 AND expires_at > ?
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            (email, datetime.now(timezone.utc).isoformat()),
-        )
+        if self._verification_codes_layout == "frozen":
+            cursor = await db.execute(
+                """
+                SELECT * FROM verification_codes
+                WHERE email = ?
+                  AND purpose = 'login'
+                  AND code_digest = ?
+                  AND used_at IS NULL
+                  AND expires_at > ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (email, _code_digest(code), _to_epoch_ms(datetime.now(timezone.utc))),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT * FROM verification_codes
+                WHERE email = ? AND used = 0 AND expires_at > ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (email, datetime.now(timezone.utc).isoformat()),
+            )
         row = await cursor.fetchone()
         if row is None:
+            return None
+        if self._verification_codes_layout != "frozen" and row["code"] != code:
             return None
         return VerificationCode(
             id=row["id"],
             email=row["email"],
-            code=row["code"],
-            expires_at=row["expires_at"],
-            used=bool(row["used"]),
-            created_at=row["created_at"],
+            code=code,
+            expires_at=(
+                _from_epoch_ms(row["expires_at"])
+                if self._verification_codes_layout == "frozen"
+                else row["expires_at"]
+            ),
+            used=(
+                row["used_at"] is not None
+                if self._verification_codes_layout == "frozen"
+                else bool(row["used"])
+            ),
+            created_at=(
+                _from_epoch_ms(row["created_at"])
+                if self._verification_codes_layout == "frozen"
+                else row["created_at"]
+            ),
         )
 
     async def mark_code_used(self, code_id: str) -> None:
         db = await self._ensure_db()
-        await db.execute(
-            "UPDATE verification_codes SET used = 1 WHERE id = ?",
-            (code_id,),
-        )
+        if self._verification_codes_layout == "frozen":
+            await db.execute(
+                "UPDATE verification_codes SET used_at = ? WHERE id = ?",
+                (_to_epoch_ms(datetime.now(timezone.utc)), code_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE verification_codes SET used = 1 WHERE id = ?",
+                (code_id,),
+            )
         await db.commit()
 
     async def get_or_create_user(self, email: str) -> User:
@@ -183,3 +254,15 @@ class AuthStore:
             await self.initialize()
         assert self._db is not None
         return self._db
+
+
+def _code_digest(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _to_epoch_ms(value: datetime) -> int:
+    return int(value.timestamp() * 1000)
+
+
+def _from_epoch_ms(value: int | str) -> datetime:
+    return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
