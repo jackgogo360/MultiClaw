@@ -128,12 +128,15 @@ from multiclaw.auth.store import AuthStore
 from multiclaw.auth.middleware import AuthMiddleware
 from multiclaw.auth.router import router as auth_router
 from multiclaw.api.chat import (
+    build_workflow_coordinator,
     encode_run_metadata,
     encode_scoped_event,
     encode_session_metadata,
+    iterate_message_stream,
 )
 from multiclaw.api.dependencies import current_user, tenant_context, tenant_uow
 from multiclaw.stream import DataStreamEncoder
+from multiclaw.workflow.models import RunStatus, TenantRunQuotaError
 
 
 # ---------------------------------------------------------------------------
@@ -794,9 +797,25 @@ async def chat(
     run_id = str(uuid4())
     run_context = context.for_run(session.id, run_id)
     runtime = await request.app.state.runtime_pool.acquire(run_context)
+    workflow = build_workflow_coordinator(
+        request.app.state.database,
+        request.app.state.settings,
+        connection=uow.conn,
+    )
+    workflow_lease = None
+    try:
+        workflow_lease = await workflow.start_run(run_context, runtime.runtime_instance_id)
+        await uow.commit()
+    except TenantRunQuotaError as error:
+        raise HTTPException(status_code=429, detail=str(error)) from error
     try:
         run_lease = runtime.begin_run()
     except RuntimeError as error:
+        if workflow_lease is not None:
+            await build_workflow_coordinator(
+                request.app.state.database,
+                request.app.state.settings,
+            ).finish_run(workflow_lease, RunStatus.CANCELLED)
         if str(error) == "runtime is unavailable":
             raise RuntimeUnavailableError(
                 request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
@@ -812,6 +831,18 @@ async def chat(
         pending_tool_results = 0
         subscription = None
         stream_task: asyncio.Task | None = None
+        current_workflow_lease = workflow_lease
+        terminal_persisted = False
+
+        async def persist_terminal(status: RunStatus) -> None:
+            nonlocal current_workflow_lease, terminal_persisted
+            if current_workflow_lease is None or terminal_persisted:
+                return
+            current_workflow_lease = await build_workflow_coordinator(
+                request.app.state.database,
+                request.app.state.settings,
+            ).finish_run(current_workflow_lease, status)
+            terminal_persisted = True
 
         def close_text_part() -> list[str]:
             nonlocal text_part_id
@@ -899,9 +930,11 @@ async def chat(
 
             async def run_stream():
                 try:
-                    async for item in runtime.agent.handle_message_stream(
+                    async for item in iterate_message_stream(
+                        runtime.agent.handle_message_stream,
                         message,
                         context=run_context,
+                        run_lease=current_workflow_lease,
                     ):
                         await token_queue.put(item)
                 except Exception as exc:
@@ -931,6 +964,7 @@ async def chat(
                         yield enc.text_delta(text_part_id, item["content"])
                     elif item["type"] == "done":
                         logger.info("stream done, tokens=%d, content_len=%d", token_count, len(item.get("content", "")))
+                        await persist_terminal(RunStatus.COMPLETED)
                         for chunk in drain_event_queue():
                             yield chunk
                         for chunk in close_open_parts():
@@ -941,6 +975,7 @@ async def chat(
                         return
                     elif item["type"] == "error":
                         logger.error("stream error: %s", item["content"])
+                        await persist_terminal(RunStatus.FAILED_TERMINAL)
                         for chunk in drain_event_queue():
                             yield chunk
                         for chunk in close_open_parts():
@@ -997,6 +1032,7 @@ async def chat(
                     exc = stream_task.exception()
                     if exc:
                         logger.exception("stream task crashed")
+                        await persist_terminal(RunStatus.FAILED_TERMINAL)
                         for chunk in drain_event_queue():
                             yield chunk
                         for chunk in close_open_parts():
@@ -1021,6 +1057,11 @@ async def chat(
                 await asyncio.gather(stream_task, return_exceptions=True)
             if subscription is not None:
                 subscription.close()
+            if not terminal_persisted and current_workflow_lease is not None:
+                try:
+                    await persist_terminal(RunStatus.CANCELLED)
+                except Exception:
+                    logger.exception("failed to persist terminal run status")
             run_lease.close()
             logger.info("SSE stream ended")
 
@@ -1031,6 +1072,14 @@ async def chat(
             headers={"X-Vercel-AI-Data-Stream": "v1"},
         )
     except BaseException:
+        if workflow_lease is not None:
+            try:
+                await build_workflow_coordinator(
+                    request.app.state.database,
+                    request.app.state.settings,
+                ).finish_run(workflow_lease, RunStatus.CANCELLED)
+            except Exception:
+                logger.exception("failed to cancel run after streaming setup error")
         run_lease.close()
         raise
 

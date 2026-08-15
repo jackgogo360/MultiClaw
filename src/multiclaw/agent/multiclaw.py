@@ -20,6 +20,7 @@ from multiclaw.planner import Planner
 from multiclaw.skills import SkillManager
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.tools import CoreToolScheduler, ToolRegistry
+from multiclaw.workflow.models import RunLease
 
 logger = logging.getLogger(__name__)
 DSML_TOOLCALL_PATTERN = re.compile(
@@ -422,7 +423,9 @@ class MultiClawAgent(ToolCallAgent):
         user_input: str,
         *,
         context: TenantContext,
+        run_lease: RunLease | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        del run_lease
         logger.info("handle_message_stream: %r", user_input[:80])
 
         if user_input.startswith("plan:"):

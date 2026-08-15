@@ -13,6 +13,7 @@ from sqlalchemy.engine import make_url
 from multiclaw.cli import alembic_config, check_revision_is_head
 from multiclaw.config.settings import DatabaseSettings
 from multiclaw.storage import Database
+from multiclaw.tenancy import TenantContext
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -379,5 +380,112 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
                         "payload_hash": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
                     },
                 )
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mysql_lock_run_blocks_with_for_update(isolated_mysql_database_url):
+    await asyncio.to_thread(command.upgrade, alembic_config(database_url=isolated_mysql_database_url), "head")
+
+    database = Database.create(DatabaseSettings(driver="mysql", url=isolated_mysql_database_url))
+    context = TenantContext(
+        tenant_id="00000000-0000-0000-0000-000000000001",
+        workspace_id="00000000-0000-0000-0000-000000000101",
+        session_id="00000000-0000-0000-0000-000000000201",
+        run_id="00000000-0000-0000-0000-000000000301",
+    )
+
+    try:
+        async with database.write_transaction() as conn:
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO users (
+                        id, email, auth_epoch, default_workspace_id, status,
+                        purge_after, created_at, updated_at, disabled_at, purge_requested_at
+                    ) VALUES (
+                        :tenant_id, :email, 0, NULL, 'active', NULL, 1, 1, NULL, NULL
+                    )
+                    """
+                ),
+                {"tenant_id": context.tenant_id, "email": "lease-lock@example.com"},
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO workspaces (id, tenant_id, slug, name, status, created_at, updated_at)
+                    VALUES (:workspace_id, :tenant_id, 'default', 'Default', 'active', 1, 1)
+                    """
+                ),
+                {"tenant_id": context.tenant_id, "workspace_id": context.workspace_id},
+            )
+            await conn.execute(
+                text(
+                    """
+                    UPDATE users
+                    SET default_workspace_id = :workspace_id
+                    WHERE id = :tenant_id
+                    """
+                ),
+                {"tenant_id": context.tenant_id, "workspace_id": context.workspace_id},
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO chat_sessions (
+                        id, tenant_id, workspace_id, title, status, created_at, updated_at, last_message_at, metadata_json
+                    ) VALUES (
+                        :session_id, :tenant_id, :workspace_id, 'Lease Lock', 'active', 1, 1, NULL, '{}'
+                    )
+                    """
+                ),
+                {
+                    "tenant_id": context.tenant_id,
+                    "workspace_id": context.workspace_id,
+                    "session_id": context.session_id,
+                },
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO agent_runs (
+                        run_id, tenant_id, workspace_id, session_id, run_status, runtime_instance_id,
+                        lease_owner, fencing_token, lease_expires_at, heartbeat_at, schema_version,
+                        version, created_at, updated_at, finished_at
+                    ) VALUES (
+                        :run_id, :tenant_id, :workspace_id, :session_id, 'running', 'runtime-1',
+                        'runtime-1', 1, 9999999999999, 1, 1, 1, 1, 1, NULL
+                    )
+                    """
+                ),
+                {
+                    "tenant_id": context.tenant_id,
+                    "workspace_id": context.workspace_id,
+                    "session_id": context.session_id,
+                    "run_id": context.run_id,
+                },
+            )
+
+        conn1 = await database.engine.connect()
+        tx1 = await database.dialect.begin_write(conn1)
+        conn2 = await database.engine.connect()
+        tx2 = await database.dialect.begin_write(conn2)
+        try:
+            await database.dialect.lock_run(conn1, context)
+
+            blocked = asyncio.create_task(database.dialect.lock_run(conn2, context))
+            await asyncio.sleep(0.2)
+            assert blocked.done() is False
+
+            await tx1.commit()
+            await asyncio.wait_for(blocked, timeout=3)
+        finally:
+            if tx1.is_active:
+                await tx1.rollback()
+            if tx2.is_active:
+                await tx2.rollback()
+            await conn1.close()
+            await conn2.close()
     finally:
         await database.dispose()
