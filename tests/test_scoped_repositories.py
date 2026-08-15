@@ -467,6 +467,70 @@ async def test_memory_duplicate_save_updates_same_scope_and_rejects_foreign_scop
 
 
 @pytest.mark.asyncio
+async def test_memory_duplicate_save_rejects_same_workspace_cross_session_collision(
+    scoped_database: Database,
+    scoped_contexts: dict[str, TenantContext],
+) -> None:
+    context = scoped_contexts["primary"]
+    entry_id = str(uuid4())
+
+    async with TenantUnitOfWork(scoped_database, context) as uow:
+        session_a = await uow.sessions.create("Alpha")
+        session_b = await uow.sessions.create("Beta")
+        repo_a = MemoryRepository(uow.conn, context.for_session(session_a.id), scoped_database.dialect)
+        repo_b = MemoryRepository(uow.conn, context.for_session(session_b.id), scoped_database.dialect)
+
+        original = await repo_a.save(
+            MemoryEntry(id=entry_id, content="session a value", type="note", session_id=session_a.id)
+        )
+
+        with pytest.raises(IntegrityError):
+            await repo_b.save(
+                MemoryEntry(id=entry_id, content="session b overwrite", type="note", session_id=session_b.id)
+            )
+
+        preserved = await repo_a.query("session", top_k=5)
+        session_b_visible = await repo_b.query("session", top_k=5)
+        still_usable = await repo_a.save(
+            MemoryEntry(id=entry_id, content="session a updated", type="note", session_id=session_a.id)
+        )
+
+    assert original.content == "session a value"
+    assert [entry.content for entry in preserved] == ["session a value"]
+    assert session_b_visible == []
+    assert still_usable.content == "session a updated"
+
+
+@pytest.mark.asyncio
+async def test_memory_duplicate_save_rejects_longterm_and_session_bound_id_collisions(
+    scoped_database: Database,
+    scoped_contexts: dict[str, TenantContext],
+) -> None:
+    context = scoped_contexts["primary"]
+    entry_id = str(uuid4())
+
+    async with TenantUnitOfWork(scoped_database, context) as uow:
+        session = await uow.sessions.create("Alpha")
+        repo = MemoryRepository(uow.conn, context.for_session(session.id), scoped_database.dialect)
+
+        longterm = await uow.memory.save(
+            MemoryEntry(id=entry_id, content="workspace value", type="note")
+        )
+
+        with pytest.raises(IntegrityError):
+            await repo.save(
+                MemoryEntry(id=entry_id, content="session overwrite", type="note", session_id=session.id)
+            )
+
+        root_matches = await uow.memory.query("workspace", top_k=5)
+        session_matches = await repo.query("workspace", top_k=5)
+
+    assert longterm.content == "workspace value"
+    assert [entry.content for entry in root_matches] == ["workspace value"]
+    assert [entry.content for entry in session_matches] == ["workspace value"]
+
+
+@pytest.mark.asyncio
 async def test_memory_duplicate_save_latest_value_wins_across_uow_retries(
     scoped_database: Database,
     scoped_contexts: dict[str, TenantContext],
