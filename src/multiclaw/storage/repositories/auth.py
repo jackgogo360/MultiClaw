@@ -177,4 +177,3 @@ class WorkspaceRepository(_ConnectionBoundRepository):
         )
         row = result.mappings().one()
         return WorkspaceRecord.from_row(row)
-
