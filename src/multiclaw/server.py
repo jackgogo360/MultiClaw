@@ -88,6 +88,10 @@ def _note_startup_cleanup_error(primary: BaseException, phase: str, error: BaseE
     primary.add_note(f"{phase} cleanup failed: {type(error).__name__}: {error}")
 
 
+def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException) -> None:
+    primary.add_note(f"{phase} failed: {type(error).__name__}: {error}")
+
+
 from multiclaw.config import Settings
 from multiclaw.events import Event, EventBus
 from multiclaw.governance import (
@@ -96,6 +100,7 @@ from multiclaw.governance import (
 )
 from multiclaw.session import SessionStatus
 from multiclaw.runtime import RuntimeFactory, RuntimePool
+from multiclaw.runtime.pool import RuntimeCapacityError, RuntimeUnavailableError
 from multiclaw.storage import Database
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
@@ -522,16 +527,34 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        try:
-            if auth_store is not None:
-                await auth_store.close()
-        finally:
+        primary: BaseException | None = None
+
+        if auth_store is not None:
             try:
-                if runtime_pool is not None:
-                    await runtime_pool.close()
-            finally:
-                if runtime_factory is not None:
-                    await runtime_factory.database.dispose()
+                await auth_store.close()
+            except BaseException as error:
+                primary = error
+
+        if runtime_pool is not None:
+            try:
+                await runtime_pool.close()
+            except BaseException as error:
+                if primary is None:
+                    primary = error
+                else:
+                    _note_cleanup_error(primary, "runtime_pool.close", error)
+
+        if runtime_factory is not None:
+            try:
+                await runtime_factory.database.dispose()
+            except BaseException as error:
+                if primary is None:
+                    primary = error
+                else:
+                    _note_cleanup_error(primary, "database.dispose", error)
+
+        if primary is not None:
+            raise primary
 
 
 app = FastAPI(title="MultiClaw", lifespan=lifespan)
@@ -540,6 +563,32 @@ app.include_router(auth_router)
 app.include_router(auth_router, prefix="/api")
 
 api = APIRouter(prefix="/api")
+
+
+def _runtime_error_response(retry_after_seconds: int) -> JSONResponse:
+    return JSONResponse(
+        {"detail": "runtime temporarily unavailable"},
+        status_code=503,
+        headers={"Retry-After": str(retry_after_seconds)},
+    )
+
+
+@app.exception_handler(RuntimeCapacityError)
+async def handle_runtime_capacity_error(
+    request: Request,
+    exc: RuntimeCapacityError,
+) -> JSONResponse:
+    del request
+    return _runtime_error_response(exc.retry_after_seconds)
+
+
+@app.exception_handler(RuntimeUnavailableError)
+async def handle_runtime_unavailable_error(
+    request: Request,
+    exc: RuntimeUnavailableError,
+) -> JSONResponse:
+    del request
+    return _runtime_error_response(exc.retry_after_seconds)
 
 
 @app.middleware("http")
