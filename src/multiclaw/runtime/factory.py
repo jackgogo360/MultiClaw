@@ -8,7 +8,7 @@ from typing import Any
 
 from multiclaw.agent import MultiClawAgent
 from multiclaw.config import Settings
-from multiclaw.events import EventBus
+from multiclaw.events import EventBus, EventRouter
 from multiclaw.governance import (
     ExecutionGuard,
     InMemoryAuditLogger,
@@ -21,7 +21,7 @@ from multiclaw.governance.sandbox.manager import SandboxManager
 from multiclaw.llm import ModelRouter
 from multiclaw.memory import MemoryEntry, MemoryProtocol
 from multiclaw.planner import Planner
-from multiclaw.runtime.models import EventRouter, RuntimeClock, TenantRuntime
+from multiclaw.runtime.models import RuntimeClock, TenantRuntime
 from multiclaw.skills import SkillManager
 from multiclaw.storage import Database
 from multiclaw.storage.uow import TenantUnitOfWork
@@ -149,7 +149,14 @@ class RuntimeFactory:
             )
             readiness = sandbox_controller.finalize_readiness()
             scheduler = self._build_scheduler(event_bus)
-            agent = self._build_agent(context, registry, scheduler, event_bus, skill_manager)
+            scheduler.event_router = event_router
+            agent = self._build_agent(
+                context,
+                registry,
+                scheduler,
+                event_bus,
+                skill_manager,
+            )
         except BaseException as primary:
             self._cleanup_create_failure(
                 primary,
@@ -162,6 +169,7 @@ class RuntimeFactory:
             raise
 
         agent.database = self.database
+        agent.event_router = event_router
         agent.mcp_manager = mcp_manager
         agent.sandbox_controller = sandbox_controller
         agent.sandbox_readiness = readiness

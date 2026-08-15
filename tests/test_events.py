@@ -1,7 +1,10 @@
 import asyncio
 import pytest
+from pydantic import ValidationError
+
 from multiclaw.events.types import Event, AgentStateEvent, AgentState
 from multiclaw.events.bus import EventBus
+from multiclaw.tenancy import TenantContext
 
 
 class TestEvent:
@@ -22,6 +25,18 @@ class TestEvent:
     def test_event_timestamp_is_utc(self):
         event = Event(type="test.event", data={})
         assert event.timestamp.tzinfo is not None
+
+    def test_event_scope_from_context_requires_session_and_run(self):
+        from multiclaw.events import EventScope
+
+        with pytest.raises(ValueError, match="event scope requires session and run"):
+            EventScope.from_context(TenantContext("tenant", "workspace"))
+
+    def test_scoped_event_rejects_wildcard_scope_values(self):
+        from multiclaw.events import EventScope
+
+        with pytest.raises(ValidationError):
+            EventScope(tenant_id="tenant", workspace_id="workspace", session_id="session", run_id="*")
 
 
 class TestEventBus:

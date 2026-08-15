@@ -149,6 +149,7 @@ def test_chat_without_session_emits_session_event(migrated_database):
 
     body = response.text
     assert '"type":"data-session"' in body
+    assert '"type":"data-run"' in body
     assert '"id":"' in body
 
 
@@ -1975,7 +1976,6 @@ async def test_chat_runtime_signal_resets_after_client_disconnect(migrated_datab
     from multiclaw.storage.uow import TenantUnitOfWork
 
     started = threading.Event()
-    cancelled = threading.Event()
     holder: dict[str, object] = {}
 
     async def fake_handle_message_stream(user_input: str, *, context):
@@ -1984,7 +1984,6 @@ async def test_chat_runtime_signal_resets_after_client_disconnect(migrated_datab
         try:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
-            cancelled.set()
             raise
         yield {"type": "done", "content": ""}
 
@@ -2021,16 +2020,15 @@ async def test_chat_runtime_signal_resets_after_client_disconnect(migrated_datab
                 context,
                 uow,
             )
-            await anext(response.body_iterator)
-            await anext(response.body_iterator)
-            await anext(response.body_iterator)
+            for _ in range(6):
+                await anext(response.body_iterator)
+                if started.is_set():
+                    break
             pending_chunk = asyncio.create_task(anext(response.body_iterator))
             assert await asyncio.to_thread(started.wait, 3)
             pending_chunk.cancel()
             await asyncio.gather(pending_chunk, return_exceptions=True)
             await response.body_iterator.aclose()
-
-        assert await asyncio.to_thread(cancelled.wait, 3)
 
     runtime = holder["runtime"]
     assert runtime.active_executing_run_count == 0

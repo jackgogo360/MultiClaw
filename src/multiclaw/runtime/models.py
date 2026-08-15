@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from multiclaw.events import EventBus
+from multiclaw.events import EventBus, EventRouter
 from multiclaw.governance import SandboxController, SandboxReadiness
 from multiclaw.mcp import MCPClientManager
 from multiclaw.skills import SkillManager
@@ -19,14 +19,6 @@ class RuntimeClock(Protocol):
 
 class SecretHandle(Protocol):
     def close(self) -> Any: ...
-
-
-class EventRouter:
-    def __init__(self) -> None:
-        self._routes: dict[str, list[str]] = {}
-
-    def clear(self) -> None:
-        self._routes.clear()
 
 
 class RuntimeExecutionLease:

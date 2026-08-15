@@ -10,6 +10,7 @@ from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.agent.tool_batch import ToolBatchExecutor
 from multiclaw.context import ContextBuildReport, ContextBuildResult
 from multiclaw.llm import LLMResponse
+from multiclaw.tenancy import TenantContext
 from multiclaw.tools import (
     ToolBuilder,
     ToolExecutionResult,
@@ -65,6 +66,10 @@ class _ReportOnlyContextBuilder:
 
 
 class _DummyMemory:
+    async def recent(self, _context, limit: int, entry_type: str | None = None):
+        del limit, entry_type
+        return []
+
     async def save(self, _entry):
         return None
 
@@ -173,10 +178,14 @@ class _BatchScheduler:
     async def can_run_concurrently(self, builder, raw_params: dict) -> bool:
         return builder.read_only
 
-    async def run(self, builder, raw_params: dict) -> ToolExecutionResult:
+    async def run(self, builder, raw_params: dict, **_kwargs) -> ToolExecutionResult:
         self.run_calls.append((builder.name, raw_params))
         params = builder.validate(raw_params)
         return await builder.build(params).execute()
+
+
+def _stream_context(session_id: str = "s1", run_id: str = "r1") -> TenantContext:
+    return TenantContext("tenant-a", "workspace-a").for_run(session_id, run_id)
 
 
 @pytest.mark.asyncio
@@ -193,7 +202,7 @@ async def test_handle_message_stream_preserves_tool_call_ids(monkeypatch):
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     tool_call = next(event for event in events if event["type"] == "tool_call")
@@ -227,14 +236,14 @@ async def test_handle_message_stream_uses_context_build_with_report_and_only_pro
 
     events = []
     with patch("multiclaw.agent.multiclaw.logger.info") as mock_info:
-        async for event in agent.handle_message_stream("hello", session_id="s1"):
+        async for event in agent.handle_message_stream("hello", context=_stream_context()):
             events.append(event)
 
     assert events[-1] == {"type": "done", "content": "streamed", "data": {}}
     agent.context_builder.build_with_report.assert_awaited_once()
     request = agent.context_builder.build_with_report.await_args.args[0]
     assert request.user_input == "hello"
-    assert request.session_id == "s1"
+    assert request.context.session_id == "s1"
     assert request.context_window_limit == 1000
     assert request.skill_prompts == []
     assert router.stream_calls[0]["messages"] == expected_messages
@@ -272,7 +281,7 @@ async def test_handle_message_stream_retries_when_final_summary_contains_dsml():
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     done = next(event for event in events if event["type"] == "done")
@@ -336,7 +345,7 @@ async def test_handle_message_stream_parallel_read_only_batch_overlaps_when_enab
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
         if event["type"] == "tool_call":
             timeline.append(f"ui_call:{event['call_id']}")
@@ -351,7 +360,7 @@ async def test_handle_message_stream_parallel_read_only_batch_overlaps_when_enab
         "call_1",
         "call_2",
     ]
-    assert [call.args[0] for call in agent.remember.await_args_list] == [
+    assert [call.args[1] for call in agent.remember.await_args_list] == [
         "done:first",
         "done:second",
     ]
@@ -406,7 +415,7 @@ async def test_handle_message_stream_read_write_read_batch_preserves_serial_barr
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     assert max_active == 1
@@ -476,7 +485,7 @@ async def test_handle_message_stream_preserves_original_tool_call_ids_and_result
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     followup_messages = router.stream_calls[1]["messages"]
@@ -551,7 +560,7 @@ async def test_handle_message_stream_parallel_flag_disabled_keeps_read_only_batc
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     assert max_active == 1
@@ -587,7 +596,7 @@ async def test_handle_message_stream_reflects_without_emitting_repeated_tool_ui_
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     tool_calls = [event for event in events if event["type"] == "tool_call"]
@@ -635,7 +644,7 @@ async def test_handle_message_stream_forces_summary_when_reflection_generation_f
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     tool_calls = [event for event in events if event["type"] == "tool_call"]

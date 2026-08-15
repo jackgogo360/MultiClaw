@@ -93,7 +93,7 @@ def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException
 
 
 from multiclaw.config import Settings
-from multiclaw.events import Event, EventBus
+from multiclaw.events import EventBus, EventScope, ScopedEvent
 from multiclaw.governance import (
     SandboxController,
     SandboxReadiness,
@@ -127,6 +127,11 @@ from uuid import uuid4
 from multiclaw.auth.store import AuthStore
 from multiclaw.auth.middleware import AuthMiddleware
 from multiclaw.auth.router import router as auth_router
+from multiclaw.api.chat import (
+    encode_run_metadata,
+    encode_scoped_event,
+    encode_session_metadata,
+)
 from multiclaw.api.dependencies import current_user, tenant_context, tenant_uow
 from multiclaw.stream import DataStreamEncoder
 
@@ -786,8 +791,9 @@ async def chat(
     # Update session activity (title from first message)
     session = await uow.sessions.touch_message(session.id, message)
     assert session is not None
-    session_context = context.for_session(session.id)
-    runtime = await request.app.state.runtime_pool.acquire(session_context)
+    run_id = str(uuid4())
+    run_context = context.for_run(session.id, run_id)
+    runtime = await request.app.state.runtime_pool.acquire(run_context)
     try:
         run_lease = runtime.begin_run()
     except RuntimeError as error:
@@ -804,7 +810,7 @@ async def chat(
         reasoning_part_id: str | None = None
         step_open = False
         pending_tool_results = 0
-        sub_id: str | None = None
+        subscription = None
         stream_task: asyncio.Task | None = None
 
         def close_text_part() -> list[str]:
@@ -840,27 +846,63 @@ async def chat(
             step_open = False
             return [enc.finish_step()]
 
+        def drain_event_queue() -> list[str]:
+            chunks: list[str] = []
+            while not event_queue.empty():
+                evt = event_queue.get_nowait()
+                chunks.append(encode_scoped_event(evt))
+                if evt.event_type == "tool.awaiting_approval":
+                    logger.info(
+                        "yield approval_required: request_id=%s tool=%s",
+                        evt.data.get("request_id"),
+                        evt.data.get("tool"),
+                    )
+                    chunks.extend(open_step())
+                    chunks.extend(close_open_parts())
+                    tool_call_id = (
+                        evt.data.get("call_id")
+                        or evt.data.get("request_id")
+                        or ""
+                    )
+                    chunks.append(
+                        enc.tool_input_available(
+                            tool_call_id,
+                            evt.data.get("tool", ""),
+                            evt.data.get("params", {}),
+                        )
+                    )
+                    chunks.append(
+                        enc.tool_approval_request(
+                            evt.data.get("request_id", ""),
+                            tool_call_id,
+                        )
+                    )
+            return chunks
+
         try:
             yield enc.start()
-            yield enc.data_part(
-                "data-session",
-                session.model_dump(mode="json"),
-                transient=True,
-            )
+            yield encode_session_metadata(session.model_dump(mode="json"))
+            yield encode_run_metadata(session.id, run_id)
             for chunk in open_step():
                 yield chunk
 
             token_queue: asyncio.Queue[dict] = asyncio.Queue()
-            event_queue: asyncio.Queue[Event] = asyncio.Queue()
+            event_queue: asyncio.Queue[ScopedEvent] = asyncio.Queue()
 
-            async def collector(event: Event):
+            async def collector(event: ScopedEvent):
                 await event_queue.put(event)
 
-            sub_id = runtime.event_bus.subscribe("*", collector)
+            subscription = runtime.event_router.subscribe(
+                EventScope.from_context(run_context),
+                collector,
+            )
 
             async def run_stream():
                 try:
-                    async for item in runtime.agent.handle_message_stream(message, context=session_context):
+                    async for item in runtime.agent.handle_message_stream(
+                        message,
+                        context=run_context,
+                    ):
                         await token_queue.put(item)
                 except Exception as exc:
                     logger.exception("stream error")
@@ -889,6 +931,8 @@ async def chat(
                         yield enc.text_delta(text_part_id, item["content"])
                     elif item["type"] == "done":
                         logger.info("stream done, tokens=%d, content_len=%d", token_count, len(item.get("content", "")))
+                        for chunk in drain_event_queue():
+                            yield chunk
                         for chunk in close_open_parts():
                             yield chunk
                         for chunk in close_step():
@@ -897,6 +941,8 @@ async def chat(
                         return
                     elif item["type"] == "error":
                         logger.error("stream error: %s", item["content"])
+                        for chunk in drain_event_queue():
+                            yield chunk
                         for chunk in close_open_parts():
                             yield chunk
                         for chunk in close_step():
@@ -945,40 +991,22 @@ async def chat(
                     else:
                         yield enc.data_part("data-state", {"item": item}, transient=True)
 
-                while not event_queue.empty():
-                    evt = event_queue.get_nowait()
-                    if evt.type == "tool.awaiting_approval":
-                        logger.info(
-                            "yield approval_required: request_id=%s tool=%s",
-                            evt.data.get("request_id"), evt.data.get("tool"),
-                        )
-                        for chunk in open_step():
-                            yield chunk
-                        for chunk in close_open_parts():
-                            yield chunk
-                        tool_call_id = evt.data.get("call_id") or uuid4().hex
-                        yield enc.tool_input_available(
-                            tool_call_id,
-                            evt.data.get("tool", ""),
-                            evt.data.get("params", {}),
-                        )
-                        yield enc.tool_approval_request(
-                            evt.data.get("request_id", ""),
-                            tool_call_id,
-                        )
-                    else:
-                        yield enc.data_part("data-state", {"state": evt.type}, transient=True)
-
+                for chunk in drain_event_queue():
+                    yield chunk
                 if stream_task.done():
                     exc = stream_task.exception()
                     if exc:
                         logger.exception("stream task crashed")
+                        for chunk in drain_event_queue():
+                            yield chunk
                         for chunk in close_open_parts():
                             yield chunk
                         for chunk in close_step():
                             yield chunk
                         yield enc.error(str(exc))
                     else:
+                        for chunk in drain_event_queue():
+                            yield chunk
                         for chunk in close_open_parts():
                             yield chunk
                         for chunk in close_step():
@@ -991,8 +1019,8 @@ async def chat(
             if stream_task is not None:
                 stream_task.cancel()
                 await asyncio.gather(stream_task, return_exceptions=True)
-            if sub_id is not None:
-                runtime.event_bus.unsubscribe(sub_id)
+            if subscription is not None:
+                subscription.close()
             run_lease.close()
             logger.info("SSE stream ended")
 

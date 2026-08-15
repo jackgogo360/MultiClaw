@@ -4,8 +4,9 @@ import re
 import uuid
 from typing import Any
 
-from multiclaw.events import Event, EventBus
+from multiclaw.events import Event, EventBus, EventRouter, ScopedEvent
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
+from multiclaw.tenancy import TenantContext
 from multiclaw.tools.base import ToolBuilder, ToolExecutionResult, ToolStatus
 
 logger = logging.getLogger(__name__)
@@ -24,11 +25,13 @@ class CoreToolScheduler:
         execution_guard: ExecutionGuard,
         audit_logger: InMemoryAuditLogger,
         event_bus: EventBus,
+        event_router: EventRouter | None = None,
     ) -> None:
         self.permission_checker = permission_checker
         self.execution_guard = execution_guard
         self.audit_logger = audit_logger
         self.event_bus = event_bus
+        self.event_router = event_router
         self._pending: dict[str, asyncio.Event] = {}
         self._pending_results: dict[str, bool] = {}
 
@@ -58,13 +61,20 @@ class CoreToolScheduler:
         self,
         builder: ToolBuilder,
         raw_params: dict[str, Any],
+        *,
+        context: TenantContext | None = None,
+        call_id: str | None = None,
     ) -> ToolExecutionResult:
         try:
-            await self.event_bus.publish(
-                Event(type="tool.scheduled", data={"tool": builder.name})
+            await self._publish_event(
+                "tool.scheduled",
+                self._event_data(builder.name, call_id),
+                context=context,
             )
-            await self.event_bus.publish(
-                Event(type="tool.validating", data={"tool": builder.name})
+            await self._publish_event(
+                "tool.validating",
+                self._event_data(builder.name, call_id),
+                context=context,
             )
             params = builder.validate(raw_params)
 
@@ -83,11 +93,18 @@ class CoreToolScheduler:
                     await self._finalize_terminal_result(
                         builder.name,
                         result,
+                        context=context,
+                        call_id=call_id,
                         audit_detail="tool execution failed",
                         error_label="tool execution failed",
                     )
                     return result
-                await self._finalize_terminal_result(builder.name, result)
+                await self._finalize_terminal_result(
+                    builder.name,
+                    result,
+                    context=context,
+                    call_id=call_id,
+                )
                 return result
 
             decision = await self.permission_checker.check(
@@ -104,16 +121,16 @@ class CoreToolScheduler:
                 event = asyncio.Event()
                 self._pending[request_id] = event
 
-                await self.event_bus.publish(
-                    Event(
-                        type="tool.awaiting_approval",
-                        data={
-                            "request_id": request_id,
-                            "tool": builder.name,
-                            "params": raw_params,
-                            "description": builder.approval_description(raw_params),
-                        },
-                    )
+                await self._publish_event(
+                    "tool.awaiting_approval",
+                    {
+                        "request_id": request_id,
+                        "tool": builder.name,
+                        "params": raw_params,
+                        "description": builder.approval_description(raw_params),
+                        **({"call_id": call_id} if call_id else {}),
+                    },
+                    context=context,
                 )
                 await self.audit_logger.record(
                     tool_name=builder.name,
@@ -137,6 +154,8 @@ class CoreToolScheduler:
                     await self._finalize_terminal_result(
                         builder.name,
                         result,
+                        context=context,
+                        call_id=call_id,
                         audit_detail=result.content,
                     )
                     return result
@@ -151,16 +170,21 @@ class CoreToolScheduler:
                     await self._finalize_terminal_result(
                         builder.name,
                         result,
+                        context=context,
+                        call_id=call_id,
                         audit_detail=result.content,
                     )
                     return result
 
             if not decision.allow:
-                await self.event_bus.publish(
-                    Event(
-                        type="tool.error",
-                        data={"tool": builder.name, "error": decision.reason},
-                    )
+                await self._publish_event(
+                    "tool.error",
+                    {
+                        "tool": builder.name,
+                        "error": decision.reason,
+                        **({"call_id": call_id} if call_id else {}),
+                    },
+                    context=context,
                 )
                 await self.audit_logger.record(
                     tool_name=builder.name,
@@ -174,8 +198,10 @@ class CoreToolScheduler:
 
             invocation = builder.build(params)
             invocation.configure_permission(decision.approved_roots)
-            await self.event_bus.publish(
-                Event(type="tool.executing", data={"tool": builder.name})
+            await self._publish_event(
+                "tool.executing",
+                self._event_data(builder.name, call_id),
+                context=context,
             )
             result = await self.execution_guard.run(invocation.execute)
         except Exception as exc:
@@ -187,12 +213,19 @@ class CoreToolScheduler:
             await self._finalize_terminal_result(
                 builder.name,
                 result,
+                context=context,
+                call_id=call_id,
                 audit_detail="tool execution failed",
                 error_label="tool execution failed",
             )
             return result
 
-        await self._finalize_terminal_result(builder.name, result)
+        await self._finalize_terminal_result(
+            builder.name,
+            result,
+            context=context,
+            call_id=call_id,
+        )
         return result
 
     def _audit_detail(self, result: ToolExecutionResult) -> str:
@@ -210,6 +243,8 @@ class CoreToolScheduler:
         tool_name: str,
         result: ToolExecutionResult,
         *,
+        context: TenantContext | None = None,
+        call_id: str | None = None,
         audit_detail: str | None = None,
         error_label: str | None = None,
     ) -> None:
@@ -221,6 +256,8 @@ class CoreToolScheduler:
         await self._publish_result_event(
             tool_name,
             result,
+            context=context,
+            call_id=call_id,
             error_label=error_label,
         )
 
@@ -229,11 +266,15 @@ class CoreToolScheduler:
         tool_name: str,
         result: ToolExecutionResult,
         *,
+        context: TenantContext | None = None,
+        call_id: str | None = None,
         error_label: str | None = None,
     ) -> None:
         if result.status == ToolStatus.SUCCESS:
-            await self.event_bus.publish(
-                Event(type="tool.completed", data={"tool": tool_name})
+            await self._publish_event(
+                "tool.completed",
+                self._event_data(tool_name, call_id),
+                context=context,
             )
             return
 
@@ -242,9 +283,33 @@ class CoreToolScheduler:
             if result.status == ToolStatus.ERROR
             else f"tool returned {result.status.value}"
         )
-        await self.event_bus.publish(
-            Event(type="tool.error", data={"tool": tool_name, "error": resolved_error_label})
+        await self._publish_event(
+            "tool.error",
+            {
+                "tool": tool_name,
+                "error": resolved_error_label,
+                **({"call_id": call_id} if call_id else {}),
+            },
+            context=context,
         )
+
+    @staticmethod
+    def _event_data(tool_name: str, call_id: str | None) -> dict[str, Any]:
+        data = {"tool": tool_name}
+        if call_id:
+            data["call_id"] = call_id
+        return data
+
+    async def _publish_event(
+        self,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        context: TenantContext | None,
+    ) -> None:
+        await self.event_bus.publish(Event(type=event_type, data=data))
+        if self.event_router is not None and context is not None:
+            await self.event_router.publish(ScopedEvent.from_context(context, event_type, data))
 
     def _normalized_audit_fields(self, audit: dict[str, Any]) -> dict[str, str]:
         normalized: dict[str, str] = {}
