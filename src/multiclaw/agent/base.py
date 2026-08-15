@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from multiclaw.agent.models import Observation
 from multiclaw.events import AgentState, AgentStateEvent, EventBus
 from multiclaw.memory import MemoryEntry, MemoryProtocol
+from multiclaw.tenancy.context import TenantContext
 
 
 class BaseAgent(ABC):
@@ -20,9 +21,9 @@ class BaseAgent(ABC):
         self.state = next_state
         await self.event_bus.publish(event)
 
-    async def remember(self, content: str, entry_type: str) -> None:
-        await self.memory.save(MemoryEntry(content=content, type=entry_type))
+    async def remember(self, context: TenantContext, content: str, entry_type: str) -> None:
+        await self.memory.save(context, MemoryEntry(content=content, type=entry_type))
 
     @abstractmethod
-    async def handle_message(self, user_input: str) -> Observation:
+    async def handle_message(self, user_input: str, *, context: TenantContext) -> Observation:
         raise NotImplementedError
