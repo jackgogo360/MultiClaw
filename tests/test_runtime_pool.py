@@ -87,6 +87,11 @@ class RetryCloseSecret(_FailOnce):
         self._maybe_fail()
 
 
+class EqualSecretHandle(RetryCloseSecret):
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, EqualSecretHandle)
+
+
 class RetryCloseController(_FailOnce):
     def close(self) -> None:
         self._maybe_fail()
@@ -588,6 +593,42 @@ async def test_tenant_runtime_close_retries_only_failed_phases(clock):
 
 
 @pytest.mark.asyncio
+async def test_tenant_runtime_close_tracks_secret_handles_by_identity_not_equality(clock):
+    first = EqualSecretHandle("first", fail_first=True)
+    second = EqualSecretHandle("second")
+    runtime = _build_runtime_types()(
+        tenant_id="tenant-a",
+        runtime_instance_id="runtime-1",
+        workspace_root=Path("/tmp/runtime-tests/tenant-a/workspace-a"),
+        agent=SimpleNamespace(),
+        event_bus=EventBus(),
+        event_router=RetryCloseEventRouter("event-router"),
+        scheduler=SimpleNamespace(),
+        registry=RetryCloseRegistry("registry"),
+        skill_manager=RetryCloseSkillManager("skill-manager"),
+        mcp_manager=RetryCloseManager("mcp-manager"),
+        sandbox_controller=RetryCloseController("sandbox-controller"),
+        sandbox_readiness=None,
+        last_used_at_ms=clock.now_ms(),
+        secret_handles=[first, second],
+        clock=clock,
+    )
+
+    with pytest.raises(RuntimeError, match="first failed"):
+        await runtime.close()
+
+    assert first.calls == 1
+    assert second.calls == 1
+    assert runtime.secret_handles == [first]
+
+    await runtime.close()
+
+    assert first.calls == 2
+    assert second.calls == 1
+    assert runtime.secret_handles == []
+
+
+@pytest.mark.asyncio
 async def test_pool_reclaims_tenant_lock_entries_after_rejected_tenants(clock):
     from multiclaw.runtime.pool import RuntimeCapacityError, RuntimePool
 
@@ -708,6 +749,45 @@ async def test_pool_close_retries_failed_runtimes_without_reclosing_successes(cl
     assert await pool.peek("tenant-b") is None
     assert success.mcp_manager.calls == 1
     assert retry.mcp_manager.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_evict_idle_logs_safe_warning_on_close_failure(clock, caplog):
+    from multiclaw.runtime.pool import RuntimePool
+
+    runtime = _build_runtime_types()(
+        tenant_id="tenant-a",
+        runtime_instance_id="runtime-1",
+        workspace_root=Path("/tmp/runtime-tests/tenant-a/workspace-a"),
+        agent=SimpleNamespace(),
+        event_bus=EventBus(),
+        event_router=RetryCloseEventRouter("event-router"),
+        scheduler=SimpleNamespace(),
+        registry=RetryCloseRegistry("registry"),
+        skill_manager=RetryCloseSkillManager("skill-manager"),
+        mcp_manager=RetryCloseManager("secret-token /tmp/private", fail_first=True),
+        sandbox_controller=RetryCloseController("sandbox-controller"),
+        sandbox_readiness=None,
+        last_used_at_ms=clock.now_ms(),
+        clock=clock,
+    )
+    pool = RuntimePool(
+        factory=FakeRuntimeFactory(clock),
+        max_resident_tenants=1,
+        idle_ttl_ms=5_000,
+        clock=clock,
+    )
+    pool._runtimes["tenant-a"] = runtime
+    clock.advance(pool.idle_ttl_ms + 1)
+
+    with caplog.at_level("WARNING"):
+        assert await pool.evict_idle(clock.now_ms()) == 0
+
+    assert "tenant-a" in caplog.text
+    assert "runtime-1" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "/tmp/private" not in caplog.text
 
 
 def test_threading_event_sanity():

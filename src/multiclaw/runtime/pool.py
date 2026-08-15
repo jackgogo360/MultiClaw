@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import logging
 import math
 from typing import Protocol
 
 from multiclaw.runtime.models import RuntimeClock, TenantRuntime
 from multiclaw.tenancy import TenantContext
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeFactoryProtocol(Protocol):
@@ -129,7 +132,13 @@ class RuntimePool:
             self._mark_runtime_unavailable(current)
             try:
                 await current.close()
-            except Exception:
+            except Exception as error:
+                logger.warning(
+                    "Runtime eviction deferred tenant_id=%s runtime_instance_id=%s error_type=%s",
+                    tenant_id,
+                    getattr(current, "runtime_instance_id", "unknown"),
+                    type(error).__name__,
+                )
                 return False
             if self._runtimes.get(tenant_id) is current:
                 self._runtimes.pop(tenant_id, None)

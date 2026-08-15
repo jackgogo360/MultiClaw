@@ -1852,9 +1852,88 @@ def test_chat_runtime_signal_blocks_idle_eviction_until_stream_finishes(migrated
         request_thread.join(timeout=5)
 
         assert request_thread.is_alive() is False
-        assert runtime.active_executing_run_count == 0
-        assert runtime.active_run_count == 0
-        assert response_box["response"].status_code == 200
+    assert runtime.active_executing_run_count == 0
+    assert runtime.active_run_count == 0
+    assert response_box["response"].status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_chat_establishes_run_lease_before_first_stream_iteration(migrated_database, monkeypatch):
+    import multiclaw.server as server
+    from multiclaw.storage.uow import TenantUnitOfWork
+
+    release = asyncio.Event()
+    holder: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context):
+        del user_input, context
+        await release.wait()
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "stale@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            holder["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request(
+            {
+                "type": "http",
+                "app": server.app,
+                "method": "POST",
+                "path": "/api/chat",
+                "headers": [],
+            }
+        )
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await server.chat(
+                server.ChatRequest(message="hello"),
+                request,
+                context,
+                uow,
+            )
+            runtime = holder["runtime"]
+            assert runtime.active_executing_run_count == 1
+            assert runtime.active_run_count == 1
+            runtime.mark_unavailable()
+            await anext(response.body_iterator)
+            release.set()
+            async for _ in response.body_iterator:
+                pass
+
+    assert runtime.active_executing_run_count == 0
+    assert runtime.active_run_count == 0
+
+
+def test_chat_returns_retryable_503_when_begin_run_rejects_unavailable_runtime(migrated_database, monkeypatch):
+    import multiclaw.server as server
+
+    with TestClient(server.app) as client:
+        client.cookies = _make_auth_cookie(server.app, migrated_database)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_unavailable(context):
+            runtime = await original_acquire(context)
+            runtime.mark_unavailable()
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_unavailable)
+        response = client.post("/api/chat", json={"message": "hello"})
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "900"
+    assert response.json() == {"detail": "runtime temporarily unavailable"}
 
 
 def test_chat_runtime_signal_resets_after_stream_error(migrated_database, monkeypatch):

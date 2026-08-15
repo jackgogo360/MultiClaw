@@ -788,10 +788,17 @@ async def chat(
     assert session is not None
     session_context = context.for_session(session.id)
     runtime = await request.app.state.runtime_pool.acquire(session_context)
+    try:
+        run_lease = runtime.begin_run()
+    except RuntimeError as error:
+        if str(error) == "runtime is unavailable":
+            raise RuntimeUnavailableError(
+                request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
+            ) from error
+        raise
 
     async def event_stream():
         logger.info("SSE stream started, message=%r, session=%r", message[:80], session.id)
-        run_lease = runtime.begin_run()
         enc = DataStreamEncoder()
         text_part_id: str | None = None
         reasoning_part_id: str | None = None
