@@ -39,6 +39,23 @@ class VerificationCodeRepository(_ConnectionBoundRepository):
 
 
 class AuthUserRepository(_ConnectionBoundRepository):
+    async def get_by_id(self, user_id: str) -> UserRecord | None:
+        result = await self._conn.execute(
+            select(
+                users.c.id,
+                users.c.email,
+                users.c.status,
+                users.c.default_workspace_id,
+                users.c.auth_epoch,
+                users.c.created_at,
+                users.c.updated_at,
+            )
+            .where(users.c.id == user_id)
+            .limit(1)
+        )
+        row = result.mappings().first()
+        return None if row is None else UserRecord.from_row(row)
+
     async def create_user_with_default_workspace(
         self,
         email: str,
