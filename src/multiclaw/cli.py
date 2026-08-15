@@ -8,6 +8,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from sqlalchemy.engine import make_url
 
 from multiclaw.config import Settings
 from multiclaw.storage import Database
@@ -42,8 +43,29 @@ def alembic_config(*, database_url: str | None = None) -> Config:
     return config
 
 
+def _sqlite_file_database_path(database_url: str) -> Path | None:
+    url = make_url(database_url)
+    if url.drivername != "sqlite+aiosqlite":
+        return None
+
+    database_name = url.database
+    if database_name in (None, "", ":memory:"):
+        return None
+    return Path(database_name)
+
+
+def _sqlite_database_exists(database_url: str) -> bool:
+    database_path = _sqlite_file_database_path(database_url)
+    if database_path is None:
+        return False
+    return database_path.exists()
+
+
 async def check_revision_is_head(*, database_url: str | None = None) -> bool:
     database_settings = _database_settings(database_url)
+    if database_settings.driver == "sqlite" and not _sqlite_database_exists(database_settings.url):
+        return False
+
     config = alembic_config(database_url=database_settings.url)
     head_revision = ScriptDirectory.from_config(config).get_current_head()
 
@@ -81,6 +103,9 @@ def main(argv: list[str] | None = None) -> int:
         command.upgrade(alembic_config(), "head")
         return 0
     if args.db_command == "current":
+        database_settings = _database_settings()
+        if database_settings.driver == "sqlite" and not _sqlite_database_exists(database_settings.url):
+            return 1
         command.current(alembic_config())
         return 0
     if args.db_command == "check":

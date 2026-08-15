@@ -14,6 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.sql.naming import conv
 
 
 NAMING_CONVENTION = {
@@ -47,7 +48,7 @@ users = Table(
     UniqueConstraint("id", "default_workspace_id"),
     CheckConstraint(
         "status IN ('active', 'disabled', 'pending_purge')",
-        name="users_status_valid",
+        name=conv("ck_users_users_status_valid"),
     ),
     ForeignKeyConstraint(
         ["id", "default_workspace_id"],
@@ -72,7 +73,7 @@ workspaces = Table(
     UniqueConstraint("tenant_id", "slug"),
     CheckConstraint(
         "status IN ('active', 'disabled', 'pending_purge')",
-        name="workspaces_status_valid",
+        name=conv("ck_workspaces_workspaces_status_valid"),
     ),
     ForeignKeyConstraint(
         ["tenant_id"],
@@ -163,7 +164,7 @@ agent_runs = Table(
             "'blocked_incompatible', 'blocked_corrupt', 'cancelled'"
             ")"
         ),
-        name="agent_runs_run_status_valid",
+        name=conv("ck_agent_runs_agent_runs_run_status_valid"),
     ),
     ForeignKeyConstraint(
         ["tenant_id", "workspace_id", "session_id"],
@@ -193,7 +194,7 @@ approval_requests = Table(
     UniqueConstraint("tenant_id", "workspace_id", "session_id", "run_id", "tool_call_id"),
     CheckConstraint(
         "approval_status IN ('awaiting_user', 'approved', 'rejected', 'expired')",
-        name="approval_requests_status_valid",
+        name=conv("ck_approval_requests_approval_requests_status_valid"),
     ),
     ForeignKeyConstraint(
         ["tenant_id", "workspace_id", "session_id", "run_id"],
@@ -239,11 +240,11 @@ tool_executions = Table(
             "'failed_terminal', 'uncertain', 'blocked_incompatible', 'blocked_corrupt'"
             ")"
         ),
-        name="tool_executions_status_valid",
+        name=conv("ck_tool_executions_tool_executions_status_valid"),
     ),
     CheckConstraint(
         "recovery_strategy IN ('read_only_replay', 'idempotent_retry', 'manual_uncertain')",
-        name="tool_executions_recovery_strategy_valid",
+        name=conv("ck_tool_executions_tool_executions_recovery_strategy_valid"),
     ),
     ForeignKeyConstraint(
         ["tenant_id", "workspace_id", "session_id", "run_id"],
@@ -339,15 +340,15 @@ user_secrets = Table(
     UniqueConstraint("key_provider_name", "key_version", "nonce"),
     CheckConstraint(
         "key_provider_name = 'deployment-keyring'",
-        name="user_secrets_key_provider_name_fixed",
+        name=conv("ck_user_secrets_user_secrets_key_provider_name_fixed"),
     ),
     CheckConstraint(
         "format_version = 1",
-        name="user_secrets_format_version_fixed",
+        name=conv("ck_user_secrets_user_secrets_format_version_fixed"),
     ),
     CheckConstraint(
         "algorithm = 'AES-256-GCM'",
-        name="user_secrets_algorithm_fixed",
+        name=conv("ck_user_secrets_user_secrets_algorithm_fixed"),
     ),
     ForeignKeyConstraint(
         ["tenant_id"],
@@ -444,7 +445,7 @@ deletion_jobs = Table(
     UniqueConstraint("tenant_id", "job_id"),
     CheckConstraint(
         "status IN ('scheduled', 'running')",
-        name="deletion_jobs_status_valid",
+        name=conv("ck_deletion_jobs_deletion_jobs_status_valid"),
     ),
     ForeignKeyConstraint(
         ["tenant_id"],
@@ -467,7 +468,7 @@ verification_codes = Table(
     Column("created_at", BIGINT, nullable=False),
     CheckConstraint(
         "purpose IN ('login', 'deletion_recovery')",
-        name="verification_codes_purpose_valid",
+        name=conv("ck_verification_codes_verification_codes_purpose_valid"),
     ),
 )
 
