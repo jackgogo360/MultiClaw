@@ -185,6 +185,17 @@ def two_users(client: TestClient, migrated_database: Database) -> TwoUsers:
     return TwoUsers(a=user_a, b=user_b, session_id=created.json()["id"])
 
 
+@pytest.fixture
+def owned_session(client: TestClient, user_a_cookie: SeededIdentity) -> str:
+    created = client.post(
+        "/api/sessions",
+        cookies=user_a_cookie.cookie,
+        json={"title": "Owned by A"},
+    )
+    assert created.status_code == 200
+    return created.json()["id"]
+
+
 def test_request_tenant_ignores_spoofed_headers_and_body(client: TestClient, user_a_cookie: SeededIdentity):
     response = client.post(
         "/api/sessions",
@@ -206,6 +217,46 @@ def test_foreign_session_id_is_404_and_does_not_create_session(client: TestClien
         json={"message": "hello", "session_id": two_users.session_id},
     )
     after = client.get("/api/sessions", cookies=two_users.a.cookie).json()
+
+    assert response.status_code == 404
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("payload", "label"),
+    [
+        ({"message": "hello", "session_id": ""}, "empty session_id"),
+        ({"message": "hello", "session_id": "session-missing"}, "missing session_id"),
+        ({"message": "hello", "id": ""}, "empty id"),
+        ({"message": "hello", "id": "session-missing"}, "missing id"),
+    ],
+)
+def test_invalid_explicit_session_identifier_is_404_and_does_not_create_session(
+    client: TestClient,
+    user_a_cookie: SeededIdentity,
+    payload: dict[str, str],
+    label: str,
+):
+    before = client.get("/api/sessions", cookies=user_a_cookie.cookie).json()
+    response = client.post("/api/chat", cookies=user_a_cookie.cookie, json=payload)
+    after = client.get("/api/sessions", cookies=user_a_cookie.cookie).json()
+
+    assert response.status_code == 404, label
+    assert after == before, label
+
+
+def test_explicit_empty_session_id_takes_precedence_over_valid_id_and_does_not_create_session(
+    client: TestClient,
+    user_a_cookie: SeededIdentity,
+    owned_session: str,
+):
+    before = client.get("/api/sessions", cookies=user_a_cookie.cookie).json()
+    response = client.post(
+        "/api/chat",
+        cookies=user_a_cookie.cookie,
+        json={"message": "hello", "session_id": "", "id": owned_session},
+    )
+    after = client.get("/api/sessions", cookies=user_a_cookie.cookie).json()
 
     assert response.status_code == 404
     assert after == before
