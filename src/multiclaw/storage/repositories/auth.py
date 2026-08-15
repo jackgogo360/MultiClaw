@@ -20,6 +20,10 @@ class BootstrapProbeError(RuntimeError):
     pass
 
 
+def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException) -> None:
+    primary.add_note(f"{phase} cleanup failed: {type(error).__name__}: {error}")
+
+
 @dataclass(slots=True)
 class _ConnectionBoundRepository:
     _conn: AsyncConnection
@@ -83,16 +87,31 @@ class AuthUserRepository(_ConnectionBoundRepository):
                 .values(default_workspace_id=workspace_id, updated_at=now_ms)
             )
             await savepoint.commit()
-        except IntegrityError:
-            if savepoint.is_active:
-                await savepoint.rollback()
+        except IntegrityError as primary:
+            if not await self._rollback_savepoint(savepoint, primary):
+                raise primary
             return await self._get_existing_bootstrapped_user(normalized_email)
-        except BaseException:
-            if savepoint.is_active:
-                await savepoint.rollback()
-            raise
+        except BaseException as primary:
+            await self._rollback_savepoint(savepoint, primary)
+            raise primary
 
         return await self._get_existing_bootstrapped_user(normalized_email)
+
+    async def _rollback_savepoint(
+        self,
+        savepoint,
+        primary: BaseException | None,
+    ) -> bool:
+        if not savepoint.is_active:
+            return True
+        try:
+            await savepoint.rollback()
+        except BaseException as error:
+            if primary is None:
+                raise
+            _note_cleanup_error(primary, "savepoint rollback", error)
+            return False
+        return True
 
     async def _get_existing_bootstrapped_user(self, email: str) -> UserRecord:
         result = await self._conn.execute(
@@ -147,7 +166,12 @@ class TenantUserRepository(_ConnectionBoundRepository):
                 users.c.created_at,
                 users.c.updated_at,
             )
-            .where(users.c.id == self._context.tenant_id)
+            .select_from(users.join(workspaces, workspaces.c.tenant_id == users.c.id))
+            .where(
+                users.c.id == self._context.tenant_id,
+                workspaces.c.tenant_id == self._context.tenant_id,
+                workspaces.c.id == self._context.workspace_id,
+            )
             .limit(1)
         )
         row = result.mappings().one()
