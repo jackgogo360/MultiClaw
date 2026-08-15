@@ -8,6 +8,12 @@ def clear_multiclaw_env(monkeypatch):
     for key in list(os.environ):
         if key.startswith("MULTICLAW_"):
             monkeypatch.delenv(key, raising=False)
+    for key in (
+        "MULTICLAW_TEST_MYSQL_URL",
+        "MULTICLAW_SECRETS_KEYRING_B64",
+        "MULTICLAW_AUTH_JWT_SIGNING_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture
