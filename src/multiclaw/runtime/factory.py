@@ -193,7 +193,16 @@ class RuntimeFactory:
             last_used_at_ms=self.clock.now_ms(),
             clock=self.clock,
         )
-        runtime.apply_workflow_counters(await self._load_workflow_counters(context))
+        try:
+            runtime.apply_workflow_counters(await self._load_workflow_counters(context))
+        except BaseException as primary:
+            try:
+                await runtime.close()
+            except BaseException as error:
+                primary.add_note(f"runtime.close failed: {type(error).__name__}: {error}")
+                for note in getattr(error, "__notes__", ()) or ():
+                    primary.add_note(note)
+            raise
         return runtime
 
     def probe_startup(self) -> tuple[SandboxReadiness, tuple[Any, ...]]:
