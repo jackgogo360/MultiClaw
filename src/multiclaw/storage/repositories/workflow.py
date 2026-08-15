@@ -607,10 +607,10 @@ class WorkflowRepository:
         execution_id: str | None = None,
         expected_execution_status: ExecutionStatus | None = None,
         expected_execution_version: int | None = None,
-    ) -> bool:
+    ) -> int | None:
         await self._dialect.lock_run(self._conn, lease.context)
         if not await self._has_current_lease(lease):
-            return False
+            return None
         if execution_id is not None:
             execution = await self.get_execution_recovery(lease.context, execution_id)
             if execution is None:
@@ -640,7 +640,7 @@ class WorkflowRepository:
                 created_at=self._dialect.db_now_ms(),
             )
         )
-        return True
+        return int(checkpoint_seq)
 
     async def _has_current_lease(self, lease: RunLease) -> bool:
         result = await self._conn.execute(

@@ -141,6 +141,7 @@ from multiclaw.stream import DataStreamEncoder
 from multiclaw.workflow.models import (
     LeaseConflictError,
     RecoveryAction,
+    RecoveryOutcome,
     RunLeaseHandle,
     RunStatus,
     StaleFenceError,
@@ -819,6 +820,41 @@ async def chat(
         request.app.state.database,
         request.app.state.settings,
     )
+
+    async def _cleanup_prestream_failure(
+        primary: BaseException,
+        *,
+        workflow_lease,
+        recovery_outcome: RecoveryOutcome | None,
+        request: Request,
+    ) -> None:
+        target = RunStatus.FAILED_TERMINAL
+        if recovery_outcome is not None and recovery_outcome.status in {
+            RunStatus.BLOCKED_CORRUPT,
+            RunStatus.BLOCKED_INCOMPATIBLE,
+        }:
+            target = recovery_outcome.status
+
+        coordinator = build_workflow_coordinator(
+            request.app.state.database,
+            request.app.state.settings,
+        )
+        try:
+            await coordinator.finish_run_with_checkpoint(workflow_lease, target)
+            return
+        except Exception as terminal_error:
+            logger.exception("failed to persist pre-stream terminal checkpoint cleanup")
+            primary.add_note(
+                f"pre-stream terminal checkpoint cleanup failed: {type(terminal_error).__name__}: {terminal_error}"
+            )
+        try:
+            await coordinator.finish_run(workflow_lease, target)
+        except Exception as terminal_state_error:
+            logger.exception("failed to persist pre-stream terminal state cleanup")
+            primary.add_note(
+                f"pre-stream terminal state cleanup failed: {type(terminal_state_error).__name__}: {terminal_state_error}"
+            )
+
     workflow_lease = None
     try:
         workflow_lease = await workflow.start_run_with_checkpoint(
@@ -833,6 +869,15 @@ async def chat(
             )
     except TenantRunQuotaError as error:
         raise HTTPException(status_code=429, detail=str(error)) from error
+    except Exception as error:
+        if workflow_lease is not None:
+            await _cleanup_prestream_failure(
+                error,
+                workflow_lease=workflow_lease,
+                recovery_outcome=locals().get("live_recovery"),
+                request=request,
+            )
+        raise
     try:
         run_lease = runtime.begin_run()
     except RuntimeError as error:
@@ -860,34 +905,19 @@ async def chat(
         assert workflow_lease is not None
         workflow_lease_handle = RunLeaseHandle(workflow_lease)
         terminal_persisted = False
+        fence_lost = False
 
         async def persist_terminal(status: RunStatus) -> None:
             nonlocal terminal_persisted
             if terminal_persisted:
                 return
-            try:
-                await workflow_lease_handle.refresh(
-                    lambda lease: build_workflow_coordinator(
-                        request.app.state.database,
-                        request.app.state.settings,
-                    ).finish_run_with_checkpoint(lease, status)
-                )
-            except StaleFenceError:
-                reacquired = await _reacquire_current_run_lease()
-                await workflow_lease_handle.replace(reacquired)
-                await workflow_lease_handle.refresh(
-                    lambda lease: build_workflow_coordinator(
-                        request.app.state.database,
-                        request.app.state.settings,
-                    ).finish_run_with_checkpoint(lease, status)
-                )
+            await workflow_lease_handle.refresh(
+                lambda lease: build_workflow_coordinator(
+                    request.app.state.database,
+                    request.app.state.settings,
+                ).finish_run_with_checkpoint(lease, status)
+            )
             terminal_persisted = True
-
-        async def _reacquire_current_run_lease():
-            return await build_workflow_coordinator(
-                request.app.state.database,
-                request.app.state.settings,
-            ).acquire_run(run_context, runtime.runtime_instance_id)
 
         def close_text_part() -> list[str]:
             nonlocal text_part_id
@@ -992,6 +1022,7 @@ async def chat(
                     await token_queue.put({"type": "error", "content": msg})
 
             async def heartbeat_run_lease() -> None:
+                nonlocal fence_lost
                 interval_seconds = max(
                     0.001,
                     request.app.state.settings.workflow.heartbeat_ms / 1000,
@@ -1011,14 +1042,13 @@ async def chat(
                                 request.app.state.settings,
                             ).heartbeat(lease)
                         )
-                    except StaleFenceError:
-                        try:
-                            reacquired = await _reacquire_current_run_lease()
-                        except Exception as exc:
-                            logger.exception("run lease heartbeat reacquire failed")
-                            await token_queue.put({"type": "error", "content": _friendly_error(exc)})
-                            return
-                        await workflow_lease_handle.replace(reacquired)
+                    except StaleFenceError as exc:
+                        fence_lost = True
+                        logger.exception("run lease heartbeat lost current fence")
+                        if stream_task is not None:
+                            stream_task.cancel()
+                        await token_queue.put({"type": "error", "content": _friendly_error(exc)})
+                        return
                     except Exception as exc:
                         logger.exception("run lease heartbeat failed")
                         await token_queue.put({"type": "error", "content": _friendly_error(exc)})
@@ -1046,6 +1076,8 @@ async def chat(
                             yield enc.text_start(text_part_id)
                         yield enc.text_delta(text_part_id, item["content"])
                     elif item["type"] == "done":
+                        if fence_lost:
+                            continue
                         logger.info("stream done, tokens=%d, content_len=%d", token_count, len(item.get("content", "")))
                         await persist_terminal(RunStatus.COMPLETED)
                         for chunk in drain_event_queue():
@@ -1058,7 +1090,8 @@ async def chat(
                         return
                     elif item["type"] == "error":
                         logger.error("stream error: %s", item["content"])
-                        await persist_terminal(RunStatus.FAILED_TERMINAL)
+                        if not fence_lost:
+                            await persist_terminal(RunStatus.FAILED_TERMINAL)
                         for chunk in drain_event_queue():
                             yield chunk
                         for chunk in close_open_parts():
@@ -1115,7 +1148,8 @@ async def chat(
                     exc = stream_task.exception()
                     if exc:
                         logger.exception("stream task crashed")
-                        await persist_terminal(RunStatus.FAILED_TERMINAL)
+                        if not fence_lost:
+                            await persist_terminal(RunStatus.FAILED_TERMINAL)
                         for chunk in drain_event_queue():
                             yield chunk
                         for chunk in close_open_parts():
@@ -1143,7 +1177,7 @@ async def chat(
                 await asyncio.gather(stream_task, return_exceptions=True)
             if subscription is not None:
                 subscription.close()
-            if not terminal_persisted:
+            if not terminal_persisted and not fence_lost:
                 try:
                     await persist_terminal(RunStatus.CANCELLED)
                 except Exception:

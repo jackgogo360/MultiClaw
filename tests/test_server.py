@@ -33,7 +33,14 @@ from multiclaw.storage import Database
 from multiclaw.storage.schema import agent_runs, execution_checkpoints, memory_entries, tool_executions
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
-from multiclaw.workflow.models import CheckpointPhase, RunLease, RunLeaseHandle, RunStatus
+from multiclaw.workflow.models import (
+    CheckpointPhase,
+    RecoveryAction,
+    RecoveryOutcome,
+    RunLease,
+    RunLeaseHandle,
+    RunStatus,
+)
 from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.shell import ShellToolBuilder
 from sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
@@ -138,6 +145,38 @@ async def _assistant_chat_messages(database: Database, context: TenantContext) -
         }
         for row in rows
     ]
+
+
+async def _expire_lease_with_db_clock(database: Database, context: TenantContext) -> None:
+    async with database.write_transaction() as conn:
+        await conn.execute(
+            agent_runs.update()
+            .where(
+                agent_runs.c.tenant_id == context.tenant_id,
+                agent_runs.c.workspace_id == context.workspace_id,
+                agent_runs.c.session_id == context.session_id,
+                agent_runs.c.run_id == context.run_id,
+            )
+            .values(lease_expires_at=database.dialect.db_now_ms() - 1)
+        )
+
+
+async def _latest_run_context(database: Database, context: TenantContext) -> TenantContext:
+    async with database.connect() as conn:
+        result = await conn.execute(
+            select(
+                agent_runs.c.session_id,
+                agent_runs.c.run_id,
+            )
+            .where(
+                agent_runs.c.tenant_id == context.tenant_id,
+                agent_runs.c.workspace_id == context.workspace_id,
+            )
+            .order_by(agent_runs.c.created_at.desc(), agent_runs.c.run_id.desc())
+            .limit(1)
+        )
+        row = result.mappings().one()
+    return context.for_run(str(row["session_id"]), str(row["run_id"]))
 
 
 class _StaticReportContextBuilder:
@@ -2362,6 +2401,260 @@ async def test_chat_invokes_live_recovery_validation_before_stream_iteration(mig
     assert validation_called.is_set() is True
     assert captured["validated_context"] == captured["handler_context"]
     assert captured["validated_phases"] == [CheckpointPhase.RUN_STARTED.value]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_status"),
+    [
+        (
+            RecoveryOutcome(
+                action=None,
+                status=RunStatus.BLOCKED_CORRUPT,
+                reason="corrupt checkpoint",
+            ),
+            RunStatus.BLOCKED_CORRUPT,
+        ),
+        (
+            RecoveryOutcome(
+                action=None,
+                status=RunStatus.BLOCKED_INCOMPATIBLE,
+                reason="incompatible checkpoint",
+            ),
+            RunStatus.BLOCKED_INCOMPATIBLE,
+        ),
+    ],
+)
+async def test_chat_validation_failure_cleans_up_blocked_run_without_stream_start(
+    migrated_database,
+    monkeypatch,
+    outcome: RecoveryOutcome,
+    expected_status: RunStatus,
+):
+    import multiclaw.server as server
+    from multiclaw.workflow.coordinator import WorkflowCoordinator
+
+    captured: dict[str, object] = {}
+
+    class FakeRecoveryService:
+        async def validate_live_run(self, context):
+            captured["validated_context"] = context
+            return outcome
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "validation-blocked@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(request_context):
+            runtime = await original_acquire(request_context)
+            original_handler = runtime.agent.handle_message_stream
+
+            async def fail_if_started(*args, **kwargs):
+                raise AssertionError("stream handler should not start after blocked validation")
+
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fail_if_started)
+            captured["runtime"] = runtime
+            captured["original_handler"] = original_handler
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        monkeypatch.setattr(server, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
+        request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
+
+        with pytest.raises(RuntimeError, match="live workflow checkpoint validation failed"):
+            async with TenantUnitOfWork(server.app.state.database, context) as uow:
+                await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+
+    run_context = await _latest_run_context(migrated_database, context)
+    assert await _run_status(migrated_database, run_context) == expected_status.value
+    assert [row["phase"] for row in await _checkpoint_rows(migrated_database, run_context)] == [
+        CheckpointPhase.RUN_STARTED.value,
+        CheckpointPhase.RUN_TERMINAL.value,
+    ]
+    terminal = (await _checkpoint_rows(migrated_database, run_context))[-1]
+    assert terminal["payload"]["terminal_status"] == expected_status.value
+    runtime = captured["runtime"]
+    assert runtime.active_run_count == 0
+    assert runtime.active_executing_run_count == 0
+
+    followup_context = TenantContext(context.tenant_id, context.workspace_id)
+    async with TenantUnitOfWork(server.app.state.database, followup_context) as uow:
+        session = await uow.sessions.create(title="followup")
+    another_run = followup_context.for_run(session.id, str(uuid4()))
+    lease = await WorkflowCoordinator(server.app.state.database, settings=server.app.state.settings).start_run(
+        another_run,
+        "runtime-followup",
+    )
+    await WorkflowCoordinator(server.app.state.database, settings=server.app.state.settings).finish_run(
+        lease,
+        RunStatus.CANCELLED,
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_validation_exception_cleans_up_failed_run_without_stream_start(
+    migrated_database,
+    monkeypatch,
+):
+    import multiclaw.server as server
+
+    captured: dict[str, object] = {}
+
+    class FakeRecoveryService:
+        async def validate_live_run(self, context):
+            captured["validated_context"] = context
+            raise RuntimeError("validation exploded")
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "validation-exception@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(request_context):
+            runtime = await original_acquire(request_context)
+
+            async def fail_if_started(*args, **kwargs):
+                raise AssertionError("stream handler should not start after validation exception")
+
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fail_if_started)
+            captured["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        monkeypatch.setattr(server, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
+        request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
+
+        with pytest.raises(RuntimeError, match="validation exploded"):
+            async with TenantUnitOfWork(server.app.state.database, context) as uow:
+                await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+
+    run_context = await _latest_run_context(migrated_database, context)
+    assert await _run_status(migrated_database, run_context) == RunStatus.FAILED_TERMINAL.value
+    assert [row["phase"] for row in await _checkpoint_rows(migrated_database, run_context)] == [
+        CheckpointPhase.RUN_STARTED.value,
+        CheckpointPhase.RUN_TERMINAL.value,
+    ]
+    terminal = (await _checkpoint_rows(migrated_database, run_context))[-1]
+    assert terminal["payload"]["terminal_status"] == RunStatus.FAILED_TERMINAL.value
+    runtime = captured["runtime"]
+    assert runtime.active_run_count == 0
+    assert runtime.active_executing_run_count == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_stale_stream_aborts_after_foreign_takeover_progress_and_does_not_reacquire(
+    migrated_database,
+    monkeypatch,
+):
+    import multiclaw.server as server
+    from multiclaw.workflow.coordinator import WorkflowCoordinator
+    from multiclaw.workflow.models import StaleFenceError
+
+    started = asyncio.Event()
+    continue_after_takeover = asyncio.Event()
+    captured: dict[str, object] = {}
+
+    async def fake_handle_message_stream(user_input: str, *, context, run_lease_handle):
+        del user_input
+        coordinator = WorkflowCoordinator(server.app.state.database, settings=server.app.state.settings)
+        captured["context"] = context
+        captured["run_lease_handle"] = run_lease_handle
+        started.set()
+        await continue_after_takeover.wait()
+        try:
+            await run_lease_handle.use_current(
+                lambda lease: coordinator.checkpoint(
+                    lease,
+                    CheckpointPhase.MODEL_OUTPUT_COMMITTED,
+                    {
+                        "run_id": context.run_id,
+                        "message_id": str(uuid4()),
+                        "output_digest": "9" * 64,
+                        "model_cursor": "cursor-stale-stream",
+                        "cursor": "cursor-stale-stream",
+                    },
+                )
+            )
+        except Exception as error:
+            captured["handler_error"] = error
+            raise
+        captured["handler_checkpoint_succeeded"] = True
+        yield {"type": "done", "content": "stale-success", "data": {}}
+
+    with TestClient(server.app):
+        monkeypatch.setattr(server.app.state.settings.workflow, "heartbeat_ms", 20)
+        monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 90)
+        user_id, _ = await _seed_user(migrated_database, "stale-reacquire@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(request_context):
+            runtime = await original_acquire(request_context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            captured["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+
+        chunks: list[str] = []
+
+        async def consume() -> None:
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+
+        consume_task = asyncio.create_task(consume())
+        await started.wait()
+        run_context = captured["context"]
+        coordinator = WorkflowCoordinator(server.app.state.database, settings=server.app.state.settings)
+        await _expire_lease_with_db_clock(migrated_database, run_context)
+        takeover = await coordinator.acquire_run(run_context, "runtime-2")
+        await coordinator.checkpoint(
+            takeover,
+            CheckpointPhase.MODEL_OUTPUT_COMMITTED,
+            {
+                "run_id": run_context.run_id,
+                "message_id": str(uuid4()),
+                "output_digest": "8" * 64,
+                "model_cursor": "cursor-takeover",
+                "cursor": "cursor-takeover",
+            },
+        )
+        await _expire_lease_with_db_clock(migrated_database, run_context)
+        await asyncio.sleep(0.08)
+        continue_after_takeover.set()
+        await consume_task
+
+    body = "".join(chunks)
+    if "handler_error" in captured:
+        assert isinstance(captured["handler_error"], (StaleFenceError, asyncio.CancelledError))
+    assert captured.get("handler_checkpoint_succeeded") is not True
+    assert '"type":"finish"' not in body
+    assert '"type":"error"' in body
+    assert "stale-success" not in body
+    phases = [row["phase"] for row in await _checkpoint_rows(migrated_database, run_context)]
+    assert phases == [
+        CheckpointPhase.RUN_STARTED.value,
+        CheckpointPhase.MODEL_OUTPUT_COMMITTED.value,
+    ]
 
 
 @pytest.mark.asyncio
