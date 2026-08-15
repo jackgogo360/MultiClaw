@@ -267,15 +267,20 @@ def load_mcp_tools_config(
     path: Optional[str | Path] = None,
     *,
     search_parents: bool = True,
+    workspace_root: str | Path | None = None,
 ) -> dict[str, dict[str, list[str]]]:
     """Load per-server tool filter config from .mcp.json.
 
     Returns {server_name: {"include": [...], "exclude": [...]}}
     """
+    canonical_workspace_root = _canonical_workspace_root(workspace_root)
     candidates = (
         [_ConfigPathCandidate(path=Path(path), source="explicit_path")]
         if path
-        else _find_config_file_candidates(search_parents)
+        else _find_config_file_candidates(
+            search_parents,
+            workspace_root=canonical_workspace_root,
+        )
     )
     result: dict[str, dict[str, list[str]]] = {}
     seen_server_names: set[str] = set()

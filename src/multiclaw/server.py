@@ -328,7 +328,10 @@ def _register_mcp_tools(
         logger.info("No MCP servers configured (no .mcp.json found)")
         return
 
-    tools_configs = load_mcp_tools_config(config_path)
+    tools_configs = _load_mcp_tools_config_for_workspace(
+        config_path,
+        workspace_root=workspace_root,
+    )
     registry_lock = threading.RLock()
     refreshed_servers: set[str] = set()
 
@@ -457,6 +460,16 @@ def _load_mcp_config_for_workspace(
     if "workspace_root" in inspect.signature(load_mcp_config).parameters:
         return load_mcp_config(config_path, workspace_root=workspace_root)
     return load_mcp_config(config_path)
+
+
+def _load_mcp_tools_config_for_workspace(
+    config_path: str | None,
+    *,
+    workspace_root: Path,
+) -> dict[str, dict[str, list[str]]]:
+    if "workspace_root" in inspect.signature(load_mcp_tools_config).parameters:
+        return load_mcp_tools_config(config_path, workspace_root=workspace_root)
+    return load_mcp_tools_config(config_path)
 
 
 def _is_workspace_untrusted_config(config: object) -> bool:
