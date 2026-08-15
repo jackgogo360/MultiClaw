@@ -12,8 +12,9 @@ from multiclaw.context import ContextBuildReport, ContextBuildResult
 from multiclaw.events import EventBus
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.llm import LLMResponse, ModelRouter, ToolCall
-from multiclaw.memory import InMemoryMemory
+from multiclaw.memory import MemoryEntry
 from multiclaw.planner import Planner
+from multiclaw.tenancy.context import TenantContext
 from multiclaw.tools import (
     CoreToolScheduler,
     ToolBuilder,
@@ -22,6 +23,107 @@ from multiclaw.tools import (
     ToolRegistry,
     ToolStatus,
 )
+
+
+ROOT_CONTEXT = TenantContext(
+    tenant_id="00000000-0000-0000-0000-000000000001",
+    workspace_id="00000000-0000-0000-0000-000000000002",
+)
+SESSION_CONTEXT = ROOT_CONTEXT.for_session("00000000-0000-0000-0000-000000000101")
+OTHER_SESSION_CONTEXT = ROOT_CONTEXT.for_session("00000000-0000-0000-0000-000000000102")
+ALT_SESSION_CONTEXT = ROOT_CONTEXT.for_session("00000000-0000-0000-0000-000000000103")
+
+
+class _ScopedMemoryFake:
+    def __init__(self) -> None:
+        self._entries: list[tuple[TenantContext, MemoryEntry]] = []
+
+    async def save(self, context: TenantContext, entry: MemoryEntry) -> MemoryEntry:
+        if entry.type == "chat_message":
+            if context.session_id is None:
+                raise ValueError("session_id is required for chat_message entries")
+            session_id = context.session_id if entry.session_id is None else entry.session_id
+            if session_id != context.session_id:
+                raise ValueError("session_id must match the current context")
+            entry = entry.model_copy(update={"session_id": session_id})
+        self._entries.append((context, entry))
+        return entry
+
+    async def query(
+        self,
+        context: TenantContext,
+        query: str,
+        top_k: int,
+        entry_type: str | None = None,
+    ) -> list[MemoryEntry]:
+        terms = set(query.lower().split())
+        matches: list[tuple[int, int, MemoryEntry]] = []
+        for index, (scope, entry) in enumerate(self._entries):
+            if scope.tenant_id != context.tenant_id or scope.workspace_id != context.workspace_id:
+                continue
+            if entry_type is not None and entry.type != entry_type:
+                continue
+            if context.session_id is None:
+                if entry.session_id is not None:
+                    continue
+            elif entry.session_id not in {None, context.session_id}:
+                continue
+            score = len(terms & set(entry.content.lower().split()))
+            if score > 0:
+                matches.append((score, index, entry))
+        matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [entry for _, _, entry in matches[:top_k]]
+
+    async def recent(
+        self,
+        context: TenantContext,
+        limit: int,
+        entry_type: str | None = None,
+    ) -> list[MemoryEntry]:
+        if entry_type == "chat_message" and context.session_id is None:
+            raise ValueError("session_id is required for chat_message recent lookups")
+        results: list[MemoryEntry] = []
+        for scope, entry in reversed(self._entries):
+            if scope.tenant_id != context.tenant_id or scope.workspace_id != context.workspace_id:
+                continue
+            if entry_type is not None and entry.type != entry_type:
+                continue
+            if context.session_id is None:
+                if entry.session_id is not None:
+                    continue
+            elif entry_type == "chat_message" and entry.session_id != context.session_id:
+                continue
+            results.append(entry)
+        return results[:limit]
+
+    async def context(
+        self,
+        context: TenantContext,
+        max_chars: int,
+        limit: int,
+        entry_type: str | None = None,
+    ) -> list[MemoryEntry]:
+        selected: list[MemoryEntry] = []
+        used = 0
+        for entry in await self.recent(context, limit=limit, entry_type=entry_type):
+            entry_len = len(entry.content)
+            separator = 1 if selected else 0
+            if used + separator + entry_len > max_chars:
+                continue
+            selected.append(entry)
+            used += separator + entry_len
+        return list(reversed(selected))
+
+    async def forget(self, context: TenantContext, entry_id: str) -> None:
+        self._entries = [
+            (scope, entry)
+            for scope, entry in self._entries
+            if not (
+                scope.tenant_id == context.tenant_id
+                and scope.workspace_id == context.workspace_id
+                and entry.id == entry_id
+            )
+        ]
 
 
 @pytest.fixture(autouse=True)
@@ -127,7 +229,7 @@ def agent(test_config_path):
         router=ModelRouter(settings),
         registry=registry,
         scheduler=scheduler,
-        memory=InMemoryMemory(),
+        memory=_ScopedMemoryFake(),
         planner=Planner(),
         event_bus=EventBus(),
     )
@@ -175,12 +277,12 @@ class TestMultiClawAgent:
         mock_client.post.side_effect = [tool_call_response, final_response]
 
         with patch("httpx.AsyncClient", return_value=mock_client):
-            observation = await agent.handle_message("echo hello")
+            observation = await agent.handle_message("echo hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert "hello" in observation.content
         # Tool result stored in memory
-        matches = await agent.memory.query("hello", top_k=5)
+        matches = await agent.memory.query(SESSION_CONTEXT, "hello", top_k=5)
         tool_results = [m for m in matches if m.type == "tool_result"]
         assert len(tool_results) == 1
         assert tool_results[0].content == "hello"
@@ -190,7 +292,8 @@ class TestMultiClawAgent:
         from multiclaw.agent import ObservationType
 
         observation = await agent.handle_message(
-            "plan: collect facts and summarize findings"
+            "plan: collect facts and summarize findings",
+            context=SESSION_CONTEXT,
         )
 
         assert observation.type == ObservationType.USER_RESPONSE
@@ -200,26 +303,25 @@ class TestMultiClawAgent:
     async def test_plain_message_returns_llm_text(self, agent):
         from multiclaw.agent import ObservationType
 
-        observation = await agent.handle_message("hello")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert "mock_response" in observation.content
 
     @pytest.mark.asyncio
     async def test_saves_user_messages_to_memory(self, agent):
-        await agent.handle_message("remember this")
+        await agent.handle_message("remember this", context=SESSION_CONTEXT)
 
-        matches = await agent.memory.query("remember", top_k=5)
+        matches = await agent.memory.query(SESSION_CONTEXT, "remember", top_k=5)
 
         assert len(matches) == 1
         assert matches[0].content == "remember this"
 
     @pytest.mark.asyncio
     async def test_injects_relevant_memory_before_user_message(self, agent):
-        from multiclaw.memory import MemoryEntry
-
         await agent.memory.save(
-            MemoryEntry(content="alpha project uses SQLite memory", type="note")
+            SESSION_CONTEXT,
+            MemoryEntry(content="alpha project uses SQLite memory", type="note"),
         )
 
         mock_response = Mock()
@@ -233,7 +335,7 @@ class TestMultiClawAgent:
         mock_client.post.return_value = mock_response
 
         with patch("httpx.AsyncClient", return_value=mock_client):
-            await agent.handle_message("what does alpha use?")
+            await agent.handle_message("what does alpha use?", context=SESSION_CONTEXT)
 
         request_body = mock_client.post.call_args.kwargs["json"]
         messages = request_body["messages"]
@@ -257,8 +359,6 @@ class TestMultiClawAgent:
 
     @pytest.mark.asyncio
     async def test_agent_saves_user_and_assistant_messages_with_session_id(self, agent):
-        from multiclaw.memory import MemoryEntry
-
         mock_response = Mock()
         mock_response.json.return_value = {
             "choices": [{"message": {"role": "assistant", "content": "response"}}]
@@ -270,10 +370,15 @@ class TestMultiClawAgent:
         mock_client.post.return_value = mock_response
 
         with patch("httpx.AsyncClient", return_value=mock_client):
-            await agent.handle_message("hello", session_id="session-1")
+            await agent.handle_message(
+                "hello",
+                context=ROOT_CONTEXT.for_session("00000000-0000-0000-0000-000000000111"),
+            )
 
         recent = await agent.memory.recent(
-            limit=2, entry_type="chat_message", session_id="session-1"
+            ROOT_CONTEXT.for_session("00000000-0000-0000-0000-000000000111"),
+            limit=2,
+            entry_type="chat_message",
         )
 
         assert [entry.role for entry in recent] == ["assistant", "user"]
@@ -281,14 +386,14 @@ class TestMultiClawAgent:
 
     @pytest.mark.asyncio
     async def test_agent_uses_recent_chat_history_for_same_session(self, agent):
-        from multiclaw.memory import MemoryEntry
-
         # Pre-populate chat history for two different sessions
         await agent.memory.save(
-            MemoryEntry(content="session one user", type="chat_message", session_id="s1", role="user", turn_index=1)
+            SESSION_CONTEXT,
+            MemoryEntry(content="session one user", type="chat_message", role="user", turn_index=1),
         )
         await agent.memory.save(
-            MemoryEntry(content="session two user", type="chat_message", session_id="s2", role="user", turn_index=1)
+            OTHER_SESSION_CONTEXT,
+            MemoryEntry(content="session two user", type="chat_message", role="user", turn_index=1),
         )
 
         mock_response = Mock()
@@ -302,7 +407,7 @@ class TestMultiClawAgent:
         mock_client.post.return_value = mock_response
 
         with patch("httpx.AsyncClient", return_value=mock_client):
-            await agent.handle_message("follow-up", session_id="s1")
+            await agent.handle_message("follow-up", context=SESSION_CONTEXT)
 
         payload = mock_client.post.call_args.kwargs["json"]["messages"]
         contents = [msg["content"] for msg in payload if "content" in msg and msg["content"] is not None]
@@ -328,7 +433,7 @@ class TestMultiClawAgent:
             max_reflections=1,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "changed approach"
@@ -355,7 +460,7 @@ class TestMultiClawAgent:
             max_reflections=1,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "forced summary"
@@ -390,7 +495,7 @@ class TestMultiClawAgent:
             max_reflections=1,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "done"
@@ -419,7 +524,7 @@ class TestMultiClawAgent:
             max_reflections=1,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "forced summary"
@@ -461,7 +566,7 @@ class TestMultiClawAgent:
         )
         agent.settings.agent.max_tool_rounds = 1
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation == Observation(
             type=ObservationType.USER_RESPONSE,
@@ -517,7 +622,7 @@ class TestMultiClawAgent:
             parallel_enabled=True,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "finished"
@@ -566,7 +671,7 @@ class TestMultiClawAgent:
             parallel_enabled=True,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "finished"
@@ -579,7 +684,7 @@ class TestMultiClawAgent:
             "start:read-2",
             "end:read-2",
         ]
-        assert [call.args[0] for call in agent.remember.await_args_list] == [
+        assert [call.args[1] for call in agent.remember.await_args_list] == [
             "read-1",
             "write",
             "read-2",
@@ -621,7 +726,7 @@ class TestMultiClawAgent:
             parallel_enabled=True,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
         second_call_messages = agent.router.completion.await_args_list[1].kwargs["messages"]
         assistant_message = next(
             message for message in second_call_messages if message.get("tool_calls")
@@ -644,7 +749,7 @@ class TestMultiClawAgent:
             "result:first",
             "result:second",
         ]
-        assert [call.args[0] for call in agent.remember.await_args_list] == [
+        assert [call.args[1] for call in agent.remember.await_args_list] == [
             "result:first",
             "result:second",
         ]
@@ -686,7 +791,7 @@ class TestMultiClawAgent:
             parallel_enabled=False,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "finished"
@@ -714,7 +819,7 @@ class TestMultiClawAgent:
         agent.context_builder = _ReportOnlyContextBuilder(expected_messages)
 
         with patch("multiclaw.agent.multiclaw.logger.info") as mock_info:
-            observation = await agent.handle_message("hello", session_id="s1")
+            observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation == Observation(
             type=ObservationType.USER_RESPONSE,
@@ -723,7 +828,7 @@ class TestMultiClawAgent:
         agent.context_builder.build_with_report.assert_awaited_once()
         request = agent.context_builder.build_with_report.await_args.args[0]
         assert request.user_input == "hello"
-        assert request.session_id == "s1"
+        assert request.context == SESSION_CONTEXT
         assert request.context_window_limit == 1000
         assert request.skill_prompts == []
         assert agent.router.completion.await_args_list[0].kwargs["messages"] == expected_messages
@@ -759,7 +864,7 @@ class TestMultiClawAgent:
             router=ModelRouter(settings),
             registry=registry,
             scheduler=scheduler,
-            memory=InMemoryMemory(),
+            memory=_ScopedMemoryFake(),
             planner=Planner(),
             event_bus=EventBus(),
         )
@@ -820,8 +925,13 @@ class _StubRegistry:
 
 
 class _StubMemory:
-    async def save(self, _entry):
+    async def save(self, _context, _entry):
         return None
+
+    async def recent(self, _context, limit: int, entry_type: str | None = None):
+        assert limit >= 1
+        assert entry_type == "chat_message"
+        return []
 
 
 def _build_stub_agent(

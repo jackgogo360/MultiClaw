@@ -11,6 +11,8 @@ from multiclaw.storage.repositories.auth import (
     VerificationCodeRepository,
     WorkspaceRepository,
 )
+from multiclaw.storage.repositories.memory import MemoryRepository
+from multiclaw.storage.repositories.sessions import SessionRepository
 from multiclaw.tenancy.context import TenantContext
 
 
@@ -107,6 +109,8 @@ class AuthUnitOfWork(_BaseUnitOfWork["AuthUnitOfWork"]):
 class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
     users: TenantUserRepository
     workspaces: WorkspaceRepository
+    sessions: SessionRepository
+    memory: MemoryRepository
 
     def __init__(self, database: Database, context: TenantContext) -> None:
         super().__init__(database)
@@ -116,3 +120,5 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
         assert self.conn is not None
         self.users = TenantUserRepository(self.conn, self._database.dialect, self._context)
         self.workspaces = WorkspaceRepository(self.conn, self._database.dialect, self._context)
+        self.sessions = SessionRepository(self.conn, self._context, self._database.dialect)
+        self.memory = MemoryRepository(self.conn, self._context, self._database.dialect)

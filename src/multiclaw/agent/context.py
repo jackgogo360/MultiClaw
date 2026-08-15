@@ -3,13 +3,14 @@ from dataclasses import dataclass, field
 
 from multiclaw.context import ContextBuildReport, ContextBuildResult, estimate_tokens
 from multiclaw.memory import MemoryEntry, MemoryProtocol
+from multiclaw.tenancy.context import TenantContext
 
 
 @dataclass
 class ContextRequest:
     system_prompt: str
     user_input: str
-    session_id: str
+    context: TenantContext
     context_window_limit: int
     skill_prompts: list[tuple[str, str]] = field(default_factory=list)
 
@@ -60,7 +61,7 @@ class ContextBuilder:
         for _, body in request.skill_prompts:
             messages.append({"role": "system", "content": body})
 
-        recent_entries = await self._recent_chat_entries(request.session_id)
+        recent_entries = await self._recent_chat_entries(request.context)
         for entry in recent_entries:
             messages.append({"role": entry.role, "content": entry.content})
 
@@ -107,7 +108,7 @@ class ContextBuilder:
         else:
             l0_dropped = 1
 
-        recent_entries = await self._recent_chat_entries(request.session_id)
+        recent_entries = await self._recent_chat_entries(request.context)
         relevant_entries = await self._relevant_entries(request, recent_entries)
 
         remaining_after_l0 = max(available_tokens - l0_tokens, 0)
@@ -146,11 +147,11 @@ class ContextBuilder:
             ),
         )
 
-    async def _recent_chat_entries(self, session_id: str) -> list[MemoryEntry]:
+    async def _recent_chat_entries(self, context: TenantContext) -> list[MemoryEntry]:
         recent_entries = await self.memory.recent(
+            context,
             limit=self.recent_turns * 4,
             entry_type="chat_message",
-            session_id=session_id,
         )
         return [
             entry
@@ -165,10 +166,9 @@ class ContextBuilder:
     ) -> list[MemoryEntry]:
         recent_contents = {entry.content for entry in recent_entries}
         relevant_entries = await self.memory.query(
+            request.context,
             request.user_input,
             top_k=5,
-            session_id=request.session_id,
-            include_legacy=self.include_legacy_memory,
         )
         return [
             entry

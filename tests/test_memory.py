@@ -1,180 +1,95 @@
+import importlib
+import inspect
+import json
+
 import pytest
 
-
-@pytest.mark.asyncio
-async def test_in_memory_memory_save_and_query():
-    from multiclaw.memory import InMemoryMemory, MemoryEntry
-
-    memory = InMemoryMemory()
-    await memory.save(MemoryEntry(content="remember alpha", type="note"))
-    await memory.save(MemoryEntry(content="remember beta", type="note"))
-
-    results = await memory.query("alpha", top_k=5)
-
-    assert len(results) == 1
-    assert results[0].content == "remember alpha"
+from multiclaw.memory import MemoryEntry, MemoryProtocol
 
 
-@pytest.mark.asyncio
-async def test_in_memory_memory_forget_removes_entry():
-    from multiclaw.memory import InMemoryMemory, MemoryEntry
+def test_memory_entry_defaults_are_scope_free() -> None:
+    entry = MemoryEntry(content="remember alpha", type="note")
 
-    memory = InMemoryMemory()
-    entry = await memory.save(MemoryEntry(content="remember alpha", type="note"))
+    dumped = entry.model_dump()
 
-    await memory.forget(entry.id)
-    results = await memory.query("alpha", top_k=5)
-
-    assert results == []
-
-
-def test_memory_package_exports():
-    from multiclaw import memory
-    from multiclaw.memory import InMemoryMemory, MemoryEntry, MemoryProtocol
-
-    assert memory.InMemoryMemory is InMemoryMemory
-    assert memory.MemoryEntry is MemoryEntry
-    assert memory.MemoryProtocol is MemoryProtocol
+    assert len(entry.id) == 36
+    assert entry.session_id is None
+    assert entry.role == "note"
+    assert isinstance(entry.created_at, int)
+    assert dumped["metadata"] == {}
+    assert "tenant_id" not in dumped
+    assert "workspace_id" not in dumped
 
 
-@pytest.mark.asyncio
-async def test_in_memory_query_ranks_keyword_overlap():
-    from multiclaw.memory import InMemoryMemory, MemoryEntry
+def test_memory_entry_from_row_parses_metadata_json() -> None:
+    entry = MemoryEntry.from_row(
+        {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "content": "hello",
+            "type": "chat_message",
+            "session_id": "44444444-4444-4444-4444-444444444444",
+            "role": "assistant",
+            "turn_index": 4,
+            "created_at": 123,
+            "metadata_json": json.dumps({"a": 1}, sort_keys=True),
+        }
+    )
 
-    memory = InMemoryMemory()
-    await memory.save(MemoryEntry(content="alpha only", type="note"))
-    await memory.save(MemoryEntry(content="alpha beta gamma", type="note"))
+    assert entry == MemoryEntry(
+        id="11111111-1111-1111-1111-111111111111",
+        content="hello",
+        type="chat_message",
+        session_id="44444444-4444-4444-4444-444444444444",
+        role="assistant",
+        turn_index=4,
+        created_at=123,
+        metadata={"a": 1},
+    )
 
-    results = await memory.query("alpha beta", top_k=2)
 
-    assert [entry.content for entry in results] == [
-        "alpha beta gamma",
-        "alpha only",
+def test_memory_entry_allows_unbound_chat_messages_until_repository_save() -> None:
+    entry = MemoryEntry(content="hello", type="chat_message", role="user")
+
+    assert entry.session_id is None
+
+
+def test_memory_entry_normalizes_empty_session_id_to_none() -> None:
+    entry = MemoryEntry(content="hello", type="note", session_id="")
+
+    assert entry.session_id is None
+
+def test_memory_protocol_methods_take_context_first() -> None:
+    assert list(inspect.signature(MemoryProtocol.save).parameters) == [
+        "self",
+        "context",
+        "entry",
+    ]
+    assert list(inspect.signature(MemoryProtocol.query).parameters)[:4] == [
+        "self",
+        "context",
+        "query",
+        "top_k",
+    ]
+    assert list(inspect.signature(MemoryProtocol.recent).parameters)[:3] == [
+        "self",
+        "context",
+        "limit",
+    ]
+    assert list(inspect.signature(MemoryProtocol.context).parameters)[:4] == [
+        "self",
+        "context",
+        "max_chars",
+        "limit",
     ]
 
 
-@pytest.mark.asyncio
-async def test_in_memory_recent_returns_newest_first_with_filters():
-    from multiclaw.memory import InMemoryMemory, MemoryEntry
+def test_memory_package_exports_scoped_api_only() -> None:
+    import multiclaw.memory as memory_package
 
-    memory = InMemoryMemory()
-    await memory.save(MemoryEntry(content="tenant a old", type="note", tenant_id="a"))
-    await memory.save(MemoryEntry(content="tenant b", type="note", tenant_id="b"))
-    await memory.save(MemoryEntry(content="tenant a new", type="tool_result", tenant_id="a"))
-
-    results = await memory.recent(limit=2, tenant_id="a")
-
-    assert [entry.content for entry in results] == ["tenant a new", "tenant a old"]
-
-
-@pytest.mark.asyncio
-async def test_in_memory_context_keeps_recent_entries_within_character_budget():
-    from multiclaw.memory import InMemoryMemory, MemoryEntry
-
-    memory = InMemoryMemory()
-    await memory.save(MemoryEntry(content="old entry is too long", type="note"))
-    await memory.save(MemoryEntry(content="middle", type="note"))
-    await memory.save(MemoryEntry(content="new", type="note"))
-
-    results = await memory.context(max_chars=12, limit=3)
-
-    assert [entry.content for entry in results] == ["middle", "new"]
-
-
-@pytest.mark.asyncio
-async def test_sqlite_memory_persists_entries_across_instances(tmp_path):
-    from multiclaw.memory import MemoryEntry, SqliteMemory
-
-    db_path = tmp_path / "memory.db"
-    first = SqliteMemory(str(db_path))
-    await first.initialize()
-    saved = await first.save(
-        MemoryEntry(content="persistent alpha beta", type="note", tenant_id="tenant-1")
-    )
-    await first.close()
-
-    second = SqliteMemory(str(db_path))
-    await second.initialize()
-    results = await second.query("alpha", top_k=5, tenant_id="tenant-1")
-    await second.close()
-
-    assert [entry.id for entry in results] == [saved.id]
-    assert results[0].content == "persistent alpha beta"
-
-
-@pytest.mark.asyncio
-async def test_sqlite_memory_creates_parent_directory(tmp_path):
-    from multiclaw.memory import MemoryEntry, SqliteMemory
-
-    db_path = tmp_path / "nested" / "memory.db"
-    memory = SqliteMemory(str(db_path))
-    await memory.save(MemoryEntry(content="created parent directory", type="note"))
-    await memory.close()
-
-    assert db_path.exists()
-
-
-@pytest.mark.asyncio
-async def test_in_memory_filters_by_session_id():
-    from multiclaw.memory import InMemoryMemory, MemoryEntry
-
-    memory = InMemoryMemory()
-    await memory.save(
-        MemoryEntry(content="first user", type="chat_message", session_id="s1", role="user", turn_index=1)
-    )
-    await memory.save(
-        MemoryEntry(content="other session", type="chat_message", session_id="s2", role="user", turn_index=1)
-    )
-    await memory.save(
-        MemoryEntry(content="first assistant", type="chat_message", session_id="s1", role="assistant", turn_index=2)
-    )
-
-    results = await memory.recent(limit=3, session_id="s1", entry_type="chat_message")
-
-    assert [entry.content for entry in results] == ["first assistant", "first user"]
-
-
-@pytest.mark.asyncio
-async def test_in_memory_query_filters_by_session_id():
-    from multiclaw.memory import InMemoryMemory, MemoryEntry
-
-    memory = InMemoryMemory()
-    await memory.save(MemoryEntry(content="legacy alpha", type="note"))
-    await memory.save(MemoryEntry(content="session alpha", type="note", session_id="s1"))
-
-    results = await memory.query("alpha", top_k=5, session_id="s1")
-
-    assert [entry.content for entry in results] == ["session alpha"]
-
-
-@pytest.mark.asyncio
-async def test_sqlite_memory_session_scoped_recent(tmp_path):
-    from multiclaw.memory import MemoryEntry, SqliteMemory
-
-    memory = SqliteMemory(str(tmp_path / "memory.db"))
-    await memory.save(
-        MemoryEntry(content="first user", type="chat_message", session_id="s1", role="user", turn_index=1)
-    )
-    await memory.save(
-        MemoryEntry(content="other session", type="chat_message", session_id="s2", role="user", turn_index=1)
-    )
-    await memory.save(
-        MemoryEntry(content="first assistant", type="chat_message", session_id="s1", role="assistant", turn_index=2)
-    )
-
-    results = await memory.recent(limit=3, session_id="s1", entry_type="chat_message")
-
-    assert [entry.content for entry in results] == ["first assistant", "first user"]
-
-
-@pytest.mark.asyncio
-async def test_sqlite_memory_query_filters_by_session_id(tmp_path):
-    from multiclaw.memory import MemoryEntry, SqliteMemory
-
-    memory = SqliteMemory(str(tmp_path / "memory.db"))
-    await memory.save(MemoryEntry(content="legacy alpha", type="note"))
-    await memory.save(MemoryEntry(content="session alpha", type="note", session_id="s1"))
-
-    results = await memory.query("alpha", top_k=5, session_id="s1")
-
-    assert [entry.content for entry in results] == ["session alpha"]
+    assert memory_package.MemoryEntry is MemoryEntry
+    assert memory_package.MemoryProtocol is MemoryProtocol
+    assert not hasattr(memory_package, "InMemoryMemory")
+    assert not hasattr(memory_package, "SqliteMemory")
+    assert importlib.util.find_spec("multiclaw.memory.sqlite") is None
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("multiclaw.memory.sqlite")

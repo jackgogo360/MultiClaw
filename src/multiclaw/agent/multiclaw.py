@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -17,8 +17,9 @@ from multiclaw.events import AgentState, EventBus
 from multiclaw.llm import LLMResponse, ModelRouter
 from multiclaw.memory import MemoryEntry, MemoryProtocol
 from multiclaw.planner import Planner
-from multiclaw.tools import CoreToolScheduler, ToolRegistry
 from multiclaw.skills import SkillManager
+from multiclaw.tenancy.context import TenantContext
+from multiclaw.tools import CoreToolScheduler, ToolRegistry
 
 logger = logging.getLogger(__name__)
 DSML_TOOLCALL_PATTERN = re.compile(
@@ -211,9 +212,15 @@ class MultiClawAgent(ToolCallAgent):
     # non-streaming path
     # ------------------------------------------------------------------
 
-    async def handle_message(self, user_input: str, session_id: str = "") -> Observation:
+    async def handle_message(
+        self,
+        user_input: str,
+        *,
+        context: TenantContext,
+    ) -> Observation:
         if user_input.startswith("plan:"):
-            await self._save_chat_msg(user_input, "user", session_id)
+            next_turn_index = await self._next_turn_index(context)
+            await self._save_chat_msg(context, "user", user_input, next_turn_index)
             request = user_input[len("plan:") :].strip()
             plan = self.planner.create_plan(request)
             return Observation(
@@ -238,12 +245,13 @@ class MultiClawAgent(ToolCallAgent):
             ContextRequest(
                 system_prompt=self.settings.agent.system_prompt,
                 user_input=user_msg,
-                session_id=session_id,
+                context=context,
                 context_window_limit=self.settings.memory.context_window_limit,
                 skill_prompts=skill_prompts,
             )
         )
-        await self._save_chat_msg(user_msg, "user", session_id)
+        next_turn_index = await self._next_turn_index(context)
+        await self._save_chat_msg(context, "user", user_msg, next_turn_index)
         tools = self.registry.to_openai_schemas()
         max_rounds = self.settings.agent.max_tool_rounds
         controller = self._build_resilience_controller()
@@ -256,7 +264,7 @@ class MultiClawAgent(ToolCallAgent):
             )
 
             if not response.tool_calls:
-                await self._save_chat_msg(response.content, "assistant", session_id)
+                await self._save_chat_msg(context, "assistant", response.content, next_turn_index + 1)
                 return Observation(
                     type=ObservationType.USER_RESPONSE,
                     content=response.content,
@@ -292,7 +300,7 @@ class MultiClawAgent(ToolCallAgent):
                         outcome.observation.content,
                     )
                 )
-                await self.remember(outcome.observation.content, "tool_result")
+                await self.remember(context, outcome.observation.content, "tool_result")
 
             if controller is not None:
                 result_decision = controller.observe_results(result_contents)
@@ -311,14 +319,14 @@ class MultiClawAgent(ToolCallAgent):
         # Max rounds exceeded — force a final summary without tools
         logger.warning(
             "max tool rounds (%d) exceeded for session=%s, forcing final summary with %d messages",
-            max_rounds, session_id, len(messages),
+            max_rounds, context.session_id, len(messages),
         )
         try:
             full_text = await self._generate_final_summary(
                 messages,
                 self._collect_completion_text_response,
             )
-            await self._save_chat_msg(full_text, "assistant", session_id)
+            await self._save_chat_msg(context, "assistant", full_text, next_turn_index + 1)
             return Observation(
                 type=ObservationType.USER_RESPONSE,
                 content=full_text,
@@ -394,12 +402,16 @@ class MultiClawAgent(ToolCallAgent):
         return self._strip_dsml_tool_markup(full_text)
 
     async def handle_message_stream(
-        self, user_input: str, session_id: str = ""
+        self,
+        user_input: str,
+        *,
+        context: TenantContext,
     ) -> AsyncIterator[dict[str, Any]]:
         logger.info("handle_message_stream: %r", user_input[:80])
 
         if user_input.startswith("plan:"):
-            await self._save_chat_msg(user_input, "user", session_id)
+            next_turn_index = await self._next_turn_index(context)
+            await self._save_chat_msg(context, "user", user_input, next_turn_index)
             logger.info("-> plan mode")
             request = user_input[len("plan:") :].strip()
             plan = self.planner.create_plan(request)
@@ -433,12 +445,13 @@ class MultiClawAgent(ToolCallAgent):
             ContextRequest(
                 system_prompt=self.settings.agent.system_prompt,
                 user_input=user_msg,
-                session_id=session_id,
+                context=context,
                 context_window_limit=self.settings.memory.context_window_limit,
                 skill_prompts=skill_prompts,
             )
         )
-        await self._save_chat_msg(user_msg, "user", session_id)
+        next_turn_index = await self._next_turn_index(context)
+        await self._save_chat_msg(context, "user", user_msg, next_turn_index)
         tools = self.registry.to_openai_schemas()
         max_rounds = self.settings.agent.max_tool_rounds
         controller = self._build_resilience_controller()
@@ -531,10 +544,7 @@ class MultiClawAgent(ToolCallAgent):
                                     outcome.observation.content,
                                 )
                             )
-                            await self.remember(
-                                outcome.observation.content,
-                                "tool_result",
-                            )
+                            await self.remember(context, outcome.observation.content, "tool_result")
 
                         if controller is not None:
                             result_decision = controller.observe_results(result_contents)
@@ -569,7 +579,12 @@ class MultiClawAgent(ToolCallAgent):
                         full_text = reasoning_text
                         yield {"type": "token", "content": full_text}
                     logger.info("streaming complete, text_len=%d", len(full_text))
-                    await self._save_chat_msg(full_text, "assistant", session_id)
+                    await self._save_chat_msg(
+                        context,
+                        "assistant",
+                        full_text,
+                        next_turn_index + 1,
+                    )
                     await self.transition(AgentState.FINISHED)
                     yield {"type": "done", "content": full_text, "data": {}}
                     return
@@ -577,7 +592,7 @@ class MultiClawAgent(ToolCallAgent):
             except (httpx.ReadTimeout, asyncio.TimeoutError) as exc:
                 logger.error(
                     "stream timeout round=%d/%d session=%s input=%r",
-                    round_num + 1, max_rounds, session_id, user_input[:200],
+                    round_num + 1, max_rounds, context.session_id, user_input[:200],
                 )
                 yield {
                     "type": "error",
@@ -593,7 +608,7 @@ class MultiClawAgent(ToolCallAgent):
         # Max rounds exceeded — force a final summary without tools
         logger.warning(
             "max tool rounds (%d) exceeded for session=%s, forcing final summary with %d messages",
-            max_rounds, session_id, len(messages),
+            max_rounds, context.session_id, len(messages),
         )
         try:
             full_text = await self._generate_final_summary(
@@ -601,7 +616,12 @@ class MultiClawAgent(ToolCallAgent):
                 self._collect_plain_text_response,
             )
             if full_text:
-                await self._save_chat_msg(full_text, "assistant", session_id)
+                await self._save_chat_msg(
+                    context,
+                    "assistant",
+                    full_text,
+                    next_turn_index + 1,
+                )
                 yield {"type": "token", "content": full_text}
             yield {"type": "done", "content": full_text, "data": {}}
         except Exception:
@@ -612,12 +632,28 @@ class MultiClawAgent(ToolCallAgent):
                 "data": {},
             }
 
-    async def _save_chat_msg(self, content: str, role: str, session_id: str) -> None:
+    async def _next_turn_index(self, context: TenantContext) -> int:
+        if context.session_id is None:
+            raise ValueError("session_id is required for chat messages")
+        recent = await self.memory.recent(context, limit=1, entry_type="chat_message")
+        return (recent[0].turn_index + 1) if recent else 1
+
+    async def _save_chat_msg(
+        self,
+        context: TenantContext,
+        role: Literal["user", "assistant"],
+        content: str,
+        turn_index: int,
+    ) -> None:
+        if context.session_id is None:
+            raise ValueError("session_id is required for chat messages")
         await self.memory.save(
+            context,
             MemoryEntry(
                 content=content,
                 type="chat_message",
                 role=role,
-                session_id=session_id,
-            )
+                session_id=context.session_id,
+                turn_index=turn_index,
+            ),
         )
