@@ -831,6 +831,7 @@ async def chat(
         pending_tool_results = 0
         subscription = None
         stream_task: asyncio.Task | None = None
+        heartbeat_task: asyncio.Task | None = None
         current_workflow_lease = workflow_lease
         terminal_persisted = False
 
@@ -919,6 +920,7 @@ async def chat(
 
             token_queue: asyncio.Queue[dict] = asyncio.Queue()
             event_queue: asyncio.Queue[ScopedEvent] = asyncio.Queue()
+            heartbeat_stop = asyncio.Event()
 
             async def collector(event: ScopedEvent):
                 await event_queue.put(event)
@@ -942,7 +944,32 @@ async def chat(
                     msg = _friendly_error(exc)
                     await token_queue.put({"type": "error", "content": msg})
 
+            async def heartbeat_run_lease() -> None:
+                nonlocal current_workflow_lease
+                interval_seconds = max(
+                    0.001,
+                    request.app.state.settings.workflow.heartbeat_ms / 1000,
+                )
+                while True:
+                    try:
+                        await asyncio.wait_for(heartbeat_stop.wait(), timeout=interval_seconds)
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                    if current_workflow_lease is None or terminal_persisted:
+                        continue
+                    try:
+                        current_workflow_lease = await build_workflow_coordinator(
+                            request.app.state.database,
+                            request.app.state.settings,
+                        ).heartbeat(current_workflow_lease)
+                    except Exception as exc:
+                        logger.exception("run lease heartbeat failed")
+                        await token_queue.put({"type": "error", "content": _friendly_error(exc)})
+                        return
+
             stream_task = asyncio.create_task(run_stream())
+            heartbeat_task = asyncio.create_task(heartbeat_run_lease())
 
             while True:
                 token_count = 0
@@ -1052,6 +1079,10 @@ async def chat(
 
                 await asyncio.sleep(0.02)
         finally:
+            if heartbeat_task is not None:
+                heartbeat_stop.set()
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
             if stream_task is not None:
                 stream_task.cancel()
                 await asyncio.gather(stream_task, return_exceptions=True)
