@@ -11,6 +11,7 @@ from multiclaw.tools import glob as glob_module
 from multiclaw.tools import grep as grep_module
 from multiclaw.tools import list_dir as list_dir_module
 from multiclaw.events import EventBus
+from multiclaw.tenancy import TenantContext
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.tools import (
     CoreToolScheduler,
@@ -789,6 +790,47 @@ class TestCoreToolScheduler:
             and entry.detail == "ordered"
             for entry in entries
         )
+
+    @pytest.mark.asyncio
+    async def test_incomplete_scope_context_skips_event_router_but_keeps_runtime_bus_events(self):
+        class RecordingRouter:
+            def __init__(self) -> None:
+                self.published: list[object] = []
+
+            async def publish(self, event) -> None:
+                self.published.append(event)
+
+        event_bus = EventBus()
+        scheduler = CoreToolScheduler(
+            permission_checker=PermissionChecker(guarded_tools={"delete_file"}),
+            execution_guard=ExecutionGuard(),
+            audit_logger=InMemoryAuditLogger(),
+            event_bus=event_bus,
+            event_router=RecordingRouter(),
+        )
+        events: list[tuple[str, dict]] = []
+
+        async def handler(event):
+            if event.type.startswith("tool."):
+                events.append((event.type.removeprefix("tool."), event.data))
+
+        event_bus.subscribe("*", handler)
+
+        result = await scheduler.run(
+            EchoToolBuilder(),
+            {"text": "hello"},
+            context=TenantContext("tenant-a", "workspace-a").for_session("session-a"),
+            call_id="call-123",
+        )
+
+        assert result.status == ToolStatus.SUCCESS
+        assert events == [
+            ("scheduled", {"tool": "echo", "call_id": "call-123"}),
+            ("validating", {"tool": "echo", "call_id": "call-123"}),
+            ("executing", {"tool": "echo", "call_id": "call-123"}),
+            ("completed", {"tool": "echo", "call_id": "call-123"}),
+        ]
+        assert scheduler.event_router.published == []
 
     @pytest.mark.asyncio
     async def test_external_read_allowed_after_approval(self, tmp_path):

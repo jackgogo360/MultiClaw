@@ -1,6 +1,7 @@
 """Integration tests for MCP -> ToolRegistry -> execution pipeline."""
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -143,7 +144,7 @@ def test_registry_replaces_mcp_server_namespace():
     ]
 
 
-def test_manager_callback_receives_refreshed_list_after_state_replacement(caplog):
+def test_manager_callback_receives_refreshed_list_after_state_replacement():
     manager = MCPClientManager()
     old_tool = ToolInfo(
         name="mcp__alpha__old",
@@ -176,12 +177,15 @@ def test_manager_callback_receives_refreshed_list_after_state_replacement(caplog
 
     manager.set_tools_changed_callback(callback)
 
-    with caplog.at_level("ERROR"):
+    with patch("multiclaw.mcp.manager.logger.exception") as mock_exception:
         manager._on_tools_changed("alpha", [new_tool])
 
     assert [tool.original_name for tool in manager.get_server_states()["alpha"].tools] == ["new"]
     assert seen == [["new"]]
-    assert "Tools changed callback failed for server 'alpha'" in caplog.text
+    mock_exception.assert_called_once_with(
+        "Tools changed callback failed for server '%s'",
+        "alpha",
+    )
 
 
 def test_create_transport_builds_sandboxed_stdio_launch_spec_with_controlled_grants(

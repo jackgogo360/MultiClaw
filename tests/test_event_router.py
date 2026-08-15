@@ -74,6 +74,34 @@ async def test_event_router_handler_failure_does_not_block_other_exact_subscribe
     assert seen == ["tool.completed"]
 
 
+@pytest.mark.asyncio
+async def test_event_router_isolates_payload_between_handlers_and_source_event():
+    from multiclaw.events import EventRouter, EventScope, ScopedEvent
+
+    router = EventRouter()
+    scope = EventScope(tenant_id="t", workspace_id="w", session_id="s", run_id="r")
+    source = ScopedEvent.from_scope(
+        scope,
+        "tool.completed",
+        {"outer": {"value": 1}},
+    )
+    seen: list[dict[str, int]] = []
+
+    async def mutating_handler(event: ScopedEvent) -> None:
+        event.data["outer"]["value"] = 99
+
+    async def observing_handler(event: ScopedEvent) -> None:
+        seen.append({"value": event.data["outer"]["value"]})
+
+    router.subscribe(scope, mutating_handler)
+    router.subscribe(scope, observing_handler)
+
+    await router.publish(source)
+
+    assert seen == [{"value": 1}]
+    assert source.data == {"outer": {"value": 1}}
+
+
 def test_event_scope_requires_non_empty_non_wildcard_fields():
     from multiclaw.events import EventScope
 

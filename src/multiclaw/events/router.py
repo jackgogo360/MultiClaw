@@ -5,6 +5,7 @@ import threading
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 
 from multiclaw.events.types import EventScope, ScopedEvent
 
@@ -46,7 +47,7 @@ class EventRouter:
             handlers = list(self._handlers.get(key, ()))
         for _sub_id, handler in handlers:
             try:
-                await handler(event)
+                await handler(self._clone_event(event))
             except Exception:
                 logger.exception(
                     "Error in scoped event handler for %s",
@@ -75,4 +76,10 @@ class EventRouter:
             scope.workspace_id,
             scope.session_id,
             scope.run_id,
+        )
+
+    @staticmethod
+    def _clone_event(event: ScopedEvent) -> ScopedEvent:
+        return event.model_copy(
+            update={"data": deepcopy(event.data)},
         )
