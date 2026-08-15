@@ -996,11 +996,15 @@ async def chat(
             run_lease.close()
             logger.info("SSE stream ended")
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"X-Vercel-AI-Data-Stream": "v1"},
-    )
+    try:
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"X-Vercel-AI-Data-Stream": "v1"},
+        )
+    except BaseException:
+        run_lease.close()
+        raise
 
 
 def _resolve_chat_message(req: ChatRequest) -> str:

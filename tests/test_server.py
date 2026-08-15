@@ -2093,3 +2093,41 @@ async def test_chat_runtime_signal_resets_when_client_closes_after_first_chunk(
     runtime = holder["runtime"]
     assert runtime.active_executing_run_count == 0
     assert runtime.active_run_count == 0
+
+
+def test_chat_closes_run_lease_when_streaming_response_constructor_raises(
+    migrated_database,
+    monkeypatch,
+):
+    import multiclaw.server as server
+
+    captured: dict[str, object] = {}
+
+    class BoomStreamingResponse:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("constructor failed")
+
+    async def fake_handle_message_stream(user_input: str, *, context):
+        del user_input, context
+        yield {"type": "done", "content": ""}
+
+    with TestClient(server.app) as client:
+        client.cookies = _make_auth_cookie(server.app, migrated_database)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            monkeypatch.setattr(runtime.agent, "handle_message_stream", fake_handle_message_stream)
+            captured["runtime"] = runtime
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        monkeypatch.setattr(server, "StreamingResponse", BoomStreamingResponse)
+
+        with pytest.raises(RuntimeError, match="constructor failed"):
+            client.post("/api/chat", json={"message": "hello"})
+
+    runtime = captured["runtime"]
+    assert runtime.active_executing_run_count == 0
+    assert runtime.active_run_count == 0
