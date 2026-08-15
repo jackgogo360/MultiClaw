@@ -61,10 +61,12 @@ async def test_storage_engine_sqlite_sets_foreign_keys_busy_timeout_and_wal(tmp_
             foreign_keys = await conn.scalar(text("PRAGMA foreign_keys"))
             busy_timeout = await conn.scalar(text("PRAGMA busy_timeout"))
             journal_mode = await conn.scalar(text("PRAGMA journal_mode"))
+            synchronous = await conn.scalar(text("PRAGMA synchronous"))
 
         assert foreign_keys == 1
         assert busy_timeout == 4321
         assert journal_mode is not None
         assert journal_mode.lower() == "wal"
+        assert synchronous == 1
     finally:
         await database.dispose()
