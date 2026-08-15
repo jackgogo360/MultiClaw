@@ -11,6 +11,7 @@ from multiclaw.governance import SandboxController, SandboxReadiness
 from multiclaw.mcp import MCPClientManager
 from multiclaw.skills import SkillManager
 from multiclaw.tools import CoreToolScheduler, ToolRegistry
+from multiclaw.workflow.models import WorkflowRuntimeCounters
 
 
 class RuntimeClock(Protocol):
@@ -165,6 +166,12 @@ class TenantRuntime:
         self.touch()
         return RuntimeExecutionLease(self)
 
+    def apply_workflow_counters(self, counters: WorkflowRuntimeCounters) -> None:
+        self.active_run_count = counters.active_run_count
+        self.active_executing_run_count = counters.active_executing_run_count
+        self.awaiting_user_run_count = counters.awaiting_user_run_count
+        self.checkpointed_awaiting_user_run_count = counters.checkpointed_awaiting_user_run_count
+
     async def close(self) -> None:
         async with self._close_lock:
             if self._close_complete:
@@ -188,7 +195,7 @@ class TenantRuntime:
                 else:
                     self._mcp_stopped = True
 
-            if not self._skill_closed:
+            if not self._skill_closed and self.skill_manager is not None:
                 try:
                     self.skill_manager.close()
                 except BaseException as error:
@@ -196,7 +203,7 @@ class TenantRuntime:
                 else:
                     self._skill_closed = True
 
-            if not self._registry_cleared:
+            if not self._registry_cleared and self.registry is not None:
                 try:
                     self.registry.clear()
                 except BaseException as error:
@@ -204,7 +211,7 @@ class TenantRuntime:
                 else:
                     self._registry_cleared = True
 
-            if not self._event_router_cleared:
+            if not self._event_router_cleared and self.event_router is not None:
                 try:
                     self.event_router.clear()
                 except BaseException as error:

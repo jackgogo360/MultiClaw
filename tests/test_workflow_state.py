@@ -19,7 +19,12 @@ from multiclaw.auth.models import UserRecord
 from multiclaw.cli import alembic_config
 from multiclaw.config import DatabaseSettings, Settings
 from multiclaw.storage import Database
-from multiclaw.storage.schema import agent_runs, approval_requests, tool_executions
+from multiclaw.storage.schema import (
+    agent_runs,
+    approval_requests,
+    execution_checkpoints,
+    tool_executions,
+)
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
@@ -137,6 +142,28 @@ async def _seed_execution(
             )
         )
     return execution_id
+
+
+async def _fetch_execution_state(
+    database: Database,
+    lease: RunLease,
+    execution_id: str,
+) -> tuple[str, int]:
+    async with database.connect() as conn:
+        result = await conn.execute(
+            select(
+                tool_executions.c.execution_status,
+                tool_executions.c.version,
+            ).where(
+                tool_executions.c.tenant_id == lease.context.tenant_id,
+                tool_executions.c.workspace_id == lease.context.workspace_id,
+                tool_executions.c.session_id == lease.context.session_id,
+                tool_executions.c.run_id == lease.context.run_id,
+                tool_executions.c.execution_id == execution_id,
+            )
+        )
+        row = result.mappings().one()
+    return str(row["execution_status"]), int(row["version"])
 
 
 @dataclass(slots=True, frozen=True)
@@ -292,6 +319,136 @@ async def test_execution_without_approval_fk_can_start(workflow_database: Databa
 
 
 @pytest.mark.asyncio
+async def test_execution_transition_rejects_illegal_source_target_pair(workflow_database: Database):
+    run_context = await _create_run_context(workflow_database, suffix="-exec-illegal")
+    lease = await _coordinator(workflow_database).start_run(run_context, "runtime")
+    execution_id = await _seed_execution(workflow_database, lease, status=ExecutionStatus.EXECUTING)
+
+    with pytest.raises(InvalidTransitionError):
+        await _coordinator(workflow_database).transition_execution(
+            lease,
+            execution_id,
+            expected_status=ExecutionStatus.EXECUTING,
+            expected_version=1,
+            target=ExecutionStatus.REPLAYING,
+        )
+
+
+@pytest.mark.asyncio
+async def test_execution_transition_updates_under_current_lease(workflow_database: Database):
+    run_context = await _create_run_context(workflow_database, suffix="-exec-green")
+    lease = await _coordinator(workflow_database).start_run(run_context, "runtime")
+    execution_id = await _seed_execution(workflow_database, lease, status=ExecutionStatus.NOT_STARTED)
+
+    lease = await _coordinator(workflow_database).transition_execution(
+        lease,
+        execution_id,
+        expected_status=ExecutionStatus.NOT_STARTED,
+        expected_version=1,
+        target=ExecutionStatus.REPLAYING,
+    )
+    assert await _fetch_execution_state(workflow_database, lease, execution_id) == (
+        ExecutionStatus.REPLAYING.value,
+        2,
+    )
+
+    lease = await _coordinator(workflow_database).transition_execution(
+        lease,
+        execution_id,
+        expected_status=ExecutionStatus.REPLAYING,
+        expected_version=2,
+        target=ExecutionStatus.EXECUTING,
+    )
+    assert await _fetch_execution_state(workflow_database, lease, execution_id) == (
+        ExecutionStatus.EXECUTING.value,
+        3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_execution_transition_detects_version_conflict(workflow_database: Database):
+    run_context = await _create_run_context(workflow_database, suffix="-exec-version")
+    lease = await _coordinator(workflow_database).start_run(run_context, "runtime")
+    execution_id = await _seed_execution(workflow_database, lease, status=ExecutionStatus.NOT_STARTED)
+
+    with pytest.raises(VersionConflictError):
+        await _coordinator(workflow_database).transition_execution(
+            lease,
+            execution_id,
+            expected_status=ExecutionStatus.NOT_STARTED,
+            expected_version=2,
+            target=ExecutionStatus.REPLAYING,
+        )
+
+
+@pytest.mark.asyncio
+async def test_stale_lease_blocks_execution_transition_after_takeover(workflow_database: Database):
+    run_context = await _create_run_context(workflow_database, suffix="-exec-stale")
+    first = await _coordinator(workflow_database).start_run(run_context, "runtime-1")
+    execution_id = await _seed_execution(workflow_database, first, status=ExecutionStatus.NOT_STARTED)
+    await _expire_lease_with_db_clock(workflow_database, run_context)
+    current = await _coordinator(workflow_database).acquire_run(run_context, "runtime-2")
+
+    with pytest.raises(StaleFenceError):
+        await _coordinator(workflow_database).transition_execution(
+            first,
+            execution_id,
+            expected_status=ExecutionStatus.NOT_STARTED,
+            expected_version=1,
+            target=ExecutionStatus.REPLAYING,
+        )
+
+    current = await _coordinator(workflow_database).transition_execution(
+        current,
+        execution_id,
+        expected_status=ExecutionStatus.NOT_STARTED,
+        expected_version=1,
+        target=ExecutionStatus.REPLAYING,
+    )
+    assert current.version >= 2
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_insert_requires_current_lease(workflow_database: Database):
+    run_context = await _create_run_context(workflow_database, suffix="-checkpoint")
+    first = await _coordinator(workflow_database).start_run(run_context, "runtime-1")
+    await _expire_lease_with_db_clock(workflow_database, run_context)
+    current = await _coordinator(workflow_database).acquire_run(run_context, "runtime-2")
+
+    with pytest.raises(StaleFenceError):
+        await _coordinator(workflow_database).write_checkpoint(
+            first,
+            checkpoint_id=str(uuid4()),
+            checkpoint_seq=1,
+            phase="run",
+            payload_json="{}",
+            payload_hash="1" * 64,
+            schema_version=1,
+        )
+
+    await _coordinator(workflow_database).write_checkpoint(
+        current,
+        checkpoint_id=str(uuid4()),
+        checkpoint_seq=1,
+        phase="run",
+        payload_json="{}",
+        payload_hash="2" * 64,
+        schema_version=1,
+    )
+
+    async with workflow_database.connect() as conn:
+        count = await conn.scalar(
+            select(text("COUNT(*)")).select_from(execution_checkpoints).where(
+                execution_checkpoints.c.tenant_id == run_context.tenant_id,
+                execution_checkpoints.c.workspace_id == run_context.workspace_id,
+                execution_checkpoints.c.session_id == run_context.session_id,
+                execution_checkpoints.c.run_id == run_context.run_id,
+            )
+        )
+    assert count == 1
+
+
+@pytest.mark.asyncio
 async def test_start_run_enforces_persisted_quota(workflow_database: Database):
     settings = Settings(_config_file="/nonexistent", runtime={"max_concurrent_runs_per_tenant": 2})
     tenant_id, workspace_id = await _seed_user(workflow_database, "quota@example.com")
@@ -348,4 +505,3 @@ async def test_tenant_context_rejects_active_user_without_default_workspace():
         await tenant_context(request, user)
 
     assert exc_info.value.status_code == 403
-

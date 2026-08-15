@@ -4,6 +4,7 @@ from typing import Generic, TypeVar
 
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncTransaction
 
+from multiclaw.config.settings import WorkflowSettings
 from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.auth import (
     AuthUserRepository,
@@ -134,9 +135,16 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
     memory: MemoryRepository
     workflow: WorkflowRepository
 
-    def __init__(self, database: Database, context: TenantContext) -> None:
+    def __init__(
+        self,
+        database: Database,
+        context: TenantContext,
+        *,
+        workflow_settings: WorkflowSettings | None = None,
+    ) -> None:
         super().__init__(database)
         self._context = context
+        self._workflow_settings = workflow_settings or WorkflowSettings()
 
     def _bind_repositories(self) -> None:
         assert self.conn is not None
@@ -147,6 +155,6 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
         self.workflow = WorkflowRepository(
             self.conn,
             self._database.dialect,
-            5000,
-            20000,
+            self._workflow_settings.heartbeat_ms,
+            self._workflow_settings.lease_ttl_ms,
         )

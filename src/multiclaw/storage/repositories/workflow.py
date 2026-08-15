@@ -2,24 +2,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import and_, func, insert, select, update
+from sqlalchemy import and_, exists, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql.elements import ColumnElement
 
 from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
-from multiclaw.storage.schema import agent_runs, approval_requests, tool_executions, users
+from multiclaw.storage.schema import (
+    agent_runs,
+    approval_requests,
+    execution_checkpoints,
+    tool_executions,
+    users,
+)
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import (
     ApprovalRecord,
     ApprovalStatus,
+    ExecutionRecord,
     ExecutionStatus,
     InvalidTransitionError,
-    LEGAL_APPROVAL_TRANSITIONS,
+    LEGAL_EXECUTION_TRANSITIONS,
     LEGAL_RUN_TRANSITIONS,
+    RecoveryStrategy,
     TERMINAL_EXECUTION_STATUSES,
     RunLease,
     RunRecord,
     RunStatus,
+    WorkflowRuntimeCounters,
 )
 
 
@@ -66,7 +75,7 @@ class WorkflowRepository:
     _heartbeat_ms: int
     _lease_ttl_ms: int
 
-    async def lock_tenant(self, tenant_id: str) -> None:
+    async def _lock_tenant(self, tenant_id: str) -> None:
         if self._dialect.name != "mysql":
             return
         await self._conn.execute(
@@ -108,7 +117,55 @@ class WorkflowRepository:
         )
         return int(result.scalar_one())
 
-    async def create_run(
+    async def get_runtime_counters(self, context: TenantContext) -> WorkflowRuntimeCounters:
+        scope = and_(
+            agent_runs.c.tenant_id == context.tenant_id,
+            agent_runs.c.workspace_id == context.workspace_id,
+        )
+        active_run_count = await self._conn.scalar(
+            select(func.count())
+            .select_from(agent_runs)
+            .where(agent_runs.c.run_status.in_(ACTIVE_RUN_STATUSES), scope)
+        )
+        active_executing_run_count = await self._conn.scalar(
+            select(func.count())
+            .select_from(agent_runs)
+            .where(
+                scope,
+                agent_runs.c.run_status.in_((RunStatus.RUNNING.value, RunStatus.RESUMING.value)),
+            )
+        )
+        awaiting_user_run_count = await self._conn.scalar(
+            select(func.count())
+            .select_from(agent_runs)
+            .where(scope, agent_runs.c.run_status == RunStatus.AWAITING_USER.value)
+        )
+        checkpointed_awaiting_user_run_count = await self._conn.scalar(
+            select(func.count())
+            .select_from(agent_runs)
+            .where(
+                scope,
+                agent_runs.c.run_status == RunStatus.AWAITING_USER.value,
+                exists(
+                    select(1)
+                    .select_from(execution_checkpoints)
+                    .where(
+                        execution_checkpoints.c.tenant_id == agent_runs.c.tenant_id,
+                        execution_checkpoints.c.workspace_id == agent_runs.c.workspace_id,
+                        execution_checkpoints.c.session_id == agent_runs.c.session_id,
+                        execution_checkpoints.c.run_id == agent_runs.c.run_id,
+                    )
+                ),
+            )
+        )
+        return WorkflowRuntimeCounters(
+            active_run_count=int(active_run_count or 0),
+            active_executing_run_count=int(active_executing_run_count or 0),
+            awaiting_user_run_count=int(awaiting_user_run_count or 0),
+            checkpointed_awaiting_user_run_count=int(checkpointed_awaiting_user_run_count or 0),
+        )
+
+    async def _create_run(
         self,
         context: TenantContext,
         *,
@@ -170,7 +227,7 @@ class WorkflowRepository:
             lease_expires_at=int(row["lease_expires_at"]),
         )
 
-    async def take_over_run(
+    async def _take_over_run(
         self,
         context: TenantContext,
         *,
@@ -209,7 +266,7 @@ class WorkflowRepository:
             current.version + 1,
         )
 
-    async def refresh_lease(self, lease: RunLease) -> RunLease | None:
+    async def _refresh_lease(self, lease: RunLease) -> RunLease | None:
         now_ms = self._dialect.db_now_ms()
         result = await self._conn.execute(
             update(agent_runs)
@@ -230,7 +287,7 @@ class WorkflowRepository:
             lease.version + 1,
         )
 
-    async def transition_run(self, lease: RunLease, target: RunStatus) -> RunLease | None:
+    async def _transition_run(self, lease: RunLease, target: RunStatus) -> RunLease | None:
         await self._dialect.lock_run(self._conn, lease.context)
         current = await self.get_run(lease.context)
         if current is None:
@@ -284,6 +341,37 @@ class WorkflowRepository:
         )
         return int(result.scalar_one()) > 0
 
+    async def get_execution(
+        self,
+        context: TenantContext,
+        execution_id: str,
+    ) -> ExecutionRecord | None:
+        result = await self._conn.execute(
+            select(
+                tool_executions.c.execution_id,
+                tool_executions.c.approval_id,
+                tool_executions.c.tool_call_id,
+                tool_executions.c.tool_name,
+                tool_executions.c.tool_kind,
+                tool_executions.c.execution_status,
+                tool_executions.c.recovery_strategy,
+                tool_executions.c.version,
+                tool_executions.c.created_at,
+                tool_executions.c.updated_at,
+                tool_executions.c.finished_at,
+            )
+            .where(
+                tool_executions.c.tenant_id == context.tenant_id,
+                tool_executions.c.workspace_id == context.workspace_id,
+                tool_executions.c.session_id == context.session_id,
+                tool_executions.c.run_id == context.run_id,
+                tool_executions.c.execution_id == execution_id,
+            )
+            .limit(1)
+        )
+        row = result.mappings().first()
+        return None if row is None else self._execution_from_row(context, row)
+
     async def get_approval(self, context: TenantContext, approval_id: str) -> ApprovalRecord | None:
         result = await self._conn.execute(
             select(
@@ -301,7 +389,7 @@ class WorkflowRepository:
         row = result.mappings().first()
         return None if row is None else self._approval_from_row(context, row)
 
-    async def mark_approval_expired(self, context: TenantContext, approval_id: str, version: int) -> bool:
+    async def _mark_approval_expired(self, context: TenantContext, approval_id: str, version: int) -> bool:
         now_ms = self._dialect.db_now_ms()
         result = await self._conn.execute(
             update(approval_requests)
@@ -319,7 +407,7 @@ class WorkflowRepository:
         )
         return result.rowcount == 1
 
-    async def resolve_approval(
+    async def _resolve_approval(
         self,
         context: TenantContext,
         approval_id: str,
@@ -348,6 +436,97 @@ class WorkflowRepository:
         resolved = await self.get_approval(context, approval_id)
         assert resolved is not None
         return resolved
+
+    async def _transition_execution(
+        self,
+        lease: RunLease,
+        execution_id: str,
+        *,
+        expected_status: ExecutionStatus,
+        expected_version: int,
+        target: ExecutionStatus,
+    ) -> ExecutionRecord | None:
+        allowed = LEGAL_EXECUTION_TRANSITIONS.get(expected_status, frozenset())
+        if target not in allowed:
+            raise InvalidTransitionError(
+                f"illegal execution transition: {expected_status.value} -> {target.value}"
+            )
+
+        await self._dialect.lock_run(self._conn, lease.context)
+        if not await self._has_current_lease(lease):
+            return None
+
+        now_ms = self._dialect.db_now_ms()
+        values = {
+            "execution_status": target.value,
+            "updated_at": now_ms,
+            "version": tool_executions.c.version + 1,
+        }
+        if target in TERMINAL_EXECUTION_STATUSES:
+            values["finished_at"] = now_ms
+
+        result = await self._conn.execute(
+            update(tool_executions)
+            .where(
+                tool_executions.c.tenant_id == lease.context.tenant_id,
+                tool_executions.c.workspace_id == lease.context.workspace_id,
+                tool_executions.c.session_id == lease.context.session_id,
+                tool_executions.c.run_id == lease.context.run_id,
+                tool_executions.c.execution_id == execution_id,
+                tool_executions.c.execution_status == expected_status.value,
+                tool_executions.c.version == expected_version,
+                exists(select(1).select_from(agent_runs).where(current_lease_predicate(lease, self._dialect))),
+            )
+            .values(**values)
+        )
+        if result.rowcount != 1:
+            return None
+        transitioned = await self.get_execution(lease.context, execution_id)
+        assert transitioned is not None
+        return transitioned
+
+    async def _insert_checkpoint(
+        self,
+        lease: RunLease,
+        *,
+        checkpoint_id: str,
+        checkpoint_seq: int,
+        phase: str,
+        payload_json: str,
+        payload_hash: str,
+        schema_version: int,
+        approval_id: str | None = None,
+        execution_id: str | None = None,
+    ) -> bool:
+        await self._dialect.lock_run(self._conn, lease.context)
+        if not await self._has_current_lease(lease):
+            return False
+        await self._conn.execute(
+            insert(execution_checkpoints).values(
+                checkpoint_id=checkpoint_id,
+                tenant_id=lease.context.tenant_id,
+                workspace_id=lease.context.workspace_id,
+                session_id=lease.context.session_id,
+                run_id=lease.context.run_id,
+                approval_id=approval_id,
+                execution_id=execution_id,
+                phase=phase,
+                checkpoint_seq=checkpoint_seq,
+                payload_json=payload_json,
+                payload_hash=payload_hash,
+                schema_version=schema_version,
+                created_at=self._dialect.db_now_ms(),
+            )
+        )
+        return True
+
+    async def _has_current_lease(self, lease: RunLease) -> bool:
+        result = await self._conn.execute(
+            select(agent_runs.c.run_id)
+            .where(current_lease_predicate(lease, self._dialect))
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
 
     def _validate_run_transition(self, current: RunRecord, lease: RunLease, target: RunStatus) -> None:
         if current.lease_owner != lease.lease_owner or current.fencing_token != lease.fencing_token:
@@ -392,4 +571,21 @@ class WorkflowRepository:
             resolved_at=None if row["resolved_at"] is None else int(row["resolved_at"]),
             expires_at=int(row["expires_at"]),
             version=int(row["version"]),
+        )
+
+    @staticmethod
+    def _execution_from_row(context: TenantContext, row) -> ExecutionRecord:
+        return ExecutionRecord(
+            context=context,
+            execution_id=str(row["execution_id"]),
+            approval_id=None if row["approval_id"] is None else str(row["approval_id"]),
+            tool_call_id=str(row["tool_call_id"]),
+            tool_name=str(row["tool_name"]),
+            tool_kind=str(row["tool_kind"]),
+            status=ExecutionStatus(str(row["execution_status"])),
+            recovery_strategy=RecoveryStrategy(str(row["recovery_strategy"])),
+            version=int(row["version"]),
+            created_at=int(row["created_at"]),
+            updated_at=int(row["updated_at"]),
+            finished_at=None if row["finished_at"] is None else int(row["finished_at"]),
         )

@@ -6,7 +6,7 @@ from typing import Any
 from multiclaw.events import ScopedEvent
 from multiclaw.stream import DataStreamEncoder
 from multiclaw.workflow.coordinator import WorkflowCoordinator
-from multiclaw.workflow.models import RunLease
+from multiclaw.workflow.models import RunLease, RunLeaseHandle
 
 
 def encode_session_metadata(session_payload: dict[str, Any]) -> str:
@@ -49,9 +49,13 @@ async def iterate_message_stream(
     *,
     context,
     run_lease: RunLease,
+    run_lease_handle: RunLeaseHandle,
 ):
+    signature = inspect.signature(handler)
     kwargs = {"context": context}
-    if stream_accepts_run_lease(handler):
+    if "run_lease" in signature.parameters:
         kwargs["run_lease"] = run_lease
+    if "run_lease_handle" in signature.parameters:
+        kwargs["run_lease_handle"] = run_lease_handle
     async for item in handler(user_input, **kwargs):
         yield item

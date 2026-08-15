@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from enum import Enum
 
@@ -149,12 +150,44 @@ class TenantRunQuotaError(WorkflowError):
 
 
 @dataclass(frozen=True, slots=True)
+class WorkflowRuntimeCounters:
+    active_run_count: int = 0
+    active_executing_run_count: int = 0
+    awaiting_user_run_count: int = 0
+    checkpointed_awaiting_user_run_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class RunLease:
     context: TenantContext
     lease_owner: str
     fencing_token: int
     version: int
     lease_expires_at: int
+
+
+class RunLeaseHandle:
+    def __init__(self, lease: RunLease) -> None:
+        self._lease = lease
+        self._lock = asyncio.Lock()
+
+    async def current(self) -> RunLease:
+        async with self._lock:
+            return self._lease
+
+    async def replace(self, lease: RunLease) -> RunLease:
+        async with self._lock:
+            self._lease = lease
+            return lease
+
+    async def use_current(self, operation):
+        async with self._lock:
+            return await operation(self._lease)
+
+    async def refresh(self, refresher) -> RunLease:
+        async with self._lock:
+            self._lease = await refresher(self._lease)
+            return self._lease
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +206,22 @@ class RunRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionRecord:
+    context: TenantContext
+    execution_id: str
+    approval_id: str | None
+    tool_call_id: str
+    tool_name: str
+    tool_kind: str
+    status: ExecutionStatus
+    recovery_strategy: RecoveryStrategy
+    version: int
+    created_at: int
+    updated_at: int
+    finished_at: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class ApprovalRecord:
     context: TenantContext
     approval_id: str
@@ -182,4 +231,3 @@ class ApprovalRecord:
     resolved_at: int | None
     expires_at: int
     version: int
-
