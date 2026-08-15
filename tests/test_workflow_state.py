@@ -231,6 +231,44 @@ async def test_stale_runtime_cannot_write_after_lease_takeover(workflow_database
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    (
+        RunStatus.COMPLETED,
+        RunStatus.FAILED_TERMINAL,
+        RunStatus.CANCELLED,
+        RunStatus.BLOCKED_CORRUPT,
+        RunStatus.BLOCKED_INCOMPATIBLE,
+    ),
+)
+async def test_terminal_run_cannot_be_reacquired_after_lease_expiry(
+    workflow_database: Database,
+    terminal_status: RunStatus,
+):
+    run_context = await _create_run_context(
+        workflow_database,
+        suffix=f"-terminal-takeover-{terminal_status.value}",
+    )
+
+    lease = await _coordinator(workflow_database).start_run(run_context, "runtime-1")
+    finished = await _coordinator(workflow_database).finish_run(lease, terminal_status)
+    before = await _coordinator(workflow_database).get_run(run_context)
+    assert before is not None
+
+    await _expire_lease_with_db_clock(workflow_database, run_context)
+
+    with pytest.raises(InvalidTransitionError):
+        await _coordinator(workflow_database).acquire_run(run_context, "runtime-2")
+
+    after = await _coordinator(workflow_database).get_run(run_context)
+    assert after is not None
+    assert after.lease_owner == before.lease_owner
+    assert after.fencing_token == before.fencing_token
+    assert after.version == before.version
+    assert after.status is terminal_status
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_requires_current_fence_owner(workflow_database: Database):
     run_context = await _create_run_context(workflow_database, suffix="-heartbeat")
 

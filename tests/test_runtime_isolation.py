@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 from alembic import command
-from sqlalchemy import insert
+from sqlalchemy import insert, text
 
 from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings, McpSettings, Settings, SkillSettings
@@ -740,3 +740,162 @@ async def test_runtime_factory_reconciles_persisted_workflow_counters_without_do
     finally:
         await pool.close()
         await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_allows_zero_counters_only_when_agent_runs_table_is_absent(
+    tmp_path: Path,
+):
+    from multiclaw.runtime.factory import RuntimeFactory
+
+    settings = _settings_for_runtime(tmp_path)
+    database = Database.create(settings.database)
+    factory = RuntimeFactory(
+        settings=settings,
+        database=database,
+        workspace_resolver=WorkspaceResolver(tmp_path),
+        sandbox_controller_factory=lambda workspace_root, event_bus: ReadyRecordingSandboxController(
+            workspace_root=workspace_root
+        ),
+    )
+
+    try:
+        runtime = await factory.create(TenantContext("tenant-a", "workspace-a"))
+    finally:
+        await database.dispose()
+
+    assert runtime.active_run_count == 0
+    assert runtime.active_executing_run_count == 0
+    assert runtime.awaiting_user_run_count == 0
+    assert runtime.checkpointed_awaiting_user_run_count == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_raises_and_cleans_up_when_workflow_table_drift_is_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from multiclaw.runtime.factory import RuntimeFactory
+
+    class TrackingController(ReadyRecordingSandboxController):
+        def __init__(self, *, workspace_root: Path) -> None:
+            super().__init__(workspace_root=workspace_root)
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            super().close()
+
+    class TrackingManager:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    class TrackingRegistry:
+        def __init__(self) -> None:
+            self.clear_calls = 0
+
+        def clear(self) -> None:
+            self.clear_calls += 1
+
+    class TrackingSkillManager:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        def discover(self) -> None:
+            return None
+
+    captured: dict[str, object] = {}
+
+    class SkillManagerFactory(TrackingSkillManager):
+        def __init__(self, project_root: Path, max_active: int) -> None:
+            del project_root, max_active
+            super().__init__()
+            captured["skill_manager"] = self
+
+    monkeypatch.setattr("multiclaw.runtime.factory.SkillManager", SkillManagerFactory)
+
+    class TrackingFactory(RuntimeFactory):
+        def _build_registry(self, workspace_root, event_bus, sandbox_controller):
+            del workspace_root, event_bus, sandbox_controller
+            registry = TrackingRegistry()
+            captured["registry"] = registry
+            return registry
+
+        def _build_mcp_manager(self, workspace_root, event_bus, registry, sandbox_controller):
+            del workspace_root, event_bus, registry, sandbox_controller
+            manager = TrackingManager()
+            captured["manager"] = manager
+            return manager
+
+    database = await _create_migrated_runtime_database(tmp_path)
+    async with AuthUnitOfWork(database) as uow:
+        user = await uow.users.create_user_with_default_workspace("drift@example.com")
+    assert user.default_workspace_id is not None
+    context = TenantContext(user.id, user.default_workspace_id)
+    async with database.write_transaction() as conn:
+        await conn.execute(
+            insert(chat_sessions).values(
+                id="session-awaiting",
+                tenant_id=context.tenant_id,
+                workspace_id=context.workspace_id,
+                title="Awaiting",
+                status="active",
+                created_at=1,
+                updated_at=1,
+                last_message_at=None,
+                metadata_json="{}",
+            )
+        )
+        await conn.execute(
+            insert(agent_runs).values(
+                run_id="run-awaiting",
+                tenant_id=context.tenant_id,
+                workspace_id=context.workspace_id,
+                session_id="session-awaiting",
+                run_status=RunStatus.AWAITING_USER.value,
+                runtime_instance_id="seed-runtime",
+                lease_owner="seed-runtime",
+                fencing_token=1,
+                lease_expires_at=9999999999999,
+                heartbeat_at=1,
+                schema_version=1,
+                version=1,
+                created_at=1,
+                updated_at=1,
+                finished_at=None,
+            )
+        )
+        await conn.execute(text("DROP TABLE execution_checkpoints"))
+
+    controllers: list[TrackingController] = []
+
+    def controller_factory(workspace_root: Path, event_bus):
+        del event_bus
+        controller = TrackingController(workspace_root=workspace_root)
+        controllers.append(controller)
+        return controller
+
+    factory = TrackingFactory(
+        settings=_settings_for_runtime(tmp_path).model_copy(update={"mcp": McpSettings(enabled=True)}),
+        database=database,
+        workspace_resolver=WorkspaceResolver(tmp_path),
+        sandbox_controller_factory=controller_factory,
+    )
+
+    try:
+        with pytest.raises(Exception, match="execution_checkpoints"):
+            await factory.create(context)
+    finally:
+        await database.dispose()
+
+    assert len(controllers) == 1
+    assert controllers[0].close_calls == 1
+    assert captured["manager"].stop_calls == 1
+    assert captured["registry"].clear_calls == 1
+    assert captured["skill_manager"].close_calls == 1

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -43,6 +44,13 @@ from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
 
 from multiclaw.mcp import MCPClientManager
+
+
+_SQLITE_MISSING_TABLE_RE = re.compile(r"no such table:\s*(?P<table>[^\s]+)", re.IGNORECASE)
+_MYSQL_MISSING_TABLE_RE = re.compile(
+    r"table\s+'[^']+\.(?P<table>[^'.`]+)'\s+doesn't exist",
+    re.IGNORECASE,
+)
 
 
 class _DatabaseBackedMemory(MemoryProtocol):
@@ -329,12 +337,30 @@ class RuntimeFactory:
                 )
                 return await repository.get_runtime_counters(context)
         except (sa_exc.OperationalError, sa_exc.ProgrammingError) as error:
-            message = str(error).lower()
-            if "no such table" in message or "doesn't exist" in message:
+            if self._missing_workflow_table_name(error) == "agent_runs":
                 from multiclaw.workflow.models import WorkflowRuntimeCounters
 
                 return WorkflowRuntimeCounters()
             raise
+
+    @staticmethod
+    def _missing_workflow_table_name(error: BaseException) -> str | None:
+        messages = []
+        original = getattr(error, "orig", None)
+        if original is not None:
+            messages.extend(str(part) for part in getattr(original, "args", ()) if part is not None)
+            messages.append(str(original))
+        messages.append(str(error))
+
+        for message in messages:
+            sqlite_match = _SQLITE_MISSING_TABLE_RE.search(message)
+            if sqlite_match:
+                table = sqlite_match.group("table").split(".")[-1].strip("`\"' ")
+                return table
+            mysql_match = _MYSQL_MISSING_TABLE_RE.search(message)
+            if mysql_match:
+                return mysql_match.group("table").strip("`\"' ")
+        return None
 
     def _build_mcp_manager(
         self,

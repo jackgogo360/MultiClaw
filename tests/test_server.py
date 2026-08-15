@@ -25,10 +25,12 @@ from multiclaw.mcp.types import (
     WebSocketServerConfig,
 )
 from multiclaw.mcp.types import ToolInfo
+from multiclaw.api.chat import iterate_message_stream
 from multiclaw.storage import Database
 from multiclaw.storage.schema import tool_executions
 from multiclaw.storage.uow import AuthUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
+from multiclaw.workflow.models import RunLease, RunLeaseHandle
 from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.shell import ShellToolBuilder
 from sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
@@ -87,6 +89,42 @@ def _make_auth_cookie(app, database: Database, *, email: str = "test@example.com
         algorithm="HS256",
     )
     return {"token": token}
+
+
+@pytest.mark.asyncio
+async def test_iterate_message_stream_passes_lease_surfaces_to_kwargs_handler():
+    context = TenantContext("tenant-a", "workspace-a", session_id="session-a", run_id="run-a")
+    lease = RunLease(
+        context=context,
+        lease_owner="runtime-1",
+        fencing_token=1,
+        version=1,
+        lease_expires_at=12345,
+    )
+    lease_handle = RunLeaseHandle(lease)
+    captured: dict[str, object] = {}
+
+    async def handler(user_input: str, **kwargs):
+        captured["user_input"] = user_input
+        captured.update(kwargs)
+        yield {"type": "done", "content": ""}
+
+    items = [
+        item
+        async for item in iterate_message_stream(
+            handler,
+            "hello",
+            context=context,
+            run_lease=lease,
+            run_lease_handle=lease_handle,
+        )
+    ]
+
+    assert items == [{"type": "done", "content": ""}]
+    assert captured["user_input"] == "hello"
+    assert captured["context"] == context
+    assert captured["run_lease"] == lease
+    assert captured["run_lease_handle"] is lease_handle
 
 
 def _make_runtime_factory(

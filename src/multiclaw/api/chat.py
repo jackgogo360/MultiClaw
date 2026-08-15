@@ -35,7 +35,11 @@ def stream_accepts_run_lease(handler) -> bool:
     except (TypeError, ValueError):
         return False
 
-    if "run_lease" in signature.parameters:
+    return _accepts_keyword(signature, "run_lease")
+
+
+def _accepts_keyword(signature: inspect.Signature, keyword: str) -> bool:
+    if keyword in signature.parameters:
         return True
     return any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -53,9 +57,9 @@ async def iterate_message_stream(
 ):
     signature = inspect.signature(handler)
     kwargs = {"context": context}
-    if "run_lease" in signature.parameters:
+    if _accepts_keyword(signature, "run_lease"):
         kwargs["run_lease"] = run_lease
-    if "run_lease_handle" in signature.parameters:
+    if _accepts_keyword(signature, "run_lease_handle"):
         kwargs["run_lease_handle"] = run_lease_handle
     async for item in handler(user_input, **kwargs):
         yield item
