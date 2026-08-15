@@ -257,6 +257,219 @@ async def test_runtime_factory_preserves_primary_create_failure_and_notes_cleanu
     assert any("controller close failed" in note for note in error.value.__notes__)
 
 
+@pytest.mark.asyncio
+async def test_runtime_factory_closes_built_runtime_when_counter_load_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from multiclaw.runtime.factory import RuntimeFactory
+
+    class TrackingController(ReadyRecordingSandboxController):
+        def __init__(self, *, workspace_root: Path) -> None:
+            super().__init__(workspace_root=workspace_root)
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            super().close()
+
+    class TrackingManager:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    class TrackingRegistry:
+        def __init__(self) -> None:
+            self.clear_calls = 0
+
+        def clear(self) -> None:
+            self.clear_calls += 1
+
+    class TrackingSkillManager:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        def discover(self) -> None:
+            return None
+
+    captured: dict[str, object] = {}
+
+    class SkillManagerFactory(TrackingSkillManager):
+        def __init__(self, project_root: Path, max_active: int) -> None:
+            del project_root, max_active
+            super().__init__()
+            captured["skill_manager"] = self
+
+    monkeypatch.setattr("multiclaw.runtime.factory.SkillManager", SkillManagerFactory)
+
+    class FailingFactory(RuntimeFactory):
+        def _build_registry(self, workspace_root, event_bus, sandbox_controller):
+            del workspace_root, event_bus, sandbox_controller
+            registry = TrackingRegistry()
+            captured["registry"] = registry
+            return registry
+
+        def _build_mcp_manager(self, workspace_root, event_bus, registry, sandbox_controller):
+            del workspace_root, event_bus, registry, sandbox_controller
+            manager = TrackingManager()
+            captured["manager"] = manager
+            return manager
+
+        def _build_agent(self, context, registry, scheduler, event_bus, skill_manager):
+            captured["skill_manager"] = skill_manager
+            return super()._build_agent(context, registry, scheduler, event_bus, skill_manager)
+
+        async def _load_workflow_counters(self, context):
+            del context
+            raise RuntimeError("counter load failed")
+
+    settings = _settings_for_runtime(tmp_path).model_copy(update={"mcp": McpSettings(enabled=True)})
+    database = Database.create(settings.database)
+    resolver = WorkspaceResolver(tmp_path)
+    controllers: list[TrackingController] = []
+
+    def controller_factory(workspace_root: Path, event_bus):
+        del event_bus
+        controller = TrackingController(workspace_root=workspace_root)
+        controllers.append(controller)
+        return controller
+
+    factory = FailingFactory(
+        settings=settings,
+        database=database,
+        workspace_resolver=resolver,
+        sandbox_controller_factory=controller_factory,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="counter load failed"):
+            await factory.create(TenantContext("tenant-a", "workspace-a"))
+    finally:
+        await database.dispose()
+
+    assert len(controllers) == 1
+    assert controllers[0].close_calls == 1
+    assert captured["manager"].stop_calls == 1
+    assert captured["registry"].clear_calls == 1
+    assert captured["skill_manager"].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_preserves_counter_load_failure_and_notes_runtime_close_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from multiclaw.runtime.factory import RuntimeFactory
+    from multiclaw.runtime.models import TenantRuntime
+
+    class TrackingController(ReadyRecordingSandboxController):
+        def __init__(self, *, workspace_root: Path) -> None:
+            super().__init__(workspace_root=workspace_root)
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("controller close failed")
+
+    class TrackingManager:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            raise RuntimeError("mcp stop failed")
+
+    class TrackingRegistry:
+        def __init__(self) -> None:
+            self.clear_calls = 0
+
+        def clear(self) -> None:
+            self.clear_calls += 1
+            raise RuntimeError("registry clear failed")
+
+    class TrackingSkillManager:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("skill close failed")
+
+        def discover(self) -> None:
+            return None
+
+    captured: dict[str, object] = {}
+
+    class SkillManagerFactory(TrackingSkillManager):
+        def __init__(self, project_root: Path, max_active: int) -> None:
+            del project_root, max_active
+            super().__init__()
+            captured["skill_manager"] = self
+
+    monkeypatch.setattr("multiclaw.runtime.factory.SkillManager", SkillManagerFactory)
+
+    class FailingFactory(RuntimeFactory):
+        def _build_registry(self, workspace_root, event_bus, sandbox_controller):
+            del workspace_root, event_bus, sandbox_controller
+            registry = TrackingRegistry()
+            captured["registry"] = registry
+            return registry
+
+        def _build_mcp_manager(self, workspace_root, event_bus, registry, sandbox_controller):
+            del workspace_root, event_bus, registry, sandbox_controller
+            manager = TrackingManager()
+            captured["manager"] = manager
+            return manager
+
+        def _build_agent(self, context, registry, scheduler, event_bus, skill_manager):
+            captured["skill_manager"] = skill_manager
+            return super()._build_agent(context, registry, scheduler, event_bus, skill_manager)
+
+        async def _load_workflow_counters(self, context):
+            del context
+            raise RuntimeError("counter load failed")
+
+    settings = _settings_for_runtime(tmp_path).model_copy(update={"mcp": McpSettings(enabled=True)})
+    database = Database.create(settings.database)
+    resolver = WorkspaceResolver(tmp_path)
+    controllers: list[TrackingController] = []
+
+    def controller_factory(workspace_root: Path, event_bus):
+        del event_bus
+        controller = TrackingController(workspace_root=workspace_root)
+        controllers.append(controller)
+        return controller
+
+    factory = FailingFactory(
+        settings=settings,
+        database=database,
+        workspace_resolver=resolver,
+        sandbox_controller_factory=controller_factory,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="counter load failed") as error:
+            await factory.create(TenantContext("tenant-a", "workspace-a"))
+    finally:
+        await database.dispose()
+
+    assert len(controllers) == 1
+    assert controllers[0].close_calls == 1
+    assert captured["manager"].stop_calls == 1
+    assert captured["registry"].clear_calls == 1
+    assert captured["skill_manager"].close_calls == 1
+    assert error.value.__notes__
+    assert any("mcp stop failed" in note for note in error.value.__notes__)
+    assert any("registry clear failed" in note for note in error.value.__notes__)
+    assert any("skill close failed" in note for note in error.value.__notes__)
+    assert any("controller close failed" in note for note in error.value.__notes__)
+
+
 def test_runtime_factory_probe_startup_closes_controller_when_initialize_fails(tmp_path: Path):
     from multiclaw.runtime.factory import RuntimeFactory
 
