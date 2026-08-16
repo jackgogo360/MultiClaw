@@ -602,12 +602,19 @@ async def lifespan(app: FastAPI):
 
             recovery_task = asyncio.create_task(recovery_loop())
             if getattr(readiness, "ready", True):
+                async def deletion_loop() -> None:
+                    async with observability_scope(
+                        metrics=app.state.operational_metrics,
+                        trace_sink=app.state.trace_sink,
+                    ):
+                        await deletion_worker.run_until_stopped(
+                            stop_event=deletion_stop,
+                            batch_size=DELETION_BATCH_SIZE,
+                            interval_seconds=DELETION_POLL_INTERVAL_SECONDS,
+                        )
+
                 deletion_task = asyncio.create_task(
-                    deletion_worker.run_until_stopped(
-                        stop_event=deletion_stop,
-                        batch_size=DELETION_BATCH_SIZE,
-                        interval_seconds=DELETION_POLL_INTERVAL_SECONDS,
-                    )
+                    deletion_loop()
                 )
 
             async def auth_cleanup_loop() -> None:
