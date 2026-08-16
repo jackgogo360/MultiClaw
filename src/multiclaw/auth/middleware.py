@@ -11,6 +11,14 @@ from sqlalchemy import select
 
 PUBLIC_PREFIXES = ("/auth/", "/api/auth/", "/assets/")
 PUBLIC_EXACT = {"/multiclaw.png", "/health/ready"}
+RECOVERY_ROUTE_METHODS = {
+    ("GET", "/api/account/deletion"),
+    ("POST", "/api/account/deletion/recover"),
+}
+PENDING_DELETION_ROUTE_METHODS = {
+    ("POST", "/api/account/deletion"),
+    *RECOVERY_ROUTE_METHODS,
+}
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -18,6 +26,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         auth = request.app.state.auth
         token = request.cookies.get("token")
         user = None
+        pending_user = None
         token_iat = None
         request.state.request_started_at_ms = getattr(request.state, "request_started_at_ms", 0)
         if token and hasattr(request.app.state, "database"):
@@ -43,18 +52,22 @@ class AuthMiddleware(BaseHTTPMiddleware):
             else:
                 async with AuthUnitOfWork(request.app.state.database, read_only=True) as uow:
                     current_user = await uow.users.get_by_id(subject)
+                if current_user is not None and current_user.status == "pending_purge":
+                    pending_user = current_user
                 if (
                     current_user is not None
-                    and current_user.status == "active"
                     and current_user.auth_epoch == token_auth_epoch
+                    and current_user.status in {"active", "pending_purge"}
                 ):
                     user = current_user
 
         request.state.authenticated_user = user
+        request.state.pending_auth_user = pending_user
         request.state.authenticated_iat = token_iat
         request.state.user = _user_payload(user)
 
         path = request.url.path
+        is_recovery_route = (request.method, path) in RECOVERY_ROUTE_METHODS
         if request.method not in SAFE_METHODS:
             reason = csrf_failure_reason(request, auth.allowed_origins)
             if reason is not None:
@@ -73,11 +86,28 @@ class AuthMiddleware(BaseHTTPMiddleware):
             response = await _maybe_handle_preflight(request, call_next)
             return _with_cors_headers(request, response)
 
+        if is_recovery_route:
+            response = await _maybe_handle_preflight(request, call_next)
+            return _with_cors_headers(request, response)
+
         # All other routes require auth
         if not user:
+            if pending_user is not None:
+                if (request.method, path) in PENDING_DELETION_ROUTE_METHODS:
+                    response = await _maybe_handle_preflight(request, call_next)
+                    return _with_cors_headers(request, response)
+                return _with_cors_headers(
+                    request,
+                    JSONResponse({"detail": "Account pending deletion"}, status_code=403),
+                )
             return _with_cors_headers(
                 request,
                 JSONResponse({"detail": "Unauthorized"}, status_code=401),
+            )
+        if user.status == "pending_purge" and (request.method, path) not in PENDING_DELETION_ROUTE_METHODS:
+            return _with_cors_headers(
+                request,
+                JSONResponse({"detail": "Account pending deletion"}, status_code=403),
             )
 
         response = await _maybe_handle_preflight(request, call_next)
