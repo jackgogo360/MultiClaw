@@ -4,7 +4,6 @@ import jwt
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from multiclaw.auth.email_sender import is_mock_enabled, send_verification_code
-from multiclaw.auth.middleware import require_auth
 from multiclaw.auth.models import (
     AuthResponse,
     CSRF_COOKIE_NAME,
@@ -13,14 +12,12 @@ from multiclaw.auth.models import (
     LOGIN_CODE_PURPOSE,
     MAX_SENDS_PER_DAY,
     MeResponse,
-    RECENT_AUTH_MAX_AGE_SECONDS,
     SendCodeRequest,
     SESSION_COOKIE_NAME,
     SESSION_TTL_SECONDS,
     SESSION_TOKEN_AUDIENCE,
     VERIFICATION_CODE_TTL_SECONDS,
     VerifyRequest,
-    build_auth_runtime,
     issue_verification_code,
 )
 from multiclaw.config import Settings

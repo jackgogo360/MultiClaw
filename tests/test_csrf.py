@@ -1,6 +1,16 @@
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from alembic import command
+
+from multiclaw.cli import alembic_config
+
+
+def _migrate_database(tmp_path) -> None:
+    command.upgrade(
+        alembic_config(database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"),
+        "head",
+    )
 
 
 def test_public_csrf_route_sets_matching_cookie_and_body(tmp_path, monkeypatch):
@@ -63,6 +73,109 @@ def test_mutations_reject_untrusted_origin_even_with_matching_double_submit(tmp_
         )
 
     assert response.status_code == 403
+
+
+def test_mutations_accept_trusted_referer_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "sqlite")
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_DATABASE__URL", f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", "csrf-jwt-key-material-1234567890")
+    monkeypatch.setenv("MULTICLAW_EMAIL__PROVIDER", "resend")
+    monkeypatch.setenv("MULTICLAW_RESEND__MOCK", "true")
+    _migrate_database(tmp_path)
+    import multiclaw.server as server
+
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/auth/send-code",
+            json={"email": "csrf@example.com"},
+            headers={"Referer": "http://testserver/settings", "X-CSRF-Token": "abc"},
+            cookies={"csrf_token": "abc"},
+        )
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "header_name",
+    ["Origin", "Referer"],
+)
+def test_mutations_reject_untrusted_host_confusion(tmp_path, monkeypatch, header_name):
+    monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "sqlite")
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_DATABASE__URL", f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", "csrf-jwt-key-material-1234567890")
+    monkeypatch.setenv("MULTICLAW_EMAIL__PROVIDER", "resend")
+    monkeypatch.setenv("MULTICLAW_RESEND__MOCK", "true")
+    _migrate_database(tmp_path)
+    import multiclaw.server as server
+
+    value = "http://testserver.evil" if header_name == "Origin" else "http://testserver.evil/path"
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/auth/send-code",
+            json={"email": "csrf@example.com"},
+            headers={header_name: value, "X-CSRF-Token": "abc"},
+            cookies={"csrf_token": "abc"},
+        )
+
+    assert response.status_code == 403
+
+
+def test_csrf_cookie_uses_secure_samesite_and_is_not_httponly_in_production(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "sqlite")
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_DATABASE__URL", f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", "csrf-jwt-key-material-1234567890")
+    monkeypatch.setenv("MULTICLAW_APP__ALLOWED_ORIGINS", "[\"https://app.example\"]")
+    _migrate_database(tmp_path)
+    import multiclaw.server as server
+
+    with TestClient(server.app, base_url="https://app.example") as client:
+        response = client.get("/auth/csrf")
+
+    set_cookie = response.headers["set-cookie"]
+    assert response.status_code == 200
+    assert "Secure" in set_cookie
+    assert "SameSite=lax" in set_cookie
+    assert "HttpOnly" not in set_cookie
+
+
+def test_session_cookie_is_secure_samesite_and_httponly_in_production(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "sqlite")
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_DATABASE__URL", f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", "csrf-jwt-key-material-1234567890")
+    monkeypatch.setenv("MULTICLAW_EMAIL__PROVIDER", "resend")
+    monkeypatch.setenv("MULTICLAW_RESEND__MOCK", "true")
+    monkeypatch.setenv("MULTICLAW_APP__ALLOWED_ORIGINS", "[\"https://app.example\"]")
+    _migrate_database(tmp_path)
+    import multiclaw.server as server
+
+    with TestClient(server.app, base_url="https://app.example") as client:
+        client.cookies.set("csrf_token", "abc")
+        client.app.state.auth_forced_code = "654321"
+        send_response = client.post(
+            "/auth/send-code",
+            json={"email": "cookie@example.com"},
+            headers={"Origin": "https://app.example", "X-CSRF-Token": "abc"},
+        )
+        assert send_response.status_code == 200
+        verify_response = client.post(
+            "/auth/verify",
+            json={"email": "cookie@example.com", "code": "654321"},
+            headers={"Origin": "https://app.example", "X-CSRF-Token": "abc"},
+        )
+
+    cookies = verify_response.headers.get_list("set-cookie")
+    session_cookie = next(value for value in cookies if value.startswith("token="))
+    csrf_cookie = next(value for value in cookies if value.startswith("csrf_token="))
+    assert "Secure" in session_cookie
+    assert "SameSite=lax" in session_cookie
+    assert "HttpOnly" in session_cookie
+    assert "Secure" in csrf_cookie
+    assert "SameSite=lax" in csrf_cookie
+    assert "HttpOnly" not in csrf_cookie
 
 
 def test_csrf_validation_uses_constant_time_compare():
