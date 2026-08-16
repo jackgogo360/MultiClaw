@@ -2136,6 +2136,126 @@ def test_lifespan_builds_one_shared_deletion_service_and_worker_and_stops_worker
     assert fake_factory.database.dispose_calls == 1
 
 
+def test_lifespan_scopes_deletion_worker_observability_to_app_collectors(tmp_path, monkeypatch):
+    import multiclaw.server as server_module
+    from multiclaw.observability import current_metrics, current_trace_sink, increment_metric, record_trace_event
+
+    default_metrics = current_metrics()
+    default_metrics.clear()
+    default_trace = current_trace_sink()
+    default_trace.clear()
+    deletion_started = threading.Event()
+    scheduled_tasks: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    class FakeDatabase:
+        def __init__(self) -> None:
+            self.dispose_calls = 0
+            self.dialect = object()
+
+        async def dispose(self) -> None:
+            self.dispose_calls += 1
+
+        def connect(self):
+            class _Connect:
+                async def __aenter__(self_inner):
+                    return self_inner
+
+                async def __aexit__(self_inner, exc_type, exc, tb):
+                    return None
+
+            return _Connect()
+
+    class FakeRuntimePool:
+        def __init__(self, *, factory, max_resident_tenants, idle_ttl_ms) -> None:
+            del factory, max_resident_tenants, idle_ttl_ms
+
+        async def close(self) -> None:
+            return None
+
+    class FakeAuth:
+        signing_key = b"x" * 32
+        allowed_origins = frozenset({"http://testserver"})
+
+        async def close(self) -> None:
+            return None
+
+    class FakeFactory:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(
+                database=SimpleNamespace(path=str(tmp_path / "app.db")),
+                runtime=SimpleNamespace(max_resident_tenants=1, idle_ttl_seconds=1),
+                workflow=SimpleNamespace(heartbeat_ms=1000, lease_ttl_ms=1000),
+                deletion=SimpleNamespace(retention_days=7),
+            )
+            self.database = FakeDatabase()
+            self.workspace_resolver = SimpleNamespace(root=tmp_path)
+
+        def probe_startup(self):
+            return SimpleNamespace(ready=True), ()
+
+    class FakeRecoveryWorker:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def run_once(self) -> None:
+            await asyncio.sleep(0)
+
+    class FakeAuthCleanupWorker:
+        def __init__(self, database) -> None:
+            del database
+
+        async def run_once(self) -> None:
+            await asyncio.sleep(0)
+
+    class FakeDeletionWorker:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def run_until_stopped(
+            self,
+            *,
+            stop_event: asyncio.Event,
+            batch_size: int = 10,
+            interval_seconds: float = 1.0,
+        ) -> None:
+            del batch_size, interval_seconds
+            increment_metric(
+                "multiclaw_purge_retry_total",
+                labels={"backend": "sqlite", "operation": "purge_retry", "status": "error", "error_class": "oserror"},
+            )
+            record_trace_event("purge_retry", attributes={"tenant_id": "tenant-app", "path": "/srv/app-secret"})
+            deletion_started.set()
+            await stop_event.wait()
+
+    fake_factory = FakeFactory()
+    monkeypatch.setattr(server_module, "create_runtime_factory", lambda: fake_factory)
+    monkeypatch.setattr(server_module, "RuntimePool", FakeRuntimePool)
+    monkeypatch.setattr(server_module, "build_auth_runtime", lambda settings: FakeAuth())
+    monkeypatch.setattr(server_module, "_validate_allowed_origins", lambda origins: frozenset(origins))
+    monkeypatch.setattr(server_module, "WorkflowRecoveryWorker", FakeRecoveryWorker)
+    monkeypatch.setattr(server_module, "AuthCleanupWorker", FakeAuthCleanupWorker)
+    monkeypatch.setattr(server_module, "DeletionWorker", FakeDeletionWorker)
+    monkeypatch.setattr(
+        server_module.asyncio,
+        "create_task",
+        lambda coro: scheduled_tasks.append(real_create_task(coro)) or scheduled_tasks[-1],
+    )
+
+    with TestClient(server_module.app):
+        assert deletion_started.wait(timeout=1.0)
+        app_metrics = server_module.app.state.operational_metrics
+        app_trace = server_module.app.state.trace_sink
+        assert any(metric_name == "multiclaw_purge_retry_total" for metric_name, _labels in app_metrics.counters)
+        assert default_metrics.counters == {}
+        assert app_trace.events
+        assert default_trace.events == []
+
+    increment_metric("after_shutdown", labels={"backend": "sqlite", "operation": "post", "status": "ok"})
+    assert any(metric_name == "after_shutdown" for metric_name, _labels in default_metrics.counters)
+    assert not any(metric_name == "after_shutdown" for metric_name, _labels in app_metrics.counters)
+
+
 def test_lifespan_does_not_start_deletion_worker_when_readiness_is_not_ready(tmp_path, monkeypatch):
     import multiclaw.server as server_module
 
