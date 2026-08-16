@@ -69,11 +69,11 @@ Before any future forward-only upgrade, take a backup of a production-like datab
 1. Add the new key version to the keyring.
 2. Mark that new version as active.
 3. Keep all older versions that are still referenced by database rows.
-4. Use a controlled maintenance runner to invoke the current `SecretRotationService.rotate_batch()` implementation in batches.
-5. Monitor the returned `rotated`, `skipped`, and `failed` counts for each batch.
-6. Remove an old key version only after the database no longer references it.
-
-There is currently no public key-rotation CLI. Do not invent one in runbooks or release procedures.
+4. Because there is currently no productized rotation runner or CLI, handle rotation only through an operator-authored, code-reviewed one-off script or internal maintenance service running in a controlled maintenance environment.
+5. In that maintenance path, explicitly construct the current rotation service and invoke `SecretRotationService.rotate_batch()` in batches.
+6. If a batch fails, stop the rotation attempt and keep all older key versions.
+7. Monitor the returned `rotated`, `skipped`, and `failed` counts for each batch.
+8. Remove an old key version only after the database no longer references it.
 
 ## Backend-Specific Notes
 
