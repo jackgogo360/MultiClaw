@@ -49,6 +49,15 @@ export const sessionStore = {
     return state;
   },
 
+  reset() {
+    setState({
+      currentId: null,
+      sessions: [],
+      hydrateSessionId: null,
+      resetVersion: state.resetVersion + 1,
+    });
+  },
+
   replaceSessions(sessions: Session[]) {
     const currentId =
       state.currentId && sessions.some((session) => session.id === state.currentId)
