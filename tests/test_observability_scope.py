@@ -71,3 +71,32 @@ def test_observability_scope_isolates_concurrent_scopes_and_child_tasks():
     assert trace_a.events and trace_b.events
     assert "tenant-a" not in str(trace_a.events)
     assert "C:\\secret.txt" not in str(trace_b.events)
+
+
+def test_deletion_worker_uses_app_scoped_observability_not_default_collector():
+    from multiclaw.observability import observability_scope
+
+    default_metrics = current_metrics()
+    default_metrics.clear()
+    default_trace = current_trace_sink()
+    default_trace.clear()
+    app_metrics = OperationalMetrics()
+    app_trace = TraceEventSink()
+
+    async def deletion_like_task():
+        increment_metric(
+            "multiclaw_purge_retry_total",
+            labels={"backend": "sqlite", "operation": "purge_retry", "status": "error", "error_class": "oserror"},
+        )
+        record_trace_event("purge_retry", attributes={"tenant_id": "tenant-a", "path": "/srv/secret"})
+
+    async def run():
+        async with observability_scope(metrics=app_metrics, trace_sink=app_trace):
+            await deletion_like_task()
+
+    asyncio.run(run())
+
+    assert any(metric_name == "multiclaw_purge_retry_total" for metric_name, _labels in app_metrics.counters)
+    assert default_metrics.counters == {}
+    assert app_trace.events
+    assert default_trace.events == []
