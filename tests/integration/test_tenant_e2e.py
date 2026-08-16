@@ -532,13 +532,18 @@ async def _collect_secret_metrics(
         )
         invalid_secret = await uow.secrets.get_encrypted("llm", "openai", invalid_secret_name)
         assert invalid_secret is not None
+        tampered_ciphertext = (
+            invalid_secret.record.ciphertext[:-1]
+            + bytes([invalid_secret.record.ciphertext[-1] ^ 0x01])
+        )
+        assert tampered_ciphertext != invalid_secret.record.ciphertext
         await uow.secrets.put_encrypted(
             secret_id=invalid_secret.secret_id,
             provider_kind="llm",
             provider_name="openai",
             secret_name=invalid_secret_name,
             record=invalid_secret.record.replace(
-                ciphertext=invalid_secret.record.ciphertext[:-1] + b"\x00"
+                ciphertext=tampered_ciphertext
             ),
         )
 
