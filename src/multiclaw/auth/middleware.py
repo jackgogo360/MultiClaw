@@ -76,6 +76,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     JSONResponse({"detail": "CSRF validation failed"}, status_code=403),
                 )
 
+        if request.method == "OPTIONS" and request.headers.get("origin"):
+            return _with_cors_headers(request, Response(status_code=204))
+
         # Public paths
         if path.startswith(PUBLIC_PREFIXES) or path in PUBLIC_EXACT:
             response = await _maybe_handle_preflight(request, call_next)

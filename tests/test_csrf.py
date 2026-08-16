@@ -178,6 +178,54 @@ def test_session_cookie_is_secure_samesite_and_httponly_in_production(tmp_path, 
     assert "HttpOnly" not in csrf_cookie
 
 
+@pytest.mark.parametrize("path", ["/api/account/deletion", "/api/account/deletion/recover"])
+def test_credentialed_mutation_preflight_returns_204_with_trusted_cors_headers(
+    tmp_path,
+    monkeypatch,
+    path: str,
+):
+    monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "sqlite")
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_DATABASE__URL", f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", "csrf-jwt-key-material-1234567890")
+    _migrate_database(tmp_path)
+    import multiclaw.server as server
+
+    with TestClient(server.app) as client:
+        response = client.options(
+            path,
+            headers={
+                "Origin": "http://testserver",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+
+    assert response.status_code == 204
+    assert response.headers["Access-Control-Allow-Origin"] == "http://testserver"
+    assert response.headers["Access-Control-Allow-Credentials"] == "true"
+
+
+def test_credentialed_mutation_preflight_with_untrusted_origin_omits_allow_origin(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "sqlite")
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_DATABASE__URL", f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", "csrf-jwt-key-material-1234567890")
+    _migrate_database(tmp_path)
+    import multiclaw.server as server
+
+    with TestClient(server.app) as client:
+        response = client.options(
+            "/api/account/deletion/recover",
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+
+    assert response.status_code == 204
+    assert "Access-Control-Allow-Origin" not in response.headers
+
+
 def test_csrf_validation_uses_constant_time_compare():
     from multiclaw.security import csrf as csrf_module
 

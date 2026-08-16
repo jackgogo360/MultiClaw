@@ -231,13 +231,7 @@ async def send_deletion_recovery_code(body: SendCodeRequest, request: Request):
             email=email,
             purpose=DELETION_RECOVERY_CODE_PURPOSE,
         )
-        recent = await uow.verification_codes.count_recent_codes(
-            email,
-            purpose=DELETION_RECOVERY_CODE_PURPOSE,
-            window_ms=24 * 60 * 60 * 1000,
-        )
-        if recent >= MAX_SENDS_PER_DAY:
-            return AuthResponse()
+        now_ms = await uow.verification_codes.db_now_ms()
         scheduled = (
             await uow.conn.execute(
                 select(deletion_jobs.c.job_id)
@@ -246,18 +240,29 @@ async def send_deletion_recovery_code(body: SendCodeRequest, request: Request):
                     users.c.email == email,
                     users.c.status == "pending_purge",
                     deletion_jobs.c.status == "scheduled",
+                    deletion_jobs.c.purge_after > now_ms,
                 )
                 .limit(1)
             )
         ).scalar_one_or_none()
-        if scheduled is not None:
-            reserved_code_id = await uow.verification_codes.issue_code(
-                email=email,
-                purpose=code_issue.purpose,
-                code_digest=code_issue.code_digest,
-                ttl_seconds=VERIFICATION_CODE_TTL_SECONDS,
+        if scheduled is None:
+            return AuthResponse()
+        recent = await uow.verification_codes.count_recent_codes(
+            email,
+            purpose=DELETION_RECOVERY_CODE_PURPOSE,
+            window_ms=24 * 60 * 60 * 1000,
+        )
+        if recent >= MAX_SENDS_PER_DAY:
+            raise HTTPException(
+                status_code=429, detail="Too many attempts, please try again tomorrow"
             )
-            should_send = True
+        reserved_code_id = await uow.verification_codes.issue_code(
+            email=email,
+            purpose=code_issue.purpose,
+            code_digest=code_issue.code_digest,
+            ttl_seconds=VERIFICATION_CODE_TTL_SECONDS,
+        )
+        should_send = True
 
     if not should_send or is_mock_enabled(settings):
         return AuthResponse()
