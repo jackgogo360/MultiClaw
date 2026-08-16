@@ -312,6 +312,7 @@ async def _seed_dispatch_state(
     database: Database,
     *,
     context: TenantContext,
+    lease=None,
     tool_name: str,
     recovery_strategy: RecoveryStrategy,
     raw_params: dict[str, object],
@@ -321,7 +322,8 @@ async def _seed_dispatch_state(
 ) -> str:
     scheduler = _scheduler(database)
     coordinator = _coordinator(database)
-    lease = await coordinator.start_run_with_checkpoint(context, "seed-runtime")
+    if lease is None:
+        lease = await coordinator.start_run_with_checkpoint(context, "seed-runtime")
     canonical = scheduler._canonicalize_input(raw_params)
     execution = await coordinator.create_execution(
         lease,
@@ -886,3 +888,86 @@ async def test_worker_blocks_fail_closed_for_invalid_replay_inputs(
         ExecutionStatus.BLOCKED_CORRUPT.value,
         ExecutionStatus.BLOCKED_INCOMPATIBLE.value,
     }
+
+
+@pytest.mark.asyncio
+async def test_worker_candidate_failure_isolated_and_runtime_released(
+    workflow_database: Database,
+):
+    failing_context = await _create_run_context(workflow_database, email_suffix="-fail-isolated")
+    good_context = await _create_run_context(workflow_database, email_suffix="-good-isolated")
+    failing_coordinator = _coordinator(workflow_database)
+    await failing_coordinator.start_run_with_checkpoint(failing_context, "runtime-failing")
+    await _expire_run_lease(workflow_database, failing_context)
+    await _seed_dispatch_state(
+        workflow_database,
+        context=good_context,
+        tool_name="good_probe",
+        recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+        raw_params={"label": "good", "delay": 0.0, "idempotency_key": None},
+        tool_call_id="call-good",
+    )
+
+    async def good_runner(params: PersistedParams) -> ToolExecutionResult:
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    class _ExplodingContinuation:
+        async def resume(self, **kwargs) -> None:
+            del kwargs
+            raise RuntimeError("boom")
+
+    runtime = _TrackingRuntime(
+        runtime_instance_id="runtime-isolated",
+        scheduler=_scheduler(workflow_database),
+        builders=[
+            PersistedToolBuilder(
+                name="good_probe",
+                runner=good_runner,
+                recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+            )
+        ],
+    )
+    runtime.recovery_continuation = _ExplodingContinuation()
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+
+    await worker.run_once()
+
+    failing_run = await failing_coordinator.get_run(failing_context)
+    good_execution = await _latest_execution_row(workflow_database, good_context)
+    assert failing_run is not None
+    assert good_execution["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert runtime.begin_calls == 2
+    assert runtime.closed_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_revive_terminal_run(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-terminal-noop")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-terminal")
+    await coordinator.finish_run_with_checkpoint(lease, RunStatus.CANCELLED)
+    await _expire_run_lease(workflow_database, context)
+
+    runtime = _TrackingRuntime(
+        runtime_instance_id="runtime-terminal-recovery",
+        scheduler=_scheduler(workflow_database),
+        builders=[],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    run = await coordinator.get_run(context)
+    assert run is not None
+    assert run.status is RunStatus.CANCELLED
+    assert runtime.begin_calls == 0
+    assert runtime.closed_calls == 0
