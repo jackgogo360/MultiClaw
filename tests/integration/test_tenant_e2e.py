@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import os
@@ -45,6 +46,8 @@ from multiclaw.workflow.models import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from database_fixtures import _ORIGINAL_TEST_MYSQL_URL
+
+TEST_JWT_SIGNING_KEY = "test-jwt-signing-key-material-1234567890"
 
 
 class SessionMessage(TypedDict):
@@ -127,13 +130,55 @@ async def _load_current_deletion_job(database: Database, tenant_id: str):
         return await uow.deletions.get_current()
 
 
-def _build_authenticated_request(user, *, request_started_at_ms: int):
+def _build_request(*, request_started_at_ms: int):
     from starlette.requests import Request
 
     request = Request({"type": "http", "method": "GET", "path": "/api/sessions", "headers": []})
-    request.state.authenticated_user = user
     request.state.request_started_at_ms = request_started_at_ms
     return request
+
+
+def _make_cookie(*, user_id: str, email: str, auth_epoch: int) -> dict[str, str]:
+    import time
+
+    import jwt
+
+    now = int(time.time())
+    return {
+        "token": jwt.encode(
+            {
+                "sub": user_id,
+                "email": email,
+                "aud": "multiclaw-api",
+                "iat": now,
+                "exp": now + 86_400,
+                "auth_epoch": auth_epoch,
+            },
+            TEST_JWT_SIGNING_KEY,
+            algorithm="HS256",
+        )
+    }
+
+
+@contextmanager
+def _real_auth_client(database: Database, monkeypatch: pytest.MonkeyPatch):
+    from fastapi.testclient import TestClient
+
+    database_url = database.engine.url.render_as_string(hide_password=False)
+    monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "mysql" if database_url.startswith("mysql+") else "sqlite")
+    monkeypatch.setenv("MULTICLAW_DATABASE__URL", database_url)
+    if database.engine.url.database is not None:
+        monkeypatch.setenv("MULTICLAW_DATABASE__PATH", database.engine.url.database)
+    else:
+        monkeypatch.delenv("MULTICLAW_DATABASE__PATH", raising=False)
+    monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", TEST_JWT_SIGNING_KEY)
+
+    import multiclaw.server as server
+
+    with TestClient(server.app) as client:
+        yield client
 
 
 def _coordinator(database: Database) -> WorkflowCoordinator:
@@ -656,10 +701,9 @@ async def test_real_tenant_aggregate_isolation_gate(tenant_isolation_database: D
 async def test_real_deletion_recovery_blocks_ordinary_tenant_access(
     tenant_isolation_database: Database,
     retention_days: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from fastapi import HTTPException
-
-    from multiclaw.api.dependencies import current_user, tenant_context
+    from multiclaw.api.dependencies import tenant_context
     from multiclaw.deletion.service import DeletionService
 
     base_context = await _seed_user(tenant_isolation_database, f"tenant-deletion-{retention_days}")
@@ -704,13 +748,16 @@ async def test_real_deletion_recovery_blocks_ordinary_tenant_access(
     assert pending_deletion_user.purge_after == pending_job.purge_after
     assert runtime_pool.revoked == [base_context.tenant_id]
 
-    pending_request = _build_authenticated_request(pending_user, request_started_at_ms=request_started_at_ms)
-    pending_request_user = await current_user(pending_request)
-    with pytest.raises(HTTPException, match="Account unavailable") as exc_info:
-        await tenant_context(pending_request, pending_request_user)
+    pending_cookie = _make_cookie(
+        user_id=base_context.tenant_id,
+        email=pending_user.email,
+        auth_epoch=pending_user.auth_epoch,
+    )
+    with _real_auth_client(tenant_isolation_database, monkeypatch) as client:
+        blocked = client.get("/api/sessions", cookies=pending_cookie)
 
-    assert exc_info.value.status_code == 403
-    assert exc_info.value.detail == "Account unavailable"
+    assert blocked.status_code == 403
+    assert blocked.json() == {"detail": "Account pending deletion"}
 
     await service.recover(base_context, scheduled.job_id)
 
@@ -729,11 +776,10 @@ async def test_real_deletion_recovery_blocks_ordinary_tenant_access(
     assert restored_deletion_user.purge_after is None
     assert runtime_pool.revoked == [base_context.tenant_id, base_context.tenant_id]
 
-    restored_request = _build_authenticated_request(
-        restored_user,
+    restored_request = _build_request(
         request_started_at_ms=request_started_at_ms,
     )
-    restored_context = await tenant_context(restored_request, await current_user(restored_request))
+    restored_context = await tenant_context(restored_request, restored_user)
 
     assert restored_context.tenant_id == base_context.tenant_id
     assert restored_context.workspace_id == base_context.workspace_id
