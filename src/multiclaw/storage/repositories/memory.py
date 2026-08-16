@@ -201,6 +201,9 @@ class MemoryRepository:
         row = result.mappings().first()
         return None if row is None else MemoryEntry.from_row(row)
 
+    async def get(self, entry_id: str, target_session_id: str | None = None) -> MemoryEntry | None:
+        return await self._get_row(entry_id, target_session_id)
+
     def _prepare_entry(self, entry: MemoryEntry) -> MemoryEntry:
         if entry.type == "chat_message":
             if self._context.session_id is None:

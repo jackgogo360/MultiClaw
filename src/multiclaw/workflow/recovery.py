@@ -17,6 +17,7 @@ from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.storage.schema import agent_runs, approval_requests
 from multiclaw.tenancy.context import TenantContext
+from multiclaw.workflow.continuation import WorkflowContinuationService
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     ApprovalStatus,
@@ -616,12 +617,7 @@ class WorkflowRecoveryWorker:
             run_lease_handle=run_lease_handle,
             force_execute=True,
         )
-        await run_lease_handle.refresh(
-            lambda lease: WorkflowCoordinator(
-                self._database,
-                settings=self._settings,
-            ).transition_run(lease, RunStatus.RUNNING)
-        )
+        await self._invoke_continuation(runtime=runtime, context=context, run_lease_handle=run_lease_handle)
         return True
 
     async def _consume_outcome(
@@ -691,25 +687,42 @@ class WorkflowRecoveryWorker:
                 action=outcome.action,
                 run_lease_handle=run_lease_handle,
             )
+            if outcome.action is not RecoveryAction.MARK_MANUAL_UNCERTAIN:
+                await self._invoke_continuation(
+                    runtime=runtime,
+                    context=context,
+                    run_lease_handle=run_lease_handle,
+                )
             return
 
         if outcome.action is RecoveryAction.RESUME_MODEL:
-            continuation = getattr(runtime, "recovery_continuation", None)
-            if continuation is not None and hasattr(continuation, "resume"):
-                await self._maybe_await(
-                    continuation.resume(
-                        runtime=runtime,
-                        context=context,
-                        run_lease_handle=run_lease_handle,
-                        recovery_outcome=outcome,
-                    )
-                )
-            await run_lease_handle.refresh(
-                lambda lease: WorkflowCoordinator(
-                    self._database,
-                    settings=self._settings,
-                ).transition_run(lease, RunStatus.RUNNING)
+            await self._invoke_continuation(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+                recovery_outcome=outcome,
             )
+
+    async def _invoke_continuation(
+        self,
+        *,
+        runtime,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        recovery_outcome: RecoveryOutcome | None = None,
+    ) -> None:
+        continuation = getattr(runtime, "recovery_continuation", None)
+        if continuation is None or not hasattr(continuation, "resume"):
+            return
+        await self._maybe_await(
+            continuation.resume(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+                recovery_outcome=recovery_outcome
+                or RecoveryOutcome(action=RecoveryAction.RESUME_MODEL),
+            )
+        )
 
     @staticmethod
     async def _maybe_await(value):
@@ -727,9 +740,52 @@ class RuntimeRecoveryContinuationService:
         run_lease_handle: RunLeaseHandle,
         recovery_outcome: RecoveryOutcome,
     ) -> None:
-        del context, run_lease_handle, recovery_outcome
         callback = getattr(getattr(runtime, "agent", None), "resume_recovery", None)
-        if callable(callback):
-            result = callback()
-            if inspect.isawaitable(result):
-                await result
+        if not callable(callback):
+            return
+
+        database = getattr(runtime.agent, "database", None)
+        settings = getattr(runtime.agent, "settings", None)
+        if database is None or settings is None:
+            return
+        workflow = WorkflowCoordinator(database, settings=settings)
+        continuation = WorkflowContinuationService(database, settings=settings)
+        checkpoint = await workflow.get_latest_checkpoint(context)
+        recovered_tool_result = None
+        recovered_tool_input_json = None
+        if checkpoint is not None:
+            phase, payload = decode_checkpoint(checkpoint)
+            if phase is CheckpointPhase.EXECUTION_RESULT_OBSERVED:
+                result_payload = payload if isinstance(payload, ExecutionResultObservedPayload) else None
+                assert result_payload is not None
+                execution = await workflow.get_execution_recovery(context, result_payload.execution_id)
+                if execution is not None:
+                    recovered_tool_input_json = execution.input_payload_json
+                    recovered_tool_result = await continuation.load_tool_result(
+                        context=context,
+                        result_ref=result_payload.result_ref,
+                        expected_digest=result_payload.result_digest,
+                    )
+        result = callback(
+            context=context,
+            run_lease_handle=run_lease_handle,
+            workflow_continuation=continuation,
+            recovered_tool_result=recovered_tool_result,
+            recovered_tool_input_json=recovered_tool_input_json,
+        )
+        if inspect.isawaitable(result):
+            await result
+        current_run = await WorkflowCoordinator(database, settings=settings).get_run(context)
+        if current_run is not None and current_run.status is RunStatus.RESUMING:
+            await run_lease_handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    database,
+                    settings=settings,
+                ).transition_run(lease, RunStatus.RUNNING)
+            )
+        await run_lease_handle.refresh(
+            lambda lease: WorkflowCoordinator(
+                database,
+                settings=settings,
+            ).finish_run_with_checkpoint(lease, RunStatus.COMPLETED)
+        )

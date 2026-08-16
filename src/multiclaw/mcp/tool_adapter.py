@@ -188,11 +188,6 @@ class MCPToolInvocation(ToolInvocation):
                 self._tool_name,
                 self.params.model_dump(),
             )
-            text = _extract_text(result.content)
-            return ToolExecutionResult(
-                status=ToolStatus.ERROR if result.is_error else ToolStatus.SUCCESS,
-                content=text,
-            )
         except Exception as exc:
             logger.error(
                 "MCP tool call failed: %s/%s - %s",
@@ -202,3 +197,12 @@ class MCPToolInvocation(ToolInvocation):
                 status=ToolStatus.ERROR,
                 content=str(exc),
             )
+
+        if result.external_request_id is not None and self.progress_recorder is not None:
+            await self.progress_recorder.record_external_request_id(result.external_request_id)
+        text = _extract_text(result.content)
+        return ToolExecutionResult(
+            status=ToolStatus.ERROR if result.is_error else ToolStatus.SUCCESS,
+            content=text,
+            external_request_id=result.external_request_id,
+        )

@@ -11,6 +11,7 @@ from multiclaw.config import Settings
 from multiclaw.events import Event, EventBus, EventRouter, ScopedEvent
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.storage.engine import Database
+from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.tenancy import TenantContext
 from multiclaw.tools.base import (
     ToolBuilder,
@@ -19,6 +20,7 @@ from multiclaw.tools.base import (
     ToolStatus,
 )
 from multiclaw.workflow.coordinator import WorkflowCoordinator
+from multiclaw.workflow.continuation import WorkflowContinuationService
 from multiclaw.workflow.models import (
     CheckpointPhase,
     ExecutionRecoveryRecord,
@@ -560,12 +562,18 @@ class CoreToolScheduler:
         ):
             raise ValueError("external_request_id conflict")
         external_request_id = result.external_request_id or recorded_external_request_id
-        result_ref = result.result_ref or f"tool_execution:{prepared.execution_id}:result.content"
-        result_digest = result.result_digest or hashlib.sha256(
-            result.content.encode("utf-8")
-        ).hexdigest()
         async with self.database.write_transaction() as conn:
             workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
+            continuation = WorkflowContinuationService(self.database, settings=self.settings)
+            persisted_result = await continuation.persist_tool_result(
+                repository=MemoryRepository(conn, context, self.database.dialect),
+                context=context,
+                content=result.content,
+                tool_call_id=call_id or prepared.execution_id,
+                tool_name=tool_name,
+                execution_id=prepared.execution_id,
+                result_status=resolved_status.value,
+            )
             updated = await workflow.complete_execution(
                 prepared.lease,
                 prepared.execution_id,
@@ -573,8 +581,8 @@ class CoreToolScheduler:
                 expected_version=prepared.progress_state.execution_version,
                 target_status=resolved_status,
                 external_request_id=external_request_id,
-                result_ref=result_ref,
-                result_digest=result_digest,
+                result_ref=persisted_result.result_ref,
+                result_digest=persisted_result.result_digest,
             )
             prepared.progress_state.execution_version = updated.version
             prepared.progress_state.external_request_id = updated.external_request_id
@@ -586,8 +594,8 @@ class CoreToolScheduler:
                     "run_id": context.run_id,
                     "execution_id": prepared.execution_id,
                     "result_status": resolved_status.value,
-                    "result_digest": result_digest,
-                    "result_ref": result_ref,
+                    "result_digest": persisted_result.result_digest,
+                    "result_ref": persisted_result.result_ref,
                     "external_request_id": updated.external_request_id,
                     "resume_cursor": resume_cursor,
                     "cursor": resume_cursor,
