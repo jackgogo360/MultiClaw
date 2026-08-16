@@ -1180,7 +1180,7 @@ Add at end:
 jwt_secret = ""
 
 [brevo]
-api_key = "REMOVED_BREVO_API_KEY"
+api_key = "<BREVO_API_KEY>"
 sender_email = ""
 sender_name = "MultiClaw"
 ```
