@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from uuid import uuid4
 
 from sqlalchemy import and_, exists, func, insert, literal, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -10,6 +11,7 @@ from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
 from multiclaw.storage.schema import (
     agent_runs,
     approval_requests,
+    audit_logs,
     execution_checkpoints,
     tool_executions,
     users,
@@ -548,6 +550,60 @@ class WorkflowRepository:
         )
         row = result.mappings().first()
         return None if row is None else self._approval_from_row(context, row)
+
+    async def get_workspace_approval(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        approval_id: str,
+    ) -> ApprovalRecord | None:
+        result = await self._conn.execute(
+            select(approval_requests).where(
+                approval_requests.c.tenant_id == tenant_id,
+                approval_requests.c.workspace_id == workspace_id,
+                approval_requests.c.approval_id == approval_id,
+            )
+        )
+        row = result.mappings().first()
+        if row is None:
+            return None
+        return self._approval_from_row(
+            TenantContext(
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                session_id=str(row["session_id"]),
+                run_id=str(row["run_id"]),
+            ),
+            row,
+        )
+
+    async def insert_audit_log(
+        self,
+        context: TenantContext,
+        *,
+        event_type: str,
+        status: str,
+        tool_name: str | None,
+        detail_redacted: str,
+        approval_id: str | None = None,
+        execution_id: str | None = None,
+    ) -> None:
+        await self._conn.execute(
+            insert(audit_logs).values(
+                audit_id=str(uuid4()),
+                tenant_id=context.tenant_id,
+                workspace_id=context.workspace_id,
+                session_id=context.session_id,
+                run_id=context.run_id,
+                approval_id=approval_id,
+                execution_id=execution_id,
+                event_type=event_type,
+                status=status,
+                tool_name=tool_name,
+                detail_redacted=detail_redacted,
+                created_at=self._dialect.db_now_ms(),
+            )
+        )
 
     async def get_latest_checkpoint(self, context: TenantContext) -> CheckpointRecord | None:
         result = await self._conn.execute(

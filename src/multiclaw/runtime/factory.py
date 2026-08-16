@@ -14,8 +14,8 @@ from multiclaw.config import Settings
 from multiclaw.events import EventBus, EventRouter
 from multiclaw.governance import (
     ExecutionGuard,
-    InMemoryAuditLogger,
     PermissionChecker,
+    ScopedAuditLogger,
     SandboxController,
     SandboxProcessRunner,
     SandboxReadiness,
@@ -295,7 +295,7 @@ class RuntimeFactory:
                 }
             ),
             execution_guard=ExecutionGuard(),
-            audit_logger=InMemoryAuditLogger(),
+            audit_logger=ScopedAuditLogger(),
             event_bus=event_bus,
             database=self.database,
             settings=self.settings,

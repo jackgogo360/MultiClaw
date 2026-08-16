@@ -1,4 +1,4 @@
-from multiclaw.governance.audit import InMemoryAuditLogger
+from multiclaw.governance.audit import InMemoryAuditLogger, ScopedAuditLogger
 from multiclaw.governance.models import AuditLog, PermissionDecision
 from multiclaw.governance.permission import PermissionChecker
 from multiclaw.governance.sandbox import (
@@ -30,6 +30,7 @@ __all__ = [
     "InMemoryAuditLogger",
     "PermissionChecker",
     "PermissionDecision",
+    "ScopedAuditLogger",
     "SandboxBackend",
     "SandboxConfigurationError",
     "SandboxController",

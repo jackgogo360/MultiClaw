@@ -118,3 +118,45 @@ def test_request_logging_records_chat_validation_failure(tmp_path, monkeypatch, 
 
     assert response.status_code == 422
     assert any("HTTP POST /api/chat -> 422" in message for message in handler.messages)
+
+
+def test_request_logging_does_not_leak_secret_canary(tmp_path, monkeypatch, caplog):
+    secret_canary = "sk-request-log-canary-1234567890"
+    hidden_path = tmp_path / "private" / ".env.secret"
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    monkeypatch.setenv("MULTICLAW_DATABASE__URL", _sqlite_url(tmp_path))
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", TEST_JWT_SIGNING_KEY)
+    database = asyncio.run(_create_database(tmp_path))
+    from multiclaw.server import app
+
+    caplog.set_level(logging.INFO, logger="multiclaw")
+    handler = _RecordHandler()
+    logger = logging.getLogger("multiclaw")
+    logger.addHandler(handler)
+
+    async def broken_stream(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError(f"Authorization: Bearer {secret_canary} path={hidden_path}")
+        yield
+
+    try:
+        with TestClient(app) as client:
+            client.cookies = _make_auth_cookie(database)
+            original_acquire = app.state.runtime_pool.acquire
+
+            async def acquire_and_patch(context):
+                runtime = await original_acquire(context)
+                monkeypatch.setattr(runtime.agent, "handle_message_stream", broken_stream)
+                return runtime
+
+            monkeypatch.setattr(app.state.runtime_pool, "acquire", acquire_and_patch)
+            response = client.post("/api/chat", json={"message": "hello"})
+    finally:
+        logger.removeHandler(handler)
+        asyncio.run(database.dispose())
+
+    assert response.status_code == 200
+    assert secret_canary not in response.text
+    assert str(hidden_path) not in response.text
+    assert all(secret_canary not in message for message in handler.messages)
+    assert all(str(hidden_path) not in message for message in handler.messages)
