@@ -522,6 +522,76 @@ async def test_literal_http_manager_keeps_reusable_connection_without_secret_res
     assert created_transports[0]._headers["Authorization"] == "Bearer literal-token"
 
 
+@pytest.mark.asyncio
+async def test_secret_backed_refresh_invokes_tools_changed_callback_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sequence = iter(
+        [
+            [ToolInfo(name="mcp__demo__old", server_name="demo", original_name="old", description="old", input_schema={})],
+            [ToolInfo(name="mcp__demo__new", server_name="demo", original_name="new", description="new", input_schema={})],
+        ]
+    )
+
+    class _FakeTransport:
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+    class _FakeClient:
+        def __init__(self, name: str, transport) -> None:
+            del name, transport
+            self.connected = False
+
+        def set_on_tools_changed(self, callback) -> None:
+            self._callback = callback
+
+        async def connect(self) -> None:
+            self.connected = True
+
+        async def discover_tools(self) -> list[ToolInfo]:
+            return next(sequence)
+
+        async def disconnect(self) -> None:
+            self.connected = False
+
+    class _FakeResolver:
+        async def resolve_reference(self, context: TenantContext, reference: str) -> ResolvedSecret:
+            del context, reference
+            return ResolvedSecret(
+                provider_kind="mcp",
+                provider_name="demo",
+                secret_name="Authorization",
+                source="user",
+                masked_value="****oken",
+                secret_bytes=SecretBytes(b"tenant-token"),
+            )
+
+    monkeypatch.setattr("multiclaw.mcp.manager.create_transport", lambda config, **kwargs: _FakeTransport())
+    monkeypatch.setattr("multiclaw.mcp.manager.MCPClient", _FakeClient)
+
+    seen: list[list[str]] = []
+    manager = MCPClientManager(
+        secret_resolver=_FakeResolver(),
+        tenant_context=TenantContext("tenant-a", "workspace-a"),
+    )
+    manager.set_tools_changed_callback(
+        lambda server_name, tools: seen.append([server_name, *[tool.original_name for tool in tools]])
+    )
+    config = HTTPServerConfig(
+        url="https://example.com/mcp",
+        headers={"Authorization": "secret://mcp/demo/Authorization"},
+    )
+
+    await manager._connect_server("demo", config)
+    refreshed = await manager._refresh_server("demo")
+
+    assert [tool.original_name for tool in refreshed] == ["new"]
+    assert seen == [["demo", "new"]]
+
+
 def test_create_transport_builds_sandboxed_stdio_launch_spec_with_controlled_grants(
     tmp_path: Path,
 ) -> None:

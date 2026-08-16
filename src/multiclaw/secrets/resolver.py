@@ -25,6 +25,13 @@ class SecretBytes:
         self._buffer = bytearray(value)
         self._closed = False
 
+    @classmethod
+    def adopt(cls, value: bytearray) -> "SecretBytes":
+        secret = cls.__new__(cls)
+        secret._buffer = value
+        secret._closed = False
+        return secret
+
     @contextmanager
     def reveal(self):
         if self._closed:
@@ -104,6 +111,8 @@ class SecretResolver:
         provider_kind: str,
         provider_name: str,
         secret_name: str,
+        *,
+        platform_lookup=None,
     ) -> ResolvedSecret:
         from multiclaw.storage.uow import TenantUnitOfWork
 
@@ -130,12 +139,17 @@ class SecretResolver:
                 secret_name=secret_name,
                 source="user",
                 masked_value=row.masked_value,
-                secret_bytes=SecretBytes(plaintext),
+                secret_bytes=SecretBytes.adopt(plaintext),
             )
 
         if not self._settings.allow_platform_fallback:
             raise SecretNotConfiguredError("secret is not configured")
-        fallback = await self._lookup_platform_secret(provider_kind, provider_name, secret_name)
+        fallback = await self._lookup_platform_secret(
+            provider_kind,
+            provider_name,
+            secret_name,
+            platform_lookup=platform_lookup,
+        )
         if not fallback:
             raise SecretNotConfiguredError("secret is not configured")
         return ResolvedSecret(
@@ -144,7 +158,7 @@ class SecretResolver:
             secret_name=secret_name,
             source="platform",
             masked_value=_mask_value(secret_name),
-            secret_bytes=SecretBytes(fallback.encode("utf-8")),
+            secret_bytes=SecretBytes.adopt(bytearray(fallback.encode("utf-8"))),
         )
 
     async def resolve_credentials(
@@ -155,13 +169,18 @@ class SecretResolver:
         base_url: str,
         platform_value: str = "",
     ) -> ResolvedCredentials:
-        previous_lookup = self._platform_lookup
-        if platform_value and previous_lookup is None:
-            self._platform_lookup = lambda *_args: platform_value
-        try:
-            resolved = await self.resolve(context, "llm", provider_name, "api_key")
-        finally:
-            self._platform_lookup = previous_lookup
+        per_call_lookup = (
+            (lambda lookup_provider_kind, lookup_provider_name, lookup_secret_name: platform_value)
+            if platform_value
+            else None
+        )
+        resolved = await self.resolve(
+            context,
+            "llm",
+            provider_name,
+            "api_key",
+            platform_lookup=per_call_lookup,
+        )
         return ResolvedCredentials(
             provider_name=provider_name,
             source=resolved.source,
@@ -178,10 +197,13 @@ class SecretResolver:
         provider_kind: str,
         provider_name: str,
         secret_name: str,
+        *,
+        platform_lookup=None,
     ) -> str | None:
-        if self._platform_lookup is None:
+        lookup = platform_lookup if platform_lookup is not None else self._platform_lookup
+        if lookup is None:
             return None
-        value = self._platform_lookup(provider_kind, provider_name, secret_name)
+        value = lookup(provider_kind, provider_name, secret_name)
         if inspect.isawaitable(value):
             value = await value
         if value is None:

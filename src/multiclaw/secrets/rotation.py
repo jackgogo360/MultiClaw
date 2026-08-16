@@ -54,6 +54,7 @@ class SecretRotationService:
                     TenantContext(tenant_id=str(row["tenant_id"]), workspace_id="rotation-scope"),
                 )
                 encrypted = repository.from_mapping(row)
+                plaintext = None
                 try:
                     plaintext = self._envelope.decrypt(
                         encrypted.record,
@@ -67,7 +68,7 @@ class SecretRotationService:
                         ),
                     )
                     new_record = self._envelope.encrypt(
-                        bytes(plaintext),
+                        plaintext,
                         EnvelopeFields(
                             tenant_id=str(row["tenant_id"]),
                             workspace_id=row["workspace_id"],
@@ -89,4 +90,12 @@ class SecretRotationService:
                         skipped += 1
                 except Exception:
                     failed += 1
+                finally:
+                    if plaintext is not None:
+                        _zeroize_bytearray(plaintext)
         return RotationResult(rotated=rotated, skipped=skipped, failed=failed)
+
+
+def _zeroize_bytearray(value: bytearray) -> None:
+    for index in range(len(value)):
+        value[index] = 0

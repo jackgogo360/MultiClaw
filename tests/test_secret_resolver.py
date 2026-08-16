@@ -294,6 +294,129 @@ def test_secret_bytes_repr_masks_and_zeroizes() -> None:
     assert "secret-canary-123" not in repr(secret)
 
 
+def test_secret_bytes_adopts_owned_buffer_without_copy() -> None:
+    raw = bytearray(b"owned-secret")
+    secret = SecretBytes.adopt(raw)
+
+    with secret.reveal() as plaintext:
+        assert bytes(plaintext) == b"owned-secret"
+
+    assert raw == bytearray(b"\x00" * len(raw))
+
+
+@pytest.mark.asyncio
+async def test_resolver_zeroizes_original_decrypt_buffer_on_context_exit(
+    secrets_database: Database,
+) -> None:
+    context = await _seed_scope(secrets_database, slug="alpha")
+    await _store_secret(secrets_database, context, plaintext=b"user-canary-value")
+    raw = bytearray(b"user-canary-value")
+
+    class _FakeEnvelope:
+        def decrypt(self, record, fields):
+            del record, fields
+            return raw
+
+    resolver = SecretResolver(
+        database=secrets_database,
+        settings=SecretSettings(allow_platform_fallback=False),
+        keyring=DeploymentKeyring.load(
+            SecretSettings(),
+            environ={"MULTICLAW_SECRETS_KEYRING_B64": _keyring_payload()},
+        ),
+        envelope=_FakeEnvelope(),
+    )
+
+    resolved = await resolver.resolve(context, "llm", "openai", "api_key")
+    with resolved.reveal() as plaintext:
+        assert bytes(plaintext) == b"user-canary-value"
+
+    assert raw == bytearray(b"\x00" * len(raw))
+
+
+@pytest.mark.asyncio
+async def test_resolver_zeroizes_original_decrypt_buffer_on_reveal_exception(
+    secrets_database: Database,
+) -> None:
+    context = await _seed_scope(secrets_database, slug="alpha")
+    await _store_secret(secrets_database, context, plaintext=b"user-canary-value")
+    raw = bytearray(b"user-canary-value")
+
+    class _FakeEnvelope:
+        def decrypt(self, record, fields):
+            del record, fields
+            return raw
+
+    resolver = SecretResolver(
+        database=secrets_database,
+        settings=SecretSettings(allow_platform_fallback=False),
+        keyring=DeploymentKeyring.load(
+            SecretSettings(),
+            environ={"MULTICLAW_SECRETS_KEYRING_B64": _keyring_payload()},
+        ),
+        envelope=_FakeEnvelope(),
+    )
+
+    resolved = await resolver.resolve(context, "llm", "openai", "api_key")
+    with pytest.raises(RuntimeError, match="boom"):
+        with resolved.reveal():
+            raise RuntimeError("boom")
+
+    assert raw == bytearray(b"\x00" * len(raw))
+
+
+@pytest.mark.asyncio
+async def test_resolve_credentials_concurrent_platform_values_do_not_race(
+    secrets_database: Database,
+) -> None:
+    context = await _seed_scope(secrets_database, slug="alpha")
+    keyring = DeploymentKeyring.load(
+        SecretSettings(),
+        environ={"MULTICLAW_SECRETS_KEYRING_B64": _keyring_payload()},
+    )
+    barrier = asyncio.Event()
+    arrivals = 0
+    arrival_lock = asyncio.Lock()
+
+    class _RacingResolver(SecretResolver):
+        async def resolve(self, context, provider_kind, provider_name, secret_name, **kwargs):
+            nonlocal arrivals
+            async with arrival_lock:
+                arrivals += 1
+                if arrivals == 2:
+                    barrier.set()
+            await barrier.wait()
+            return await super().resolve(context, provider_kind, provider_name, secret_name, **kwargs)
+
+    resolver = _RacingResolver(
+        database=secrets_database,
+        settings=SecretSettings(allow_platform_fallback=True),
+        keyring=keyring,
+        envelope=SecretEnvelopeService(keyring),
+        platform_lookup=None,
+    )
+
+    openai_task = resolver.resolve_credentials(
+        context,
+        provider_name="openai",
+        base_url="https://openai.example/v1",
+        platform_value="OPENAI_KEY",
+    )
+    anthropic_task = resolver.resolve_credentials(
+        context,
+        provider_name="anthropic",
+        base_url="https://anthropic.example/v1",
+        platform_value="ANTHROPIC_KEY",
+    )
+
+    openai_credentials, anthropic_credentials = await asyncio.gather(openai_task, anthropic_task)
+
+    with openai_credentials.api_key.reveal() as plaintext:
+        assert bytes(plaintext) == b"OPENAI_KEY"
+    with anthropic_credentials.api_key.reveal() as plaintext:
+        assert bytes(plaintext) == b"ANTHROPIC_KEY"
+
+
 @pytest.mark.asyncio
 async def test_keyring_referenced_versions_fail_closed_with_repository_counts(
     secrets_database: Database,

@@ -288,7 +288,7 @@ class MCPClientManager:
         finally:
             await self._dispose_secret_client(secret_client, resolved_config)
         self._register_tools(server_name, tools, None)
-        self._states[server_name].tools = tools
+        self._on_tools_changed(server_name, tools)
         return tools
 
     def _register_tools(self, server_name: str, tools: list[ToolInfo], client: MCPClient) -> None:

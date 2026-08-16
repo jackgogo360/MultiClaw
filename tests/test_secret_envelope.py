@@ -1,5 +1,7 @@
 import base64
+import io
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -111,6 +113,80 @@ def test_keyring_rejects_group_or_world_readable_file(tmp_path: Path) -> None:
 
     with pytest.raises(SecretKeyringError, match="permissions"):
         DeploymentKeyring.load(SecretSettings(keyring_file=str(keyring_file)), environ={})
+
+
+def test_keyring_rejects_boolean_versions_in_json() -> None:
+    payload = base64.b64encode(
+        json.dumps(
+            {
+                "active_key_version": True,
+                "keys": {"1": _KEY_V1},
+            }
+        ).encode("utf-8")
+    ).decode("ascii")
+
+    with pytest.raises(SecretKeyringError, match="active key version"):
+        DeploymentKeyring.load(SecretSettings(), environ={"MULTICLAW_SECRETS_KEYRING_B64": payload})
+
+
+def test_keyring_rejects_duplicate_normalized_versions() -> None:
+    payload = base64.b64encode(
+        json.dumps(
+            {
+                "active_key_version": 1,
+                "keys": {"1": _KEY_V1, "01": _KEY_V3},
+            }
+        ).encode("utf-8")
+    ).decode("ascii")
+
+    with pytest.raises(SecretKeyringError, match="duplicate normalized"):
+        DeploymentKeyring.load(SecretSettings(), environ={"MULTICLAW_SECRETS_KEYRING_B64": payload})
+
+
+def test_keyring_rejects_symlink_file_source(tmp_path: Path) -> None:
+    target = tmp_path / "real-keyring.json"
+    target.write_text(base64.b64decode(_keyring_payload()).decode("utf-8"), encoding="utf-8")
+    target.chmod(0o600)
+    symlink = tmp_path / "keyring-link.json"
+    symlink.symlink_to(target)
+
+    with pytest.raises(SecretKeyringError, match="unavailable|cannot be read|symlink"):
+        DeploymentKeyring.load(SecretSettings(keyring_file=str(symlink)), environ={})
+
+
+def test_keyring_file_loader_uses_single_fd_open(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    keyring_file = tmp_path / "keyring.json"
+    keyring_file.write_text(base64.b64decode(_keyring_payload()).decode("utf-8"), encoding="utf-8")
+    keyring_file.chmod(0o600)
+    events: list[tuple[str, object]] = []
+    real_open = os.open
+    real_fstat = os.fstat
+    real_fdopen = os.fdopen
+
+    def tracking_open(path, flags, mode=0o777):
+        events.append(("open", os.fspath(path)))
+        return real_open(path, flags, mode)
+
+    def tracking_fstat(fd):
+        events.append(("fstat", fd))
+        return real_fstat(fd)
+
+    def tracking_fdopen(fd, mode="r", encoding=None, closefd=True):
+        events.append(("fdopen", fd))
+        return real_fdopen(fd, mode, encoding=encoding, closefd=closefd)
+
+    def forbidden_read_text(*args, **kwargs):
+        raise AssertionError("Path.read_text should not be used")
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "fstat", tracking_fstat)
+    monkeypatch.setattr(os, "fdopen", tracking_fdopen)
+    monkeypatch.setattr(Path, "read_text", forbidden_read_text)
+
+    keyring = DeploymentKeyring.load(SecretSettings(keyring_file=str(keyring_file)), environ={})
+
+    assert keyring.active_key_version == 3
+    assert [event[0] for event in events] == ["open", "fstat", "fdopen"]
 
 
 def test_keyring_mapping_is_immutable_and_referenced_versions_fail_closed() -> None:

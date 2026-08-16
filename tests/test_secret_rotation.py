@@ -311,6 +311,58 @@ async def test_rotation_reference_counts_gate_old_key_removal(rotation_database:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["success", "cas_conflict", "encrypt_error"])
+async def test_rotation_zeroizes_decrypt_buffers_across_paths(
+    rotation_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    context = await _seed_scope(rotation_database)
+    await _store_old_secret(rotation_database, context, name="api_key")
+    raw = bytearray(b"value-for-api_key")
+    seen_encrypt_inputs: list[object] = []
+
+    class _TrackingEnvelope:
+        def decrypt(self, record, fields):
+            del record, fields
+            return raw
+
+        def encrypt(self, plaintext, fields, *, key_version=None):
+            del fields, key_version
+            seen_encrypt_inputs.append(plaintext)
+            if mode == "encrypt_error":
+                raise RuntimeError("boom")
+            return SecretEnvelopeService(_keyring()).encrypt(bytes(plaintext), EnvelopeFields(
+                tenant_id=context.tenant_id,
+                workspace_id=None,
+                secret_id="replacement-secret",
+                provider_kind="llm",
+                provider_name="openai",
+                secret_name="api_key",
+            ))
+
+    if mode == "cas_conflict":
+        async def always_conflict(self, *args, **kwargs):
+            del args, kwargs
+            return False
+
+        monkeypatch.setattr(SecretsRepository, "compare_and_swap_rotation", always_conflict)
+
+    service = SecretRotationService(
+        database=rotation_database,
+        keyring=_keyring(),
+        envelope=_TrackingEnvelope(),
+    )
+
+    await service.rotate_batch(limit=100)
+
+    assert raw == bytearray(b"\x00" * len(raw))
+    if mode != "encrypt_error":
+        assert seen_encrypt_inputs
+        assert not isinstance(seen_encrypt_inputs[0], bytes)
+
+
+@pytest.mark.asyncio
 async def test_deployment_key_version_gate_counts_all_tenants(
     deployment_gate_database: Database,
 ) -> None:
