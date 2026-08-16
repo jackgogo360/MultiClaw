@@ -65,7 +65,7 @@ class SecretCredentialTester:
                 try:
                     async with self._client_factory(timeout=15.0, follow_redirects=False) as client:
                         response = await client.get(url, headers=headers)
-                except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+                except (asyncio.TimeoutError, httpx.RequestError) as exc:
                     raise SecretCredentialServiceUnavailableError("secret validation unavailable") from exc
         finally:
             resolved.close()

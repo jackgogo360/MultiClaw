@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 from alembic import command
+import httpx
 
 from multiclaw.cli import alembic_config
 from multiclaw.config import DatabaseSettings, Settings
@@ -80,6 +81,17 @@ class _FakeClient:
         if self._error is not None:
             raise self._error
         return self._response
+
+
+class _FakeClientFactoryError:
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+
+    async def __aenter__(self):
+        raise self._error
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 @pytest.fixture
@@ -232,6 +244,55 @@ async def test_secret_credential_tester_maps_timeouts_and_5xx_without_leaking(se
     )
     with pytest.raises(SecretCredentialServiceUnavailableError):
         await error_tester.validate(context, "llm", "anthropic", "api_key")
+    assert resolver.last_resolved.secret_bytes.is_zeroized()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("client_factory", "expected_error"),
+    [
+        (
+            lambda: _FakeClientFactoryError(httpx.ConnectError("boom https://api.example host=secret-host")),
+            "service_unavailable",
+        ),
+        (
+            lambda: _FakeClientFactoryError(httpx.NetworkError("dns failed secret-host")),
+            "service_unavailable",
+        ),
+        (
+            lambda: _FakeClient(error=httpx.ConnectError("connect secret-host")),
+            "service_unavailable",
+        ),
+        (
+            lambda: _FakeClient(error=httpx.RequestError("tls secret-host", request=httpx.Request("GET", "https://api.example/models"))),
+            "service_unavailable",
+        ),
+    ],
+)
+async def test_secret_credential_tester_maps_request_transport_errors_to_unavailable(
+    secret_validation_db: Database,
+    client_factory,
+    expected_error,
+):
+    from multiclaw.secrets.validation import SecretCredentialServiceUnavailableError, SecretCredentialTester
+
+    context = await _seed_context(secret_validation_db)
+    await _seed_secret(secret_validation_db, context, provider_name="openai", plaintext="transport-secret")
+    resolver = _resolver(secret_validation_db)
+    settings = Settings(
+        _config_file="/nonexistent",
+        llm={"providers": {"openai": {"base_url": "https://api.openai.example/v1"}}},
+    )
+    tester = SecretCredentialTester(
+        resolver=resolver,
+        settings=settings,
+        client_factory=lambda **kwargs: client_factory(),
+    )
+
+    assert expected_error == "service_unavailable"
+    with pytest.raises(SecretCredentialServiceUnavailableError):
+        await tester.validate(context, "llm", "openai", "api_key")
+
     assert resolver.last_resolved.secret_bytes.is_zeroized()
 
 

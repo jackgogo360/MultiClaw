@@ -22,6 +22,10 @@ router = APIRouter()
 _SQLITE_MIN_VERSION = (3, 35, 0)
 _MYSQL_MIN_VERSION = (8, 0, 36)
 _VERSION_PREFIX_RE = re.compile(r"^\s*(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)\b")
+_MYSQL_ALLOWED_SUFFIX_RE = re.compile(
+    r"^\s*(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?:-(?:0ubuntu[0-9A-Za-z.+~:-]+|commercial))?\s*$",
+    re.IGNORECASE,
+)
 
 
 @router.get("/api/health/live")
@@ -117,20 +121,28 @@ def _response(failed: list[str]) -> dict[str, Any]:
 
 
 def _backend_version_ok(backend_name: str, version: str) -> bool:
-    match = _VERSION_PREFIX_RE.match(version)
-    if match is None:
-        return False
-    parsed = (
-        int(match.group("major")),
-        int(match.group("minor")),
-        int(match.group("patch")),
-    )
     if backend_name == "sqlite":
+        match = _VERSION_PREFIX_RE.match(version)
+        if match is None:
+            return False
+        parsed = (
+            int(match.group("major")),
+            int(match.group("minor")),
+            int(match.group("patch")),
+        )
         return parsed >= _SQLITE_MIN_VERSION
     if backend_name == "mysql":
         lowered = version.lower()
         if "mariadb" in lowered or "percona" in lowered:
             return False
+        match = _MYSQL_ALLOWED_SUFFIX_RE.match(version)
+        if match is None:
+            return False
+        parsed = (
+            int(match.group("major")),
+            int(match.group("minor")),
+            int(match.group("patch")),
+        )
         if parsed[0] != 8:
             return False
         return parsed >= _MYSQL_MIN_VERSION
