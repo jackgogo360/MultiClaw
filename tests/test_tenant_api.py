@@ -217,6 +217,7 @@ def test_foreign_and_missing_session_message_routes_are_indistinguishable_404(mi
 
     with TestClient(server.app) as client:
         client.cookies = owner.cookie
+        client.app.state.operational_metrics.clear()
         created = client.post("/api/sessions", json={"title": "Owner Session"}).json()
 
     with TestClient(server.app) as client:
@@ -227,6 +228,7 @@ def test_foreign_and_missing_session_message_routes_are_indistinguishable_404(mi
     assert foreign_response.status_code == 404
     assert missing_response.status_code == 404
     assert foreign_response.json() == missing_response.json() == {"detail": "session not found"}
+    assert _metric_count_for(server.app.state.operational_metrics, "multiclaw_scope_fk_rejections_total") >= 2
 
 
 def test_chat_only_creates_session_when_no_session_id_is_supplied(migrated_database: Database):
@@ -363,6 +365,10 @@ def test_secret_api_only_returns_metadata_and_requires_recent_reauth(migrated_da
     with TestClient(server.app) as client:
         client.cookies = fresh.cookie
         listed = client.get("/api/secrets")
+        stored = client.put(
+            "/api/secrets/llm:openai/secondary_key",
+            json={"value": "another-plain-secret"},
+        )
         tested = client.post("/api/secrets/llm:openai/api_key/test")
 
     with TestClient(server.app) as client:
@@ -379,9 +385,25 @@ def test_secret_api_only_returns_metadata_and_requires_recent_reauth(migrated_da
     listed_text = json.dumps(listed_payload)
     assert "plain-secret-value" not in listed_text
     assert "plain-secret-value" not in tested.text
-    assert listed_payload and listed_payload[0]["masked_value"].startswith("****")
+    assert listed_payload and listed_payload[0]["maskedValue"].startswith("****")
     assert "value" not in listed_payload[0]
+    assert set(listed_payload[0]) == {
+        "providerKind",
+        "providerName",
+        "secretName",
+        "maskedValue",
+        "updatedAt",
+    }
+    assert stored.status_code == 200
+    assert set(stored.json()) == {
+        "providerKind",
+        "providerName",
+        "secretName",
+        "maskedValue",
+        "updatedAt",
+    }
     assert tested.status_code == 200
+    assert tested.json() == {"ok": True}
     assert stale_put.status_code == 401
     assert stale_delete.status_code == 401
     assert stale_test.status_code == 401
@@ -421,6 +443,7 @@ def test_secret_api_is_tenant_scoped(migrated_database: Database):
 
 def test_chat_returns_429_when_tenant_quota_is_exhausted(migrated_database: Database, monkeypatch: pytest.MonkeyPatch):
     import multiclaw.server as server
+    import multiclaw.api.chat as chat_api
     from multiclaw.workflow.models import TenantRunQuotaError
 
     class _Runtime:
@@ -449,9 +472,14 @@ def test_chat_returns_429_when_tenant_quota_is_exhausted(migrated_database: Data
 
     with TestClient(server.app) as client:
         client.cookies = identity.cookie
+        client.app.state.operational_metrics.clear()
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", fake_acquire)
-        monkeypatch.setattr(server, "build_workflow_coordinator", lambda *args, **kwargs: _Coordinator())
+        monkeypatch.setattr(chat_api, "build_workflow_coordinator", lambda *args, **kwargs: _Coordinator())
         response = client.post("/api/chat", json={"message": "hello"})
 
     assert response.status_code == 429
     assert response.json() == {"detail": "tenant run quota exceeded"}
+
+
+def _metric_count_for(metrics, name: str) -> int:
+    return sum(value for (metric_name, _labels), value in metrics.counters.items() if metric_name == name)

@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from multiclaw.api.dependencies import tenant_context, tenant_uow
 from multiclaw.events import EventScope, ScopedEvent
 from multiclaw.memory import MemoryEntry
+from multiclaw.observability import increment_metric, record_trace_event
 from multiclaw.runtime.pool import RuntimeUnavailableError
 from multiclaw.security.redaction import public_error_message, redact
 from multiclaw.session import SessionStatus
@@ -64,29 +65,14 @@ def encode_scoped_event(event: ScopedEvent) -> str:
 
 
 def build_workflow_coordinator(database, settings, *, connection=None) -> WorkflowCoordinator:
-    from multiclaw import server as server_module
-
-    patched = getattr(server_module, "build_workflow_coordinator", None)
-    if patched is not None and patched is not build_workflow_coordinator:
-        return patched(database, settings, connection=connection)
     return WorkflowCoordinator(database, settings=settings, connection=connection)
 
 
 def build_workflow_recovery_service(database, settings) -> RecoveryService:
-    from multiclaw import server as server_module
-
-    patched = getattr(server_module, "build_workflow_recovery_service", None)
-    if patched is not None and patched is not build_workflow_recovery_service:
-        return patched(database, settings)
     return RecoveryService(database, settings=settings)
 
 
 def build_workflow_continuation_service(database, settings) -> WorkflowContinuationService:
-    from multiclaw import server as server_module
-
-    patched = getattr(server_module, "build_workflow_continuation_service", None)
-    if patched is not None and patched is not build_workflow_continuation_service:
-        return patched(database, settings)
     return WorkflowContinuationService(database, settings=settings)
 
 
@@ -149,9 +135,17 @@ async def chat(
 
     if has_session_id or has_id_alias:
         if not requested_session_id:
+            increment_metric(
+                "multiclaw_scope_fk_rejections_total",
+                labels={"backend": "unknown", "operation": "chat_session_lookup", "status": "error", "error_class": "scope_fk_rejection"},
+            )
             raise HTTPException(status_code=404, detail="session not found")
         session = await uow.sessions.get(requested_session_id)
         if session is None:
+            increment_metric(
+                "multiclaw_scope_fk_rejections_total",
+                labels={"backend": "unknown", "operation": "chat_session_lookup", "status": "error", "error_class": "scope_fk_rejection"},
+            )
             raise HTTPException(status_code=404, detail="session not found")
         if session.status == SessionStatus.ARCHIVED:
             raise HTTPException(status_code=409, detail="session is archived")
@@ -395,6 +389,11 @@ async def chat(
                         )
                     except StaleFenceError as exc:
                         fence_lost = True
+                        increment_metric(
+                            "multiclaw_stale_fence_total",
+                            labels={"backend": "unknown", "operation": "chat_heartbeat", "status": "error", "error_class": "stale_fence"},
+                        )
+                        record_trace_event("stale_fence", attributes={"operation": "chat_heartbeat", "error": str(exc)})
                         logger.error("run lease heartbeat lost current fence")
                         if stream_task is not None:
                             stream_task.cancel()
@@ -531,11 +530,8 @@ async def chat(
             run_lease.close()
             logger.info("SSE stream ended session=%s run=%s", session.id, run_id)
 
-    from multiclaw import server as server_module
-
-    response_class = getattr(server_module, "StreamingResponse", StreamingResponse)
     try:
-        return response_class(
+        return StreamingResponse(
             event_stream(),
             media_type="text/event-stream",
             headers={"X-Vercel-AI-Data-Stream": "v1"},

@@ -36,15 +36,11 @@ async def list_secrets(
     entries = await uow.secrets.list_metadata()
     return [
         {
-            "provider": f"{entry.provider_kind}:{entry.provider_name}",
-            "provider_kind": entry.provider_kind,
-            "provider_name": entry.provider_name,
-            "name": entry.secret_name,
-            "masked_value": entry.masked_value,
-            "key_version": entry.key_version,
-            "created_at": entry.created_at,
-            "updated_at": entry.updated_at,
-            "rotated_at": entry.rotated_at,
+            "providerKind": entry.provider_kind,
+            "providerName": entry.provider_name,
+            "secretName": entry.secret_name,
+            "maskedValue": entry.masked_value,
+            "updatedAt": entry.updated_at,
         }
         for entry in entries
     ]
@@ -85,13 +81,11 @@ async def put_secret(
         ),
     )
     return {
-        "provider": f"{metadata.provider_kind}:{metadata.provider_name}",
-        "name": metadata.secret_name,
-        "masked_value": metadata.masked_value,
-        "key_version": metadata.key_version,
-        "created_at": metadata.created_at,
-        "updated_at": metadata.updated_at,
-        "rotated_at": metadata.rotated_at,
+        "providerKind": metadata.provider_kind,
+        "providerName": metadata.provider_name,
+        "secretName": metadata.secret_name,
+        "maskedValue": metadata.masked_value,
+        "updatedAt": metadata.updated_at,
     }
 
 
@@ -128,10 +122,4 @@ async def test_secret(
     except SecretNotConfiguredError:
         raise HTTPException(status_code=404, detail="secret not found") from None
     resolved.close()
-    return {
-        "ok": True,
-        "provider": f"{provider_kind}:{provider_name}",
-        "name": name,
-        "masked_value": resolved.masked_value,
-        "source": resolved.source,
-    }
+    return {"ok": True}

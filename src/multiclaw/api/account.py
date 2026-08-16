@@ -54,10 +54,13 @@ async def require_recent_deletion_auth(request: Request):
     token_iat = getattr(request.state, "authenticated_iat", None)
     if type(token_iat) is not int:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
-    async with request.app.state.database.connect() as conn:
-        result = await conn.execute(select(request.app.state.database.dialect.db_now_ms()))
-        db_now_seconds = int(result.scalar_one()) // 1000
+    request_started_at_ms = getattr(request.state, "request_started_at_ms", 0)
+    if type(request_started_at_ms) is int and request_started_at_ms > 0:
+        db_now_seconds = request_started_at_ms // 1000
+    else:
+        async with request.app.state.database.connect() as conn:
+            result = await conn.execute(select(request.app.state.database.dialect.db_now_ms()))
+            db_now_seconds = int(result.scalar_one()) // 1000
     if db_now_seconds - token_iat > RECENT_AUTH_MAX_AGE_SECONDS:
         raise HTTPException(status_code=401, detail="Recent authentication required")
     return user

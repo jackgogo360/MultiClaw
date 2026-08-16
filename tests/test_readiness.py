@@ -1,5 +1,8 @@
 import asyncio
+import base64
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from alembic import command
@@ -13,6 +16,19 @@ from multiclaw.storage import Database
 
 def _sqlite_url(tmp_path: Path) -> str:
     return f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+
+
+def _keyring_payload() -> str:
+    return base64.b64encode(
+        json.dumps(
+            {
+                "active_key_version": 3,
+                "keys": {
+                    "3": base64.b64encode(bytes(range(32))).decode("ascii"),
+                },
+            }
+        ).encode("utf-8")
+    ).decode("ascii")
 
 
 async def _create_database(tmp_path: Path) -> Database:
@@ -29,6 +45,7 @@ def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", "readiness-jwt-key-material-1234567890")
+    monkeypatch.setenv("MULTICLAW_SECRETS_KEYRING_B64", _keyring_payload())
     database = asyncio.run(_create_database(tmp_path))
     try:
         yield database
@@ -57,13 +74,30 @@ def test_readiness_fails_closed_on_stale_schema_revision_without_running_upgrade
     )
 
     with TestClient(server.app) as client:
+        client.app.state.operational_metrics.clear()
         response = client.get("/api/health/ready")
 
     assert response.status_code == 503
     payload = response.json()
+    assert set(payload) == {"ready", "status", "checks_failed"}
     assert payload.get("status") == "not_ready"
     assert "schema_revision" in payload.get("checks_failed", [])
     assert calls == []
+    assert _metric_count_for(server.app.state.operational_metrics, "multiclaw_migration_revision_failures_total") == 1
+
+
+def test_readiness_records_keyring_failure_metric(migrated_database: Database, monkeypatch: pytest.MonkeyPatch):
+    import multiclaw.server as server
+
+    monkeypatch.delenv("MULTICLAW_SECRETS_KEYRING_B64", raising=False)
+
+    with TestClient(server.app) as client:
+        client.app.state.operational_metrics.clear()
+        response = client.get("/api/health/ready")
+
+    assert response.status_code == 503
+    assert "keyring" in response.json()["checks_failed"]
+    assert _metric_count_for(server.app.state.operational_metrics, "multiclaw_keyring_failures_total") == 1
 
 
 def test_liveness_is_public_and_does_not_touch_database(
@@ -91,6 +125,137 @@ def test_liveness_is_public_and_does_not_touch_database(
     assert touched is False
 
 
+def test_readiness_reports_active_default_workspace_integrity_without_leaking_details(
+    migrated_database: Database,
+):
+    import multiclaw.server as server
+
+    asyncio.run(_seed_active_user_without_default_workspace(migrated_database))
+
+    with TestClient(server.app) as client:
+        response = client.get("/api/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "ready": False,
+        "status": "not_ready",
+        "checks_failed": ["active_default_workspace_integrity"],
+    }
+
+
+def test_readiness_mysql_branch_uses_low_cardinality_contract_failures(monkeypatch: pytest.MonkeyPatch):
+    import multiclaw.api.health as health_module
+    from fastapi import FastAPI
+    from starlette.requests import Request
+
+    class _FakeConn:
+        async def scalar(self, stmt):
+            sql = str(stmt)
+            lowered = sql.lower()
+            if "version()" in lowered:
+                return "8.0.35"
+            if "@@session.time_zone" in sql:
+                return "+08:00"
+            if "@@transaction_isolation" in sql:
+                return "REPEATABLE-READ"
+            return None
+
+        async def execute(self, stmt):
+            sql = str(stmt).lower()
+            if "information_schema.tables" in sql:
+                return _MappingsResult([{"engine": "MyISAM", "table_name": "users"}])
+            if "information_schema.referential_constraints" in sql:
+                return _MappingsResult([])
+            return _MappingsResult([])
+
+        async def run_sync(self, fn):
+            return fn(SimpleNamespace())
+
+    class _FakeConnect:
+        async def __aenter__(self):
+            return _FakeConn()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeDatabase:
+        dialect = SimpleNamespace(name="mysql")
+
+        def connect(self):
+            return _FakeConnect()
+
+    monkeypatch.setattr(
+        health_module.MigrationContext,
+        "configure",
+        lambda sync_conn: SimpleNamespace(get_current_revision=lambda: "20260815_0001"),
+    )
+    monkeypatch.setattr(
+        health_module.ScriptDirectory,
+        "from_config",
+        lambda config: SimpleNamespace(get_current_head=lambda: "20260815_0001"),
+    )
+    monkeypatch.setattr(
+        health_module.DeploymentKeyring,
+        "load",
+        lambda settings: SimpleNamespace(require_versions=lambda usage: None),
+    )
+
+    app = FastAPI()
+    app.state.database = _FakeDatabase()
+    app.state.settings = SimpleNamespace(
+        database=SimpleNamespace(url="mysql+aiomysql://fake"),
+        secrets=SimpleNamespace(),
+    )
+    app.state.workspace_root = Path.cwd()
+    request = Request({"type": "http", "app": app, "method": "GET", "path": "/api/health/ready", "headers": []})
+
+    response = asyncio.run(health_module.health_ready(request))
+
+    assert response.status_code == 503
+    assert json.loads(response.body.decode()) == {
+        "ready": False,
+        "status": "not_ready",
+        "checks_failed": [
+            "backend_version",
+            "mysql_time_zone",
+            "mysql_isolation",
+            "mysql_innodb",
+            "schema_integrity",
+        ],
+    }
+
+
 async def _set_revision(database: Database, *, revision: str) -> None:
     async with database.write_transaction() as conn:
         await conn.execute(text("UPDATE alembic_version SET version_num = :revision"), {"revision": revision})
+
+
+async def _seed_active_user_without_default_workspace(database: Database) -> None:
+    async with database.write_transaction() as conn:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO users (
+                    id, email, auth_epoch, default_workspace_id, status,
+                    purge_after, created_at, updated_at, disabled_at, purge_requested_at
+                )
+                VALUES (:user_id, :email, 0, NULL, 'active', NULL, 1, 1, NULL, NULL)
+                """
+            ),
+            {"user_id": "11111111-1111-1111-1111-111111111111", "email": "broken-active@example.com"},
+        )
+
+
+class _MappingsResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+
+def _metric_count_for(metrics, name: str) -> int:
+    return sum(value for (metric_name, _labels), value in metrics.counters.items() if metric_name == name)

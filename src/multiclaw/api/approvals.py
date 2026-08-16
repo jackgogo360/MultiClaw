@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from multiclaw.api.dependencies import tenant_context
+from multiclaw.observability import increment_metric, record_trace_event
 from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.tenancy import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
@@ -82,6 +83,19 @@ async def decide_approval(
         if message == "approval record not found":
             raise HTTPException(status_code=404, detail="approval not found") from error
         raise HTTPException(status_code=409, detail=message) from error
+    increment_metric(
+        "multiclaw_approval_recovery_total",
+        labels={
+            "backend": getattr(request.app.state.database.dialect, "name", "unknown"),
+            "operation": "approval_decision",
+            "status": resolved.status.value,
+            "error_class": "approval_recovery",
+        },
+    )
+    record_trace_event(
+        "approval_recovery",
+        attributes={"approval_id": approval_id, "status": resolved.status.value},
+    )
     return ApprovalResponse.from_record(resolved)
 
 

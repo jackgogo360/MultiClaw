@@ -10,7 +10,9 @@ from typing import Any
 
 from multiclaw.config import Settings
 from multiclaw.events import Event, EventBus, EventRouter, ScopedEvent
-from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
+from multiclaw.governance import ExecutionGuard, PermissionChecker
+from multiclaw.observability import increment_metric, record_trace_event
+from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.tenancy import TenantContext
@@ -129,7 +131,7 @@ class CoreToolScheduler:
         self,
         permission_checker: PermissionChecker,
         execution_guard: ExecutionGuard,
-        audit_logger: InMemoryAuditLogger,
+        audit_logger,
         event_bus: EventBus,
         event_router: EventRouter | None = None,
         database: Database | None = None,
@@ -223,11 +225,6 @@ class CoreToolScheduler:
                     },
                     context=context,
                 )
-                await self.audit_logger.record(
-                    tool_name=builder.name,
-                    status=ToolStatus.AWAITING_APPROVAL.value,
-                    detail=f"approval required, approval_id={approval.approval_id}",
-                )
                 return ToolExecutionResult(
                     status=ToolStatus.AWAITING_APPROVAL,
                     content="approval required",
@@ -249,10 +246,13 @@ class CoreToolScheduler:
                     },
                     context=context,
                 )
-                await self.audit_logger.record(
-                    tool_name=builder.name,
-                    status=ToolStatus.CANCELLED.value,
-                    detail=decision.reason,
+                await self._finalize_terminal_result(
+                    builder.name,
+                    ToolExecutionResult(status=ToolStatus.CANCELLED, content=decision.reason),
+                    context=context,
+                    call_id=call_id,
+                    audit_detail=decision.reason,
+                    error_label=decision.reason,
                 )
                 return ToolExecutionResult(
                     status=ToolStatus.CANCELLED,
@@ -439,6 +439,7 @@ class CoreToolScheduler:
         )
         async with self.database.write_transaction() as conn:
             workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
+            repository = self._workflow_repository(conn)
             transitioned = await workflow.transition_run(lease, RunStatus.AWAITING_USER)
             approval = await workflow.create_approval(
                 transitioned,
@@ -474,6 +475,16 @@ class CoreToolScheduler:
                     "cursor": approval_cursor,
                 },
                 approval_id=approval.approval_id,
+            )
+            await self.audit_logger.record(
+                repository,
+                context,
+                event_type="tool.awaiting_approval",
+                status=ToolStatus.AWAITING_APPROVAL.value,
+                tool_name=builder.name,
+                detail=f"approval required, approval_id={approval.approval_id}",
+                approval_id=approval.approval_id,
+                execution_id=created.execution_id,
             )
         await run_lease_handle.replace(transitioned)
         return approval
@@ -580,6 +591,7 @@ class CoreToolScheduler:
         external_request_id = result.external_request_id or recorded_external_request_id
         async with self.database.write_transaction() as conn:
             workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
+            repository = self._workflow_repository(conn)
             continuation = WorkflowContinuationService(self.database, settings=self.settings)
             persisted_result = await continuation.persist_tool_result(
                 repository=MemoryRepository(conn, context, self.database.dialect),
@@ -621,14 +633,23 @@ class CoreToolScheduler:
                 execution_expected_status=resolved_status,
                 execution_expected_version=updated.version,
             )
+            await self.audit_logger.record(
+                repository,
+                context,
+                event_type="tool.completed" if result.status == ToolStatus.SUCCESS else "tool.error",
+                status=result.status.value,
+                tool_name=tool_name,
+                detail="tool execution failed" if result.status is ToolStatus.ERROR else self._audit_detail(result),
+                approval_id=prepared.approval_id,
+                execution_id=prepared.execution_id,
+            )
         if run_lease_handle is not None:
             await run_lease_handle.replace(prepared.lease)
-        await self._finalize_terminal_result(
+        await self._publish_result_event(
             tool_name,
             result,
             context=context,
             call_id=call_id,
-            audit_detail="tool execution failed" if result.status is ToolStatus.ERROR else None,
             error_label="tool execution failed" if result.status is ToolStatus.ERROR else None,
         )
 
@@ -962,6 +983,20 @@ class CoreToolScheduler:
             result_digest=execution.result_digest
             or hashlib.sha256(b"uncertain").hexdigest(),
         )
+        increment_metric(
+            "multiclaw_recovery_outcomes_total",
+            labels={
+                "backend": getattr(self.database.dialect, "name", "unknown"),
+                "operation": "recovery_uncertain",
+                "status": ExecutionStatus.UNCERTAIN.value,
+                "error_class": "manual_uncertain",
+                "recovery_strategy": execution.recovery_strategy.value,
+            },
+        )
+        record_trace_event(
+            "recovery_uncertain",
+            attributes={"execution_id": execution.execution_id, "recovery_strategy": execution.recovery_strategy.value},
+        )
         await self._persist_execution_result(
             prepared,
             tool_name=execution.tool_name,
@@ -987,9 +1022,24 @@ class CoreToolScheduler:
             content=detail,
             external_request_id=execution.external_request_id,
         )
+        increment_metric(
+            "multiclaw_recovery_outcomes_total",
+            labels={
+                "backend": getattr(self.database.dialect, "name", "unknown"),
+                "operation": "recovery_blocked",
+                "status": status.value,
+                "error_class": "blocked_recovery",
+                "recovery_strategy": execution.recovery_strategy.value,
+            },
+        )
+        record_trace_event(
+            "recovery_blocked",
+            attributes={"execution_id": execution.execution_id, "status": status.value, "detail": detail},
+        )
         lease = await run_lease_handle.current()
         async with self.database.write_transaction() as conn:
             workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
+            repository = self._workflow_repository(conn)
             continuation = WorkflowContinuationService(self.database, settings=self.settings)
             persisted_result = await continuation.persist_tool_result(
                 repository=MemoryRepository(conn, context, self.database.dialect),
@@ -1028,12 +1078,21 @@ class CoreToolScheduler:
                 execution_expected_status=status,
                 execution_expected_version=updated.version,
             )
-        await self._finalize_terminal_result(
+            await self.audit_logger.record(
+                repository,
+                context,
+                event_type="tool.error",
+                status=result.status.value,
+                tool_name=execution.tool_name,
+                detail=detail,
+                approval_id=execution.approval_id,
+                execution_id=execution.execution_id,
+            )
+        await self._publish_result_event(
             execution.tool_name,
             result,
             context=context,
             call_id=execution.tool_call_id,
-            audit_detail=detail,
             error_label=detail,
         )
         return result
@@ -1167,17 +1226,36 @@ class CoreToolScheduler:
         audit_detail: str | None = None,
         error_label: str | None = None,
     ) -> None:
-        await self.audit_logger.record(
-            tool_name=tool_name,
-            status=result.status.value,
-            detail=audit_detail if audit_detail is not None else self._audit_detail(result),
-        )
+        if self.database is not None and context is not None:
+            async with self.database.write_transaction() as conn:
+                await self.audit_logger.record(
+                    self._workflow_repository(conn),
+                    context,
+                    event_type="tool.completed" if result.status == ToolStatus.SUCCESS else "tool.error",
+                    tool_name=tool_name,
+                    status=result.status.value,
+                    detail=audit_detail if audit_detail is not None else self._audit_detail(result),
+                )
+        else:
+            await self.audit_logger.record(
+                tool_name=tool_name,
+                status=result.status.value,
+                detail=audit_detail if audit_detail is not None else self._audit_detail(result),
+            )
         await self._publish_result_event(
             tool_name,
             result,
             context=context,
             call_id=call_id,
             error_label=error_label,
+        )
+
+    def _workflow_repository(self, conn) -> WorkflowRepository:
+        return WorkflowRepository(
+            conn,
+            self.database.dialect,
+            self.settings.workflow.heartbeat_ms,
+            self.settings.workflow.lease_ttl_ms,
         )
 
     async def _publish_result_event(
