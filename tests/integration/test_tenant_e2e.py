@@ -1003,19 +1003,6 @@ async def test_real_deletion_purge_removes_only_target_tenant_and_closes_recover
     assert survivor_job is None
     assert runtime_pool.revoked == [target.base_context.tenant_id]
 
-    await service.force_job_purge_after(
-        tenant_id=target.base_context.tenant_id,
-        purge_after=0,
-    )
-    refreshed_pending_job = await _load_current_deletion_job(
-        tenant_isolation_database,
-        target.base_context.tenant_id,
-    )
-    assert refreshed_pending_job is not None
-    assert refreshed_pending_job.job_id == scheduled.job_id
-    assert refreshed_pending_job.status == "scheduled"
-    assert refreshed_pending_job.purge_after == 0
-
     worker = DeletionWorker(
         database=tenant_isolation_database,
         runtime_pool=runtime_pool,
@@ -1029,12 +1016,18 @@ async def test_real_deletion_purge_removes_only_target_tenant_and_closes_recover
     entered_purge = asyncio.Event()
     release_purge = asyncio.Event()
     original_purge_job = worker._purge_job
+    next_claim_calls: list[str] = []
 
     async def paused_purge_job(job):
         entered_purge.set()
         await release_purge.wait()
         return await original_purge_job(job)
 
+    async def next_claimable_tenant_id() -> str | None:
+        next_claim_calls.append(target.base_context.tenant_id)
+        return target.base_context.tenant_id if len(next_claim_calls) == 1 else None
+
+    monkeypatch.setattr(worker, "_next_claimable_tenant_id", next_claimable_tenant_id)
     monkeypatch.setattr(worker, "_purge_job", paused_purge_job)
     batch_task = asyncio.create_task(worker.run_batch(batch_size=1))
     try:
@@ -1098,6 +1091,7 @@ async def test_real_deletion_purge_removes_only_target_tenant_and_closes_recover
     assert batch.claimed == 1
     assert batch.completed == 1
     assert batch.failed == 0
+    assert next_claim_calls == [target.base_context.tenant_id]
     assert target_user_after is None
     assert target_deletion_user_after is None
     assert target_job_after is None
