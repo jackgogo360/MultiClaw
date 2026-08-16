@@ -151,6 +151,8 @@ class MemoryRepository:
         ]
         if entry_type is not None:
             filters.append(memory_entries.c.type == entry_type)
+        else:
+            filters.append(memory_entries.c.type != "tool_result")
         if entry_type == "chat_message" and self._context.session_id is None:
             raise ValueError("session_id is required for chat_message queries")
         filters.append(self._visibility_filter(include_long_term=visible_scope == "session_or_long_term"))

@@ -406,6 +406,10 @@ class WorkflowCoordinator:
         async with self._write_connection() as conn:
             return await self._repository(conn).get_execution_recovery(context, execution_id)
 
+    async def get_approval(self, context: TenantContext, approval_id: str):
+        async with self._write_connection() as conn:
+            return await self._repository(conn).get_approval(context, approval_id)
+
     async def get_execution_by_approval_id(self, context: TenantContext, approval_id: str):
         async with self._write_connection() as conn:
             return await self._repository(conn).get_execution_by_approval_id(context, approval_id)

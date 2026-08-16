@@ -19,6 +19,7 @@ from multiclaw.storage.schema import agent_runs, approval_requests
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.continuation import WorkflowContinuationService
 from multiclaw.workflow.continuation import ContinuationOutcome, ContinuationState
+from multiclaw.workflow.continuation import PersistedToolResult
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     ApprovalStatus,
@@ -482,7 +483,7 @@ class WorkflowRecoveryWorker:
                             approval_requests.c.workspace_id == agent_runs.c.workspace_id,
                             approval_requests.c.session_id == agent_runs.c.session_id,
                             approval_requests.c.run_id == agent_runs.c.run_id,
-                            approval_requests.c.approval_status.in_(("approved", "expired")),
+                            approval_requests.c.approval_status.in_(("approved", "expired", "rejected")),
                         )
                     ).label("awaiting_resolution"),
                 )
@@ -498,7 +499,7 @@ class WorkflowRecoveryWorker:
                                     approval_requests.c.workspace_id == agent_runs.c.workspace_id,
                                     approval_requests.c.session_id == agent_runs.c.session_id,
                                     approval_requests.c.run_id == agent_runs.c.run_id,
-                                    approval_requests.c.approval_status.in_(("approved", "expired")),
+                                    approval_requests.c.approval_status.in_(("approved", "expired", "rejected")),
                                 )
                             )
                         ),
@@ -565,7 +566,7 @@ class WorkflowRecoveryWorker:
                 return
             run_lease_handle = RunLeaseHandle(lease)
 
-            if candidate.awaiting_resolution and await self._resume_approved_plan_if_present(
+            if candidate.awaiting_resolution and await self._resume_resolved_approval_if_present(
                 runtime=runtime,
                 context=candidate.context,
                 run_lease_handle=run_lease_handle,
@@ -583,7 +584,7 @@ class WorkflowRecoveryWorker:
             if runtime_lease is not None:
                 runtime_lease.close()
 
-    async def _resume_approved_plan_if_present(
+    async def _resume_resolved_approval_if_present(
         self,
         *,
         runtime,
@@ -595,11 +596,35 @@ class WorkflowRecoveryWorker:
         if checkpoint is None or checkpoint.approval_id is None:
             return False
         approval = await self._recovery_service._approval(context, checkpoint.approval_id)
-        if approval is None or approval.status is not ApprovalStatus.APPROVED:
+        if approval is None or approval.status is ApprovalStatus.AWAITING_USER:
             return False
         execution = await coordinator.get_execution_by_approval_id(context, checkpoint.approval_id)
         if execution is None or execution.status is not ExecutionStatus.NOT_STARTED:
             return False
+        if approval.status in {ApprovalStatus.REJECTED, ApprovalStatus.EXPIRED}:
+            content = "rejected by user" if approval.status is ApprovalStatus.REJECTED else "approval expired"
+            await runtime.scheduler._block_execution(
+                context=context,
+                execution=execution,
+                run_lease_handle=run_lease_handle,
+                status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
+                detail=content,
+            )
+            await self._invoke_continuation(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+                recovered_tool_result=PersistedToolResult(
+                    entry_id="",
+                    result_ref="",
+                    result_digest="",
+                    content=content,
+                    tool_call_id=execution.tool_call_id,
+                    tool_name=execution.tool_name,
+                ),
+                recovered_tool_input_json=execution.input_payload_json,
+            )
+            return True
         builder = runtime.registry.get(execution.tool_name)
         if builder is None:
             await runtime.scheduler._block_execution(
@@ -618,7 +643,9 @@ class WorkflowRecoveryWorker:
             run_lease_handle=run_lease_handle,
             force_execute=True,
         )
-        await self._invoke_continuation(runtime=runtime, context=context, run_lease_handle=run_lease_handle)
+        refreshed = await coordinator.get_execution_recovery(context, execution.execution_id)
+        if refreshed is not None and refreshed.status is ExecutionStatus.SUCCEEDED:
+            await self._invoke_continuation(runtime=runtime, context=context, run_lease_handle=run_lease_handle)
         return True
 
     async def _consume_outcome(
@@ -711,6 +738,8 @@ class WorkflowRecoveryWorker:
         context: TenantContext,
         run_lease_handle: RunLeaseHandle,
         recovery_outcome: RecoveryOutcome | None = None,
+        recovered_tool_result: PersistedToolResult | None = None,
+        recovered_tool_input_json: str | None = None,
     ) -> None:
         continuation = getattr(runtime, "recovery_continuation", None)
         if continuation is None or not hasattr(continuation, "resume"):
@@ -722,6 +751,8 @@ class WorkflowRecoveryWorker:
                 run_lease_handle=run_lease_handle,
                 recovery_outcome=recovery_outcome
                 or RecoveryOutcome(action=RecoveryAction.RESUME_MODEL),
+                recovered_tool_result=recovered_tool_result,
+                recovered_tool_input_json=recovered_tool_input_json,
             )
         )
 
@@ -740,6 +771,8 @@ class RuntimeRecoveryContinuationService:
         context: TenantContext,
         run_lease_handle: RunLeaseHandle,
         recovery_outcome: RecoveryOutcome,
+        recovered_tool_result: PersistedToolResult | None = None,
+        recovered_tool_input_json: str | None = None,
     ) -> None:
         callback = getattr(getattr(runtime, "agent", None), "resume_recovery", None)
         if not callable(callback):
@@ -752,9 +785,7 @@ class RuntimeRecoveryContinuationService:
         workflow = WorkflowCoordinator(database, settings=settings)
         continuation = WorkflowContinuationService(database, settings=settings)
         checkpoint = await workflow.get_latest_checkpoint(context)
-        recovered_tool_result = None
-        recovered_tool_input_json = None
-        if checkpoint is not None:
+        if recovered_tool_result is None and checkpoint is not None:
             phase, payload = decode_checkpoint(checkpoint)
             if phase is CheckpointPhase.EXECUTION_RESULT_OBSERVED:
                 result_payload = payload if isinstance(payload, ExecutionResultObservedPayload) else None
@@ -766,6 +797,9 @@ class RuntimeRecoveryContinuationService:
                         context=context,
                         result_ref=result_payload.result_ref,
                         expected_digest=result_payload.result_digest,
+                        expected_execution_id=execution.execution_id,
+                        expected_tool_call_id=execution.tool_call_id,
+                        expected_tool_name=execution.tool_name,
                     )
         current_run = await WorkflowCoordinator(database, settings=settings).get_run(context)
         if current_run is not None and current_run.status is RunStatus.RESUMING:

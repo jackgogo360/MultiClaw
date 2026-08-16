@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -145,10 +146,14 @@ class WorkflowContinuationService:
         context: TenantContext,
         result_ref: str,
         expected_digest: str,
+        expected_execution_id: str | None = None,
+        expected_tool_call_id: str | None = None,
+        expected_tool_name: str | None = None,
     ) -> PersistedToolResult:
-        if not result_ref.startswith("memory://"):
+        match = re.fullmatch(r"memory://([A-Za-z0-9-]{1,64})", result_ref)
+        if match is None:
             raise ValueError("unsupported result_ref")
-        entry_id = result_ref.removeprefix("memory://")
+        entry_id = match.group(1)
         async with TenantUnitOfWork(
             self._database,
             context,
@@ -157,6 +162,20 @@ class WorkflowContinuationService:
             entry = await uow.memory.get(entry_id, context.session_id)
         if entry is None:
             raise ValueError("tool result entry not found")
+        if entry.type != "tool_result" or entry.role != "tool":
+            raise ValueError("tool result entry has invalid type or role")
+        tool_call_id = str(entry.metadata.get("tool_call_id", "")).strip()
+        tool_name = str(entry.metadata.get("tool_name", "")).strip()
+        execution_id = str(entry.metadata.get("execution_id", "")).strip()
+        result_status = str(entry.metadata.get("result_status", "")).strip()
+        if not tool_call_id or not tool_name or not execution_id or not result_status:
+            raise ValueError("tool result metadata is incomplete")
+        if expected_execution_id is not None and execution_id != expected_execution_id:
+            raise ValueError("tool result execution_id mismatch")
+        if expected_tool_call_id is not None and tool_call_id != expected_tool_call_id:
+            raise ValueError("tool result tool_call_id mismatch")
+        if expected_tool_name is not None and tool_name != expected_tool_name:
+            raise ValueError("tool result tool_name mismatch")
         digest = hashlib.sha256(entry.content.encode("utf-8")).hexdigest()
         if digest != expected_digest:
             raise ValueError("tool result digest mismatch")
@@ -165,8 +184,8 @@ class WorkflowContinuationService:
             result_ref=result_ref,
             result_digest=digest,
             content=entry.content,
-            tool_call_id=str(entry.metadata.get("tool_call_id", "")),
-            tool_name=str(entry.metadata.get("tool_name", "")),
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
         )
 
 
