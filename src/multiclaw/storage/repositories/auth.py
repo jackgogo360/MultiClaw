@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import cast
-from uuid import uuid4, uuid7
+from uuid import uuid4
 
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
@@ -105,8 +105,17 @@ class VerificationCodeRepository(_ConnectionBoundRepository):
         code_digest: str,
         ttl_seconds: int,
     ) -> str:
-        code_id = str(uuid7())
-        now_ms = self._dialect.db_now_ms()
+        await self.acquire_rate_limit_lock(email=email, purpose=purpose)
+        code_id = str(uuid4())
+        now_ms = await self.db_now_ms()
+        latest_created_at_result = await self._conn.execute(
+            select(func.max(verification_codes.c.created_at)).where(
+                verification_codes.c.email == email,
+                verification_codes.c.purpose == purpose,
+            )
+        )
+        latest_created_at = cast(int | None, latest_created_at_result.scalar_one())
+        created_at = now_ms if latest_created_at is None else max(now_ms, latest_created_at + 1)
         await self._conn.execute(
             insert(verification_codes).values(
                 id=code_id,
@@ -115,7 +124,7 @@ class VerificationCodeRepository(_ConnectionBoundRepository):
                 purpose=purpose,
                 expires_at=now_ms + ttl_seconds * 1000,
                 used_at=None,
-                created_at=now_ms,
+                created_at=created_at,
             )
         )
         return code_id
