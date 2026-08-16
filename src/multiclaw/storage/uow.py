@@ -13,6 +13,7 @@ from multiclaw.storage.repositories.auth import (
     WorkspaceRepository,
 )
 from multiclaw.storage.repositories.memory import MemoryRepository
+from multiclaw.storage.repositories.secrets import SecretsRepository
 from multiclaw.storage.repositories.sessions import SessionRepository
 from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.tenancy.context import TenantContext
@@ -133,6 +134,7 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
     workspaces: WorkspaceRepository
     sessions: SessionRepository
     memory: MemoryRepository
+    secrets: SecretsRepository
     workflow: WorkflowRepository
 
     def __init__(
@@ -152,6 +154,7 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
         self.workspaces = WorkspaceRepository(self.conn, self._database.dialect, self._context)
         self.sessions = SessionRepository(self.conn, self._context, self._database.dialect)
         self.memory = MemoryRepository(self.conn, self._context, self._database.dialect)
+        self.secrets = SecretsRepository(self.conn, self._database.dialect, self._context)
         self.workflow = WorkflowRepository(
             self.conn,
             self._database.dialect,

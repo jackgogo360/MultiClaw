@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+from dataclasses import replace
 import logging
 import threading
 import time
@@ -13,7 +14,17 @@ from typing import Any, Callable, Optional
 from .circuit_breaker import CircuitBreaker
 from .client import MCPClient
 from .transport.factory import create_transport
-from .types import ServerConfig, ServerState, ServerStatus, ToolCallResult, ToolInfo
+from .types import (
+    HTTPServerConfig,
+    SSEServerConfig,
+    StdioServerConfig,
+    ServerConfig,
+    ServerState,
+    ServerStatus,
+    ToolCallResult,
+    ToolInfo,
+    WebSocketServerConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +52,15 @@ class MCPClientManager:
         remote_batch_size: int = _REMOTE_BATCH_SIZE,
         sandbox_controller=None,
         workspace_root: Path | None = None,
+        secret_resolver=None,
+        tenant_context=None,
     ) -> None:
         self._local_batch_size = local_batch_size
         self._remote_batch_size = remote_batch_size
         self._sandbox_controller = sandbox_controller
         self._workspace_root = workspace_root
+        self._secret_resolver = secret_resolver
+        self._tenant_context = tenant_context
         self._clients: dict[str, MCPClient] = {}
         self._states: dict[str, ServerState] = {}
         self._breakers: dict[str, CircuitBreaker] = {}
@@ -160,8 +175,9 @@ class MCPClientManager:
         self._breakers.setdefault(name, CircuitBreaker())
 
         try:
+            resolved_config = await self._resolve_config_secrets(config)
             transport = create_transport(
-                config,
+                resolved_config,
                 sandbox_controller=self._sandbox_controller,
                 workspace_root=self._workspace_root,
                 server_name=name,
@@ -179,6 +195,34 @@ class MCPClientManager:
             state.status = ServerStatus.FAILED
             state.error = _sanitize_error(str(e))
             logger.warning("Server '%s' connection failed: %s", name, state.error)
+
+    async def _resolve_config_secrets(self, config: ServerConfig) -> ServerConfig:
+        if self._secret_resolver is None or self._tenant_context is None:
+            return config
+        match config:
+            case StdioServerConfig():
+                return replace(
+                    config,
+                    env=await self._resolve_mapping(config.env),
+                )
+            case SSEServerConfig() | HTTPServerConfig() | WebSocketServerConfig():
+                return replace(
+                    config,
+                    headers=await self._resolve_mapping(config.headers),
+                )
+            case _:
+                return config
+
+    async def _resolve_mapping(self, values: dict[str, str]) -> dict[str, str]:
+        resolved: dict[str, str] = {}
+        for key, value in values.items():
+            if isinstance(value, str) and value.startswith("secret://"):
+                secret = await self._secret_resolver.resolve_reference(self._tenant_context, value)
+                with secret.reveal() as plaintext:
+                    resolved[key] = bytes(plaintext).decode("utf-8")
+            else:
+                resolved[key] = value
+        return resolved
 
     async def _disconnect_all(self) -> None:
         tasks = []

@@ -1,4 +1,5 @@
 """Integration tests for MCP -> ToolRegistry -> execution pipeline."""
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +15,8 @@ from multiclaw.mcp.transport.in_process import InProcessTransport
 from multiclaw.mcp.transport.stdio import StdioTransport
 from multiclaw.mcp.tool_adapter import MCPToolBuilder, _json_schema_to_pydantic
 from multiclaw.mcp.types import HTTPServerConfig, InProcessServerConfig, ServerState, ServerStatus, StdioServerConfig, ToolInfo
+from multiclaw.secrets.resolver import ResolvedSecret, SecretBytes
+from multiclaw.tenancy.context import TenantContext
 from multiclaw.tools.registry import ToolRegistry
 
 from test_sandbox_manager import RecordingBackend
@@ -186,6 +189,80 @@ def test_manager_callback_receives_refreshed_list_after_state_replacement():
         "Tools changed callback failed for server '%s'",
         "alpha",
     )
+
+
+@pytest.mark.asyncio
+async def test_manager_resolves_secret_refs_per_tenant_without_mutating_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    class _FakeTransport:
+        pass
+
+    class _FakeClient:
+        def __init__(self, name: str, transport) -> None:
+            self.connected = True
+
+        def set_on_tools_changed(self, callback) -> None:
+            self._callback = callback
+
+        async def connect(self) -> None:
+            return None
+
+        async def discover_tools(self) -> list[ToolInfo]:
+            return []
+
+        async def disconnect(self) -> None:
+            return None
+
+    class _FakeResolver:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        async def resolve_reference(self, context: TenantContext, reference: str) -> ResolvedSecret:
+            self.calls.append((context.tenant_id, "mcp", reference))
+            suffix = "tenant-a-token" if context.tenant_id == "tenant-a" else "tenant-b-token"
+            return ResolvedSecret(
+                provider_kind="mcp",
+                provider_name="demo",
+                secret_name="API_TOKEN",
+                source="user",
+                masked_value="****oken",
+                secret_bytes=SecretBytes(suffix.encode("utf-8")),
+            )
+
+    def fake_create_transport(config, **kwargs):
+        del kwargs
+        captured.append({"env": getattr(config, "env", {}), "headers": getattr(config, "headers", {})})
+        return _FakeTransport()
+
+    monkeypatch.setattr("multiclaw.mcp.manager.create_transport", fake_create_transport)
+    monkeypatch.setattr("multiclaw.mcp.manager.MCPClient", _FakeClient)
+
+    config = StdioServerConfig(
+        command="/bin/echo",
+        env={
+            "VISIBLE_FLAG": "literal",
+            "API_TOKEN": "secret://mcp/demo/API_TOKEN",
+        },
+    )
+    resolver = _FakeResolver()
+
+    manager_a = MCPClientManager(secret_resolver=resolver, tenant_context=TenantContext("tenant-a", "workspace-a"))
+    manager_b = MCPClientManager(secret_resolver=resolver, tenant_context=TenantContext("tenant-b", "workspace-b"))
+
+    await manager_a._connect_server("demo", config)
+    await manager_b._connect_server("demo", config)
+
+    assert captured[0]["env"]["VISIBLE_FLAG"] == "literal"
+    assert captured[0]["env"]["API_TOKEN"] == "tenant-a-token"
+    assert captured[1]["env"]["API_TOKEN"] == "tenant-b-token"
+    assert config.env["API_TOKEN"] == "secret://mcp/demo/API_TOKEN"
+    assert resolver.calls == [
+        ("tenant-a", "mcp", "secret://mcp/demo/API_TOKEN"),
+        ("tenant-b", "mcp", "secret://mcp/demo/API_TOKEN"),
+    ]
 
 
 def test_create_transport_builds_sandboxed_stdio_launch_spec_with_controlled_grants(
