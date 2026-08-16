@@ -59,6 +59,7 @@ def _decode_sse_messages(body: str) -> list[dict]:
 
 @pytest.mark.asyncio
 async def test_chat_streams_are_isolated_by_exact_run_scope(migrated_database, monkeypatch):
+    import multiclaw.api.chat as chat_api
     import multiclaw.server as server
     from multiclaw.events import EventScope, ScopedEvent
 
@@ -162,15 +163,15 @@ async def test_chat_streams_are_isolated_by_exact_run_scope(migrated_database, m
         )
 
         async with TenantUnitOfWork(server.app.state.database, context) as uow_a:
-            response_a = await server.chat(
-                server.ChatRequest(message="first", session_id=session.id),
+            response_a = await chat_api.chat(
+                chat_api.ChatRequest(message="first", session_id=session.id),
                 request,
                 context,
                 uow_a,
             )
         async with TenantUnitOfWork(server.app.state.database, context) as uow_b:
-            response_b = await server.chat(
-                server.ChatRequest(message="second", session_id=session.id),
+            response_b = await chat_api.chat(
+                chat_api.ChatRequest(message="second", session_id=session.id),
                 request,
                 context,
                 uow_b,
