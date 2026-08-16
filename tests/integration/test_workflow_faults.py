@@ -20,11 +20,13 @@ from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     ApprovalStatus,
     CheckpointPhase,
+    ExecutionRecoveryRecord,
     ExecutionStatus,
     InvalidTransitionError,
     RecoveryStrategy,
     RunStatus,
     StaleFenceError,
+    TERMINAL_EXECUTION_STATUSES,
 )
 from multiclaw.workflow.recovery import RecoveryAction, RecoveryService
 
@@ -391,14 +393,6 @@ async def _build_terminal_checkpoint(
 
 
 async def _measure_workflow_fault_release_gate(database: Database) -> dict[str, int]:
-    terminal_execution_statuses = {
-        ExecutionStatus.SUCCEEDED,
-        ExecutionStatus.FAILED_TERMINAL,
-        ExecutionStatus.UNCERTAIN,
-        ExecutionStatus.BLOCKED_INCOMPATIBLE,
-        ExecutionStatus.BLOCKED_CORRUPT,
-    }
-
     async def _execution_row_count(context: TenantContext) -> int:
         async with database.connect() as conn:
             result = await conn.execute(
@@ -417,7 +411,7 @@ async def _measure_workflow_fault_release_gate(database: Database) -> dict[str, 
         nonterminal_statuses = [
             status.value
             for status in ExecutionStatus
-            if status not in terminal_execution_statuses
+            if status not in TERMINAL_EXECUTION_STATUSES
         ]
         async with database.connect() as conn:
             result = await conn.execute(
@@ -444,6 +438,18 @@ async def _measure_workflow_fault_release_gate(database: Database) -> dict[str, 
             )
         return int(result.scalar_one())
 
+    def _execution_semantics(record: ExecutionRecoveryRecord) -> tuple[object, ...]:
+        return (
+            record.status,
+            record.recovery_strategy,
+            record.external_request_id,
+            record.result_ref,
+            record.result_digest,
+            record.input_hash,
+            record.tool_call_id,
+            record.approval_id,
+        )
+
     metrics: dict[str, int] = {}
 
     stale_context = await _create_run_context(database, suffix=f"-gate-stale-{uuid4().hex[:8]}")
@@ -460,8 +466,10 @@ async def _measure_workflow_fault_release_gate(database: Database) -> dict[str, 
     stale_fence_writes = 0
     try:
         await stale_coordinator.transition_run(stale_lease, RunStatus.AWAITING_USER)
-    except (InvalidTransitionError, StaleFenceError):
+    except StaleFenceError:
         pass
+    except InvalidTransitionError as error:
+        assert str(error) == "run lease no longer current"
     else:
         stale_fence_writes += 1
 
@@ -522,10 +530,11 @@ async def _measure_workflow_fault_release_gate(database: Database) -> dict[str, 
     assert manual_outcome.action == RecoveryAction.MARK_MANUAL_UNCERTAIN
     assert manual_outcome.executions_started == 0
     assert manual_execution_after.status is ExecutionStatus.EXECUTING
+    assert _execution_semantics(manual_execution_after) == _execution_semantics(manual_execution_before)
     metrics["automatic_non_idempotent_retries"] = (
         manual_outcome.executions_started
         + max(0, await _execution_row_count(manual_context) - 1)
-        + int(manual_execution_after.version != manual_execution_before.version)
+        + int(_execution_semantics(manual_execution_after) != _execution_semantics(manual_execution_before))
     )
 
     corrupt_context = await _create_run_context(database, suffix=f"-gate-corrupt-{uuid4().hex[:8]}")
@@ -563,10 +572,11 @@ async def _measure_workflow_fault_release_gate(database: Database) -> dict[str, 
     assert corrupt_outcome.status is RunStatus.BLOCKED_CORRUPT
     assert corrupt_outcome.lease is None
     assert "hash mismatch" in corrupt_outcome.reason
+    assert _execution_semantics(corrupt_execution_after) == _execution_semantics(corrupt_execution_before)
     metrics["corrupt_checkpoint_tool_starts"] = (
         corrupt_outcome.executions_started
         + max(0, await _execution_row_count(corrupt_context) - 1)
-        + int(corrupt_execution_after.version != corrupt_execution_before.version)
+        + int(_execution_semantics(corrupt_execution_after) != _execution_semantics(corrupt_execution_before))
     )
 
     completed_context = await _create_run_context(database, suffix=f"-gate-complete-{uuid4().hex[:8]}")
