@@ -23,6 +23,7 @@ import { shouldLogChatDebug } from "@/chat-debug";
 import { extractLatestUserText } from "@/lib/chat-request";
 import { sessionStore } from "@/lib/session-store";
 import { chatStore } from "@/lib/chat-store";
+import { ensureCsrfToken } from "@/lib/security";
 
 type ChatRequestState = "idle" | "sending" | "streaming";
 type ActiveRun = {
@@ -219,7 +220,17 @@ function ChatApp() {
           if (shouldLogChatDebug({ hostname: window.location.hostname })) {
             console.debug("[chat] fetch start", input, init);
           }
-          const response = await fetch(input, init);
+          const baseHeaders = input instanceof Request ? input.headers : undefined;
+          const headers = new Headers(baseHeaders);
+          for (const [key, value] of new Headers(init?.headers).entries()) {
+            headers.set(key, value);
+          }
+          headers.set("X-CSRF-Token", await ensureCsrfToken());
+          const response = await fetch(input, {
+            ...init,
+            credentials: "include",
+            headers,
+          });
           if (shouldLogChatDebug({ hostname: window.location.hostname })) {
             console.debug("[chat] fetch response", response.status, response.url);
           }
