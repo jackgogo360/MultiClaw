@@ -358,6 +358,27 @@ async def test_expired_approval_cannot_be_decided(workflow_database: Database):
     with pytest.raises(InvalidTransitionError):
         await _decide(workflow_database, approval, approved=True, version=approval.version)
 
+    async with workflow_database.connect() as conn:
+        persisted = (
+            await conn.execute(
+                select(
+                    approval_requests.c.approval_status,
+                    approval_requests.c.version,
+                    approval_requests.c.resolved_at,
+                ).where(
+                    approval_requests.c.tenant_id == approval.context.tenant_id,
+                    approval_requests.c.workspace_id == approval.context.workspace_id,
+                    approval_requests.c.session_id == approval.context.session_id,
+                    approval_requests.c.run_id == approval.context.run_id,
+                    approval_requests.c.approval_id == approval.approval_id,
+                )
+            )
+        ).mappings().one()
+
+    assert persisted["approval_status"] == ApprovalStatus.EXPIRED.value
+    assert persisted["version"] == approval.version + 1
+    assert persisted["resolved_at"] is not None
+
 
 @pytest.mark.asyncio
 async def test_execution_without_approval_fk_can_start(workflow_database: Database):

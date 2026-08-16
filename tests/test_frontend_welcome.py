@@ -88,6 +88,92 @@ def _run_node(script: str) -> dict[str, object]:
     return json.loads(result.stdout)
 
 
+def test_chat_callbacks_reach_use_chat_and_pending_approvals_stay_visible():
+    app_path = Path("frontend/src/App.tsx").resolve()
+    thread_path = Path("frontend/src/components/assistant-ui/thread.tsx").resolve()
+    typescript_path = _find_typescript_module().resolve()
+    node_script = f"""
+import fs from 'node:fs';
+import ts from {typescript_path.as_uri()!r};
+
+const appSource = fs.readFileSync({str(app_path)!r}, 'utf8');
+const threadSource = fs.readFileSync({str(thread_path)!r}, 'utf8');
+const appFile = ts.createSourceFile('App.tsx', appSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+
+let useChatOptions = new Set();
+function visit(node) {{
+  if (
+    ts.isCallExpression(node)
+    && ts.isIdentifier(node.expression)
+    && node.expression.text === 'useChat'
+    && node.arguments.length === 1
+    && ts.isObjectLiteralExpression(node.arguments[0])
+  ) {{
+    for (const property of node.arguments[0].properties) {{
+      if (ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property)) {{
+        useChatOptions.add(property.name.getText(appFile));
+      }}
+    }}
+  }}
+  ts.forEachChild(node, visit);
+}}
+visit(appFile);
+
+const toolGroupStart = threadSource.indexOf('function ToolGroupBlock');
+const toolGroupEnd = threadSource.indexOf('type PartLike', toolGroupStart);
+const toolGroupSource = threadSource.slice(toolGroupStart, toolGroupEnd);
+
+process.stdout.write(JSON.stringify({{
+  forwardsOnData: useChatOptions.has('onData'),
+  forwardsOnError: useChatOptions.has('onError'),
+  forwardsOnFinish: useChatOptions.has('onFinish'),
+  modelsRequiresAction: toolGroupSource.includes('requires-action'),
+  labelsRequiresAction: toolGroupSource.includes('Needs approval'),
+  pendingGroupCanStayOpen:
+    toolGroupSource.includes('open={{active}}')
+    || toolGroupSource.includes('open={{requiresAction')
+    || toolGroupSource.includes('open={{running || requiresAction}}'),
+}}));
+"""
+
+    payload = _run_node(node_script)
+    assert payload == {
+        "forwardsOnData": True,
+        "forwardsOnError": True,
+        "forwardsOnFinish": True,
+        "modelsRequiresAction": True,
+        "labelsRequiresAction": True,
+        "pendingGroupCanStayOpen": True,
+    }
+
+
+def test_session_hydration_rebuilds_pending_approval_tool_parts():
+    api_source = Path("frontend/src/lib/api.ts").read_text()
+    session_provider_source = Path(
+        "frontend/src/components/session/SessionProvider.tsx"
+    ).read_text()
+
+    assert "pendingApprovals" in api_source
+    assert "/pending-approvals" in api_source
+    assert "pendingApprovals" in session_provider_source
+    assert 'state: "approval-requested"' in session_provider_source
+    assert "approval_id" in session_provider_source
+    assert "tool_call_id" in session_provider_source
+
+
+def test_approval_resolution_keeps_the_locally_loaded_record_across_error_paths():
+    approval_source = Path(
+        "frontend/src/components/approval/ApprovalToolUI.tsx"
+    ).read_text()
+
+    assert "const loadApproval = async (): Promise<ApprovalRecord>" in approval_source
+    assert "let currentApproval = approval;" in approval_source
+    assert "currentApproval ??= await loadApproval();" in approval_source
+    assert 'currentApproval ? { ...currentApproval, status: "expired" } : null' in approval_source
+    assert "const refreshed = await loadApproval();" in approval_source
+    assert "return approveApi.getApproval(approvalId);" in approval_source
+
+
 def test_settings_approval_and_run_scope_contracts_are_present():
     app_path = Path("frontend/src/App.tsx").resolve()
     auth_store_path = Path("frontend/src/lib/auth-context-store.ts").resolve()

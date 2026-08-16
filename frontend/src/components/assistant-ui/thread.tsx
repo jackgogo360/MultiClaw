@@ -30,6 +30,10 @@ function ToolGroupBlock({
 
   const toolNames = toolParts.map((p) => p.toolName ?? "tool");
   const running = toolParts.some((p) => p.status?.type === "running");
+  const requiresAction = toolParts.some(
+    (p) => p.status?.type === "requires-action"
+  );
+  const active = running || requiresAction;
 
   const label =
     toolNames.length > 1
@@ -37,12 +41,12 @@ function ToolGroupBlock({
       : toolNames[0] ?? "工具";
 
   return (
-    <details className="my-2 rounded-xl border border-border/60 bg-elevated/40" open={running}>
+    <details className="my-2 rounded-xl border border-border/60 bg-elevated/40" open={active}>
       <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs text-muted-foreground marker:content-none">
         <span className="inline-flex h-2 w-2 shrink-0 rounded-full bg-accent/80" />
         <span className="font-mono text-foreground/90">{label}</span>
         <span className="ml-auto shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground/80">
-          {running ? "Running" : "Done"}
+          {requiresAction ? "Needs approval" : running ? "Running" : "Done"}
         </span>
       </summary>
       <div className="border-t border-border/50 px-3 py-2">{children}</div>

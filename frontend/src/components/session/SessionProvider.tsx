@@ -60,7 +60,10 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 
     void (async () => {
       try {
-        const messages = await sessionApi.messages(sessionId);
+        const [messages, pendingApprovals] = await Promise.all([
+          sessionApi.messages(sessionId),
+          sessionApi.pendingApprovals(sessionId),
+        ]);
         if (cancelled) {
           return;
         }
@@ -71,7 +74,21 @@ export function SessionProvider({ children }: { children: ReactNode }) {
           parts: [{ type: "text" as const, text: msg.content }],
           createdAt: msg.created_at ? new Date(msg.created_at) : new Date(),
         }));
-        chatStore.setMessages(uiMessages);
+        const approvalMessages: UIMessage[] = pendingApprovals.map((approval) => ({
+          id: `approval-${approval.approval_id}`,
+          role: "assistant",
+          parts: [
+            {
+              type: "dynamic-tool",
+              toolName: approval.tool_name,
+              toolCallId: approval.tool_call_id,
+              state: "approval-requested",
+              input: approval.tool_input,
+              approval: { id: approval.approval_id },
+            },
+          ],
+        }));
+        chatStore.setMessages([...uiMessages, ...approvalMessages]);
       } catch {
         // Silently handle
       } finally {

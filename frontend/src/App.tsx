@@ -10,6 +10,7 @@ import {
 } from "@assistant-ui/core/react";
 import { useAuiState, useAui } from "@assistant-ui/store";
 import { useChat, type UIMessage } from "@ai-sdk/react";
+import type { ChatInit } from "ai";
 import { AuthProvider } from "@/lib/auth-context";
 import { useAuth } from "@/lib/auth-context-store";
 import { LoginOverlay } from "@/components/login/LoginOverlay";
@@ -127,12 +128,16 @@ function useChatThreadRuntimeWithStore(options: Record<string, unknown>) {
     transportController.update(transportOptions);
   }, [transportController, transportOptions]);
   const transport = transportController.proxy;
+  const chatOptions = options as ChatInit<UIMessage>;
 
   const id = useAuiState((s) => s.threadListItem.id);
   const aui = useAui();
   const chat = useChat<UIMessage>({
     id,
     transport: transport as never,
+    onData: chatOptions.onData,
+    onError: chatOptions.onError,
+    onFinish: chatOptions.onFinish,
   });
 
   useEffect(() => {

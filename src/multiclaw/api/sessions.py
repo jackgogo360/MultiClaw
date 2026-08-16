@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from multiclaw.api.dependencies import tenant_uow
 from multiclaw.auth.middleware import require_recent_auth
 from multiclaw.observability import increment_metric, record_trace_event
+from multiclaw.security.redaction import redact
 from multiclaw.storage.uow import TenantUnitOfWork
 
 
@@ -18,6 +22,28 @@ class SessionCreateRequest(BaseModel):
 
 class SessionRenameRequest(BaseModel):
     title: str
+
+
+class PendingApprovalResponse(BaseModel):
+    approval_id: str
+    status: str
+    version: int
+    expires_at: int
+    resolved_at: int | None
+    tool_call_id: str
+    tool_name: str
+    tool_input: dict[str, Any]
+
+
+def _redacted_tool_input(payload_json: object) -> dict[str, Any]:
+    try:
+        decoded = json.loads(str(payload_json))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    redacted = redact(decoded)
+    return redacted if isinstance(redacted, dict) else {}
 
 
 @router.get("/sessions")
@@ -107,3 +133,32 @@ async def get_session_messages(
         record_trace_event("scope_fk_rejection", attributes={"operation": "session_messages"})
         raise HTTPException(status_code=404, detail="session not found")
     return await uow.sessions.get_messages(session_id, limit)
+
+
+@router.get(
+    "/sessions/{session_id}/pending-approvals",
+    response_model=list[PendingApprovalResponse],
+)
+async def get_session_pending_approvals(
+    session_id: str,
+    uow: TenantUnitOfWork = Depends(tenant_uow),
+):
+    session = await uow.sessions.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    rows = await uow.sessions.list_pending_approvals(session_id)
+    return [
+        PendingApprovalResponse(
+            approval_id=str(row["approval_id"]),
+            status=str(row["approval_status"]),
+            version=int(row["version"]),
+            expires_at=int(row["expires_at"]),
+            resolved_at=(
+                None if row["resolved_at"] is None else int(row["resolved_at"])
+            ),
+            tool_call_id=str(row["tool_call_id"]),
+            tool_name=str(row["tool_name"]),
+            tool_input=_redacted_tool_input(row["input_payload_json"]),
+        )
+        for row in rows
+    ]

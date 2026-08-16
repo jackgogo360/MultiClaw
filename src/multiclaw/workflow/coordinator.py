@@ -209,6 +209,7 @@ class WorkflowCoordinator:
         approved: bool,
         version: int,
     ) -> ApprovalRecord:
+        expired = False
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             resolved = await repository._resolve_approval(
@@ -220,17 +221,20 @@ class WorkflowCoordinator:
             if resolved is not None:
                 return resolved
 
-            if await repository._mark_approval_expired(context, approval_id, version):
-                raise InvalidTransitionError("approval expired")
+            expired = await repository._mark_approval_expired(context, approval_id, version)
+            if not expired:
+                current = await repository.get_approval(context, approval_id)
+                if current is None:
+                    raise VersionConflictError("approval record not found")
+                if current.status.value != "awaiting_user":
+                    raise VersionConflictError("approval already resolved")
+                if current.version != version:
+                    raise VersionConflictError("approval version conflict")
+                raise InvalidTransitionError("approval could not be resolved")
 
-            current = await repository.get_approval(context, approval_id)
-            if current is None:
-                raise VersionConflictError("approval record not found")
-            if current.status.value != "awaiting_user":
-                raise VersionConflictError("approval already resolved")
-            if current.version != version:
-                raise VersionConflictError("approval version conflict")
-            raise InvalidTransitionError("approval could not be resolved")
+        if expired:
+            raise InvalidTransitionError("approval expired")
+        raise RuntimeError("approval decision reached an invalid state")
 
     async def create_approval(
         self,
