@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite, mysql]
+    services:
+      mysql:
+        image: mysql:8.0.36
+        env:
+          MYSQL_DATABASE: multiclaw_test
+          MYSQL_USER: multiclaw
+          MYSQL_PASSWORD: multiclaw_test
+          MYSQL_ROOT_PASSWORD: root_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -uroot -proot_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      MULTICLAW_DATABASE__DRIVER: ${{ matrix.backend }}
+      MULTICLAW_DATABASE__URL: ${{ matrix.backend == 'mysql' && 'mysql+aiomysql://multiclaw:multiclaw_test@127.0.0.1:3306/multiclaw_test' || 'sqlite+aiosqlite:///./ci.sqlite3' }}
+      MULTICLAW_TEST_MYSQL_URL: ${{ matrix.backend == 'mysql' && 'mysql+aiomysql://multiclaw:multiclaw_test@127.0.0.1:3306/multiclaw_test' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - run: uv sync --locked
+
+      - run: uv run multiclaw db upgrade
+
+      - run: uv run multiclaw db check
+
+      - run: uv run pytest -q
+
+  frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+        working-directory: frontend
+
+      - run: npm run lint
+        working-directory: frontend
+
+      - run: npm run build
+        working-directory: frontend
