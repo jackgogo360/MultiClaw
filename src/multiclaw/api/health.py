@@ -74,7 +74,7 @@ async def _build_readiness_payload(request: Request) -> dict[str, Any]:
             else:
                 time_zone = str(await conn.scalar(text("SELECT @@session.time_zone")) or "")
                 isolation = str(await conn.scalar(text("SELECT @@transaction_isolation")) or "")
-                if time_zone not in {"SYSTEM", "+00:00", "UTC"}:
+                if time_zone not in {"+00:00", "UTC"}:
                     failed.append("mysql_time_zone")
                 if isolation.upper() != "READ-COMMITTED":
                     failed.append("mysql_isolation")

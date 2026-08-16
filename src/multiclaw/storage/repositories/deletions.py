@@ -23,7 +23,7 @@ from multiclaw.storage.schema import (
     verification_codes,
     workspaces,
 )
-from multiclaw.workflow.models import ApprovalStatus, ExecutionStatus, RunStatus
+from multiclaw.workflow.models import ApprovalStatus, ExecutionStatus, RunStatus, TERMINAL_RUN_STATUSES
 
 
 Dialect = SQLiteDialect | MySQLDialect
@@ -31,6 +31,7 @@ BLOCKING_RUN_STATUSES = (
     RunStatus.RUNNING.value,
     RunStatus.RESUMING.value,
 )
+TERMINAL_RUN_STATUS_VALUES = tuple(status.value for status in TERMINAL_RUN_STATUSES)
 BLOCKING_EXECUTION_STATUSES = (
     ExecutionStatus.REPLAYING.value,
     ExecutionStatus.EXECUTING.value,
@@ -224,6 +225,7 @@ class DeletionWorkflowRepository(_ScopedDeletionRepository):
             .select_from(agent_runs)
             .where(
                 agent_runs.c.tenant_id == scoped_tenant_id,
+                ~agent_runs.c.run_status.in_(TERMINAL_RUN_STATUS_VALUES),
                 agent_runs.c.lease_expires_at.is_not(None),
                 agent_runs.c.lease_expires_at > now_ms,
             )
