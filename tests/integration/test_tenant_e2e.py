@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import json
 import os
@@ -160,24 +160,27 @@ def _make_cookie(*, user_id: str, email: str, auth_epoch: int) -> dict[str, str]
     }
 
 
-@contextmanager
-def _real_auth_client(database: Database, monkeypatch: pytest.MonkeyPatch):
-    from fastapi.testclient import TestClient
+@asynccontextmanager
+async def _real_auth_client(database: Database):
+    from fastapi import FastAPI
+    import httpx
 
-    database_url = database.engine.url.render_as_string(hide_password=False)
-    monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "mysql" if database_url.startswith("mysql+") else "sqlite")
-    monkeypatch.setenv("MULTICLAW_DATABASE__URL", database_url)
-    if database.engine.url.database is not None:
-        monkeypatch.setenv("MULTICLAW_DATABASE__PATH", database.engine.url.database)
-    else:
-        monkeypatch.delenv("MULTICLAW_DATABASE__PATH", raising=False)
-    monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
-    monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
-    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", TEST_JWT_SIGNING_KEY)
+    from multiclaw.api.sessions import router as sessions_router
+    from multiclaw.auth.middleware import AuthMiddleware
+    from multiclaw.auth.models import build_auth_runtime
 
-    import multiclaw.server as server
+    app = FastAPI()
+    app.add_middleware(AuthMiddleware)
+    app.include_router(sessions_router)
+    app.state.database = database
+    app.state.settings = Settings(_config_file="/nonexistent")
+    app.state.auth = build_auth_runtime(
+        app.state.settings,
+        environ={"MULTICLAW_AUTH_JWT_SIGNING_KEY": TEST_JWT_SIGNING_KEY},
+    )
 
-    with TestClient(server.app) as client:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client
 
 
@@ -701,7 +704,6 @@ async def test_real_tenant_aggregate_isolation_gate(tenant_isolation_database: D
 async def test_real_deletion_recovery_blocks_ordinary_tenant_access(
     tenant_isolation_database: Database,
     retention_days: int,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from multiclaw.api.dependencies import tenant_context
     from multiclaw.deletion.service import DeletionService
@@ -753,8 +755,9 @@ async def test_real_deletion_recovery_blocks_ordinary_tenant_access(
         email=pending_user.email,
         auth_epoch=pending_user.auth_epoch,
     )
-    with _real_auth_client(tenant_isolation_database, monkeypatch) as client:
-        blocked = client.get("/api/sessions", cookies=pending_cookie)
+    async with _real_auth_client(tenant_isolation_database) as client:
+        client.cookies.update(pending_cookie)
+        blocked = await client.get("/api/sessions")
 
     assert blocked.status_code == 403
     assert blocked.json() == {"detail": "Account pending deletion"}
