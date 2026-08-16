@@ -370,7 +370,7 @@ async def _send_code_like_flow(
 
 
 @pytest.mark.asyncio
-async def test_send_code_lock_releases_after_commit_before_close() -> None:
+async def test_send_code_lock_releases_after_commit_before_close_then_provider_runs() -> None:
     events: list[str] = []
     tx = _LockTrackingTransaction(events)
     conn = _LockTrackingConnection(events)
@@ -382,12 +382,14 @@ async def test_send_code_lock_releases_after_commit_before_close() -> None:
             purpose=LOGIN_CODE_PURPOSE,
         )
         events.append("body")
+    events.append("provider")
 
     assert events[0].startswith("acquire:login:user@example.com")
     assert events[1] == "body"
     assert events[2] == "commit"
     assert events[3].startswith("release:lock-token")
     assert events[4] == "close"
+    assert events[5] == "provider"
 
 
 @pytest.mark.asyncio

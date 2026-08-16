@@ -112,6 +112,23 @@ class VerificationCodeRepository(_ConnectionBoundRepository):
         )
         return code_id
 
+    async def delete_code_by_id(
+        self,
+        *,
+        code_id: str,
+        email: str,
+        purpose: str,
+    ) -> bool:
+        result = await self._conn.execute(
+            delete(verification_codes).where(
+                verification_codes.c.id == code_id,
+                verification_codes.c.email == email,
+                verification_codes.c.purpose == purpose,
+                verification_codes.c.used_at.is_(None),
+            )
+        )
+        return cast(int | None, result.rowcount) == 1
+
     async def consume_latest_code(
         self,
         *,
