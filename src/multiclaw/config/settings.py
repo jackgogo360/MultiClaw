@@ -228,7 +228,6 @@ class McpSettings(BaseModel):
 
 
 class AuthSettings(BaseModel):
-    jwt_secret: str = ""
     jwt_signing_key_file: str = ""
 
 

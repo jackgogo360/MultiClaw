@@ -1,9 +1,12 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
 from multiclaw.config import Settings
+from multiclaw.config.settings import AuthSettings
+from multiclaw.auth.models import AuthConfigurationError, load_jwt_signing_key
 
 
 def _contains_value(value, candidate):
@@ -85,3 +88,71 @@ def test_repository_example_configs_contain_no_credential_literals():
     for path in (Path("multiclaw.toml"), Path("config/multiclaw.toml")):
         text = path.read_text(encoding="utf-8")
         assert not any(marker in text for marker in forbidden), path
+
+
+def test_auth_settings_no_longer_exposes_legacy_jwt_secret():
+    assert "jwt_secret" not in AuthSettings.model_fields
+
+
+def test_load_jwt_signing_key_accepts_env_only_source():
+    key = load_jwt_signing_key(
+        SimpleNamespace(auth=SimpleNamespace(jwt_signing_key_file="")),
+        environ={"MULTICLAW_AUTH_JWT_SIGNING_KEY": "x" * 32},
+    )
+
+    assert key == b"x" * 32
+
+
+def test_load_jwt_signing_key_accepts_file_only_source(tmp_path):
+    key_file = tmp_path / "jwt.key"
+    key_file.write_bytes(b"y" * 32)
+    key_file.chmod(0o600)
+
+    key = load_jwt_signing_key(
+        SimpleNamespace(auth=SimpleNamespace(jwt_signing_key_file=str(key_file))),
+        environ={},
+    )
+
+    assert key == b"y" * 32
+
+
+@pytest.mark.parametrize(
+    ("environ", "path"),
+    [
+        ({}, ""),
+        ({"MULTICLAW_AUTH_JWT_SIGNING_KEY": "x" * 32}, "configured"),
+    ],
+)
+def test_load_jwt_signing_key_requires_exactly_one_source(tmp_path, environ, path):
+    key_file = tmp_path / "jwt.key"
+    key_file.write_bytes(b"z" * 32)
+    key_file.chmod(0o600)
+    source_path = str(key_file) if path else ""
+
+    with pytest.raises(AuthConfigurationError, match="exactly one"):
+        load_jwt_signing_key(
+            SimpleNamespace(auth=SimpleNamespace(jwt_signing_key_file=source_path)),
+            environ=environ,
+        )
+
+
+@pytest.mark.parametrize(
+    ("environ", "path_bytes"),
+    [
+        ({"MULTICLAW_AUTH_JWT_SIGNING_KEY": "short"}, None),
+        ({}, b"short"),
+    ],
+)
+def test_load_jwt_signing_key_rejects_sources_shorter_than_32_bytes(tmp_path, environ, path_bytes):
+    path = ""
+    if path_bytes is not None:
+        key_file = tmp_path / "jwt.key"
+        key_file.write_bytes(path_bytes)
+        key_file.chmod(0o600)
+        path = str(key_file)
+
+    with pytest.raises(AuthConfigurationError, match="at least 32 bytes"):
+        load_jwt_signing_key(
+            SimpleNamespace(auth=SimpleNamespace(jwt_signing_key_file=path)),
+            environ=environ,
+        )

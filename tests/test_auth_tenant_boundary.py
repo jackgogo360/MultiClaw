@@ -14,6 +14,7 @@ from sqlalchemy import insert, text
 
 from multiclaw.cli import alembic_config
 from multiclaw.auth.models import issue_verification_code
+from multiclaw.auth.cleanup import AuthCleanupWorker
 from multiclaw.config.settings import DatabaseSettings
 from multiclaw.storage import Database
 from multiclaw.storage.schema import verification_codes
@@ -97,6 +98,7 @@ def _make_cookie(
     auth_epoch: int | None,
     audience: str = "multiclaw-api",
     issued_at: int | None = None,
+    expires_at: int | None = None,
 ) -> dict[str, str]:
     now = issued_at or int(datetime.now(timezone.utc).timestamp())
     claims = {
@@ -104,7 +106,7 @@ def _make_cookie(
         "email": email,
         "aud": audience,
         "iat": now,
-        "exp": now + int(timedelta(days=1).total_seconds()),
+        "exp": expires_at if expires_at is not None else now + int(timedelta(days=1).total_seconds()),
     }
     if auth_epoch is not None:
         claims["auth_epoch"] = auth_epoch
@@ -253,6 +255,11 @@ async def _seed_verification_row(
                 created_at=created_at,
             )
         )
+
+
+async def _db_now_seconds(database: Database) -> int:
+    async with AuthUnitOfWork(database, read_only=True) as uow:
+        return await uow.verification_codes.db_now_ms() // 1000
 
 
 @pytest.fixture
@@ -410,6 +417,32 @@ def test_deletion_recovery_audience_is_rejected_by_normal_api(
     assert response.json() == {"detail": "Unauthorized"}
 
 
+def test_deletion_recovery_jwt_claim_shape():
+    from multiclaw.auth.router import _make_deletion_recovery_jwt
+
+    token = _make_deletion_recovery_jwt(
+        user_id="user-123",
+        email="user@example.com",
+        job_id="job-456",
+        signing_key=TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        issued_at=1_700_000_000,
+    )
+    payload = jwt.decode(
+        token,
+        TEST_JWT_SIGNING_KEY,
+        algorithms=["HS256"],
+        audience="multiclaw-deletion-recovery",
+        options={"verify_exp": False},
+    )
+
+    assert payload["sub"] == "user-123"
+    assert payload["email"] == "user@example.com"
+    assert payload["aud"] == "multiclaw-deletion-recovery"
+    assert payload["purpose"] == "deletion_recovery"
+    assert payload["job_id"] == "job-456"
+    assert payload["exp"] - payload["iat"] == 600
+
+
 @pytest.mark.asyncio
 async def test_verification_codes_ignore_wrong_purpose_and_are_consumed_once_atomically(
     migrated_database: Database,
@@ -457,6 +490,53 @@ async def test_verification_codes_ignore_wrong_purpose_and_are_consumed_once_ato
 
     assert first is not None
     assert second is None
+
+
+@pytest.mark.asyncio
+async def test_auth_cleanup_worker_deletes_only_codes_expired_by_db_clock(
+    migrated_database: Database,
+) -> None:
+    now_ms = await _db_now_seconds(migrated_database) * 1000
+    await _seed_verification_row(
+        migrated_database,
+        email="expired-login@example.com",
+        code_digest="expired-login",
+        purpose="login",
+        expires_at=now_ms - 1,
+        created_at=now_ms - 10_000,
+    )
+    await _seed_verification_row(
+        migrated_database,
+        email="equal-recovery@example.com",
+        code_digest="equal-recovery",
+        purpose="deletion_recovery",
+        expires_at=now_ms,
+        created_at=now_ms - 9_000,
+    )
+    await _seed_verification_row(
+        migrated_database,
+        email="live-login@example.com",
+        code_digest="live-login",
+        purpose="login",
+        expires_at=now_ms + 60_000,
+        created_at=now_ms - 8_000,
+    )
+    await _seed_verification_row(
+        migrated_database,
+        email="live-recovery@example.com",
+        code_digest="live-recovery",
+        purpose="deletion_recovery",
+        expires_at=now_ms + 120_000,
+        created_at=now_ms - 7_000,
+    )
+
+    deleted = await AuthCleanupWorker(migrated_database).run_once()
+
+    assert deleted == 2
+    assert await _get_verification_rows(migrated_database, "expired-login@example.com") == []
+    assert await _get_verification_rows(migrated_database, "equal-recovery@example.com") == []
+    assert len(await _get_verification_rows(migrated_database, "live-login@example.com")) == 1
+    assert len(await _get_verification_rows(migrated_database, "live-recovery@example.com")) == 1
 
 
 def test_only_latest_unused_login_code_is_valid_in_frozen_layout(
@@ -621,6 +701,44 @@ def test_foreign_default_workspace_returns_403(client: TestClient, migrated_data
 
     assert response.status_code == 403
     assert response.json() == {"detail": "Account unavailable"}
+
+
+def test_delete_session_requires_recent_auth_using_db_clock_boundary(
+    client: TestClient,
+    migrated_database: Database,
+    user_a_cookie: SeededIdentity,
+):
+    created_boundary = client.post("/api/sessions", cookies=user_a_cookie.cookie, json={"title": "Boundary"})
+    created_stale = client.post("/api/sessions", cookies=user_a_cookie.cookie, json={"title": "Stale"})
+    assert created_boundary.status_code == 200
+    assert created_stale.status_code == 200
+    boundary_session_id = created_boundary.json()["id"]
+    stale_session_id = created_stale.json()["id"]
+    now_seconds = asyncio.run(_db_now_seconds(migrated_database))
+
+    boundary_cookie = _make_cookie(
+        TEST_JWT_SIGNING_KEY,
+        user_id=user_a_cookie.tenant_id,
+        email=user_a_cookie.email,
+        auth_epoch=user_a_cookie.auth_epoch,
+        issued_at=now_seconds - 300,
+        expires_at=now_seconds + 3600,
+    )
+    stale_cookie = _make_cookie(
+        TEST_JWT_SIGNING_KEY,
+        user_id=user_a_cookie.tenant_id,
+        email=user_a_cookie.email,
+        auth_epoch=user_a_cookie.auth_epoch,
+        issued_at=now_seconds - 301,
+        expires_at=now_seconds + 3600,
+    )
+
+    boundary_response = client.delete(f"/api/sessions/{boundary_session_id}", cookies=boundary_cookie)
+    stale_response = client.delete(f"/api/sessions/{stale_session_id}", cookies=stale_cookie)
+
+    assert boundary_response.status_code == 200
+    assert stale_response.status_code == 401
+    assert stale_response.json() == {"detail": "Recent authentication required"}
 
 
 def test_no_token_requests_stay_401(client: TestClient):

@@ -126,7 +126,7 @@ from multiclaw.mcp.types import (
 from uuid import uuid4
 
 from multiclaw.auth.cleanup import AuthCleanupWorker
-from multiclaw.auth.middleware import AuthMiddleware
+from multiclaw.auth.middleware import AuthMiddleware, require_recent_auth
 from multiclaw.auth.models import build_auth_runtime
 from multiclaw.auth.router import router as auth_router
 from multiclaw.api.chat import (
@@ -838,8 +838,10 @@ async def restore_session(
 @api.delete("/sessions/{session_id}")
 async def delete_session(
     session_id: str,
+    _recent_user=Depends(require_recent_auth),
     uow: TenantUnitOfWork = Depends(tenant_uow),
 ):
+    del _recent_user
     session = await uow.sessions.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")

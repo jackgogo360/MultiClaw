@@ -66,8 +66,6 @@ write_protected_workspace_paths = [".git"]
 read_hidden_workspace_paths = [".env", ".env.*"]
 
 [auth]
-# jwt_secret is auto-generated and persisted in DB — leave empty
-jwt_secret = ""
 # Set MULTICLAW_AUTH_JWT_SIGNING_KEY in the environment when needed.
 jwt_signing_key_file = ""
 
