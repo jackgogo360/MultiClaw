@@ -571,6 +571,16 @@ class MultiClawAgent(ToolCallAgent):
                             result_contents: list[str] = []
 
                             for outcome in outcomes:
+                                if outcome.result.status is ToolStatus.AWAITING_APPROVAL:
+                                    yield {
+                                        "type": "done",
+                                        "content": "",
+                                        "data": {
+                                            "state": ContinuationState.AWAITING_USER.value,
+                                            "detail": "tool awaiting approval",
+                                        },
+                                    }
+                                    return
                                 yield {
                                     "type": "tool_result",
                                     "call_id": outcome.call_id,

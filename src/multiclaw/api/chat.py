@@ -261,6 +261,7 @@ async def chat(
             reasoning_part_id: str | None = None
             step_open = False
             pending_tool_results = 0
+            emitted_tool_inputs: set[str] = set()
             subscription = None
             stream_task: asyncio.Task | None = None
             heartbeat_task: asyncio.Task | None = None
@@ -268,6 +269,7 @@ async def chat(
             workflow_lease_handle = RunLeaseHandle(workflow_lease)
             terminal_persisted = False
             fence_lost = False
+            awaiting_user_paused = False
 
             async def persist_terminal(status: RunStatus) -> None:
                 nonlocal terminal_persisted
@@ -322,17 +324,25 @@ async def chat(
                     if evt.event_type == "tool.awaiting_approval":
                         chunks.extend(open_step())
                         chunks.extend(close_open_parts())
-                        tool_call_id = evt.data.get("call_id") or evt.data.get("request_id") or ""
-                        chunks.append(
-                            enc.tool_input_available(
-                                tool_call_id,
-                                evt.data.get("tool", ""),
-                                redact(evt.data.get("params", {})),
-                            )
+                        approval_id = evt.data.get("approval_id") or evt.data.get("request_id") or ""
+                        tool_call_id = (
+                            evt.data.get("call_id")
+                            or evt.data.get("tool_call_id")
+                            or approval_id
+                            or ""
                         )
+                        if tool_call_id and tool_call_id not in emitted_tool_inputs:
+                            emitted_tool_inputs.add(tool_call_id)
+                            chunks.append(
+                                enc.tool_input_available(
+                                    tool_call_id,
+                                    evt.data.get("tool", ""),
+                                    redact(evt.data.get("params", {})),
+                                )
+                            )
                         chunks.append(
                             enc.tool_approval_request(
-                                evt.data.get("request_id", ""),
+                                approval_id,
                                 tool_call_id,
                             )
                         )
@@ -429,6 +439,21 @@ async def chat(
                                 yield enc.text_start(text_part_id)
                             yield enc.text_delta(text_part_id, item["content"])
                         elif item["type"] == "done":
+                            done_data = item.get("data") if isinstance(item.get("data"), dict) else {}
+                            if done_data.get("state") == RunStatus.AWAITING_USER.value:
+                                awaiting_user_paused = True
+                                while pending_tool_results > 0:
+                                    pending_tool_results -= 1
+                                    run_lease.mark_tool_execution_finished()
+                                run_lease.mark_awaiting_user(checkpoint_persisted=True)
+                                for chunk in drain_event_queue():
+                                    yield chunk
+                                for chunk in close_open_parts():
+                                    yield chunk
+                                for chunk in close_step():
+                                    yield chunk
+                                yield enc.finish("stop")
+                                return
                             if fence_lost:
                                 continue
                             await persist_terminal(RunStatus.COMPLETED)
@@ -459,6 +484,7 @@ async def chat(
                             pending_tool_results += 1
                             run_lease.mark_tool_execution_started()
                             tool_call_id = item.get("call_id") or uuid4().hex
+                            emitted_tool_inputs.add(tool_call_id)
                             yield enc.tool_input_available(
                                 tool_call_id,
                                 item["name"],
@@ -527,7 +553,7 @@ async def chat(
                     await asyncio.gather(stream_task, return_exceptions=True)
                 if subscription is not None:
                     subscription.close()
-                if not terminal_persisted and not fence_lost:
+                if not terminal_persisted and not fence_lost and not awaiting_user_paused:
                     try:
                         await persist_terminal(RunStatus.CANCELLED)
                     except Exception:
