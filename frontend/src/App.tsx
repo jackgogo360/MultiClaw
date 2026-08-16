@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
 import {
   useAISDKRuntime,
@@ -18,12 +18,21 @@ import { ChatView } from "@/components/chat/ChatView";
 import { API_BASE } from "@/lib/constants";
 import { SessionProvider } from "@/components/session/SessionProvider";
 import { SessionList } from "@/components/session/SessionList";
+import { DeletionSettings } from "@/components/settings/DeletionSettings";
 import { shouldLogChatDebug } from "@/chat-debug";
 import { extractLatestUserText } from "@/lib/chat-request";
 import { sessionStore } from "@/lib/session-store";
 import { chatStore } from "@/lib/chat-store";
 
 type ChatRequestState = "idle" | "sending" | "streaming";
+type ActiveRun = {
+  sessionId: string;
+  runId: string;
+};
+type DataPart = {
+  type: string;
+  data?: unknown;
+};
 
 type LatestTransportController = {
   proxy: AssistantChatTransport<UIMessage>;
@@ -48,6 +57,39 @@ function createLatestTransportProxy(
       currentTransport = transport;
     },
   };
+}
+
+function readRunScope(data: unknown): ActiveRun | null {
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+  const record = data as { session_id?: unknown; run_id?: unknown };
+  if (typeof record.session_id !== "string" || typeof record.run_id !== "string") {
+    return null;
+  }
+  return { sessionId: record.session_id, runId: record.run_id };
+}
+
+function shouldIgnoreScopedEvent(part: DataPart) {
+  const scoped = readRunScope(part.data);
+  if (!scoped) {
+    return false;
+  }
+  const activeRun = chatStore.getActiveRun();
+  if (!activeRun) {
+    return part.type !== "data-run";
+  }
+  return activeRun.sessionId !== scoped.sessionId || activeRun.runId !== scoped.runId;
+}
+
+function RecoveryScreen({ onBack }: { onBack: () => void }) {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background px-4 py-10">
+      <div className="w-full max-w-2xl rounded-2xl border border-border bg-surface p-6 shadow-2xl">
+        <DeletionSettings standalone onBack={onBack} />
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -129,9 +171,11 @@ function useChatThreadRuntimeWithStore(options: Record<string, unknown>) {
 }
 
 function ChatApp() {
-  const { isAuthenticated, isLoading } = useAuth();
+  const { isAuthenticated, isLoading, accountStatus } = useAuth();
   const [chatError, setChatError] = useState<string | null>(null);
   const [requestState, setRequestState] = useState<ChatRequestState>("idle");
+  const [showRecovery, setShowRecovery] = useState(false);
+  const recoveryMode = showRecovery || accountStatus === "pending_purge";
 
   const transport = useMemo(
     () =>
@@ -144,6 +188,7 @@ function ChatApp() {
               messages as Parameters<typeof extractLatestUserText>[0]
             );
             const sessionId = sessionStore.getSnapshot().currentId ?? undefined;
+            chatStore.clearActiveRun();
 
             if (shouldLogChatDebug({ hostname: window.location.hostname })) {
               console.debug("[chat] prepare request", {
@@ -186,7 +231,19 @@ function ChatApp() {
 
   const runtime = useChatRuntimeWithStore({
     transport,
-    onData: (part: { type: string; data?: unknown }) => {
+    onData: (part: DataPart) => {
+      if (part.type === "data-run") {
+        const scope = readRunScope(part.data);
+        if (scope) {
+          chatStore.setActiveRun(scope);
+        }
+        return;
+      }
+
+      if (shouldIgnoreScopedEvent(part)) {
+        return;
+      }
+
       setRequestState("streaming");
       if (part.type !== "data-session") {
         return;
@@ -210,10 +267,12 @@ function ChatApp() {
       });
     },
     onError: (error: Error) => {
+      chatStore.clearActiveRun();
       setRequestState("idle");
       setChatError(error.message);
     },
     onFinish: () => {
+      chatStore.clearActiveRun();
       setRequestState("idle");
       setChatError(null);
     },
@@ -228,17 +287,31 @@ function ChatApp() {
   }
 
   if (!isAuthenticated) {
-    return <LoginOverlay />;
+    if (recoveryMode) {
+      return <RecoveryScreen onBack={() => setShowRecovery(false)} />;
+    }
+    return (
+      <>
+        <LoginOverlay />
+        <button
+          className="fixed right-4 bottom-4 z-[60] rounded-full border border-border bg-surface px-4 py-2 text-sm text-muted-foreground shadow-lg hover:border-accent hover:text-accent"
+          onClick={() => setShowRecovery(true)}
+        >
+          Recover scheduled deletion
+        </button>
+      </>
+    );
   }
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <SessionProvider>
-        <AppLayout sidebar={<SessionList />}>
+        <AppLayout sidebar={<SessionList />} navigationDisabled={accountStatus === "pending_purge"}>
           <ChatView
             chatError={chatError}
             requestState={requestState}
             onComposerSend={() => {
+              chatStore.clearActiveRun();
               setRequestState("sending");
               setChatError(null);
             }}
