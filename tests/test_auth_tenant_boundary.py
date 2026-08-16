@@ -11,6 +11,7 @@ import jwt
 import pytest
 from alembic import command
 from fastapi.testclient import TestClient
+from sqlalchemy import literal
 from sqlalchemy import insert, text
 
 from multiclaw.cli import alembic_config
@@ -1768,6 +1769,38 @@ async def test_verification_code_failures_are_purpose_isolated_and_lock_only_mat
 
 
 @pytest.mark.asyncio
+async def test_issue_code_makes_created_at_strictly_monotonic_within_same_db_millisecond(
+    migrated_database: Database,
+) -> None:
+    async with AuthUnitOfWork(migrated_database) as uow:
+        frozen_now_ms = 1_800_000_000_000
+        original_db_now_ms = uow._database.dialect.db_now_ms
+        uow._database.dialect.db_now_ms = lambda: literal(frozen_now_ms)
+        try:
+            first_id = await uow.verification_codes.issue_code(
+                email="monotonic@example.com",
+                purpose="login",
+                code_digest="a" * 64,
+                ttl_seconds=900,
+            )
+            second_id = await uow.verification_codes.issue_code(
+                email="monotonic@example.com",
+                purpose="login",
+                code_digest="b" * 64,
+                ttl_seconds=900,
+            )
+        finally:
+            uow._database.dialect.db_now_ms = original_db_now_ms
+
+    rows = await _get_verification_rows(migrated_database, "monotonic@example.com")
+
+    assert [row["id"] for row in rows] == [first_id, second_id]
+    assert [row["created_at"] for row in rows] == [frozen_now_ms, frozen_now_ms + 1]
+    assert rows[0]["expires_at"] == frozen_now_ms + 900_000
+    assert rows[1]["expires_at"] == frozen_now_ms + 900_000
+
+
+@pytest.mark.asyncio
 async def test_auth_cleanup_worker_deletes_only_codes_expired_by_db_clock(
     migrated_database: Database,
 ) -> None:
@@ -1862,6 +1895,7 @@ def test_only_latest_unused_login_code_is_valid_in_frozen_layout(
     assert new_response.status_code == 200
     assert rows_after_new[0]["used_at"] is None
     assert rows_after_new[1]["used_at"] is not None
+    client.cookies.clear()
     assert client.post("/auth/verify", json={"email": email, "code": "111111"}).status_code == 401
 
 
