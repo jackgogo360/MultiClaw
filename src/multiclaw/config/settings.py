@@ -26,6 +26,15 @@ class AppSettings(BaseModel):
     name: str = "MultiClaw"
     version: str = "0.1.0"
     debug: bool = False
+    allowed_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost",
+            "http://localhost:5173",
+            "http://127.0.0.1",
+            "http://127.0.0.1:5173",
+            "http://testserver",
+        ]
+    )
 
 
 class DeploymentSettings(BaseModel):

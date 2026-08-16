@@ -125,8 +125,9 @@ from multiclaw.mcp.types import (
 
 from uuid import uuid4
 
-from multiclaw.auth.store import AuthStore
+from multiclaw.auth.cleanup import AuthCleanupWorker
 from multiclaw.auth.middleware import AuthMiddleware
+from multiclaw.auth.models import build_auth_runtime
 from multiclaw.auth.router import router as auth_router
 from multiclaw.api.chat import (
     build_workflow_continuation_service,
@@ -506,13 +507,21 @@ def create_runtime_factory(
 # ---------------------------------------------------------------------------
 
 
+def _validate_allowed_origins(origins: set[str] | frozenset[str]) -> frozenset[str]:
+    if "*" in origins:
+        raise ValueError("wildcard origins cannot be used with credentialed auth cookies")
+    return frozenset(origins)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     runtime_factory = None
     runtime_pool = None
-    auth_store = None
+    auth_runtime = None
     recovery_stop: asyncio.Event | None = None
     recovery_task: asyncio.Task | None = None
+    auth_cleanup_stop: asyncio.Event | None = None
+    auth_cleanup_task: asyncio.Task | None = None
     try:
         runtime_factory = create_runtime_factory()
         runtime_pool = RuntimePool(
@@ -520,10 +529,11 @@ async def lifespan(app: FastAPI):
             max_resident_tenants=runtime_factory.settings.runtime.max_resident_tenants,
             idle_ttl_ms=runtime_factory.settings.runtime.idle_ttl_seconds * 1000,
         )
-        auth_store = AuthStore(runtime_factory.settings.database.path)
+        auth_runtime = build_auth_runtime(runtime_factory.settings)
+        allowed_origins = _validate_allowed_origins(auth_runtime.allowed_origins)
         readiness, startup_events = runtime_factory.probe_startup()
-        await auth_store.initialize()
-        app.state.auth_store = auth_store
+        app.state.auth = auth_runtime
+        app.state.allowed_origins = allowed_origins
         app.state.database = runtime_factory.database
         app.state.runtime_pool = runtime_pool
         app.state.workspace_resolver = runtime_factory.workspace_resolver
@@ -531,10 +541,12 @@ async def lifespan(app: FastAPI):
         app.state.sandbox_readiness = readiness
         app.state.workspace_root = runtime_factory.workspace_resolver.root
         app.state.sandbox_startup_events = startup_events
+        app.state.auth_forced_code = None
         if hasattr(runtime_factory.database, "dialect") and hasattr(runtime_factory.database, "connect"):
             async with runtime_factory.database.connect():
                 pass
             recovery_stop = asyncio.Event()
+            auth_cleanup_stop = asyncio.Event()
 
             async def recovery_loop() -> None:
                 worker = WorkflowRecoveryWorker(
@@ -556,13 +568,24 @@ async def lifespan(app: FastAPI):
                         continue
 
             recovery_task = asyncio.create_task(recovery_loop())
+
+            async def auth_cleanup_loop() -> None:
+                worker = AuthCleanupWorker(runtime_factory.database)
+                while not auth_cleanup_stop.is_set():
+                    await worker.run_once()
+                    try:
+                        await asyncio.wait_for(auth_cleanup_stop.wait(), timeout=60.0)
+                    except asyncio.TimeoutError:
+                        continue
+
+            auth_cleanup_task = asyncio.create_task(auth_cleanup_loop())
     except BaseException as primary:
         try:
-            if auth_store is not None:
+            if auth_runtime is not None:
                 try:
-                    await auth_store.close()
+                    await auth_runtime.close()
                 except BaseException as error:
-                    _note_startup_cleanup_error(primary, "auth_store.close", error)
+                    _note_startup_cleanup_error(primary, "auth.close", error)
             if runtime_pool is not None:
                 try:
                     await runtime_pool.close()
@@ -582,15 +605,22 @@ async def lifespan(app: FastAPI):
 
         if recovery_stop is not None:
             recovery_stop.set()
+        if auth_cleanup_stop is not None:
+            auth_cleanup_stop.set()
         if recovery_task is not None:
             try:
                 await recovery_task
             except BaseException as error:
                 primary = error if primary is None else primary
-
-        if auth_store is not None:
+        if auth_cleanup_task is not None:
             try:
-                await auth_store.close()
+                await auth_cleanup_task
+            except BaseException as error:
+                primary = error if primary is None else primary
+
+        if auth_runtime is not None:
+            try:
+                await auth_runtime.close()
             except BaseException as error:
                 primary = error
 
