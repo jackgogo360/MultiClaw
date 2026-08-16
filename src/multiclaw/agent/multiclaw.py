@@ -20,7 +20,12 @@ from multiclaw.planner import Planner
 from multiclaw.skills import SkillManager
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.tools import CoreToolScheduler, ToolRegistry
-from multiclaw.workflow.continuation import PersistedToolResult
+from multiclaw.workflow.continuation import (
+    ContinuationOutcome,
+    ContinuationState,
+    PersistedToolResult,
+)
+from multiclaw.tools.base import ToolStatus
 from multiclaw.workflow.models import RunLease, RunLeaseHandle
 
 logger = logging.getLogger(__name__)
@@ -685,7 +690,7 @@ class MultiClawAgent(ToolCallAgent):
         workflow_continuation,
         recovered_tool_result: PersistedToolResult | None = None,
         recovered_tool_input_json: str | None = None,
-    ) -> str:
+    ) -> ContinuationOutcome:
         messages = [{"role": "system", "content": self.settings.agent.system_prompt}]
         chat_entries = list(
             reversed(
@@ -788,7 +793,7 @@ class MultiClawAgent(ToolCallAgent):
         run_lease_handle: RunLeaseHandle,
         workflow_continuation,
         next_turn_index: int,
-    ) -> str:
+    ) -> ContinuationOutcome:
         tools = self.registry.to_openai_schemas()
         controller = self._build_resilience_controller()
         max_rounds = self.settings.agent.max_tool_rounds
@@ -808,7 +813,10 @@ class MultiClawAgent(ToolCallAgent):
                     run_lease_handle=run_lease_handle,
                     workflow_continuation=workflow_continuation,
                 )
-                return response.content
+                return ContinuationOutcome(
+                    state=ContinuationState.COMPLETED,
+                    assistant_content=response.content,
+                )
 
             normalized_calls = self._normalize_tool_calls(response.tool_calls)
             if controller is not None:
@@ -828,6 +836,11 @@ class MultiClawAgent(ToolCallAgent):
                 run_lease_handle=run_lease_handle,
             )
             for outcome in outcomes:
+                if outcome.result.status is ToolStatus.AWAITING_APPROVAL:
+                    return ContinuationOutcome(
+                        state=ContinuationState.AWAITING_USER,
+                        detail="tool awaiting approval",
+                    )
                 messages.append(
                     _build_tool_result_msg(
                         outcome.call_id,
@@ -847,4 +860,7 @@ class MultiClawAgent(ToolCallAgent):
             run_lease_handle=run_lease_handle,
             workflow_continuation=workflow_continuation,
         )
-        return full_text
+        return ContinuationOutcome(
+            state=ContinuationState.COMPLETED,
+            assistant_content=full_text,
+        )

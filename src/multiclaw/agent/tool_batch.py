@@ -5,6 +5,7 @@ from typing import Any, Sequence
 
 from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.tenancy import TenantContext
+from multiclaw.tools.base import ToolExecutionResult, ToolStatus
 from multiclaw.tools.registry import ToolRegistry
 from multiclaw.tools.scheduler import CoreToolScheduler
 from multiclaw.workflow.models import RunLeaseHandle
@@ -22,6 +23,7 @@ class ToolCallOutcome:
     call_id: str
     name: str
     observation: Observation
+    result: ToolExecutionResult
 
 
 class ToolBatchExecutor:
@@ -48,13 +50,14 @@ class ToolBatchExecutor:
     ) -> list[ToolCallOutcome]:
         outcomes: list[ToolCallOutcome] = []
         for call in calls:
-            outcomes.append(
-                await self._execute_one(
-                    call,
-                    context=context,
-                    run_lease_handle=run_lease_handle,
-                )
+            outcome = await self._execute_one(
+                call,
+                context=context,
+                run_lease_handle=run_lease_handle,
             )
+            outcomes.append(outcome)
+            if outcome.result.status is ToolStatus.AWAITING_APPROVAL:
+                break
         return outcomes
 
     async def _execute_one(
@@ -71,6 +74,10 @@ class ToolBatchExecutor:
                 name=call.name,
                 observation=Observation(
                     type=ObservationType.ERROR,
+                    content=f"unknown tool: {call.name}",
+                ),
+                result=ToolExecutionResult(
+                    status=ToolStatus.ERROR,
                     content=f"unknown tool: {call.name}",
                 ),
             )
@@ -90,4 +97,5 @@ class ToolBatchExecutor:
                 content=result.content,
                 data=result.data,
             ),
+            result=result,
         )
