@@ -268,6 +268,8 @@ class RuntimeFactory:
             execution_guard=ExecutionGuard(),
             audit_logger=InMemoryAuditLogger(),
             event_bus=event_bus,
+            database=self.database,
+            settings=self.settings,
         )
 
     def _build_registry(

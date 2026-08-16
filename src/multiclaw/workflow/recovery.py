@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
+
+from sqlalchemy import exists, or_, select
 
 from pydantic import ValidationError
 
 from multiclaw.config import Settings
 from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.workflow import WorkflowRepository
+from multiclaw.storage.schema import agent_runs, approval_requests
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
@@ -39,6 +44,7 @@ from multiclaw.workflow.models import (
 
 
 SECRET_KEY_MARKERS = {"secret", "token", "password", "apikey", "authorization"}
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,3 +423,141 @@ def _dispatch_recovery_action(strategy: RecoveryStrategy) -> RecoveryAction:
     if strategy is RecoveryStrategy.IDEMPOTENT_RETRY:
         return RecoveryAction.RETRY_IDEMPOTENT
     return RecoveryAction.MARK_MANUAL_UNCERTAIN
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryCandidate:
+    context: TenantContext
+    awaiting_resolution: bool
+
+
+class WorkflowRecoveryWorker:
+    def __init__(
+        self,
+        *,
+        database: Database,
+        settings: Settings | None = None,
+        runtime_pool,
+        batch_size: int = 20,
+    ) -> None:
+        self._database = database
+        self._settings = settings or Settings(_config_file="/nonexistent")
+        self._runtime_pool = runtime_pool
+        self._batch_size = batch_size
+        self._recovery_service = RecoveryService(database, settings=self._settings)
+
+    async def run_once(self) -> None:
+        candidates = await self._load_candidates()
+        for candidate in candidates:
+            try:
+                await self._process_candidate(candidate)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "workflow recovery candidate failed tenant_id=%s run_id=%s",
+                    candidate.context.tenant_id,
+                    candidate.context.run_id,
+                )
+
+    async def _load_candidates(self) -> list[_RecoveryCandidate]:
+        now_ms = self._database.dialect.db_now_ms()
+        async with self._database.connect() as conn:
+            result = await conn.execute(
+                select(
+                    agent_runs.c.tenant_id,
+                    agent_runs.c.workspace_id,
+                    agent_runs.c.session_id,
+                    agent_runs.c.run_id,
+                    exists(
+                        select(1)
+                        .select_from(approval_requests)
+                        .where(
+                            approval_requests.c.tenant_id == agent_runs.c.tenant_id,
+                            approval_requests.c.workspace_id == agent_runs.c.workspace_id,
+                            approval_requests.c.session_id == agent_runs.c.session_id,
+                            approval_requests.c.run_id == agent_runs.c.run_id,
+                            approval_requests.c.approval_status.in_(("approved", "expired")),
+                        )
+                    ).label("awaiting_resolution"),
+                )
+                .where(
+                    or_(
+                        (
+                            (agent_runs.c.run_status == RunStatus.AWAITING_USER.value)
+                            & exists(
+                                select(1)
+                                .select_from(approval_requests)
+                                .where(
+                                    approval_requests.c.tenant_id == agent_runs.c.tenant_id,
+                                    approval_requests.c.workspace_id == agent_runs.c.workspace_id,
+                                    approval_requests.c.session_id == agent_runs.c.session_id,
+                                    approval_requests.c.run_id == agent_runs.c.run_id,
+                                    approval_requests.c.approval_status.in_(("approved", "expired")),
+                                )
+                            )
+                        ),
+                        (
+                            agent_runs.c.run_status.in_(
+                                (
+                                    RunStatus.RUNNING.value,
+                                    RunStatus.AWAITING_USER.value,
+                                    RunStatus.RESUMING.value,
+                                )
+                            )
+                            & (agent_runs.c.lease_expires_at <= now_ms)
+                        ),
+                    )
+                )
+                .order_by(
+                    agent_runs.c.tenant_id.asc(),
+                    agent_runs.c.workspace_id.asc(),
+                    agent_runs.c.session_id.asc(),
+                    agent_runs.c.run_id.asc(),
+                )
+                .limit(self._batch_size)
+            )
+            rows = result.mappings().all()
+        return [
+            _RecoveryCandidate(
+                context=TenantContext(
+                    tenant_id=str(row["tenant_id"]),
+                    workspace_id=str(row["workspace_id"]),
+                    session_id=str(row["session_id"]),
+                    run_id=str(row["run_id"]),
+                ),
+                awaiting_resolution=bool(row["awaiting_resolution"]),
+            )
+            for row in rows
+        ]
+
+    async def _process_candidate(self, candidate: _RecoveryCandidate) -> None:
+        runtime = await self._maybe_await(
+            self._runtime_pool.acquire(
+                TenantContext(
+                    tenant_id=candidate.context.tenant_id,
+                    workspace_id=candidate.context.workspace_id,
+                )
+            )
+        )
+        runtime_instance_id = getattr(runtime, "runtime_instance_id", "recovery-worker")
+        coordinator = WorkflowCoordinator(self._database, settings=self._settings)
+        run = await coordinator.get_run(candidate.context)
+        if run is None or run.status in TERMINAL_RUN_STATUSES:
+            return
+        try:
+            lease = await coordinator.acquire_run(candidate.context, runtime_instance_id)
+        except LeaseConflictError:
+            return
+        if candidate.awaiting_resolution:
+            try:
+                lease = await coordinator.transition_run(lease, RunStatus.RESUMING)
+            except InvalidTransitionError:
+                return
+        await self._recovery_service.recover(candidate.context, runtime_instance_id)
+
+    @staticmethod
+    async def _maybe_await(value):
+        if inspect.isawaitable(value):
+            return await value
+        return value

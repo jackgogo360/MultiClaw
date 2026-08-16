@@ -4,6 +4,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
+from multiclaw.workflow.models import RecoveryStrategy
 from multiclaw.tools._common import (
     DEFAULT_FIND_DIR_DEPTH,
     MAX_FIND_DIR_RESULTS,
@@ -79,6 +80,7 @@ class FindDirToolBuilder(WorkspaceToolBuilder):
     description = "Find directories by name pattern within the workspace."
     parameters_schema = FindDirParams
     read_only = True
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def validate(self, params: dict) -> FindDirParams:
         return FindDirParams(**params)

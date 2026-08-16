@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from multiclaw.tools._common import WorkspaceToolBuilder, _error, _success
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
 from multiclaw.tools.network_policy import NetworkPolicy, NetworkPolicyError
+from multiclaw.workflow.models import RecoveryStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +288,7 @@ class WebFetchToolBuilder(WorkspaceToolBuilder):
     name = "web_fetch"
     description = "Fetch a web page and extract content. Modes: light, markdown, browser, auto."
     parameters_schema = WebFetchParams
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
     read_only = True
 
     def __init__(self, workspace_root: str | Path | None = None, policy=None,

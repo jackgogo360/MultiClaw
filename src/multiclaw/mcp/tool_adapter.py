@@ -14,6 +14,7 @@ from multiclaw.tools.base import (
     ToolInvocation,
     ToolStatus,
 )
+from multiclaw.workflow.models import RecoveryStrategy
 
 if TYPE_CHECKING:
     from multiclaw.mcp.manager import MCPClientManager
@@ -98,6 +99,7 @@ def _is_read_only_tool_info(tool_info: Any) -> bool:
 
 
 class MCPToolBuilder(ToolBuilder):
+    tool_kind = "mcp"
     name: str
     description: str
     parameters_schema: type[BaseModel]
@@ -143,6 +145,14 @@ class MCPToolBuilder(ToolBuilder):
 
     def approval_description(self, params: dict[str, Any]) -> str:
         return f"Call MCP tool {self.name} with {json.dumps(params, ensure_ascii=False)}"
+
+    @property
+    def recovery_strategy(self) -> RecoveryStrategy:
+        return (
+            RecoveryStrategy.READ_ONLY_REPLAY
+            if self.read_only
+            else RecoveryStrategy.MANUAL_UNCERTAIN
+        )
 
     @classmethod
     def from_tool_info(cls, tool_info: Any, manager: MCPClientManager) -> "MCPToolBuilder":

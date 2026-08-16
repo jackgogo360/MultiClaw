@@ -20,6 +20,7 @@ from multiclaw.governance import (
 )
 from multiclaw.tools._common import WorkspaceToolBuilder, _error, _success
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
+from multiclaw.workflow.models import RecoveryStrategy
 
 DEFAULT_TIMEOUT = 30.0
 MAX_TIMEOUT = 300.0
@@ -205,6 +206,7 @@ class CodeExecToolBuilder(WorkspaceToolBuilder):
     name = "code_exec"
     description = "Execute Python code in a sandboxed interpreter with timeout control."
     parameters_schema = CodeExecParams
+    recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
     def __init__(
         self,

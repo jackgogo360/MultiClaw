@@ -1,15 +1,54 @@
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
+from multiclaw.config import Settings
 from multiclaw.events import Event, EventBus, EventRouter, ScopedEvent
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
+from multiclaw.storage.engine import Database
 from multiclaw.tenancy import TenantContext
 from multiclaw.tools.base import ToolBuilder, ToolExecutionResult, ToolStatus
+from multiclaw.workflow.coordinator import WorkflowCoordinator
+from multiclaw.workflow.models import (
+    CheckpointPhase,
+    ExecutionStatus,
+    RecoveryStrategy,
+    RunLease,
+    RunLeaseHandle,
+    RunStatus,
+)
 
 logger = logging.getLogger(__name__)
+APPROVAL_TTL_MS = 120_000
+MAX_CANONICAL_INPUT_BYTES = 262_144
+SECRET_KEY_MARKERS = {"secret", "token", "password", "apikey", "authorization"}
+
+
+class ExecutionConflictError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalToolInput:
+    payload_json: str
+    payload_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedExecution:
+    lease: RunLease
+    execution_id: str
+    approval_id: str | None
+    execution_version: int
+    input_payload_json: str
+    input_hash: str
+    recovery_strategy: RecoveryStrategy
+    idempotency_key: str | None
 
 
 class CoreToolScheduler:
@@ -26,21 +65,16 @@ class CoreToolScheduler:
         audit_logger: InMemoryAuditLogger,
         event_bus: EventBus,
         event_router: EventRouter | None = None,
+        database: Database | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self.permission_checker = permission_checker
         self.execution_guard = execution_guard
         self.audit_logger = audit_logger
         self.event_bus = event_bus
         self.event_router = event_router
-        self._pending: dict[str, asyncio.Event] = {}
-        self._pending_results: dict[str, bool] = {}
-
-    def resolve_approval(self, request_id: str, approved: bool) -> bool:
-        if request_id in self._pending:
-            self._pending_results[request_id] = approved
-            self._pending[request_id].set()
-            return True
-        return False
+        self.database = database
+        self.settings = settings or Settings(_config_file="/nonexistent")
 
     async def can_run_concurrently(
         self,
@@ -64,67 +98,55 @@ class CoreToolScheduler:
         *,
         context: TenantContext | None = None,
         call_id: str | None = None,
+        run_lease_handle: RunLeaseHandle | None = None,
     ) -> ToolExecutionResult:
+        await self._publish_event(
+            "tool.scheduled",
+            self._event_data(builder.name, call_id),
+            context=context,
+        )
+        await self._publish_event(
+            "tool.validating",
+            self._event_data(builder.name, call_id),
+            context=context,
+        )
+        params = builder.validate(raw_params)
+        if (
+            self.database is None
+            or context is None
+            or context.session_id is None
+            or context.run_id is None
+            or run_lease_handle is None
+        ):
+            return await self._run_ephemeral(
+                builder,
+                raw_params,
+                params=params,
+                context=context,
+                call_id=call_id,
+            )
+
         try:
-            await self._publish_event(
-                "tool.scheduled",
-                self._event_data(builder.name, call_id),
-                context=context,
-            )
-            await self._publish_event(
-                "tool.validating",
-                self._event_data(builder.name, call_id),
-                context=context,
-            )
-            params = builder.validate(raw_params)
-
-            # MCP tools are pre-approved at server-connection time
-            from multiclaw.mcp.tool_adapter import MCPToolBuilder as _MCPToolBuilder
-            if isinstance(builder, _MCPToolBuilder):
-                invocation = builder.build(params)
-                try:
-                    result = await self.execution_guard.run(invocation.execute)
-                except Exception as exc:
-                    del exc
-                    result = ToolExecutionResult(
-                        status=ToolStatus.ERROR,
-                        content="tool execution failed",
-                    )
-                    await self._finalize_terminal_result(
-                        builder.name,
-                        result,
-                        context=context,
-                        call_id=call_id,
-                        audit_detail="tool execution failed",
-                        error_label="tool execution failed",
-                    )
-                    return result
-                await self._finalize_terminal_result(
-                    builder.name,
-                    result,
-                    context=context,
-                    call_id=call_id,
-                )
-                return result
-
+            canonical_input = self._canonicalize_input(params.model_dump(mode="json"))
+            recovery_metadata = builder.recovery_metadata(params)
             decision = await self.permission_checker.check(
                 builder.name,
                 raw_params,
                 workspace_root=getattr(builder, "workspace_root", None),
             )
             if decision.requires_approval:
-                request_id = uuid.uuid4().hex[:12]
-                logger.info(
-                    "approval required: tool=%s request_id=%s reason=%s",
-                    builder.name, request_id, decision.reason,
+                approval = await self._persist_approval_request(
+                    builder,
+                    raw_params,
+                    context=context,
+                    call_id=call_id,
+                    run_lease_handle=run_lease_handle,
                 )
-                event = asyncio.Event()
-                self._pending[request_id] = event
-
                 await self._publish_event(
                     "tool.awaiting_approval",
                     {
-                        "request_id": request_id,
+                        "approval_id": approval.approval_id,
+                        "version": approval.version,
                         "tool": builder.name,
                         "params": raw_params,
                         "description": builder.approval_description(raw_params),
@@ -135,47 +157,141 @@ class CoreToolScheduler:
                 await self.audit_logger.record(
                     tool_name=builder.name,
                     status=ToolStatus.AWAITING_APPROVAL.value,
-                    detail=f"approval required, request_id={request_id}",
+                    detail=f"approval required, approval_id={approval.approval_id}",
+                )
+                return ToolExecutionResult(
+                    status=ToolStatus.AWAITING_APPROVAL,
+                    content="approval required",
+                    data={
+                        "approval_id": approval.approval_id,
+                        "version": approval.version,
+                        "expires_at_ms": approval.expires_at,
+                    },
                 )
 
-                try:
-                    await asyncio.wait_for(event.wait(), timeout=120.0)
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "approval timeout: tool=%s request_id=%s",
-                        builder.name, request_id,
-                    )
-                    self._pending.pop(request_id, None)
-                    self._pending_results.pop(request_id, None)
-                    result = ToolExecutionResult(
-                        status=ToolStatus.CANCELLED,
-                        content="Approval timed out after 120s.",
-                    )
-                    await self._finalize_terminal_result(
-                        builder.name,
-                        result,
-                        context=context,
-                        call_id=call_id,
-                        audit_detail=result.content,
-                    )
-                    return result
-                approved = self._pending_results.pop(request_id, False)
-                self._pending.pop(request_id, None)
+            if not decision.allow:
+                await self._publish_event(
+                    "tool.error",
+                    {
+                        "tool": builder.name,
+                        "error": decision.reason,
+                        **({"call_id": call_id} if call_id else {}),
+                    },
+                    context=context,
+                )
+                await self.audit_logger.record(
+                    tool_name=builder.name,
+                    status=ToolStatus.CANCELLED.value,
+                    detail=decision.reason,
+                )
+                return ToolExecutionResult(
+                    status=ToolStatus.CANCELLED,
+                    content=decision.reason,
+                )
 
-                if not approved:
-                    result = ToolExecutionResult(
-                        status=ToolStatus.CANCELLED,
-                        content="rejected by user",
-                    )
-                    await self._finalize_terminal_result(
-                        builder.name,
-                        result,
-                        context=context,
-                        call_id=call_id,
-                        audit_detail=result.content,
-                    )
-                    return result
+            invocation = builder.build(params)
+            invocation.configure_permission(decision.approved_roots)
+            prepared = await self._prepare_execution(
+                builder=builder,
+                context=context,
+                call_id=call_id,
+                run_lease_handle=run_lease_handle,
+                invocation=invocation,
+                canonical_input=canonical_input,
+                recovery_strategy=recovery_metadata.recovery_strategy,
+                idempotency_key=recovery_metadata.idempotency_key,
+            )
+            await self._publish_event(
+                "tool.executing",
+                self._event_data(builder.name, call_id),
+                context=context,
+            )
+            try:
+                result = await self.execution_guard.run(invocation.execute)
+            except Exception:
+                result = ToolExecutionResult(
+                    status=ToolStatus.ERROR,
+                    content="tool execution failed",
+                )
+                terminal_status = (
+                    ExecutionStatus.UNCERTAIN
+                    if prepared.recovery_strategy is RecoveryStrategy.MANUAL_UNCERTAIN
+                    else ExecutionStatus.FAILED_TERMINAL
+                )
+                await self._persist_execution_result(
+                    prepared,
+                    tool_name=builder.name,
+                    context=context,
+                    call_id=call_id,
+                    result=result,
+                    terminal_status=terminal_status,
+                    run_lease_handle=run_lease_handle,
+                )
+                return result
+        except ExecutionConflictError:
+            raise
+        except Exception as exc:
+            del exc
+            result = ToolExecutionResult(
+                status=ToolStatus.ERROR,
+                content="tool execution failed",
+            )
+            await self._finalize_terminal_result(
+                builder.name,
+                result,
+                context=context,
+                call_id=call_id,
+                audit_detail="tool execution failed",
+                error_label="tool execution failed",
+            )
+            return result
 
+        await self._persist_execution_result(
+            prepared,
+            tool_name=builder.name,
+            context=context,
+            call_id=call_id,
+            result=result,
+        )
+        return result
+
+    async def _run_ephemeral(
+        self,
+        builder: ToolBuilder,
+        raw_params: dict[str, Any],
+        *,
+        params,
+        context: TenantContext | None,
+        call_id: str | None,
+    ) -> ToolExecutionResult:
+        try:
+            decision = await self.permission_checker.check(
+                builder.name,
+                raw_params,
+                workspace_root=getattr(builder, "workspace_root", None),
+            )
+            if decision.requires_approval:
+                approval_id = uuid.uuid4().hex
+                await self.audit_logger.record(
+                    tool_name=builder.name,
+                    status=ToolStatus.AWAITING_APPROVAL.value,
+                    detail=f"approval required, approval_id={approval_id}",
+                )
+                await self._publish_event(
+                    "tool.awaiting_approval",
+                    {
+                        "approval_id": approval_id,
+                        "tool": builder.name,
+                        "params": raw_params,
+                        "description": builder.approval_description(raw_params),
+                        **({"call_id": call_id} if call_id else {}),
+                    },
+                    context=context,
+                )
+                return ToolExecutionResult(
+                    status=ToolStatus.AWAITING_APPROVAL,
+                    content="approval required",
+                )
             if not decision.allow:
                 await self._publish_event(
                     "tool.error",
@@ -204,8 +320,7 @@ class CoreToolScheduler:
                 context=context,
             )
             result = await self.execution_guard.run(invocation.execute)
-        except Exception as exc:
-            del exc
+        except Exception:
             result = ToolExecutionResult(
                 status=ToolStatus.ERROR,
                 content="tool execution failed",
@@ -227,6 +342,220 @@ class CoreToolScheduler:
             call_id=call_id,
         )
         return result
+
+    async def _persist_approval_request(
+        self,
+        builder: ToolBuilder,
+        raw_params: dict[str, Any],
+        *,
+        context: TenantContext,
+        call_id: str | None,
+        run_lease_handle: RunLeaseHandle,
+    ):
+        lease = await run_lease_handle.current()
+        approval_id = str(uuid.uuid4())
+        async with self.database.write_transaction() as conn:
+            workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
+            transitioned = await workflow.transition_run(lease, RunStatus.AWAITING_USER)
+            approval = await workflow.create_approval(
+                transitioned,
+                approval_id=approval_id,
+                tool_call_id=call_id or approval_id,
+                expires_at=self.database.dialect.db_now_ms() + APPROVAL_TTL_MS,
+            )
+            approval_cursor = self._approval_cursor(context.run_id, call_id or approval.approval_id)
+            await workflow.checkpoint(
+                transitioned,
+                CheckpointPhase.AWAITING_APPROVAL,
+                {
+                    "run_id": context.run_id,
+                    "approval_id": approval.approval_id,
+                    "tool_call_id": call_id or approval.approval_id,
+                    "approval_expires_at_ms": approval.expires_at,
+                    "resume_cursor": approval_cursor,
+                    "cursor": approval_cursor,
+                },
+                approval_id=approval.approval_id,
+            )
+        await run_lease_handle.replace(transitioned)
+        return approval
+
+    async def _prepare_execution(
+        self,
+        *,
+        builder: ToolBuilder,
+        context: TenantContext,
+        call_id: str | None,
+        run_lease_handle: RunLeaseHandle,
+        invocation,
+        canonical_input: _CanonicalToolInput,
+        recovery_strategy: RecoveryStrategy,
+        idempotency_key: str | None,
+    ) -> _PreparedExecution:
+        lease = await run_lease_handle.current()
+        execution_id = str(uuid.uuid4())
+        tool_call_id = call_id or execution_id
+        async with self.database.write_transaction() as conn:
+            workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
+            created = await workflow.create_execution(
+                lease,
+                execution_id=execution_id,
+                approval_id=None,
+                tool_call_id=tool_call_id,
+                tool_name=builder.name,
+                tool_kind=getattr(builder, "tool_kind", "native"),
+                recovery_strategy=recovery_strategy,
+                idempotency_key=idempotency_key,
+                input_payload_json=canonical_input.payload_json,
+                input_hash=canonical_input.payload_hash,
+            )
+            if created is None:
+                raise ExecutionConflictError("another execution is already active for this run")
+            await workflow.transition_execution(
+                lease,
+                execution_id,
+                expected_status=ExecutionStatus.NOT_STARTED,
+                expected_version=created.version,
+                target=ExecutionStatus.EXECUTING,
+            )
+            dispatch_cursor = self._dispatch_cursor(context.run_id, tool_call_id)
+            await workflow.checkpoint(
+                lease,
+                CheckpointPhase.EXECUTION_DISPATCHING,
+                {
+                    "run_id": context.run_id,
+                    "execution_id": execution_id,
+                    "tool_call_id": tool_call_id,
+                    "recovery_strategy": recovery_strategy.value,
+                    "input_hash": canonical_input.payload_hash,
+                    "input_ref": f"tool_execution:{execution_id}:input_payload_json",
+                    "idempotency_key": idempotency_key,
+                    "dispatch_cursor": dispatch_cursor,
+                    "cursor": dispatch_cursor,
+                },
+                execution_id=execution_id,
+                execution_expected_status=ExecutionStatus.EXECUTING,
+                execution_expected_version=created.version + 1,
+            )
+        return _PreparedExecution(
+            lease=lease,
+            execution_id=execution_id,
+            approval_id=None,
+            execution_version=created.version + 1,
+            input_payload_json=canonical_input.payload_json,
+            input_hash=canonical_input.payload_hash,
+            recovery_strategy=recovery_strategy,
+            idempotency_key=idempotency_key,
+        )
+
+    async def _persist_execution_result(
+        self,
+        prepared: _PreparedExecution,
+        *,
+        tool_name: str,
+        context: TenantContext,
+        call_id: str | None,
+        result: ToolExecutionResult,
+        run_lease_handle: RunLeaseHandle | None = None,
+        terminal_status: ExecutionStatus | None = None,
+    ) -> None:
+        resolved_status = terminal_status or self._terminal_execution_status(result)
+        result_ref = result.result_ref or f"tool_execution:{prepared.execution_id}:result.content"
+        result_digest = result.result_digest or hashlib.sha256(
+            result.content.encode("utf-8")
+        ).hexdigest()
+        async with self.database.write_transaction() as conn:
+            workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
+            updated = await workflow.complete_execution(
+                prepared.lease,
+                prepared.execution_id,
+                expected_status=ExecutionStatus.EXECUTING,
+                expected_version=prepared.execution_version,
+                target_status=resolved_status,
+                external_request_id=result.external_request_id,
+                result_ref=result_ref,
+                result_digest=result_digest,
+            )
+            resume_cursor = self._result_cursor(context.run_id, call_id or prepared.execution_id)
+            await workflow.checkpoint(
+                prepared.lease,
+                CheckpointPhase.EXECUTION_RESULT_OBSERVED,
+                {
+                    "run_id": context.run_id,
+                    "execution_id": prepared.execution_id,
+                    "result_status": resolved_status.value,
+                    "result_digest": result_digest,
+                    "result_ref": result_ref,
+                    "external_request_id": updated.external_request_id,
+                    "resume_cursor": resume_cursor,
+                    "cursor": resume_cursor,
+                },
+                execution_id=prepared.execution_id,
+                execution_expected_status=resolved_status,
+                execution_expected_version=updated.version,
+            )
+        if run_lease_handle is not None:
+            await run_lease_handle.replace(prepared.lease)
+        await self._finalize_terminal_result(
+            tool_name,
+            result,
+            context=context,
+            call_id=call_id,
+            audit_detail="tool execution failed" if result.status is ToolStatus.ERROR else None,
+            error_label="tool execution failed" if result.status is ToolStatus.ERROR else None,
+        )
+
+    @staticmethod
+    def _approval_cursor(run_id: str | None, tool_call_id: str) -> str:
+        return f"approval:{run_id or 'no-run'}:{tool_call_id}"
+
+    @staticmethod
+    def _dispatch_cursor(run_id: str | None, tool_call_id: str) -> str:
+        return f"dispatch:{run_id or 'no-run'}:{tool_call_id}"
+
+    @staticmethod
+    def _result_cursor(run_id: str | None, tool_call_id: str) -> str:
+        return f"result:{run_id or 'no-run'}:{tool_call_id}"
+
+    @staticmethod
+    def _terminal_execution_status(result: ToolExecutionResult) -> ExecutionStatus:
+        if result.status is ToolStatus.SUCCESS:
+            return ExecutionStatus.SUCCEEDED
+        if result.status is ToolStatus.ERROR:
+            return ExecutionStatus.FAILED_TERMINAL
+        return ExecutionStatus.FAILED_TERMINAL
+
+    def _canonicalize_input(self, value: dict[str, Any]) -> _CanonicalToolInput:
+        self._reject_secret_fields(value)
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) > MAX_CANONICAL_INPUT_BYTES:
+            raise ValueError("tool input exceeds canonical payload size limit")
+        return _CanonicalToolInput(
+            payload_json=encoded.decode("utf-8"),
+            payload_hash=hashlib.sha256(encoded).hexdigest(),
+        )
+
+    def _reject_secret_fields(self, value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
+                if any(marker in normalized for marker in SECRET_KEY_MARKERS):
+                    raise ValueError(f"tool input contains forbidden secret field {key!r}")
+                self._reject_secret_fields(item)
+            return
+        if isinstance(value, list):
+            for item in value:
+                self._reject_secret_fields(item)
+            return
+        if isinstance(value, tuple):
+            for item in value:
+                self._reject_secret_fields(item)
 
     def _audit_detail(self, result: ToolExecutionResult) -> str:
         allowlisted = self._normalized_audit_fields(result.audit)
