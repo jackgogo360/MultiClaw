@@ -7,16 +7,19 @@ from typing import Any
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from multiclaw.cli import alembic_config
+from multiclaw.observability import increment_metric, record_trace_event
 from multiclaw.secrets.keyring import DeploymentKeyring, SecretKeyringError
-from multiclaw.security.redaction import redact
 from multiclaw.storage.repositories.secrets import DeploymentSecretUsageRepository
+from multiclaw.storage.schema import metadata
 
 
 router = APIRouter()
+_SQLITE_MIN_VERSION = (3, 35, 0)
+_MYSQL_MIN_VERSION = (8, 0, 36)
 
 
 @router.get("/api/health/live")
@@ -30,28 +33,23 @@ async def health_ready(request: Request):
     return JSONResponse(payload, status_code=200 if payload["ready"] else 503)
 
 
-@router.get("/health/ready", include_in_schema=False)
-async def health_ready_alias():
-    return RedirectResponse(url="/api/health/ready", status_code=307)
-
-
 async def _build_readiness_payload(request: Request) -> dict[str, Any]:
-    failed: list[str] = []
-    details: dict[str, Any] = {}
-    readiness = getattr(request.app.state, "sandbox_readiness", None)
-    workspace_root = getattr(request.app.state, "workspace_root", None)
     database = getattr(request.app.state, "database", None)
     settings = getattr(request.app.state, "settings", None)
+    workspace_root = getattr(request.app.state, "workspace_root", None)
+    failed: list[str] = []
 
     if database is None or settings is None:
-        failed.append("db_connectivity")
-        return {"ready": False, "status": "not_ready", "checks_failed": failed}
+        return _response(["db_connectivity"])
 
     try:
         async with database.connect() as conn:
-            backend_version = await conn.scalar(text("select sqlite_version()") if database.dialect.name == "sqlite" else text("select version()"))
-            details["backend_name"] = database.dialect.name
-            details["backend_version"] = str(backend_version)
+            backend_version = await conn.scalar(
+                text("select sqlite_version()") if database.dialect.name == "sqlite" else text("select version()")
+            )
+            if not _backend_version_ok(database.dialect.name, str(backend_version or "")):
+                failed.append("backend_version")
+
             current_revision = await conn.run_sync(
                 lambda sync_conn: MigrationContext.configure(sync_conn).get_current_revision()
             )
@@ -59,48 +57,167 @@ async def _build_readiness_payload(request: Request) -> dict[str, Any]:
                 alembic_config(database_url=settings.database.url)
             ).get_current_head()
             if current_revision != expected_revision:
-                failed.append("schema_revision")
+                return _response(["schema_revision"])
+
             if database.dialect.name == "sqlite":
-                fk_enabled = int(
-                    await conn.scalar(text("PRAGMA foreign_keys"))
-                )
+                fk_enabled = int(await conn.scalar(text("PRAGMA foreign_keys")) or 0)
                 if fk_enabled != 1:
                     failed.append("sqlite_foreign_keys")
+                if not await _sqlite_schema_integrity_ok(conn):
+                    failed.append("schema_integrity")
             else:
-                time_zone = str(await conn.scalar(text("SELECT @@session.time_zone")))
-                isolation = str(await conn.scalar(text("SELECT @@transaction_isolation")))
+                time_zone = str(await conn.scalar(text("SELECT @@session.time_zone")) or "")
+                isolation = str(await conn.scalar(text("SELECT @@transaction_isolation")) or "")
                 if time_zone not in {"SYSTEM", "+00:00", "UTC"}:
                     failed.append("mysql_time_zone")
                 if isolation.upper() != "READ-COMMITTED":
                     failed.append("mysql_isolation")
-    except Exception:
-        failed.append("db_connectivity")
-        return {"ready": False, "status": "not_ready", "checks_failed": failed}
+                if not await _mysql_innodb_ok(conn):
+                    failed.append("mysql_innodb")
+                if not await _mysql_schema_integrity_ok(conn):
+                    failed.append("schema_integrity")
 
-    try:
-        if workspace_root is None or not Path(workspace_root).exists() or not os.access(workspace_root, os.R_OK | os.W_OK | os.X_OK):
-            failed.append("workspace_root_permissions")
+            if await _has_active_default_workspace_integrity_failure(conn):
+                failed.append("active_default_workspace_integrity")
     except Exception:
+        return _response(["db_connectivity"])
+
+    if not _workspace_root_permissions_ok(workspace_root):
         failed.append("workspace_root_permissions")
 
+    if not await _keyring_ok(database, settings):
+        failed.append("keyring")
+
+    return _response(failed)
+
+
+def _response(failed: list[str]) -> dict[str, Any]:
+    for check_name in failed:
+        if check_name == "schema_revision":
+            increment_metric(
+                "multiclaw_migration_revision_failures_total",
+                labels={"backend": "unknown", "operation": "schema_revision", "status": "error", "error_class": "migration_revision"},
+            )
+            record_trace_event("migration_revision_failure", attributes={"check": check_name})
+        if check_name == "keyring":
+            increment_metric(
+                "multiclaw_keyring_failures_total",
+                labels={"backend": "unknown", "operation": "keyring", "status": "error", "error_class": "keyring_failure"},
+            )
+            record_trace_event("keyring_failure", attributes={"check": check_name})
+    return {
+        "ready": not failed,
+        "status": "ready" if not failed else "not_ready",
+        "checks_failed": failed,
+    }
+
+
+def _backend_version_ok(backend_name: str, version: str) -> bool:
+    digits = []
+    for part in version.split("."):
+        if not part or not part[0].isdigit():
+            break
+        token = "".join(ch for ch in part if ch.isdigit())
+        if not token:
+            break
+        digits.append(int(token))
+    parsed = tuple(digits[:3])
+    if backend_name == "sqlite":
+        return parsed >= _SQLITE_MIN_VERSION
+    if backend_name == "mysql":
+        return parsed >= _MYSQL_MIN_VERSION
+    return False
+
+
+async def _sqlite_schema_integrity_ok(conn) -> bool:
+    tables_result = await conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+    table_names = {str(row["name"]) for row in tables_result.mappings().all()}
+    if table_names - {"alembic_version"} != set(metadata.tables):
+        return False
+    integrity = str(await conn.scalar(text("PRAGMA integrity_check")) or "").lower()
+    if integrity != "ok":
+        return False
+    fk_rows = await conn.execute(text("PRAGMA foreign_key_check"))
+    return fk_rows.mappings().all() == []
+
+
+async def _mysql_innodb_ok(conn) -> bool:
+    result = await conn.execute(
+        text(
+            """
+            SELECT table_name, engine
+            FROM information_schema.tables
+            WHERE table_schema = DATABASE()
+            """
+        )
+    )
+    rows = result.mappings().all()
+    if not rows:
+        return False
+    return all(str(row["engine"] or "").upper() == "INNODB" for row in rows)
+
+
+async def _mysql_schema_integrity_ok(conn) -> bool:
+    tables = await conn.execute(
+        text(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = DATABASE()
+            """
+        )
+    )
+    table_names = {str(row["table_name"]) for row in tables.mappings().all()}
+    if table_names != set(metadata.tables):
+        return False
+    constraints = await conn.execute(
+        text(
+            """
+            SELECT constraint_name
+            FROM information_schema.referential_constraints
+            WHERE constraint_schema = DATABASE()
+            """
+        )
+    )
+    return len(constraints.mappings().all()) >= 1
+
+
+async def _has_active_default_workspace_integrity_failure(conn) -> bool:
+    result = await conn.scalar(
+        text(
+            """
+            SELECT COUNT(*)
+            FROM users
+            LEFT JOIN workspaces
+              ON workspaces.tenant_id = users.id
+             AND workspaces.id = users.default_workspace_id
+            WHERE users.status = 'active'
+              AND (
+                users.default_workspace_id IS NULL
+                OR workspaces.id IS NULL
+                OR workspaces.status != 'active'
+              )
+            """
+        )
+    )
+    return int(result or 0) > 0
+
+
+def _workspace_root_permissions_ok(workspace_root: object) -> bool:
+    if workspace_root is None:
+        return False
+    path = Path(workspace_root)
+    return path.exists() and os.access(path, os.R_OK | os.W_OK | os.X_OK)
+
+
+async def _keyring_ok(database, settings) -> bool:
     try:
         keyring = DeploymentKeyring.load(settings.secrets)
         async with database.connect() as conn:
             usage = await DeploymentSecretUsageRepository(conn).count_key_versions_global()
         keyring.require_versions(usage)
+        return True
     except SecretKeyringError:
-        failed.append("keyring")
+        return False
     except Exception:
-        failed.append("keyring")
-
-    if readiness is not None:
-        details["sandbox"] = redact(readiness.model_dump(mode="json"))
-        if not readiness.ready:
-            failed.append("sandbox_readiness")
-
-    return {
-        "ready": not failed,
-        "status": "ready" if not failed else "not_ready",
-        "checks_failed": failed,
-        **details,
-    }
+        return False

@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from multiclaw.api.dependencies import tenant_uow
 from multiclaw.auth.middleware import require_recent_auth
+from multiclaw.observability import increment_metric, record_trace_event
 from multiclaw.storage.uow import TenantUnitOfWork
 
 
@@ -99,5 +100,10 @@ async def get_session_messages(
 ):
     session = await uow.sessions.get(session_id)
     if session is None:
+        increment_metric(
+            "multiclaw_scope_fk_rejections_total",
+            labels={"backend": "unknown", "operation": "session_messages", "status": "error", "error_class": "scope_fk_rejection"},
+        )
+        record_trace_event("scope_fk_rejection", attributes={"operation": "session_messages"})
         raise HTTPException(status_code=404, detail="session not found")
     return await uow.sessions.get_messages(session_id, limit)

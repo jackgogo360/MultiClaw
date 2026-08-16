@@ -150,6 +150,18 @@ async def test_scoped_audit_logger_persists_only_redacted_detail(migrated_databa
     assert "[REDACTED]" in row
 
 
+@pytest.mark.asyncio
+async def test_scoped_audit_logger_requires_workflow_repository_and_context_for_production_use():
+    from multiclaw.governance.audit import ScopedAuditLogger
+
+    with pytest.raises(ValueError, match="workflow_repository"):
+        await ScopedAuditLogger().record(
+            status="error",
+            tool_name="shell",
+            detail="boom",
+        )
+
+
 def test_operational_metrics_rejects_high_cardinality_or_forbidden_labels():
     from multiclaw.observability import InvalidMetricLabelError, OperationalMetrics
 

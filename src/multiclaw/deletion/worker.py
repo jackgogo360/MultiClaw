@@ -10,6 +10,7 @@ from uuid import uuid4
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from multiclaw.config.settings import Settings
+from multiclaw.observability import increment_metric, record_trace_event
 from multiclaw.storage import Database
 from multiclaw.storage.repositories.deletions import DeletionJobRecord, next_claimable_tenant_id
 from multiclaw.storage.uow import DeletionUnitOfWork
@@ -146,6 +147,19 @@ class DeletionWorker:
             )
 
     async def _record_retryable_error(self, job: DeletionJobRecord, error: str) -> None:
+        increment_metric(
+            "multiclaw_purge_retry_total",
+            labels={
+                "backend": getattr(self._database.dialect, "name", "unknown"),
+                "operation": "purge_retry",
+                "status": "error",
+                "error_class": error.lower(),
+            },
+        )
+        record_trace_event(
+            "purge_retry",
+            attributes={"tenant_id": job.tenant_id, "error": error},
+        )
         async with DeletionUnitOfWork(self._database, job.tenant_id) as uow:
             await uow.deletions.mark_retryable_error(
                 job.tenant_id,

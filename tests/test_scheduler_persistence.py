@@ -17,10 +17,12 @@ from multiclaw.cli import alembic_config
 from multiclaw.config import DatabaseSettings, Settings
 from multiclaw.events import EventBus
 from multiclaw.events import EventRouter
-from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
+from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker, ScopedAuditLogger
 from multiclaw.governance.models import PermissionDecision
+import multiclaw.api.approvals as approvals_api
+from multiclaw.observability import current_metrics
 from multiclaw.storage import Database
-from multiclaw.storage.schema import agent_runs, approval_requests, execution_checkpoints, tool_executions
+from multiclaw.storage.schema import agent_runs, approval_requests, audit_logs, execution_checkpoints, tool_executions
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 from multiclaw.tools import CoreToolScheduler, ToolBuilder, ToolExecutionResult, ToolInvocation, ToolStatus
@@ -120,6 +122,18 @@ def _scheduler(database: Database) -> CoreToolScheduler:
     )
 
 
+def _durable_scheduler(database: Database) -> CoreToolScheduler:
+    settings = Settings(_config_file="/nonexistent")
+    return CoreToolScheduler(
+        permission_checker=PermissionChecker(guarded_tools={"guarded_mutation"}),
+        execution_guard=ExecutionGuard(timeout=1.0),
+        audit_logger=ScopedAuditLogger(),
+        event_bus=EventBus(),
+        database=database,
+        settings=settings,
+    )
+
+
 async def _count_nonterminal_executions(database: Database, context: TenantContext) -> int:
     async with database.connect() as conn:
         count = await conn.scalar(
@@ -161,6 +175,33 @@ async def _approval_and_execution_counts(database: Database, context: TenantCont
             )
         )
     return int(approval_count or 0), int(execution_count or 0)
+
+
+async def _audit_rows(database: Database, context: TenantContext) -> list[dict[str, object]]:
+    async with database.connect() as conn:
+        result = await conn.execute(
+            select(
+                audit_logs.c.approval_id,
+                audit_logs.c.execution_id,
+                audit_logs.c.event_type,
+                audit_logs.c.status,
+                audit_logs.c.tool_name,
+                audit_logs.c.detail_redacted,
+            )
+            .where(
+                audit_logs.c.tenant_id == context.tenant_id,
+                audit_logs.c.workspace_id == context.workspace_id,
+                audit_logs.c.session_id == context.session_id,
+                audit_logs.c.run_id == context.run_id,
+            )
+            .order_by(audit_logs.c.created_at.asc(), audit_logs.c.audit_id.asc())
+        )
+        return [dict(row) for row in result.mappings().all()]
+
+
+def _metric_count_for_current(name: str) -> int:
+    metrics = current_metrics()
+    return sum(value for (metric_name, _labels), value in metrics.counters.items() if metric_name == name)
 
 
 async def _latest_execution_row(database: Database, context: TenantContext) -> dict[str, object]:
@@ -601,6 +642,7 @@ async def test_approval_api_persists_not_started_plan_and_worker_executes_after_
     context = await _create_run_context(workflow_database, email_suffix="-approval-api")
     lease = await _coordinator(workflow_database).start_run_with_checkpoint(context, "runtime-approval")
     call_count = 0
+    current_metrics().clear()
 
     async def runner(params: PersistedParams) -> ToolExecutionResult:
         nonlocal call_count
@@ -629,8 +671,8 @@ async def test_approval_api_persists_not_started_plan_and_worker_executes_after_
             )
         )
     )
-    response = await server.approve(
-        server.ApprovalDecisionRequest(
+    response = await approvals_api.approve_alias(
+        approvals_api.ApprovalDecisionRequest(
             approval_id=approval_id,
             approved=True,
             version=1,
@@ -647,6 +689,7 @@ async def test_approval_api_persists_not_started_plan_and_worker_executes_after_
     assert execution_row["approval_id"] == approval_id
     assert execution_row["execution_status"] == ExecutionStatus.NOT_STARTED.value
     assert call_count == 0
+    assert _metric_count_for_current("multiclaw_approval_recovery_total") == 1
 
     runtime = _TrackingRuntime(
         runtime_instance_id="runtime-recovered",
@@ -671,6 +714,76 @@ async def test_approval_api_persists_not_started_plan_and_worker_executes_after_
     assert execution_row["execution_status"] == ExecutionStatus.SUCCEEDED.value
     assert runtime.begin_calls == 1
     assert runtime.closed_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_scoped_audit_logger_persists_approval_audit_in_audit_logs(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-audit-approval")
+    lease = await _coordinator(workflow_database).start_run_with_checkpoint(context, "runtime-audit")
+    scheduler = _durable_scheduler(workflow_database)
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    result = await scheduler.run(
+        PersistedToolBuilder(
+            name="guarded_mutation",
+            runner=runner,
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        ),
+        {"label": "danger"},
+        context=context,
+        call_id="call-audit",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+
+    rows = await _audit_rows(workflow_database, context)
+    assert result.status == ToolStatus.AWAITING_APPROVAL
+    assert len(rows) == 1
+    assert rows[0]["approval_id"] == result.data["approval_id"]
+    assert rows[0]["execution_id"] is not None
+    assert rows[0]["status"] == ToolStatus.AWAITING_APPROVAL.value
+
+
+@pytest.mark.asyncio
+async def test_audit_insert_failure_rolls_back_approval_plan_mutation(
+    workflow_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from multiclaw.storage.repositories import workflow as workflow_repo_module
+
+    context = await _create_run_context(workflow_database, email_suffix="-audit-rollback")
+    lease = await _coordinator(workflow_database).start_run_with_checkpoint(context, "runtime-audit")
+    scheduler = _durable_scheduler(workflow_database)
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    async def fail_insert(self, *args, **kwargs):
+        del self, args, kwargs
+        raise RuntimeError("audit insert failed")
+
+    monkeypatch.setattr(workflow_repo_module.WorkflowRepository, "insert_audit_log", fail_insert)
+
+    with pytest.raises(RuntimeError, match="audit insert failed"):
+        await scheduler.run(
+            PersistedToolBuilder(
+                name="guarded_mutation",
+                runner=runner,
+                recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+            ),
+            {"label": "danger"},
+            context=context,
+            call_id="call-audit",
+            run_lease_handle=RunLeaseHandle(lease),
+        )
+
+    counts = await _approval_and_execution_counts(workflow_database, context)
+    rows = await _audit_rows(workflow_database, context)
+    assert counts == (0, 0)
+    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -805,6 +918,7 @@ async def test_worker_marks_manual_uncertain_without_recalling_tool(
     workflow_database: Database,
 ):
     call_count = 0
+    current_metrics().clear()
 
     async def runner(params: PersistedParams) -> ToolExecutionResult:
         nonlocal call_count
@@ -847,6 +961,7 @@ async def test_worker_marks_manual_uncertain_without_recalling_tool(
     assert call_count == 0
     assert execution_row["execution_status"] == ExecutionStatus.UNCERTAIN.value
     assert execution_row["external_request_id"] == "request-123"
+    assert _metric_count_for_current("multiclaw_recovery_outcomes_total") >= 1
 
 
 @pytest.mark.asyncio
@@ -918,6 +1033,7 @@ async def test_worker_blocks_fail_closed_for_invalid_replay_inputs(
     mode: str,
 ):
     call_count = 0
+    current_metrics().clear()
 
     async def runner(params: PersistedParams) -> ToolExecutionResult:
         nonlocal call_count
@@ -1482,6 +1598,7 @@ async def test_recovery_policy_change_denies_external_read_fails_closed(
 
     row = await _latest_execution_row(workflow_database, context)
     assert row["execution_status"] == ExecutionStatus.BLOCKED_INCOMPATIBLE.value
+    assert _metric_count_for_current("multiclaw_recovery_outcomes_total") >= 1
     assert router.calls == []
 
 

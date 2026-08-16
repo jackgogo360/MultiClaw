@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 import json
-from uuid import uuid4
-
-from sqlalchemy import insert
 
 from multiclaw.governance.models import AuditLog
 from multiclaw.security.redaction import redact
-from multiclaw.storage.schema import audit_logs
 
 
 class InMemoryAuditLogger:
@@ -16,18 +12,24 @@ class InMemoryAuditLogger:
 
     async def record(
         self,
+        workflow_repository=None,
+        context=None,
         *,
-        tool_name: str,
+        event_type: str = "tool.event",
+        tool_name: str | None = None,
         status: str,
-        detail: str,
+        detail: str = "",
         user_id: str = "",
         tenant_id: str = "",
+        approval_id: str | None = None,
+        execution_id: str | None = None,
     ) -> AuditLog:
+        del workflow_repository, context, approval_id, execution_id
         entry = AuditLog(
-            tool_name=tool_name,
+            tool_name=tool_name or "",
             status=status,
             detail=detail,
-            event_type="tool.event",
+            event_type=event_type,
             user_id=user_id,
             tenant_id=tenant_id,
         )
@@ -50,34 +52,31 @@ class ScopedAuditLogger:
         detail="",
         user_id: str = "",
         tenant_id: str = "",
+        approval_id: str | None = None,
+        execution_id: str | None = None,
     ):
         if workflow_repository is None or context is None:
-            return AuditLog(
-                tool_name=tool_name or "",
-                status=status,
-                detail=json.dumps(redact(detail), ensure_ascii=False, sort_keys=True)
-                if not isinstance(detail, str)
-                else str(redact(detail)),
-                event_type=event_type,
-                user_id=user_id,
-                tenant_id=tenant_id or getattr(context, "tenant_id", ""),
-            )
+            raise ValueError("workflow_repository and context are required")
+
+        redacted_detail = (
+            json.dumps(redact(detail), ensure_ascii=False, sort_keys=True)
+            if not isinstance(detail, str)
+            else str(redact(detail))
+        )
 
         await workflow_repository.insert_audit_log(
             context,
             event_type=event_type,
             status=status,
             tool_name=tool_name,
-            detail_redacted=json.dumps(redact(detail), ensure_ascii=False, sort_keys=True)
-            if not isinstance(detail, str)
-            else str(redact(detail)),
+            detail_redacted=redacted_detail,
+            approval_id=approval_id,
+            execution_id=execution_id,
         )
         return AuditLog(
             tool_name=tool_name or "",
             status=status,
-            detail=json.dumps(redact(detail), ensure_ascii=False, sort_keys=True)
-            if not isinstance(detail, str)
-            else str(redact(detail)),
+            detail=redacted_detail,
             event_type=event_type,
             user_id=user_id,
             tenant_id=getattr(context, "tenant_id", tenant_id),

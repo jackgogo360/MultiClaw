@@ -1,22 +1,18 @@
 import asyncio
 import hashlib
 import inspect
-import json
 import logging
 import re
 import threading
 import tempfile
 from contextlib import asynccontextmanager
-from collections.abc import Iterable
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from time import perf_counter, time
-from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
 LOG_DIR = Path.home() / ".multiclaw" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -95,18 +91,14 @@ def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException
 
 
 from multiclaw.config import Settings
-from multiclaw.events import EventBus, EventScope, ScopedEvent
+from multiclaw.events import EventBus
 from multiclaw.governance import (
     SandboxController,
-    SandboxReadiness,
 )
-from multiclaw.session import SessionStatus
 from multiclaw.runtime import RuntimeFactory, RuntimePool
 from multiclaw.runtime.pool import RuntimeCapacityError, RuntimeUnavailableError
 from multiclaw.storage import Database
-from multiclaw.storage.repositories.memory import MemoryRepository
-from multiclaw.storage.uow import TenantUnitOfWork
-from multiclaw.tenancy import TenantContext, WorkspaceResolver
+from multiclaw.tenancy import WorkspaceResolver
 from multiclaw.tools import (
     ToolRegistry,
 )
@@ -125,41 +117,23 @@ from multiclaw.mcp.types import (
     WebSocketServerConfig,
 )
 
-from uuid import uuid4
-
 from multiclaw.auth.cleanup import AuthCleanupWorker
-from multiclaw.auth.middleware import AuthMiddleware, require_recent_auth
+from multiclaw.auth.middleware import AuthMiddleware
 from multiclaw.auth.models import build_auth_runtime
 from multiclaw.auth.router import router as auth_router
 from multiclaw.api.account import router as account_router
-from multiclaw.api.approvals import ApprovalDecisionRequest, ApprovalResponse, router as approvals_router
-from multiclaw.api.chat import (
-    build_workflow_continuation_service,
-    build_workflow_coordinator,
-    build_workflow_recovery_service,
-    encode_run_metadata,
-    encode_scoped_event,
-    encode_session_metadata,
-    iterate_message_stream,
-    router as chat_router,
-)
-from multiclaw.api.health import health_ready as readiness_response
+from multiclaw.api.approvals import router as approvals_router
+from multiclaw.api.chat import router as chat_router
 from multiclaw.api.health import router as health_router
 from multiclaw.api.secrets import router as secrets_router
 from multiclaw.api.sessions import router as sessions_router
-from multiclaw.api.dependencies import current_user, tenant_context, tenant_uow
-from multiclaw.memory import MemoryEntry
-from multiclaw.stream import DataStreamEncoder
-from multiclaw.workflow.models import (
-    InvalidTransitionError,
-    LeaseConflictError,
-    RecoveryAction,
-    RecoveryOutcome,
-    RunLeaseHandle,
-    RunStatus,
-    StaleFenceError,
-    TenantRunQuotaError,
-    VersionConflictError,
+from multiclaw.observability import (
+    OperationalMetrics,
+    TraceEventSink,
+    bind_observability,
+    increment_metric,
+    observe_database_error,
+    record_trace_event,
 )
 from multiclaw.workflow.recovery import WorkflowRecoveryWorker
 from multiclaw.deletion.service import DeletionService
@@ -566,6 +540,12 @@ async def lifespan(app: FastAPI):
         app.state.runtime_pool = runtime_pool
         app.state.workspace_resolver = runtime_factory.workspace_resolver
         app.state.settings = runtime_factory.settings
+        app.state.operational_metrics = OperationalMetrics()
+        app.state.trace_sink = TraceEventSink()
+        bind_observability(
+            metrics=app.state.operational_metrics,
+            trace_sink=app.state.trace_sink,
+        )
         app.state.secret_resolver = getattr(runtime_factory, "secret_resolver", None)
         app.state.secret_keyring = getattr(app.state.secret_resolver, "_keyring", None)
         app.state.sandbox_readiness = readiness
@@ -737,8 +717,6 @@ app.include_router(sessions_router)
 app.include_router(chat_router)
 app.include_router(secrets_router)
 
-api = APIRouter(prefix="/api")
-
 
 def _runtime_error_response(retry_after_seconds: int) -> JSONResponse:
     return JSONResponse(
@@ -753,7 +731,19 @@ async def handle_runtime_capacity_error(
     request: Request,
     exc: RuntimeCapacityError,
 ) -> JSONResponse:
-    del request
+    increment_metric(
+        "multiclaw_runtime_capacity_total",
+        labels={
+            "backend": getattr(request.app.state.database.dialect, "name", "unknown"),
+            "operation": "acquire",
+            "status": "error",
+            "error_class": "runtime_capacity",
+        },
+    )
+    record_trace_event(
+        "runtime_capacity",
+        attributes={"retry_after": exc.retry_after_seconds},
+    )
     return _runtime_error_response(exc.retry_after_seconds)
 
 
@@ -762,7 +752,15 @@ async def handle_runtime_unavailable_error(
     request: Request,
     exc: RuntimeUnavailableError,
 ) -> JSONResponse:
-    del request
+    increment_metric(
+        "multiclaw_runtime_capacity_total",
+        labels={
+            "backend": getattr(request.app.state.database.dialect, "name", "unknown"),
+            "operation": "unavailable",
+            "status": "error",
+            "error_class": "runtime_unavailable",
+        },
+    )
     return _runtime_error_response(exc.retry_after_seconds)
 
 
@@ -772,8 +770,11 @@ async def log_http_requests(request, call_next):
     request.state.request_started_at_ms = int(time() * 1000)
     try:
         response = await call_next(request)
-    except Exception:
+    except Exception as error:
         duration_ms = (perf_counter() - started) * 1000
+        database = getattr(request.app.state, "database", None)
+        backend = getattr(getattr(database, "dialect", None), "name", "unknown")
+        observe_database_error(error, backend=backend, operation=request.url.path)
         logger.exception(
             "HTTP %s %s -> 500 (%.1fms)",
             request.method,
@@ -791,615 +792,6 @@ async def log_http_requests(request, call_next):
         duration_ms,
     )
     return response
-
-
-class ChatRequest(BaseModel):
-    message: str | None = None
-    session_id: str | None = None
-    id: str | None = None
-    messages: list[dict[str, Any]] | None = None
-
-
-class SessionCreateRequest(BaseModel):
-    title: str = "New Chat"
-
-
-class SessionRenameRequest(BaseModel):
-    title: str
-
-
-@app.get("/health/ready")
-async def health_ready(request: Request):
-    return await readiness_response(request)
-
-
-@api.post("/approve")
-async def approve(
-    req: ApprovalDecisionRequest,
-    request: Request,
-    context: TenantContext = Depends(tenant_context),
-):
-    coordinator = build_workflow_coordinator(
-        request.app.state.database,
-        request.app.state.settings,
-    )
-    try:
-        record = await coordinator.decide_approval(
-            context=context,
-            approval_id=req.approval_id,
-            approved=req.approved,
-            version=req.version,
-        )
-    except InvalidTransitionError as error:
-        if str(error) == "approval expired":
-            raise HTTPException(status_code=410, detail="approval expired") from error
-        raise HTTPException(status_code=409, detail="approval already resolved") from error
-    except VersionConflictError as error:
-        message = str(error)
-        if message == "approval record not found":
-            raise HTTPException(status_code=404, detail="approval not found") from error
-        raise HTTPException(status_code=409, detail=message) from error
-    return ApprovalResponse.from_record(record)
-
-
-@api.get("/sessions")
-async def list_sessions(
-    include_archived: bool = False,
-    uow: TenantUnitOfWork = Depends(tenant_uow),
-):
-    sessions = await uow.sessions.list(include_archived=include_archived)
-    return [session.model_dump(mode="json") for session in sessions]
-
-
-@api.post("/sessions")
-async def create_session(
-    req: SessionCreateRequest,
-    uow: TenantUnitOfWork = Depends(tenant_uow),
-):
-    session = await uow.sessions.create(title=req.title)
-    return session.model_dump(mode="json")
-
-
-@api.patch("/sessions/{session_id}")
-async def rename_session(
-    session_id: str,
-    req: SessionRenameRequest,
-    uow: TenantUnitOfWork = Depends(tenant_uow),
-):
-    session = await uow.sessions.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    session = await uow.sessions.rename(session_id, req.title)
-    return session.model_dump(mode="json")
-
-
-@api.post("/sessions/{session_id}/archive")
-async def archive_session(
-    session_id: str,
-    uow: TenantUnitOfWork = Depends(tenant_uow),
-):
-    session = await uow.sessions.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    session = await uow.sessions.archive(session_id)
-    return session.model_dump(mode="json")
-
-
-@api.post("/sessions/{session_id}/restore")
-async def restore_session(
-    session_id: str,
-    uow: TenantUnitOfWork = Depends(tenant_uow),
-):
-    session = await uow.sessions.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    session = await uow.sessions.restore(session_id)
-    return session.model_dump(mode="json")
-
-
-@api.delete("/sessions/{session_id}")
-async def delete_session(
-    session_id: str,
-    _recent_user=Depends(require_recent_auth),
-    uow: TenantUnitOfWork = Depends(tenant_uow),
-):
-    del _recent_user
-    session = await uow.sessions.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    await uow.sessions.delete(session_id)
-    return {"ok": True}
-
-
-@api.get("/sessions/{session_id}/messages")
-async def get_session_messages(
-    session_id: str,
-    limit: int = 50,
-    uow: TenantUnitOfWork = Depends(tenant_uow),
-):
-    session = await uow.sessions.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    return await uow.sessions.get_messages(session_id, limit)
-
-
-@api.post("/chat")
-async def chat(
-    req: ChatRequest,
-    request: Request,
-    context: TenantContext = Depends(tenant_context),
-    uow: TenantUnitOfWork = Depends(tenant_uow, scope="function"),
-):
-    """SSE streaming — real token streaming from LLM with state events."""
-    message = _resolve_chat_message(req)
-    has_session_id = req.session_id is not None
-    has_id_alias = req.id is not None
-    requested_session_id = req.session_id if has_session_id else req.id
-
-    # Resolve or create session
-    session = None
-    if has_session_id or has_id_alias:
-        if not requested_session_id:
-            raise HTTPException(status_code=404, detail="session not found")
-        session = await uow.sessions.get(requested_session_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="session not found")
-        if session.status == SessionStatus.ARCHIVED:
-            raise HTTPException(status_code=409, detail="session is archived")
-    else:
-        session = await uow.sessions.create()
-
-    # Update session activity (title from first message)
-    session = await uow.sessions.touch_message(session.id, message)
-    assert session is not None
-    run_id = str(uuid4())
-    run_context = context.for_run(session.id, run_id)
-    runtime = await request.app.state.runtime_pool.acquire(run_context)
-    session_context = context.for_session(session.id)
-    session_memory = MemoryRepository(uow.conn, session_context, request.app.state.database.dialect)
-    recent_messages = await session_memory.recent(limit=1, entry_type="chat_message")
-    user_turn_index = (recent_messages[0].turn_index + 1) if recent_messages else 1
-    await session_memory.save(
-        MemoryEntry(
-            content=message,
-            type="chat_message",
-            role="user",
-            session_id=session.id,
-            turn_index=user_turn_index,
-        )
-    )
-    workflow = build_workflow_coordinator(
-        request.app.state.database,
-        request.app.state.settings,
-        connection=uow.conn,
-    )
-    workflow_continuation = build_workflow_continuation_service(
-        request.app.state.database,
-        request.app.state.settings,
-    )
-    workflow_recovery = build_workflow_recovery_service(
-        request.app.state.database,
-        request.app.state.settings,
-    )
-
-    async def _cleanup_prestream_failure(
-        primary: BaseException,
-        *,
-        workflow_lease,
-        recovery_outcome: RecoveryOutcome | None,
-        request: Request,
-    ) -> None:
-        target = RunStatus.FAILED_TERMINAL
-        if recovery_outcome is not None and recovery_outcome.status in {
-            RunStatus.BLOCKED_CORRUPT,
-            RunStatus.BLOCKED_INCOMPATIBLE,
-        }:
-            target = recovery_outcome.status
-
-        coordinator = build_workflow_coordinator(
-            request.app.state.database,
-            request.app.state.settings,
-        )
-        try:
-            await coordinator.finish_run_with_checkpoint(workflow_lease, target)
-            return
-        except Exception as terminal_error:
-            logger.exception("failed to persist pre-stream terminal checkpoint cleanup")
-            primary.add_note(
-                f"pre-stream terminal checkpoint cleanup failed: {type(terminal_error).__name__}: {terminal_error}"
-            )
-        try:
-            await coordinator.finish_run(workflow_lease, target)
-        except Exception as terminal_state_error:
-            logger.exception("failed to persist pre-stream terminal state cleanup")
-            primary.add_note(
-                f"pre-stream terminal state cleanup failed: {type(terminal_state_error).__name__}: {terminal_state_error}"
-            )
-
-    workflow_lease = None
-    try:
-        workflow_lease = await workflow.start_run_with_checkpoint(
-            run_context,
-            runtime.runtime_instance_id,
-        )
-        await uow.commit()
-        live_recovery = await workflow_recovery.validate_live_run(run_context)
-        if live_recovery.action is not RecoveryAction.RESUME_MODEL:
-            raise RuntimeError(
-                f"live workflow checkpoint validation failed: {live_recovery.reason or live_recovery.status}"
-            )
-    except TenantRunQuotaError as error:
-        raise HTTPException(status_code=429, detail=str(error)) from error
-    except Exception as error:
-        if workflow_lease is not None:
-            await _cleanup_prestream_failure(
-                error,
-                workflow_lease=workflow_lease,
-                recovery_outcome=locals().get("live_recovery"),
-                request=request,
-            )
-        raise
-    try:
-        run_lease = runtime.begin_run()
-    except RuntimeError as error:
-        if workflow_lease is not None:
-            await build_workflow_coordinator(
-                request.app.state.database,
-                request.app.state.settings,
-            ).finish_run_with_checkpoint(workflow_lease, RunStatus.CANCELLED)
-        if str(error) == "runtime is unavailable":
-            raise RuntimeUnavailableError(
-                request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
-            ) from error
-        raise
-
-    async def event_stream():
-        logger.info("SSE stream started, message=%r, session=%r", message[:80], session.id)
-        enc = DataStreamEncoder()
-        text_part_id: str | None = None
-        reasoning_part_id: str | None = None
-        step_open = False
-        pending_tool_results = 0
-        subscription = None
-        stream_task: asyncio.Task | None = None
-        heartbeat_task: asyncio.Task | None = None
-        assert workflow_lease is not None
-        workflow_lease_handle = RunLeaseHandle(workflow_lease)
-        terminal_persisted = False
-        fence_lost = False
-
-        async def persist_terminal(status: RunStatus) -> None:
-            nonlocal terminal_persisted
-            if terminal_persisted:
-                return
-            await workflow_lease_handle.refresh(
-                lambda lease: build_workflow_coordinator(
-                    request.app.state.database,
-                    request.app.state.settings,
-                ).finish_run_with_checkpoint(lease, status)
-            )
-            terminal_persisted = True
-
-        def close_text_part() -> list[str]:
-            nonlocal text_part_id
-            if text_part_id is None:
-                return []
-            chunks = [enc.text_end(text_part_id)]
-            text_part_id = None
-            return chunks
-
-        def close_reasoning_part() -> list[str]:
-            nonlocal reasoning_part_id
-            if reasoning_part_id is None:
-                return []
-            chunks = [enc.reasoning_end(reasoning_part_id)]
-            reasoning_part_id = None
-            return chunks
-
-        def close_open_parts() -> list[str]:
-            return [*close_reasoning_part(), *close_text_part()]
-
-        def open_step() -> list[str]:
-            nonlocal step_open
-            if step_open:
-                return []
-            step_open = True
-            return [enc.start_step()]
-
-        def close_step() -> list[str]:
-            nonlocal step_open
-            if not step_open:
-                return []
-            step_open = False
-            return [enc.finish_step()]
-
-        def drain_event_queue() -> list[str]:
-            chunks: list[str] = []
-            while not event_queue.empty():
-                evt = event_queue.get_nowait()
-                chunks.append(encode_scoped_event(evt))
-                if evt.event_type == "tool.awaiting_approval":
-                    logger.info(
-                        "yield approval_required: request_id=%s tool=%s",
-                        evt.data.get("request_id"),
-                        evt.data.get("tool"),
-                    )
-                    chunks.extend(open_step())
-                    chunks.extend(close_open_parts())
-                    tool_call_id = (
-                        evt.data.get("call_id")
-                        or evt.data.get("request_id")
-                        or ""
-                    )
-                    chunks.append(
-                        enc.tool_input_available(
-                            tool_call_id,
-                            evt.data.get("tool", ""),
-                            evt.data.get("params", {}),
-                        )
-                    )
-                    chunks.append(
-                        enc.tool_approval_request(
-                            evt.data.get("request_id", ""),
-                            tool_call_id,
-                        )
-                    )
-            return chunks
-
-        try:
-            yield enc.start()
-            yield encode_session_metadata(session.model_dump(mode="json"))
-            yield encode_run_metadata(session.id, run_id)
-            for chunk in open_step():
-                yield chunk
-
-            token_queue: asyncio.Queue[dict] = asyncio.Queue()
-            event_queue: asyncio.Queue[ScopedEvent] = asyncio.Queue()
-            heartbeat_stop = asyncio.Event()
-
-            async def collector(event: ScopedEvent):
-                await event_queue.put(event)
-
-            subscription = runtime.event_router.subscribe(
-                EventScope.from_context(run_context),
-                collector,
-            )
-
-            async def run_stream():
-                try:
-                    async for item in iterate_message_stream(
-                        runtime.agent.handle_message_stream,
-                        message,
-                        context=run_context,
-                        run_lease=await workflow_lease_handle.current(),
-                        run_lease_handle=workflow_lease_handle,
-                        workflow_recovery=workflow_recovery,
-                        workflow_continuation=workflow_continuation,
-                        persisted_user_turn_index=user_turn_index,
-                    ):
-                        await token_queue.put(item)
-                except Exception as exc:
-                    logger.exception("stream error")
-                    msg = _friendly_error(exc)
-                    await token_queue.put({"type": "error", "content": msg})
-
-            async def heartbeat_run_lease() -> None:
-                nonlocal fence_lost
-                interval_seconds = max(
-                    0.001,
-                    request.app.state.settings.workflow.heartbeat_ms / 1000,
-                )
-                while True:
-                    try:
-                        await asyncio.wait_for(heartbeat_stop.wait(), timeout=interval_seconds)
-                        return
-                    except asyncio.TimeoutError:
-                        pass
-                    if terminal_persisted:
-                        continue
-                    try:
-                        await workflow_lease_handle.refresh(
-                            lambda lease: build_workflow_coordinator(
-                                request.app.state.database,
-                                request.app.state.settings,
-                            ).heartbeat(lease)
-                        )
-                    except StaleFenceError as exc:
-                        fence_lost = True
-                        logger.exception("run lease heartbeat lost current fence")
-                        if stream_task is not None:
-                            stream_task.cancel()
-                        await token_queue.put({"type": "error", "content": _friendly_error(exc)})
-                        return
-                    except Exception as exc:
-                        logger.exception("run lease heartbeat failed")
-                        await token_queue.put({"type": "error", "content": _friendly_error(exc)})
-                        return
-
-            stream_task = asyncio.create_task(run_stream())
-            heartbeat_task = asyncio.create_task(heartbeat_run_lease())
-
-            while True:
-                token_count = 0
-                while True:
-                    try:
-                        item = token_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-
-                    token_count += 1
-                    if item["type"] == "token":
-                        for chunk in open_step():
-                            yield chunk
-                        for chunk in close_reasoning_part():
-                            yield chunk
-                        if text_part_id is None:
-                            text_part_id = uuid4().hex
-                            yield enc.text_start(text_part_id)
-                        yield enc.text_delta(text_part_id, item["content"])
-                    elif item["type"] == "done":
-                        if fence_lost:
-                            continue
-                        logger.info("stream done, tokens=%d, content_len=%d", token_count, len(item.get("content", "")))
-                        await persist_terminal(RunStatus.COMPLETED)
-                        for chunk in drain_event_queue():
-                            yield chunk
-                        for chunk in close_open_parts():
-                            yield chunk
-                        for chunk in close_step():
-                            yield chunk
-                        yield enc.finish("stop")
-                        return
-                    elif item["type"] == "error":
-                        logger.error("stream error: %s", item["content"])
-                        if not fence_lost:
-                            await persist_terminal(RunStatus.FAILED_TERMINAL)
-                        for chunk in drain_event_queue():
-                            yield chunk
-                        for chunk in close_open_parts():
-                            yield chunk
-                        for chunk in close_step():
-                            yield chunk
-                        yield enc.error(item["content"])
-                        return
-                    elif item["type"] == "tool_call":
-                        for chunk in open_step():
-                            yield chunk
-                        for chunk in close_open_parts():
-                            yield chunk
-                        pending_tool_results += 1
-                        run_lease.mark_tool_execution_started()
-                        tool_call_id = item.get("call_id") or uuid4().hex
-                        yield enc.tool_input_available(
-                            tool_call_id,
-                            item["name"],
-                            item.get("arguments", {}),
-                        )
-                    elif item["type"] == "tool_result":
-                        for chunk in close_open_parts():
-                            yield chunk
-                        tool_call_id = item.get("call_id", "")
-                        if item.get("is_error", False):
-                            yield enc.tool_output_error(tool_call_id, item.get("content", ""))
-                        else:
-                            yield enc.tool_output_available(
-                                tool_call_id,
-                                {"content": item.get("content", "")},
-                            )
-                        if pending_tool_results > 0:
-                            pending_tool_results -= 1
-                            run_lease.mark_tool_execution_finished()
-                        if pending_tool_results == 0:
-                            for chunk in close_step():
-                                yield chunk
-                    elif item["type"] == "reasoning":
-                        for chunk in open_step():
-                            yield chunk
-                        for chunk in close_text_part():
-                            yield chunk
-                        if reasoning_part_id is None:
-                            reasoning_part_id = uuid4().hex
-                            yield enc.reasoning_start(reasoning_part_id)
-                        yield enc.reasoning_delta(reasoning_part_id, item["content"])
-                    else:
-                        yield enc.data_part("data-state", {"item": item}, transient=True)
-
-                for chunk in drain_event_queue():
-                    yield chunk
-                if stream_task.done():
-                    exc = stream_task.exception()
-                    if exc:
-                        logger.exception("stream task crashed")
-                        if not fence_lost:
-                            await persist_terminal(RunStatus.FAILED_TERMINAL)
-                        for chunk in drain_event_queue():
-                            yield chunk
-                        for chunk in close_open_parts():
-                            yield chunk
-                        for chunk in close_step():
-                            yield chunk
-                        yield enc.error(str(exc))
-                    else:
-                        for chunk in drain_event_queue():
-                            yield chunk
-                        for chunk in close_open_parts():
-                            yield chunk
-                        for chunk in close_step():
-                            yield chunk
-                        yield enc.finish("stop")
-                    return
-
-                await asyncio.sleep(0.02)
-        finally:
-            if heartbeat_task is not None:
-                heartbeat_stop.set()
-                await asyncio.gather(heartbeat_task, return_exceptions=True)
-            if stream_task is not None:
-                stream_task.cancel()
-                await asyncio.gather(stream_task, return_exceptions=True)
-            if subscription is not None:
-                subscription.close()
-            if not terminal_persisted and not fence_lost:
-                try:
-                    await persist_terminal(RunStatus.CANCELLED)
-                except Exception:
-                    logger.exception("failed to persist terminal run status")
-            run_lease.close()
-            logger.info("SSE stream ended")
-
-    try:
-        return StreamingResponse(
-            event_stream(),
-            media_type="text/event-stream",
-            headers={"X-Vercel-AI-Data-Stream": "v1"},
-        )
-    except BaseException:
-        if workflow_lease is not None:
-            try:
-                await build_workflow_coordinator(
-                    request.app.state.database,
-                    request.app.state.settings,
-                ).finish_run_with_checkpoint(workflow_lease, RunStatus.CANCELLED)
-            except Exception:
-                logger.exception("failed to cancel run after streaming setup error")
-        run_lease.close()
-        raise
-
-
-def _resolve_chat_message(req: ChatRequest) -> str:
-    if req.message:
-        return req.message
-
-    message = _extract_latest_user_message(req.messages or [])
-    if message:
-        return message
-
-    raise HTTPException(status_code=422, detail="No user message found in request")
-
-
-def _extract_latest_user_message(messages: list[dict[str, Any]]) -> str | None:
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            continue
-        text = _extract_message_text(message)
-        if text:
-            return text
-    return None
-
-
-def _extract_message_text(message: dict[str, Any]) -> str:
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, Iterable) and not isinstance(content, (str, bytes, dict)):
-        parts = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "text" and isinstance(part.get("text"), str):
-                parts.append(part["text"])
-        return "".join(parts)
-    return ""
 
 
 # ---------------------------------------------------------------------------

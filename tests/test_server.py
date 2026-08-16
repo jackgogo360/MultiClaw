@@ -30,6 +30,8 @@ from multiclaw.mcp.types import (
     WebSocketServerConfig,
 )
 from multiclaw.mcp.types import ToolInfo
+import multiclaw.api.approvals as approvals_api
+import multiclaw.api.chat as chat_api
 from multiclaw.api.chat import iterate_message_stream
 from multiclaw.storage import Database
 from multiclaw.storage.schema import agent_runs, execution_checkpoints, memory_entries, tool_executions
@@ -239,6 +241,10 @@ def _decode_sse_messages(body: str) -> list[dict]:
     return payloads
 
 
+def _metric_count_for(metrics, name: str) -> int:
+    return sum(value for (metric_name, _labels), value in metrics.counters.items() if metric_name == name)
+
+
 @pytest.fixture
 def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "sqlite")
@@ -404,12 +410,14 @@ def test_chat_returns_retryable_503_when_runtime_pool_is_at_capacity(migrated_da
 
     with TestClient(server.app) as client:
         client.cookies = _make_auth_cookie(server.app, migrated_database)
+        client.app.state.operational_metrics.clear()
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", fail_acquire)
         response = client.post("/api/chat", json={"message": "hello"})
 
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "7"
     assert response.json() == {"detail": "runtime temporarily unavailable"}
+    assert _metric_count_for(server.app.state.operational_metrics, "multiclaw_runtime_capacity_total") == 1
 
 
 def test_approve_does_not_acquire_runtime_pool(migrated_database, monkeypatch):
@@ -466,6 +474,33 @@ def test_server_module_no_longer_exports_process_global_runtime_symbols():
 
     assert not hasattr(server_module, "agent")
     assert not hasattr(server_module, "shared_bus")
+
+
+def test_server_module_no_longer_exports_business_endpoint_models_or_handlers():
+    import multiclaw.server as server_module
+
+    unexpected = {
+        "api",
+        "ChatRequest",
+        "SessionCreateRequest",
+        "SessionRenameRequest",
+        "health_ready",
+        "approve",
+        "list_sessions",
+        "create_session",
+        "rename_session",
+        "archive_session",
+        "restore_session",
+        "delete_session",
+        "get_session_messages",
+        "chat",
+        "_resolve_chat_message",
+        "_extract_latest_user_message",
+        "_extract_message_text",
+    }
+
+    for name in unexpected:
+        assert not hasattr(server_module, name), name
 
 
 def test_chat_rejects_archived_session(migrated_database):
@@ -771,7 +806,7 @@ def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch,
 
 @pytest.mark.asyncio
 async def test_health_ready_reads_request_app_state_and_sanitizes_response(tmp_path):
-    import multiclaw.server as server_module
+    import multiclaw.api.health as health_module
     from fastapi import FastAPI
 
     app = FastAPI()
@@ -780,7 +815,7 @@ async def test_health_ready_reads_request_app_state_and_sanitizes_response(tmp_p
     app.state.workspace_root = tmp_path
     request = Request({"type": "http", "app": app, "method": "GET", "path": "/api/health/ready", "headers": []})
 
-    response = await server_module.health_ready(request)
+    response = await health_module.health_ready(request)
 
     assert response.status_code == 503
     body = response.body.decode()
@@ -799,6 +834,19 @@ def test_application_exposes_no_superadmin_or_break_glass_route(migrated_databas
     assert "/admin" not in route_paths
     assert "/superadmin" not in route_paths
     assert "/break-glass" not in route_paths
+
+
+def test_business_routes_are_not_duplicated_and_only_api_health_is_public_surface(migrated_database):
+    from multiclaw.server import app
+
+    route_paths = [route.path for route in app.routes if hasattr(route, "path")]
+
+    assert route_paths.count("/api/approvals/{approval_id}/decision") == 1
+    assert route_paths.count("/api/approve") == 1
+    assert route_paths.count("/api/chat") == 1
+    assert route_paths.count("/api/health/live") == 1
+    assert route_paths.count("/api/health/ready") == 1
+    assert "/health/ready" not in route_paths
 
 
 @pytest.mark.parametrize(
@@ -2559,8 +2607,8 @@ async def test_chat_establishes_run_lease_before_first_stream_iteration(migrated
             }
         )
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(
-                server.ChatRequest(message="hello"),
+            response = await chat_api.chat(
+                chat_api.ChatRequest(message="hello"),
                 request,
                 context,
                 uow,
@@ -2625,8 +2673,8 @@ async def test_chat_passes_db_run_lease_to_stream_handler(migrated_database, mon
             }
         )
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(
-                server.ChatRequest(message="hello"),
+            response = await chat_api.chat(
+                chat_api.ChatRequest(message="hello"),
                 request,
                 context,
                 uow,
@@ -2681,7 +2729,7 @@ async def test_chat_persists_structured_run_start_and_terminal_checkpoints(migra
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
         async for _ in response.body_iterator:
             pass
 
@@ -2728,7 +2776,7 @@ async def test_chat_start_run_checkpoint_failure_rolls_back_live_run_creation(mi
     with TestClient(server.app):
         with pytest.raises(RuntimeError, match="start checkpoint failed"):
             async with TenantUnitOfWork(server.app.state.database, context) as uow:
-                await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+                await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
     async with migrated_database.connect() as conn:
         run_count = await conn.scalar(select(agent_runs.c.run_id).where(agent_runs.c.tenant_id == context.tenant_id))
@@ -2782,7 +2830,7 @@ async def test_chat_success_terminal_sse_waits_for_terminal_persistence_commit(m
         monkeypatch.setattr(WorkflowCoordinator, "finish_run_with_checkpoint", delayed_finish)
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
         chunks: list[str] = []
 
@@ -2847,10 +2895,10 @@ async def test_chat_invokes_live_recovery_validation_before_stream_iteration(mig
             return runtime
 
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
-        monkeypatch.setattr(server, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
+        monkeypatch.setattr(chat_api, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
         async for _ in response.body_iterator:
             pass
 
@@ -2920,12 +2968,12 @@ async def test_chat_validation_failure_cleans_up_blocked_run_without_stream_star
             return runtime
 
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
-        monkeypatch.setattr(server, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
+        monkeypatch.setattr(chat_api, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
 
         with pytest.raises(RuntimeError, match="live workflow checkpoint validation failed"):
             async with TenantUnitOfWork(server.app.state.database, context) as uow:
-                await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+                await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
     run_context = await _latest_run_context(migrated_database, context)
     assert await _run_status(migrated_database, run_context) == expected_status.value
@@ -2988,12 +3036,12 @@ async def test_chat_validation_exception_cleans_up_failed_run_without_stream_sta
             return runtime
 
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
-        monkeypatch.setattr(server, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
+        monkeypatch.setattr(chat_api, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
 
         with pytest.raises(RuntimeError, match="validation exploded"):
             async with TenantUnitOfWork(server.app.state.database, context) as uow:
-                await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+                await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
     run_context = await _latest_run_context(migrated_database, context)
     assert await _run_status(migrated_database, run_context) == RunStatus.FAILED_TERMINAL.value
@@ -3053,12 +3101,12 @@ async def test_chat_validation_cleanup_fallback_terminal_row_recovery_is_termina
             return runtime
 
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
-        monkeypatch.setattr(server, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
+        monkeypatch.setattr(chat_api, "build_workflow_recovery_service", lambda database, settings: FakeRecoveryService())
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
 
         with pytest.raises(RuntimeError, match="validation fallback cleanup"):
             async with TenantUnitOfWork(server.app.state.database, context) as uow:
-                await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+                await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
     run_context = await _latest_run_context(migrated_database, context)
     assert await _run_status(migrated_database, run_context) == RunStatus.FAILED_TERMINAL.value
@@ -3114,6 +3162,7 @@ async def test_chat_stale_stream_aborts_after_foreign_takeover_progress_and_does
         yield {"type": "done", "content": "stale-success", "data": {}}
 
     with TestClient(server.app):
+        server.app.state.operational_metrics.clear()
         monkeypatch.setattr(server.app.state.settings.workflow, "heartbeat_ms", 20)
         monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 90)
         user_id, _ = await _seed_user(migrated_database, "stale-reacquire@example.com")
@@ -3134,7 +3183,7 @@ async def test_chat_stale_stream_aborts_after_foreign_takeover_progress_and_does
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
         chunks: list[str] = []
 
@@ -3171,6 +3220,7 @@ async def test_chat_stale_stream_aborts_after_foreign_takeover_progress_and_does
     assert '"type":"finish"' not in body
     assert '"type":"error"' in body
     assert "stale-success" not in body
+    assert _metric_count_for(server.app.state.operational_metrics, "multiclaw_stale_fence_total") == 1
     phases = [row["phase"] for row in await _checkpoint_rows(migrated_database, run_context)]
     assert phases == [
         CheckpointPhase.RUN_STARTED.value,
@@ -3226,7 +3276,7 @@ async def test_chat_stream_persists_assistant_output_and_model_checkpoint_before
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
         chunks: list[str] = []
 
@@ -3335,7 +3385,7 @@ async def test_chat_forced_summary_persists_assistant_output_and_model_checkpoin
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
         chunks: list[str] = []
 
@@ -3420,7 +3470,7 @@ async def test_chat_model_output_checkpoint_failure_rolls_back_assistant_message
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
         body = "".join([chunk async for chunk in response.body_iterator])
 
@@ -3499,7 +3549,7 @@ async def test_chat_forced_summary_checkpoint_failure_rolls_back_assistant_messa
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
         request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
         body = "".join([chunk async for chunk in response.body_iterator])
 
@@ -3561,8 +3611,8 @@ async def test_chat_heartbeats_active_run_lease_during_long_stream(migrated_data
             }
         )
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(
-                server.ChatRequest(message="hello"),
+            response = await chat_api.chat(
+                chat_api.ChatRequest(message="hello"),
                 request,
                 context,
                 uow,
@@ -3725,7 +3775,7 @@ async def test_chat_passes_run_lease_handle_with_refreshed_snapshot(migrated_dat
             context,
             workflow_settings=server.app.state.settings.workflow,
         ) as uow:
-            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
             body = [chunk async for chunk in response.body_iterator]
 
     assert '"type":"error"' not in "".join(body)
@@ -3776,7 +3826,7 @@ async def test_chat_client_cancel_stops_lease_heartbeat_updates(migrated_databas
             context,
             workflow_settings=server.app.state.settings.workflow,
         ) as uow:
-            response = await server.chat(server.ChatRequest(message="hello"), request, context, uow)
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
         async def consume() -> None:
             async for _ in response.body_iterator:
                 pass
@@ -3946,8 +3996,8 @@ async def test_chat_runtime_signal_resets_after_client_disconnect(migrated_datab
             }
         )
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(
-                server.ChatRequest(message="hello"),
+            response = await chat_api.chat(
+                chat_api.ChatRequest(message="hello"),
                 request,
                 context,
                 uow,
@@ -4008,8 +4058,8 @@ async def test_chat_runtime_signal_resets_when_client_closes_after_first_chunk(
             }
         )
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
-            response = await server.chat(
-                server.ChatRequest(message="hello"),
+            response = await chat_api.chat(
+                chat_api.ChatRequest(message="hello"),
                 request,
                 context,
                 uow,
@@ -4053,7 +4103,7 @@ def test_chat_closes_run_lease_when_streaming_response_constructor_raises(
             return runtime
 
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
-        monkeypatch.setattr(server, "StreamingResponse", BoomStreamingResponse)
+        monkeypatch.setattr(chat_api, "StreamingResponse", BoomStreamingResponse)
 
         with pytest.raises(RuntimeError, match="constructor failed"):
             client.post("/api/chat", json={"message": "hello"})

@@ -4,11 +4,14 @@ import logging
 
 import jwt
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from alembic import command
+from starlette.requests import Request
 
 from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings
+from multiclaw.observability import OperationalMetrics, TraceEventSink, bind_observability
 from multiclaw.storage import Database
 from multiclaw.storage.uow import AuthUnitOfWork
 
@@ -160,3 +163,43 @@ def test_request_logging_does_not_leak_secret_canary(tmp_path, monkeypatch, capl
     assert str(hidden_path) not in response.text
     assert all(secret_canary not in message for message in handler.messages)
     assert all(str(hidden_path) not in message for message in handler.messages)
+
+
+@pytest.mark.asyncio
+async def test_log_http_requests_records_sqlite_busy_metric():
+    import multiclaw.server as server
+
+    metrics = OperationalMetrics()
+    trace_sink = TraceEventSink()
+    bind_observability(metrics=metrics, trace_sink=trace_sink)
+    app = FastAPI()
+    app.state.database = type("Database", (), {"dialect": type("Dialect", (), {"name": "sqlite"})()})()
+    request = Request({"type": "http", "app": app, "method": "GET", "path": "/busy", "headers": []})
+
+    async def fail(_request):
+        raise RuntimeError("database is locked")
+
+    with pytest.raises(RuntimeError, match="database is locked"):
+        await server.log_http_requests(request, fail)
+
+    assert any(metric_name == "multiclaw_sqlite_busy_total" for metric_name, _labels in metrics.counters)
+
+
+@pytest.mark.asyncio
+async def test_log_http_requests_records_mysql_lock_timeout_metric():
+    import multiclaw.server as server
+
+    metrics = OperationalMetrics()
+    trace_sink = TraceEventSink()
+    bind_observability(metrics=metrics, trace_sink=trace_sink)
+    app = FastAPI()
+    app.state.database = type("Database", (), {"dialect": type("Dialect", (), {"name": "mysql"})()})()
+    request = Request({"type": "http", "app": app, "method": "GET", "path": "/lock-timeout", "headers": []})
+
+    async def fail(_request):
+        raise RuntimeError("Lock wait timeout exceeded; try restarting transaction")
+
+    with pytest.raises(RuntimeError, match="Lock wait timeout exceeded"):
+        await server.log_http_requests(request, fail)
+
+    assert any(metric_name == "multiclaw_mysql_lock_timeout_total" for metric_name, _labels in metrics.counters)

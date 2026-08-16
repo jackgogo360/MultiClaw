@@ -12,6 +12,7 @@ from sqlalchemy import delete, insert, select, update
 
 from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings, Settings
+from multiclaw.observability import current_metrics
 from multiclaw.storage import Database
 from multiclaw.storage.schema import (
     agent_runs,
@@ -446,6 +447,7 @@ async def test_worker_leaves_database_intact_when_workspace_delete_fails(
         raise OSError("disk error")
 
     monkeypatch.setattr(worker, "_remove_workspace_tree", fail_unlink_tree)
+    current_metrics().clear()
 
     claimed = await worker.purge_due_jobs(batch_size=10)
     job_row, user_row = await _job_and_user_state(deletion_database, tenant_id)
@@ -456,6 +458,7 @@ async def test_worker_leaves_database_intact_when_workspace_delete_fails(
     assert user_row["status"] == "pending_purge"
     assert job_row is not None
     assert job_row["status"] == "running"
+    assert any(metric_name == "multiclaw_purge_retry_total" for metric_name, _labels in current_metrics().counters)
 
 
 @pytest.mark.asyncio
