@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Generic, TypeVar
 
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncTransaction
@@ -32,6 +33,7 @@ class _BaseUnitOfWork(Generic[SelfType]):
         self._read_only = read_only
         self.conn: AsyncConnection | None = None
         self._tx: AsyncTransaction | None = None
+        self._after_tx_cleanup: list[tuple[str, Callable[[], Awaitable[None]]]] = []
 
     async def __aenter__(self: SelfType) -> SelfType:
         try:
@@ -87,6 +89,13 @@ class _BaseUnitOfWork(Generic[SelfType]):
             return
         await self._tx.commit()
 
+    def _register_after_tx_cleanup(
+        self,
+        phase: str,
+        callback: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._after_tx_cleanup.append((phase, callback))
+
     async def _cleanup_after_failure(
         self,
         *,
@@ -99,6 +108,7 @@ class _BaseUnitOfWork(Generic[SelfType]):
                 await self._tx.rollback()
             except BaseException as error:
                 _note_cleanup_error(primary, rollback_phase, error)
+        await self._run_after_tx_cleanup(primary)
         if close_phase is not None and self.conn is not None:
             try:
                 await self.conn.close()
@@ -106,6 +116,11 @@ class _BaseUnitOfWork(Generic[SelfType]):
                 _note_cleanup_error(primary, close_phase, error)
 
     async def _close_without_primary(self) -> None:
+        primary: BaseException | None = None
+        try:
+            await self._run_after_tx_cleanup(None)
+        except BaseException as error:
+            primary = error
         if self.conn is not None:
             if (
                 self._read_only
@@ -113,7 +128,29 @@ class _BaseUnitOfWork(Generic[SelfType]):
                 and self.conn.in_transaction()
             ):
                 await self.conn.rollback()
-            await self.conn.close()
+            try:
+                await self.conn.close()
+            except BaseException as error:
+                if primary is None:
+                    raise
+                _note_cleanup_error(primary, "close", error)
+        if primary is not None:
+            raise primary
+
+    async def _run_after_tx_cleanup(self, primary: BaseException | None) -> None:
+        callbacks = self._after_tx_cleanup
+        self._after_tx_cleanup = []
+        release_error: BaseException | None = primary
+        for phase, callback in callbacks:
+            try:
+                await callback()
+            except BaseException as error:
+                if release_error is None:
+                    release_error = error
+                else:
+                    _note_cleanup_error(release_error, phase, error)
+        if primary is None and release_error is not None:
+            raise release_error
 
 
 class AuthUnitOfWork(_BaseUnitOfWork["AuthUnitOfWork"]):
@@ -127,6 +164,7 @@ class AuthUnitOfWork(_BaseUnitOfWork["AuthUnitOfWork"]):
         assert self.conn is not None
         self.users = AuthUserRepository(self.conn, self._database.dialect)
         self.verification_codes = VerificationCodeRepository(self.conn, self._database.dialect)
+        self.verification_codes.attach_cleanup_registrar(self._register_after_tx_cleanup)
 
 
 class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):

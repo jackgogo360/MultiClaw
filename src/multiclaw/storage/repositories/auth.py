@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import cast
 from uuid import uuid4
@@ -36,6 +37,46 @@ class _ConnectionBoundRepository:
 
 
 class VerificationCodeRepository(_ConnectionBoundRepository):
+    def __init__(self, conn: AsyncConnection, dialect: Dialect) -> None:
+        super().__init__(conn, dialect)
+        self._cleanup_registrar: Callable[[str, Callable[[], Awaitable[None]]], None] | None = None
+        self._rate_limit_lock_name: str | None = None
+
+    def attach_cleanup_registrar(
+        self,
+        registrar: Callable[[str, Callable[[], Awaitable[None]]], None],
+    ) -> None:
+        self._cleanup_registrar = registrar
+
+    async def acquire_rate_limit_lock(
+        self,
+        *,
+        email: str,
+        purpose: str,
+        timeout_seconds: int = 30,
+    ) -> None:
+        if self._rate_limit_lock_name is not None:
+            return
+        lock_name = await self._dialect.acquire_verification_codes_lock(
+            self._conn,
+            purpose=purpose,
+            email=email,
+            timeout_seconds=timeout_seconds,
+        )
+        if lock_name is None:
+            return
+        self._rate_limit_lock_name = lock_name
+        if self._cleanup_registrar is None:
+            return
+
+        async def release_lock() -> None:
+            assert self._rate_limit_lock_name is not None
+            lock_name = self._rate_limit_lock_name
+            self._rate_limit_lock_name = None
+            await self._dialect.release_verification_codes_lock(self._conn, lock_name)
+
+        self._cleanup_registrar("release verification code lock", release_lock)
+
     async def count_recent_codes(self, email: str, *, purpose: str, window_ms: int) -> int:
         result = await self._conn.execute(
             select(func.count())

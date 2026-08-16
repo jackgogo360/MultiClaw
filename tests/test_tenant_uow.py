@@ -9,10 +9,11 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy import text
 
-from multiclaw.auth.models import UserRecord
+from multiclaw.auth.models import LOGIN_CODE_PURPOSE, MAX_SENDS_PER_DAY, UserRecord
 from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings
 from multiclaw.storage import Database
+from multiclaw.storage.schema import verification_codes
 from multiclaw.storage.repositories.auth import AuthUserRepository, BootstrapProbeError
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
@@ -128,6 +129,60 @@ class _FakeDatabase:
     def __init__(self, connection: _FakeConnection, tx: _FakeTransaction) -> None:
         self.engine = _FakeEngine(connection)
         self.dialect = _FakeDialect(tx)
+
+
+class _LockTrackingTransaction(_FakeTransaction):
+    def __init__(self, events: list[str], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._events = events
+
+    async def rollback(self) -> None:
+        self._events.append("rollback")
+        await super().rollback()
+
+    async def commit(self) -> None:
+        self._events.append("commit")
+        await super().commit()
+
+
+class _LockTrackingConnection(_FakeConnection):
+    def __init__(self, events: list[str], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._events = events
+
+    async def close(self) -> None:
+        self._events.append("close")
+        await super().close()
+
+
+class _LockTrackingDialect(_FakeDialect):
+    def __init__(self, tx: _FakeTransaction, events: list[str]) -> None:
+        super().__init__(tx)
+        self._events = events
+
+    async def acquire_verification_codes_lock(
+        self,
+        connection: _FakeConnection,
+        *,
+        purpose: str,
+        email: str,
+        timeout_seconds: int,
+    ) -> str:
+        self._events.append(f"acquire:{purpose}:{email}:{timeout_seconds}:{id(connection)}")
+        return "lock-token"
+
+    async def release_verification_codes_lock(
+        self,
+        connection: _FakeConnection,
+        lock_name: str,
+    ) -> None:
+        self._events.append(f"release:{lock_name}:{id(connection)}")
+
+
+class _LockTrackingDatabase(_FakeDatabase):
+    def __init__(self, connection: _FakeConnection, tx: _FakeTransaction, events: list[str]) -> None:
+        self.engine = _FakeEngine(connection)
+        self.dialect = _LockTrackingDialect(tx, events)
 
 
 class _BrokenBindUnitOfWork(AuthUnitOfWork):
@@ -268,6 +323,174 @@ async def _insert_secondary_scope(database: Database) -> tuple[str, str]:
         )
 
     return tenant_id, workspace_id
+
+
+async def _get_login_code_count(database: Database, email: str) -> int:
+    async with database.connect() as conn:
+        result = await conn.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM verification_codes
+                WHERE email = :email AND purpose = 'login'
+                """
+            ),
+            {"email": email},
+        )
+    return int(result.scalar_one())
+
+
+async def _send_code_like_flow(
+    database: Database,
+    *,
+    email: str,
+    delay_seconds: float = 0.0,
+) -> int:
+    async with AuthUnitOfWork(database) as uow:
+        await uow.verification_codes.acquire_rate_limit_lock(
+            email=email,
+            purpose=LOGIN_CODE_PURPOSE,
+        )
+        recent = await uow.verification_codes.count_recent_codes(
+            email,
+            purpose=LOGIN_CODE_PURPOSE,
+            window_ms=24 * 60 * 60 * 1000,
+        )
+        if recent >= MAX_SENDS_PER_DAY:
+            return 429
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+        await uow.verification_codes.issue_code(
+            email=email,
+            purpose=LOGIN_CODE_PURPOSE,
+            code_digest=f"digest-{uuid4().hex}",
+            ttl_seconds=900,
+        )
+        return 200
+
+
+@pytest.mark.asyncio
+async def test_send_code_lock_releases_after_commit_before_close() -> None:
+    events: list[str] = []
+    tx = _LockTrackingTransaction(events)
+    conn = _LockTrackingConnection(events)
+    database = _LockTrackingDatabase(conn, tx, events)
+
+    async with AuthUnitOfWork(database) as uow:  # type: ignore[arg-type]
+        await uow.verification_codes.acquire_rate_limit_lock(
+            email="user@example.com",
+            purpose=LOGIN_CODE_PURPOSE,
+        )
+        events.append("body")
+
+    assert events[0].startswith("acquire:login:user@example.com")
+    assert events[1] == "body"
+    assert events[2] == "commit"
+    assert events[3].startswith("release:lock-token")
+    assert events[4] == "close"
+
+
+@pytest.mark.asyncio
+async def test_send_code_lock_releases_after_rollback_before_close() -> None:
+    events: list[str] = []
+    tx = _LockTrackingTransaction(events)
+    conn = _LockTrackingConnection(events)
+    database = _LockTrackingDatabase(conn, tx, events)
+    uow = AuthUnitOfWork(database)  # type: ignore[arg-type]
+    await uow.__aenter__()
+    await uow.verification_codes.acquire_rate_limit_lock(
+        email="user@example.com",
+        purpose=LOGIN_CODE_PURPOSE,
+    )
+    body_error = RuntimeError("provider failed")
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await uow.__aexit__(RuntimeError, body_error, None)
+
+    assert events[0].startswith("acquire:login:user@example.com")
+    assert events[1] == "rollback"
+    assert events[2].startswith("release:lock-token")
+    assert events[3] == "close"
+
+
+@pytest.mark.asyncio
+async def test_send_code_lock_releases_on_cancelled_error_before_close() -> None:
+    events: list[str] = []
+    tx = _LockTrackingTransaction(events)
+    conn = _LockTrackingConnection(events)
+    database = _LockTrackingDatabase(conn, tx, events)
+    uow = AuthUnitOfWork(database)  # type: ignore[arg-type]
+    await uow.__aenter__()
+    await uow.verification_codes.acquire_rate_limit_lock(
+        email="user@example.com",
+        purpose=LOGIN_CODE_PURPOSE,
+    )
+    cancelled = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await uow.__aexit__(asyncio.CancelledError, cancelled, None)
+
+    assert events[0].startswith("acquire:login:user@example.com")
+    assert events[1] == "rollback"
+    assert events[2].startswith("release:lock-token")
+    assert events[3] == "close"
+
+
+@pytest.mark.asyncio
+async def test_send_code_lock_releases_after_commit_failure_before_close() -> None:
+    events: list[str] = []
+    tx = _LockTrackingTransaction(events, commit_error=RuntimeError("commit failed"))
+    conn = _LockTrackingConnection(events)
+    database = _LockTrackingDatabase(conn, tx, events)
+    uow = AuthUnitOfWork(database)  # type: ignore[arg-type]
+    await uow.__aenter__()
+    await uow.verification_codes.acquire_rate_limit_lock(
+        email="user@example.com",
+        purpose=LOGIN_CODE_PURPOSE,
+    )
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await uow.__aexit__(None, None, None)
+
+    assert events[0].startswith("acquire:login:user@example.com")
+    assert events[1] == "commit"
+    assert events[2].startswith("release:lock-token")
+    assert events[3] == "close"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver", ["sqlite", "mysql"])
+async def test_concurrent_send_code_flow_never_exceeds_max_sends_per_day(
+    driver: str,
+    tmp_path: Path,
+    isolated_mysql_database_url: str,
+) -> None:
+    if driver == "sqlite":
+        database = await _create_database(
+            driver="sqlite",
+            database_url=_sqlite_url(tmp_path, "send-code-rate-limit.db"),
+        )
+    else:
+        database = await _create_database(driver="mysql", database_url=isolated_mysql_database_url)
+
+    try:
+        email = f"rate-limit-{uuid4()}@example.com"
+        results = await asyncio.gather(
+            *[
+                _send_code_like_flow(
+                    database,
+                    email=email,
+                    delay_seconds=0.05,
+                )
+                for _ in range(MAX_SENDS_PER_DAY + 2)
+            ]
+        )
+
+        assert results.count(200) == MAX_SENDS_PER_DAY
+        assert results.count(429) == 2
+        assert await _get_login_code_count(database, email) == MAX_SENDS_PER_DAY
+    finally:
+        await database.dispose()
 
 
 @pytest.mark.asyncio
