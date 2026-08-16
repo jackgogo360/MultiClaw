@@ -15,7 +15,7 @@ from multiclaw.config.settings import DatabaseSettings
 from multiclaw.storage import Database
 from multiclaw.storage.schema import verification_codes
 from multiclaw.storage.repositories.auth import AuthUserRepository, BootstrapProbeError
-from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
+from multiclaw.storage.uow import AuthUnitOfWork, DeletionUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
 
 
@@ -521,6 +521,48 @@ async def test_tenant_uow_uses_one_connection_and_active_transaction(migrated_sq
             assert not hasattr(repo, "rollback")
             assert not hasattr(repo, "engine")
             assert not hasattr(repo, "rebind")
+
+
+@pytest.mark.asyncio
+async def test_deletion_uow_uses_one_connection_and_rolls_back_across_repositories(
+    migrated_sqlite_database: Database,
+) -> None:
+    context = await _insert_seed_scope(migrated_sqlite_database)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        async with DeletionUnitOfWork(migrated_sqlite_database, context.tenant_id) as uow:
+            assert uow.conn is not None
+            assert uow.conn.in_transaction() is True
+            assert uow.users.connection is uow.conn
+            assert uow.deletions.connection is uow.conn
+            assert uow.workflow.connection is uow.conn
+
+            user = await uow.users.get_current(for_update=True)
+            assert user is not None
+            now_ms = await uow.deletions.db_now_ms()
+            job = await uow.deletions.create_scheduled(
+                requested_at=now_ms,
+                purge_after=now_ms + 60_000,
+            )
+            assert job.tenant_id == context.tenant_id
+            updated = await uow.users.mark_pending_purge(
+                expected_epoch=user.auth_epoch,
+                requested_at=job.requested_at,
+                purge_after=job.purge_after,
+            )
+            assert updated is True
+            raise RuntimeError("boom")
+
+    async with DeletionUnitOfWork(migrated_sqlite_database, context.tenant_id, read_only=True) as verify:
+        user = await verify.users.get_current()
+        job = await verify.deletions.get_current()
+
+    assert user is not None
+    assert user.status == "active"
+    assert user.auth_epoch == 0
+    assert user.purge_requested_at is None
+    assert user.purge_after is None
+    assert job is None
 
 
 @pytest.mark.asyncio
