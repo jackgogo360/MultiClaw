@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections import Counter
 from dataclasses import dataclass
+import json
 import os
 import sys
 from pathlib import Path
@@ -14,15 +16,18 @@ from alembic import command
 from sqlalchemy import func, select
 
 from multiclaw.cli import alembic_config
-from multiclaw.config.settings import DatabaseSettings, Settings
+from multiclaw.config.settings import DatabaseSettings, SecretSettings, Settings
 from multiclaw.events import EventRouter, EventScope, ScopedEvent
 from multiclaw.memory import MemoryEntry
 from multiclaw.secrets.envelope import (
+    EnvelopeFields,
     SECRET_ENVELOPE_ALGORITHM,
     SECRET_ENVELOPE_FORMAT_VERSION,
     EncryptedSecretRecord,
+    SecretEnvelopeService,
 )
-from multiclaw.secrets.keyring import KEYRING_PROVIDER_NAME
+from multiclaw.secrets.keyring import DeploymentKeyring, KEYRING_PROVIDER_NAME
+from multiclaw.secrets.resolver import SecretResolver, UserSecretInvalidError
 from multiclaw.storage import Database
 from multiclaw.storage.schema import chat_sessions
 from multiclaw.session import ChatSession, SessionStatus
@@ -69,6 +74,19 @@ class TenantScopes:
 
 def _sqlite_url(tmp_path: Path) -> str:
     return f"sqlite+aiosqlite:///{tmp_path / 'tenant-e2e.db'}"
+
+
+def _keyring_payload() -> str:
+    return base64.b64encode(
+        json.dumps(
+            {
+                "active_key_version": 3,
+                "keys": {
+                    "3": base64.b64encode(bytes(range(32))).decode("ascii"),
+                },
+            }
+        ).encode("utf-8")
+    ).decode("ascii")
 
 
 async def _upgrade_database(url: str) -> Database:
@@ -484,7 +502,72 @@ async def _collect_secret_metrics(
             int(any(entry.secret_id == beta_metadata.secret_id for entry in visible_metadata)),
         )
     )
-    return {"cross_tenant_secret_reads": cross_tenant_secret_reads}
+
+    invalid_secret_name = "alpha_invalid_api_key"
+    keyring = DeploymentKeyring.load(
+        SecretSettings(),
+        environ={"MULTICLAW_SECRETS_KEYRING_B64": _keyring_payload()},
+    )
+    envelope = SecretEnvelopeService(keyring, nonce_source=lambda _length: bytes(range(12)))
+    invalid_secret_id = str(uuid4())
+    invalid_record = envelope.encrypt(
+        b"alpha-invalid-secret",
+        EnvelopeFields(
+            tenant_id=alpha_base_context.tenant_id,
+            workspace_id=None,
+            secret_id=invalid_secret_id,
+            provider_kind="llm",
+            provider_name="openai",
+            secret_name=invalid_secret_name,
+        ),
+    )
+
+    async with TenantUnitOfWork(database, alpha_base_context) as uow:
+        await uow.secrets.put_encrypted(
+            secret_id=invalid_secret_id,
+            provider_kind="llm",
+            provider_name="openai",
+            secret_name=invalid_secret_name,
+            record=invalid_record,
+        )
+        invalid_secret = await uow.secrets.get_encrypted("llm", "openai", invalid_secret_name)
+        assert invalid_secret is not None
+        await uow.secrets.put_encrypted(
+            secret_id=invalid_secret.secret_id,
+            provider_kind="llm",
+            provider_name="openai",
+            secret_name=invalid_secret_name,
+            record=invalid_secret.record.replace(
+                ciphertext=invalid_secret.record.ciphertext[:-1] + b"\x00"
+            ),
+        )
+
+    platform_lookup_calls: list[tuple[str, str, str]] = []
+    resolver = SecretResolver(
+        database=database,
+        settings=SecretSettings(allow_platform_fallback=True),
+        keyring=keyring,
+        envelope=SecretEnvelopeService(keyring),
+        platform_lookup=lambda provider_kind, provider_name, secret_name: (
+            platform_lookup_calls.append((provider_kind, provider_name, secret_name))
+            or "platform-secret"
+        ),
+    )
+
+    unexpected_platform_resolutions = 0
+    try:
+        resolved = await resolver.resolve(alpha_base_context, "llm", "openai", invalid_secret_name)
+    except UserSecretInvalidError:
+        resolved = None
+    else:
+        unexpected_platform_resolutions += int(resolved.source == "platform")
+        resolved.close()
+
+    assert resolved is None
+    return {
+        "cross_tenant_secret_reads": cross_tenant_secret_reads,
+        "platform_fallback_calls": len(platform_lookup_calls) + unexpected_platform_resolutions,
+    }
 
 
 async def _collect_tenant_isolation_metrics(database: Database) -> dict[str, int]:
@@ -498,6 +581,7 @@ async def _collect_tenant_isolation_metrics(database: Database) -> dict[str, int
         "cross_tenant_writes": session_metrics["cross_tenant_writes"],
         "cross_tenant_approval_decisions": approval_metrics["cross_tenant_approval_decisions"],
         "cross_tenant_secret_reads": secret_metrics["cross_tenant_secret_reads"],
+        "platform_fallback_calls": secret_metrics["platform_fallback_calls"],
         "foreign_sse_events": event_metrics["foreign_sse_events"],
         "unexpected_session_creations": session_metrics["unexpected_session_creations"],
     }
@@ -527,5 +611,6 @@ async def test_real_tenant_aggregate_isolation_gate(tenant_isolation_database: D
     assert metrics["cross_tenant_writes"] == 0
     assert metrics["cross_tenant_approval_decisions"] == 0
     assert metrics["cross_tenant_secret_reads"] == 0
+    assert metrics["platform_fallback_calls"] == 0
     assert metrics["foreign_sse_events"] == 0
     assert metrics["unexpected_session_creations"] == 0
