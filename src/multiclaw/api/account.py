@@ -49,8 +49,6 @@ def _service(request: Request) -> DeletionService:
 async def require_recent_deletion_auth(request: Request):
     user = getattr(request.state, "authenticated_user", None)
     if user is None:
-        user = getattr(request.state, "pending_auth_user", None)
-    if user is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     token_iat = getattr(request.state, "authenticated_iat", None)
