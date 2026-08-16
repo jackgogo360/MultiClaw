@@ -532,6 +532,8 @@ async def lifespan(app: FastAPI):
         app.state.workspace_root = runtime_factory.workspace_resolver.root
         app.state.sandbox_startup_events = startup_events
         if hasattr(runtime_factory.database, "dialect") and hasattr(runtime_factory.database, "connect"):
+            async with runtime_factory.database.connect():
+                pass
             recovery_stop = asyncio.Event()
 
             async def recovery_loop() -> None:
