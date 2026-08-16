@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -9,12 +10,17 @@ import jwt
 import pytest
 from alembic import command
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import insert, text
 
 from multiclaw.cli import alembic_config
+from multiclaw.auth.models import issue_verification_code
 from multiclaw.config.settings import DatabaseSettings
 from multiclaw.storage import Database
+from multiclaw.storage.schema import verification_codes
 from multiclaw.storage.uow import AuthUnitOfWork
+
+
+TEST_JWT_SIGNING_KEY = "test-jwt-signing-key-material-1234567890"
 
 
 def _sqlite_url(tmp_path: Path) -> str:
@@ -50,6 +56,7 @@ def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__URL", _sqlite_url(tmp_path))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", TEST_JWT_SIGNING_KEY)
     database = asyncio.run(_create_database(tmp_path))
     try:
         yield database
@@ -66,21 +73,42 @@ def client(migrated_database: Database):
         yield test_client
 
 
+@pytest.fixture(autouse=True)
+def _csrf_test_defaults(monkeypatch: pytest.MonkeyPatch):
+    original_request = TestClient.request
+
+    def request_with_csrf(self, method, url, *args, **kwargs):
+        if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            headers = dict(kwargs.pop("headers", {}) or {})
+            headers.setdefault("Origin", "http://testserver")
+            headers.setdefault("X-CSRF-Token", "test-csrf-token")
+            kwargs["headers"] = headers
+            self.cookies.set("csrf_token", "test-csrf-token")
+        return original_request(self, method, url, *args, **kwargs)
+
+    monkeypatch.setattr(TestClient, "request", request_with_csrf)
+
+
 def _make_cookie(
-    secret: str,
+    signing_key: str,
     *,
     user_id: str,
     email: str,
     auth_epoch: int | None,
+    audience: str = "multiclaw-api",
+    issued_at: int | None = None,
 ) -> dict[str, str]:
+    now = issued_at or int(datetime.now(timezone.utc).timestamp())
     claims = {
         "sub": user_id,
         "email": email,
-        "exp": datetime.now(timezone.utc) + timedelta(days=1),
+        "aud": audience,
+        "iat": now,
+        "exp": now + int(timedelta(days=1).total_seconds()),
     }
     if auth_epoch is not None:
         claims["auth_epoch"] = auth_epoch
-    return {"token": jwt.encode(claims, secret, algorithm="HS256")}
+    return {"token": jwt.encode(claims, signing_key, algorithm="HS256")}
 
 
 def _force_default_workspace_id(database: Database, user_id: str, workspace_id: str) -> None:
@@ -204,17 +232,44 @@ async def _get_verification_rows(database: Database, email: str) -> list[dict[st
     return [dict(row) for row in rows]
 
 
+async def _seed_verification_row(
+    database: Database,
+    *,
+    email: str,
+    code_digest: str,
+    purpose: str,
+    expires_at: int,
+    created_at: int,
+) -> None:
+    async with database.write_transaction() as conn:
+        await conn.execute(
+            insert(verification_codes).values(
+                id=str(uuid4()),
+                email=email,
+                code_digest=code_digest,
+                purpose=purpose,
+                expires_at=expires_at,
+                used_at=None,
+                created_at=created_at,
+            )
+        )
+
+
 @pytest.fixture
 def user_a_cookie(client: TestClient, migrated_database: Database) -> SeededIdentity:
-    secret = client.app.state.auth_store.jwt_secret
-    return asyncio.run(_seed_identity(migrated_database, secret, email="user-a@example.com"))
+    return asyncio.run(
+        _seed_identity(migrated_database, TEST_JWT_SIGNING_KEY, email="user-a@example.com")
+    )
 
 
 @pytest.fixture
 def two_users(client: TestClient, migrated_database: Database) -> TwoUsers:
-    secret = client.app.state.auth_store.jwt_secret
-    user_a = asyncio.run(_seed_identity(migrated_database, secret, email="user-a@example.com"))
-    user_b = asyncio.run(_seed_identity(migrated_database, secret, email="user-b@example.com"))
+    user_a = asyncio.run(
+        _seed_identity(migrated_database, TEST_JWT_SIGNING_KEY, email="user-a@example.com")
+    )
+    user_b = asyncio.run(
+        _seed_identity(migrated_database, TEST_JWT_SIGNING_KEY, email="user-b@example.com")
+    )
     created = client.post("/api/sessions", cookies=user_b.cookie, json={"title": "Owned by B"})
     assert created.status_code == 200
     return TwoUsers(a=user_a, b=user_b, session_id=created.json()["id"])
@@ -251,6 +306,7 @@ def test_real_login_cookie_uses_current_db_auth_epoch_and_authenticates_protecte
     email = "verify-flow@example.com"
     client.app.state.settings.email.provider = "resend"
     client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "654321"
 
     send_response = client.post(
         "/auth/send-code",
@@ -271,13 +327,136 @@ def test_real_login_cookie_uses_current_db_auth_epoch_and_authenticates_protecte
     persisted_user = asyncio.run(_get_user_row(migrated_database, email))
     token = client.cookies.get("token")
     assert token is not None
-    payload = jwt.decode(token, client.app.state.auth_store.jwt_secret, algorithms=["HS256"])
+    payload = jwt.decode(
+        token,
+        TEST_JWT_SIGNING_KEY,
+        algorithms=["HS256"],
+        audience="multiclaw-api",
+    )
 
     assert payload["sub"] == persisted_user["id"]
+    assert payload["email"] == email
+    assert payload["aud"] == "multiclaw-api"
     assert payload["auth_epoch"] == persisted_user["auth_epoch"]
     assert "iat" in payload
     assert "exp" in payload
     assert me_response.json() == {"email": email, "user_id": persisted_user["id"]}
+
+
+def test_send_code_persists_domain_separated_digest_without_plaintext_leak(
+    client: TestClient,
+    migrated_database: Database,
+    caplog: pytest.LogCaptureFixture,
+):
+    email = "digest-check@example.com"
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "654321"
+
+    caplog.set_level("INFO", logger="multiclaw")
+    response = client.post("/auth/send-code", json={"email": email})
+    rows = asyncio.run(_get_verification_rows(migrated_database, email))
+
+    digest_key = hmac.digest(
+        TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        b"multiclaw.verification-code-key.v1",
+        "sha256",
+    )
+    expected_digest = hmac.new(
+        digest_key,
+        b"\0".join((b"login", email.encode("utf-8"), b"654321")),
+        "sha256",
+    ).hexdigest()
+
+    assert response.status_code == 200
+    assert rows == [
+        {
+            "id": rows[0]["id"],
+            "email": email,
+            "code_digest": expected_digest,
+            "purpose": "login",
+            "expires_at": rows[0]["expires_at"],
+            "used_at": None,
+            "created_at": rows[0]["created_at"],
+        }
+    ]
+    assert rows[0]["code_digest"] != "654321"
+    assert "654321" not in caplog.text
+    assert "654321" not in response.text
+
+
+def test_deletion_recovery_audience_is_rejected_by_normal_api(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="recovery-audience@example.com",
+        )
+    )
+    recovery_cookie = _make_cookie(
+        TEST_JWT_SIGNING_KEY,
+        user_id=identity.tenant_id,
+        email=identity.email,
+        auth_epoch=identity.auth_epoch,
+        audience="multiclaw-deletion-recovery",
+    )
+
+    response = client.get("/api/sessions", cookies=recovery_cookie)
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
+
+
+@pytest.mark.asyncio
+async def test_verification_codes_ignore_wrong_purpose_and_are_consumed_once_atomically(
+    migrated_database: Database,
+) -> None:
+    async with AuthUnitOfWork(migrated_database) as uow:
+        await uow.conn.execute(
+            insert(verification_codes).values(
+                id=str(uuid4()),
+                email="atomic@example.com",
+                code_digest="digest-a",
+                purpose="deletion_recovery",
+                expires_at=uow._database.dialect.db_now_ms() + 60_000,
+                used_at=None,
+                created_at=uow._database.dialect.db_now_ms(),
+            )
+        )
+        await uow.conn.execute(
+            insert(verification_codes).values(
+                id=str(uuid4()),
+                email="atomic@example.com",
+                code_digest="digest-b",
+                purpose="login",
+                expires_at=uow._database.dialect.db_now_ms() + 60_000,
+                used_at=None,
+                created_at=uow._database.dialect.db_now_ms() + 1,
+            )
+        )
+
+    async with AuthUnitOfWork(migrated_database) as uow:
+        assert await uow.verification_codes.consume_latest_code(
+            email="atomic@example.com",
+            purpose="login",
+            code_digest="digest-a",
+        ) is None
+        first = await uow.verification_codes.consume_latest_code(
+            email="atomic@example.com",
+            purpose="login",
+            code_digest="digest-b",
+        )
+        second = await uow.verification_codes.consume_latest_code(
+            email="atomic@example.com",
+            purpose="login",
+            code_digest="digest-b",
+        )
+
+    assert first is not None
+    assert second is None
 
 
 def test_only_latest_unused_login_code_is_valid_in_frozen_layout(
@@ -285,16 +464,36 @@ def test_only_latest_unused_login_code_is_valid_in_frozen_layout(
     migrated_database: Database,
 ):
     email = "stale-code@example.com"
-    store = client.app.state.auth_store
-    old_code = store.build_code(email, code="111111")
-    new_code = store.build_code(email, code="222222").model_copy(
-        update={
-            "created_at": old_code.created_at + timedelta(milliseconds=1),
-            "expires_at": old_code.expires_at + timedelta(milliseconds=1),
-        }
+    old_digest = issue_verification_code(
+        TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        email=email,
+        forced_code="111111",
+    ).code_digest
+    new_digest = issue_verification_code(
+        TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        email=email,
+        forced_code="222222",
+    ).code_digest
+    asyncio.run(
+        _seed_verification_row(
+            migrated_database,
+            email=email,
+            code_digest=old_digest,
+            purpose="login",
+            expires_at=1_900_000_000_000,
+            created_at=1_800_000_000_000,
+        )
     )
-    asyncio.run(store.save_code(old_code))
-    asyncio.run(store.save_code(new_code))
+    asyncio.run(
+        _seed_verification_row(
+            migrated_database,
+            email=email,
+            code_digest=new_digest,
+            purpose="login",
+            expires_at=1_900_000_000_001,
+            created_at=1_800_000_000_001,
+        )
+    )
 
     old_response = client.post("/auth/verify", json={"email": email, "code": "111111"})
     rows_after_old = asyncio.run(_get_verification_rows(migrated_database, email))
@@ -364,20 +563,24 @@ def test_explicit_empty_session_id_takes_precedence_over_valid_id_and_does_not_c
 
 
 @pytest.mark.parametrize("status", ["disabled", "pending_purge"])
-def test_unavailable_user_status_returns_403(
+def test_unavailable_user_status_returns_401(
     client: TestClient,
     migrated_database: Database,
     status: str,
 ):
-    secret = client.app.state.auth_store.jwt_secret
     identity = asyncio.run(
-        _seed_identity(migrated_database, secret, email=f"{status}@example.com", status=status)
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email=f"{status}@example.com",
+            status=status,
+        )
     )
 
     response = client.get("/api/sessions", cookies=identity.cookie)
 
-    assert response.status_code == 403
-    assert response.json() == {"detail": "Account unavailable"}
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
 
 
 @pytest.mark.parametrize("workspace_mode", ["null", "missing"])
@@ -386,11 +589,10 @@ def test_invalid_default_workspace_returns_403(
     migrated_database: Database,
     workspace_mode: str,
 ):
-    secret = client.app.state.auth_store.jwt_secret
     identity = asyncio.run(
         _seed_identity(
             migrated_database,
-            secret,
+            TEST_JWT_SIGNING_KEY,
             email=f"{workspace_mode}@example.com",
             workspace_mode=workspace_mode,
         )
@@ -403,12 +605,13 @@ def test_invalid_default_workspace_returns_403(
 
 
 def test_foreign_default_workspace_returns_403(client: TestClient, migrated_database: Database):
-    secret = client.app.state.auth_store.jwt_secret
-    owner = asyncio.run(_seed_identity(migrated_database, secret, email="owner@example.com"))
+    owner = asyncio.run(
+        _seed_identity(migrated_database, TEST_JWT_SIGNING_KEY, email="owner@example.com")
+    )
     identity = asyncio.run(
         _seed_identity(
             migrated_database,
-            secret,
+            TEST_JWT_SIGNING_KEY,
             email="foreign-workspace@example.com",
             workspace_mode=f"foreign:{owner.workspace_id}",
         )
@@ -445,8 +648,10 @@ def test_malformed_signed_claims_are_401(
         {
             **claims,
             "exp": datetime.now(timezone.utc) + timedelta(days=1),
+            "aud": "multiclaw-api",
+            "iat": int(datetime.now(timezone.utc).timestamp()),
         },
-        client.app.state.auth_store.jwt_secret,
+        TEST_JWT_SIGNING_KEY,
         algorithm="HS256",
     )
 
@@ -473,11 +678,10 @@ def test_auth_me_does_not_acquire_write_lock_for_authenticated_lookup(
 
 
 def test_missing_auth_epoch_is_401_before_scope_resolution(client: TestClient, migrated_database: Database):
-    secret = client.app.state.auth_store.jwt_secret
     identity = asyncio.run(
         _seed_identity(
             migrated_database,
-            secret,
+            TEST_JWT_SIGNING_KEY,
             email="missing-epoch@example.com",
             workspace_mode="null",
             token_auth_epoch=None,
@@ -491,12 +695,13 @@ def test_missing_auth_epoch_is_401_before_scope_resolution(client: TestClient, m
 
 
 def test_auth_epoch_mismatch_is_401_before_scope_resolution(client: TestClient, migrated_database: Database):
-    secret = client.app.state.auth_store.jwt_secret
-    owner = asyncio.run(_seed_identity(migrated_database, secret, email="epoch-owner@example.com"))
+    owner = asyncio.run(
+        _seed_identity(migrated_database, TEST_JWT_SIGNING_KEY, email="epoch-owner@example.com")
+    )
     identity = asyncio.run(
         _seed_identity(
             migrated_database,
-            secret,
+            TEST_JWT_SIGNING_KEY,
             email="epoch-mismatch@example.com",
             auth_epoch=7,
             workspace_mode=f"foreign:{owner.workspace_id}",

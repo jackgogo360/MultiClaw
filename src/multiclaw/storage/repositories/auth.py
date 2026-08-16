@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 from uuid import uuid4
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from multiclaw.auth.models import UserRecord, WorkspaceRecord
+from multiclaw.auth.models import UserRecord, VerificationCodeRecord, WorkspaceRecord, digests_match
 from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
 from multiclaw.storage.schema import users, verification_codes, workspaces
 from multiclaw.tenancy.context import TenantContext
@@ -35,7 +36,98 @@ class _ConnectionBoundRepository:
 
 
 class VerificationCodeRepository(_ConnectionBoundRepository):
-    pass
+    async def count_recent_codes(self, email: str, *, purpose: str, window_ms: int) -> int:
+        result = await self._conn.execute(
+            select(func.count())
+            .select_from(verification_codes)
+            .where(
+                verification_codes.c.email == email,
+                verification_codes.c.purpose == purpose,
+                verification_codes.c.created_at > self._dialect.db_now_ms() - window_ms,
+            )
+        )
+        return int(result.scalar_one())
+
+    async def issue_code(
+        self,
+        *,
+        email: str,
+        purpose: str,
+        code_digest: str,
+        ttl_seconds: int,
+    ) -> str:
+        code_id = str(uuid4())
+        now_ms = self._dialect.db_now_ms()
+        await self._conn.execute(
+            insert(verification_codes).values(
+                id=code_id,
+                email=email,
+                code_digest=code_digest,
+                purpose=purpose,
+                expires_at=now_ms + ttl_seconds * 1000,
+                used_at=None,
+                created_at=now_ms,
+            )
+        )
+        return code_id
+
+    async def consume_latest_code(
+        self,
+        *,
+        email: str,
+        purpose: str,
+        code_digest: str,
+    ) -> VerificationCodeRecord | None:
+        result = await self._conn.execute(
+            select(
+                verification_codes.c.id,
+                verification_codes.c.email,
+                verification_codes.c.code_digest,
+                verification_codes.c.purpose,
+                verification_codes.c.expires_at,
+                verification_codes.c.used_at,
+                verification_codes.c.created_at,
+            )
+            .where(
+                verification_codes.c.email == email,
+                verification_codes.c.purpose == purpose,
+                verification_codes.c.used_at.is_(None),
+                verification_codes.c.expires_at > self._dialect.db_now_ms(),
+            )
+            .order_by(verification_codes.c.created_at.desc(), verification_codes.c.id.desc())
+            .limit(1)
+        )
+        row = result.mappings().first()
+        if row is None:
+            return None
+        record = VerificationCodeRecord.from_row(row)
+        if not digests_match(record.code_digest, code_digest):
+            return None
+
+        updated = await self._conn.execute(
+            update(verification_codes)
+            .where(
+                verification_codes.c.id == record.id,
+                verification_codes.c.used_at.is_(None),
+                verification_codes.c.expires_at > self._dialect.db_now_ms(),
+            )
+            .values(used_at=self._dialect.db_now_ms())
+        )
+        if cast(int | None, updated.rowcount) != 1:
+            return None
+        return record
+
+    async def db_now_ms(self) -> int:
+        result = await self._conn.execute(select(self._dialect.db_now_ms()))
+        return int(result.scalar_one())
+
+    async def delete_expired_codes(self) -> int:
+        result = await self._conn.execute(
+            delete(verification_codes).where(
+                verification_codes.c.expires_at <= self._dialect.db_now_ms()
+            )
+        )
+        return int(result.rowcount or 0)
 
 
 class AuthUserRepository(_ConnectionBoundRepository):

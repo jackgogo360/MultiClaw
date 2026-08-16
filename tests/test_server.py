@@ -45,6 +45,8 @@ from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.shell import ShellToolBuilder
 from sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
 
+TEST_JWT_SIGNING_KEY = "test-jwt-signing-key-material-1234567890"
+
 
 class _RecordHandler(logging.Handler):
     def __init__(self) -> None:
@@ -229,6 +231,7 @@ def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__URL", _sqlite_url(tmp_path))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", TEST_JWT_SIGNING_KEY)
     database = asyncio.run(_create_database(tmp_path))
     try:
         yield database
@@ -236,17 +239,35 @@ def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         asyncio.run(database.dispose())
 
 
+@pytest.fixture(autouse=True)
+def _csrf_test_defaults(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", TEST_JWT_SIGNING_KEY)
+    original_request = TestClient.request
+
+    def request_with_csrf(self, method, url, *args, **kwargs):
+        if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            headers = dict(kwargs.pop("headers", {}) or {})
+            headers.setdefault("Origin", "http://testserver")
+            headers.setdefault("X-CSRF-Token", "test-csrf-token")
+            kwargs["headers"] = headers
+            self.cookies.set("csrf_token", "test-csrf-token")
+        return original_request(self, method, url, *args, **kwargs)
+
+    monkeypatch.setattr(TestClient, "request", request_with_csrf)
+
+
 def _make_auth_cookie(app, database: Database, *, email: str = "test@example.com") -> dict:
-    secret = app.state.auth_store.jwt_secret
     user_id, auth_epoch = asyncio.run(_seed_user(database, email))
     token = jwt.encode(
         {
             "sub": user_id,
             "email": email,
             "auth_epoch": auth_epoch,
+            "aud": "multiclaw-api",
+            "iat": int(datetime.now(timezone.utc).timestamp()),
             "exp": datetime.now(timezone.utc) + timedelta(days=1),
         },
-        secret,
+        TEST_JWT_SIGNING_KEY,
         algorithm="HS256",
     )
     return {"token": token}
@@ -1595,7 +1616,7 @@ def test_lifespan_still_disposes_database_when_runtime_pool_close_fails(tmp_path
     assert fake_factory.database.dispose_calls == 1
 
 
-def test_lifespan_disposes_database_when_auth_store_initialize_fails(tmp_path, monkeypatch):
+def test_lifespan_disposes_database_when_auth_context_build_fails(tmp_path, monkeypatch):
     import multiclaw.server as server_module
 
     class FakeDatabase:
@@ -1617,20 +1638,21 @@ def test_lifespan_disposes_database_when_auth_store_initialize_fails(tmp_path, m
         create=None,
     )
 
-    async def _boom(self) -> None:
-        raise RuntimeError("auth store init failed")
-
     monkeypatch.setattr(server_module, "create_runtime_factory", lambda: fake_factory)
-    monkeypatch.setattr(server_module.AuthStore, "initialize", _boom)
+    monkeypatch.setattr(
+        server_module,
+        "build_auth_runtime",
+        lambda settings: (_ for _ in ()).throw(RuntimeError("auth context init failed")),
+    )
 
-    with pytest.raises(RuntimeError, match="auth store init failed"):
+    with pytest.raises(RuntimeError, match="auth context init failed"):
         with TestClient(server_module.app):
             pass
 
     assert fake_database.dispose_calls == 1
 
 
-def test_lifespan_preserves_primary_error_when_auth_store_close_fails(tmp_path, monkeypatch):
+def test_lifespan_preserves_primary_error_when_auth_close_fails(tmp_path, monkeypatch):
     import multiclaw.server as server_module
 
     class FakeDatabase:
@@ -1652,23 +1674,39 @@ def test_lifespan_preserves_primary_error_when_auth_store_close_fails(tmp_path, 
         create=None,
     )
 
-    async def _boom(self) -> None:
-        raise RuntimeError("auth store init failed")
-
-    async def _close_boom(self) -> None:
-        raise RuntimeError("auth store close failed")
-
     monkeypatch.setattr(server_module, "create_runtime_factory", lambda: fake_factory)
-    monkeypatch.setattr(server_module.AuthStore, "initialize", _boom)
-    monkeypatch.setattr(server_module.AuthStore, "close", _close_boom)
+    class FakeAuth:
+        signing_key = b"x" * 32
+        allowed_origins = frozenset({"http://testserver"})
 
-    with pytest.raises(RuntimeError, match="auth store init failed") as exc_info:
+        async def close(self) -> None:
+            raise RuntimeError("auth close failed")
+
+    monkeypatch.setattr(
+        server_module,
+        "build_auth_runtime",
+        lambda settings: (_ for _ in ()).throw(RuntimeError("auth init failed")),
+    )
+    monkeypatch.setattr(server_module, "build_auth_runtime", lambda settings: FakeAuth())
+    monkeypatch.setattr(
+        server_module,
+        "_validate_allowed_origins",
+        lambda origins: frozenset(origins),
+    )
+
+    original_probe = fake_factory.probe_startup
+
+    def probe_then_fail():
+        return original_probe()
+
+    fake_factory.probe_startup = probe_then_fail
+
+    with pytest.raises(RuntimeError, match="auth close failed") as exc_info:
         with TestClient(server_module.app):
             pass
 
     assert fake_database.dispose_calls == 1
-    assert exc_info.value.__notes__
-    assert any("auth_store.close" in note and "auth store close failed" in note for note in exc_info.value.__notes__)
+    assert str(exc_info.value) == "auth close failed"
 
 
 def test_lifespan_preserves_primary_error_when_database_dispose_fails(tmp_path, monkeypatch):
@@ -1694,13 +1732,14 @@ def test_lifespan_preserves_primary_error_when_database_dispose_fails(tmp_path, 
         create=None,
     )
 
-    async def _boom(self) -> None:
-        raise RuntimeError("auth store init failed")
-
     monkeypatch.setattr(server_module, "create_runtime_factory", lambda: fake_factory)
-    monkeypatch.setattr(server_module.AuthStore, "initialize", _boom)
+    monkeypatch.setattr(
+        server_module,
+        "build_auth_runtime",
+        lambda settings: (_ for _ in ()).throw(RuntimeError("auth init failed")),
+    )
 
-    with pytest.raises(RuntimeError, match="auth store init failed") as exc_info:
+    with pytest.raises(RuntimeError, match="auth init failed") as exc_info:
         with TestClient(server_module.app):
             pass
 
@@ -1817,23 +1856,24 @@ def test_lifespan_normal_shutdown_preserves_primary_and_calls_all_cleanup_in_ord
         create=None,
     )
 
-    async def fake_initialize(self) -> None:
-        self.jwt_secret = "secret"
+    class FakeAuth:
+        signing_key = b"x" * 32
+        allowed_origins = frozenset({"http://testserver"})
 
-    async def fake_close(self) -> None:
-        call_order.append("auth_store.close")
-        raise RuntimeError("auth store close failed")
+        async def close(self) -> None:
+            call_order.append("auth.close")
+            raise RuntimeError("auth close failed")
 
     monkeypatch.setattr(server_module, "create_runtime_factory", lambda: fake_factory)
     monkeypatch.setattr(server_module, "RuntimePool", FailingRuntimePool)
-    monkeypatch.setattr(server_module.AuthStore, "initialize", fake_initialize)
-    monkeypatch.setattr(server_module.AuthStore, "close", fake_close)
+    monkeypatch.setattr(server_module, "build_auth_runtime", lambda settings: FakeAuth())
+    monkeypatch.setattr(server_module, "_validate_allowed_origins", lambda origins: frozenset(origins))
 
-    with pytest.raises(RuntimeError, match="auth store close failed") as error:
+    with pytest.raises(RuntimeError, match="auth close failed") as error:
         with TestClient(server_module.app):
             pass
 
-    assert call_order == ["auth_store.close", "runtime_pool.close", "database.dispose"]
+    assert call_order == ["auth.close", "runtime_pool.close", "database.dispose"]
     assert error.value.__notes__
     assert any("runtime_pool.close" in note and "runtime pool close failed" in note for note in error.value.__notes__)
     assert any("database.dispose" in note and "database dispose failed" in note for note in error.value.__notes__)

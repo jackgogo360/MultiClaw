@@ -12,6 +12,8 @@ from multiclaw.config.settings import DatabaseSettings
 from multiclaw.storage import Database
 from multiclaw.storage.uow import AuthUnitOfWork
 
+TEST_JWT_SIGNING_KEY = "chat-request-jwt-key-material-1234567890"
+
 
 def _sqlite_url(tmp_path: Path) -> str:
     return f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
@@ -36,6 +38,7 @@ def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__URL", _sqlite_url(tmp_path))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", TEST_JWT_SIGNING_KEY)
     database = asyncio.run(_create_database(tmp_path))
     try:
         yield database
@@ -44,19 +47,36 @@ def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def _make_auth_cookie(app, database: Database, *, email: str = "test@example.com") -> dict:
-    secret = app.state.auth_store.jwt_secret
     user_id, auth_epoch = asyncio.run(_seed_user(database, email))
     token = jwt.encode(
         {
             "sub": user_id,
             "email": email,
             "auth_epoch": auth_epoch,
+            "aud": "multiclaw-api",
+            "iat": int(datetime.now(timezone.utc).timestamp()),
             "exp": datetime.now(timezone.utc) + timedelta(days=1),
         },
-        secret,
+        TEST_JWT_SIGNING_KEY,
         algorithm="HS256",
     )
     return {"token": token}
+
+
+@pytest.fixture(autouse=True)
+def _csrf_test_defaults(monkeypatch: pytest.MonkeyPatch):
+    original_request = TestClient.request
+
+    def request_with_csrf(self, method, url, *args, **kwargs):
+        if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            headers = dict(kwargs.pop("headers", {}) or {})
+            headers.setdefault("Origin", "http://testserver")
+            headers.setdefault("X-CSRF-Token", "test-csrf-token")
+            kwargs["headers"] = headers
+            self.cookies.set("csrf_token", "test-csrf-token")
+        return original_request(self, method, url, *args, **kwargs)
+
+    monkeypatch.setattr(TestClient, "request", request_with_csrf)
 
 
 def test_chat_accepts_ai_sdk_message_shape(migrated_database, monkeypatch):
