@@ -1,13 +1,12 @@
 from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
 from multiclaw.storage.engine import Database
-from multiclaw.storage.repository import Repository
-from multiclaw.storage.sqlite import SqliteConfig, SqliteRepository
+from multiclaw.storage.uow import AuthUnitOfWork, DeletionUnitOfWork, TenantUnitOfWork
 
 __all__ = [
+    "AuthUnitOfWork",
     "Database",
+    "DeletionUnitOfWork",
     "MySQLDialect",
-    "Repository",
     "SQLiteDialect",
-    "SqliteConfig",
-    "SqliteRepository",
+    "TenantUnitOfWork",
 ]
