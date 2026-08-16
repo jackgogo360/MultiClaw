@@ -24,14 +24,14 @@ export interface SecretMetadata {
 }
 
 export interface AccountDeletionRequest {
-  status: string;
+  status: "scheduled";
   job_id: string;
   requested_at: number;
   purge_after: number;
 }
 
 export interface AccountDeletionStatus {
-  status: string;
+  status: "pending_purge";
   purge_after: number;
 }
 

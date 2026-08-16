@@ -126,10 +126,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         clearCsrfToken();
         setSignedOut(email);
         setAccountStatus("pending_purge");
-        setDeletionStatus({
-          status: scheduled.status,
-          purge_after: scheduled.purge_after,
-        });
+        setDeletionStatus(null);
         setReauthEmailHint(null);
         resetServerState();
         return scheduled;
