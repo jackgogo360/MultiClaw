@@ -1846,3 +1846,155 @@ async def test_memory_tool_result_loader_rejects_foreign_session_lookup(
             expected_tool_call_id="call-1",
             expected_tool_name="demo_tool",
         )
+
+
+@pytest.mark.asyncio
+async def test_recovery_invalid_approved_input_blocks_from_not_started(
+    workflow_database: Database,
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside text\n", encoding="utf-8")
+    context = await _create_run_context(workflow_database, email_suffix="-invalid-approved-input")
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        from multiclaw.memory import MemoryEntry
+
+        await uow.memory.save(
+            MemoryEntry(
+                content="read outside",
+                type="chat_message",
+                role="user",
+                session_id=context.session_id,
+                turn_index=1,
+            )
+        )
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-invalid-approved-input")
+    scheduler = _scheduler(workflow_database)
+    invalid_payload = scheduler._canonicalize_input(
+        {"file_path": str(outside), "offset": 0, "limit": 2000}
+    )
+    rebound_approval_id = scheduler._approval_binding_id(
+        context=context,
+        tool_call_id="call-invalid-approved-input",
+        tool_name="read_file",
+        tool_kind="native",
+        input_hash=invalid_payload.payload_hash,
+        approved_roots=[str(outside.resolve())],
+        recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+        idempotency_key=None,
+    )
+    approval = await coordinator.create_approval(
+        lease,
+        approval_id=rebound_approval_id,
+        tool_call_id="call-invalid-approved-input",
+        expires_at=workflow_database.dialect.db_now_ms() + 120_000,
+    )
+    await coordinator.decide_approval(
+        context,
+        approval.approval_id,
+        approved=True,
+        version=approval.version,
+    )
+    execution = await coordinator.create_execution(
+        lease,
+        execution_id=str(uuid4()),
+        approval_id=approval.approval_id,
+        tool_call_id="call-invalid-approved-input",
+        tool_name="read_file",
+        tool_kind="native",
+        recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+        idempotency_key=None,
+        input_payload_json=invalid_payload.payload_json,
+        input_hash=invalid_payload.payload_hash,
+        status=ExecutionStatus.NOT_STARTED,
+    )
+    assert execution is not None
+    lease = await coordinator.transition_run(lease, RunStatus.AWAITING_USER)
+    await coordinator.checkpoint(
+        lease,
+        CheckpointPhase.AWAITING_APPROVAL,
+        {
+            "run_id": context.run_id,
+            "approval_id": approval.approval_id,
+            "tool_call_id": "call-invalid-approved-input",
+            "approval_expires_at_ms": approval.expires_at,
+            "resume_cursor": f"approval:{context.run_id}:call-invalid-approved-input",
+            "cursor": f"approval:{context.run_id}:call-invalid-approved-input",
+        },
+        approval_id=approval.approval_id,
+    )
+
+    runtime = _real_runtime(
+        database=workflow_database,
+        context=context,
+        router=_CompletionRouter([]),
+        builders=[ReadFileToolBuilder(str(workspace))],
+    )
+    await _expire_run_lease(workflow_database, context)
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    row = await _latest_execution_row(workflow_database, context)
+    run = await coordinator.get_run(context)
+    assert row["execution_status"] == ExecutionStatus.BLOCKED_CORRUPT.value
+    assert run is not None
+    assert run.status is not RunStatus.RESUMING
+    assert runtime.active_run_count == 0
+    assert runtime.active_executing_run_count == 0
+    assert runtime.active_tool_execution_count == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_failure_after_prepare_uses_refreshed_executing_state(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-prepare-failure")
+    await _seed_dispatch_state(
+        workflow_database,
+        context=context,
+        tool_name="read_only_probe",
+        recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+        raw_params={"label": "replay-me", "delay": 0.0, "idempotency_key": None},
+        tool_call_id="call-prepare-failure",
+    )
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    runtime = _TrackingRuntime(
+        runtime_instance_id="runtime-prepare-failure",
+        scheduler=_scheduler(workflow_database),
+        builders=[
+            PersistedToolBuilder(
+                name="read_only_probe",
+                runner=runner,
+                recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+            )
+        ],
+    )
+
+    original_prepare = runtime.scheduler._prepare_recovery_execution
+
+    async def fail_after_prepare(*args, **kwargs):
+        prepared = await original_prepare(*args, **kwargs)
+        raise RuntimeError("fail after prepare")
+
+    runtime.scheduler._prepare_recovery_execution = fail_after_prepare
+
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    row = await _latest_execution_row(workflow_database, context)
+    assert row["execution_status"] == ExecutionStatus.FAILED_TERMINAL.value
+    assert runtime.closed_calls == 1
