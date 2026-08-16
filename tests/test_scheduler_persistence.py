@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -1740,3 +1741,108 @@ async def test_generic_memory_history_and_query_exclude_tool_results(
     assert all(entry.type != "tool_result" for entry in scoped)
     assert queried == []
     assert [entry.type for entry in explicit] == ["tool_result"]
+
+
+@pytest.mark.asyncio
+async def test_approval_binding_mismatch_blocks_mutated_external_read(
+    workflow_database: Database,
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside1 = tmp_path / "outside1.txt"
+    outside2 = tmp_path / "outside2.txt"
+    outside1.write_text("outside1\n", encoding="utf-8")
+    outside2.write_text("outside2\n", encoding="utf-8")
+    context = await _create_run_context(workflow_database, email_suffix="-binding-mutate")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-binding")
+    result = await _scheduler(workflow_database).run(
+        ReadFileToolBuilder(str(workspace)),
+        {"file_path": str(outside1)},
+        context=context,
+        call_id="call-binding",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+    await coordinator.decide_approval(
+        context,
+        result.data["approval_id"],
+        approved=True,
+        version=result.data["version"],
+    )
+    scheduler = _scheduler(workflow_database)
+    mutated = scheduler._canonicalize_input({"file_path": str(outside2), "offset": 1, "limit": 2000})
+    async with workflow_database.write_transaction() as conn:
+        await conn.execute(
+            update(tool_executions)
+            .where(
+                tool_executions.c.tenant_id == context.tenant_id,
+                tool_executions.c.workspace_id == context.workspace_id,
+                tool_executions.c.session_id == context.session_id,
+                tool_executions.c.run_id == context.run_id,
+            )
+            .values(
+                input_payload_json=mutated.payload_json,
+                input_hash=mutated.payload_hash,
+            )
+        )
+
+    router = _CompletionRouter([LLMResponse(content="must not run", tool_calls=[], reasoning_content="")])
+    runtime = _real_runtime(database=workflow_database, context=context, router=router, builders=[ReadFileToolBuilder(str(workspace))])
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    row = await _latest_execution_row(workflow_database, context)
+    assert row["execution_status"] == ExecutionStatus.BLOCKED_CORRUPT.value
+    assert router.calls == []
+
+
+@pytest.mark.asyncio
+async def test_memory_tool_result_loader_rejects_foreign_session_lookup(
+    workflow_database: Database,
+):
+    from multiclaw.memory import MemoryEntry
+
+    tenant_id, workspace_id = await _seed_user(workflow_database, "foreign-tool-result@example.com")
+    owner = await _create_run_context(
+        workflow_database,
+        email_suffix="-foreign-owner",
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+    )
+    other = await _create_run_context(
+        workflow_database,
+        email_suffix="-foreign-other",
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+    )
+    async with TenantUnitOfWork(workflow_database, owner) as uow:
+        entry = await uow.memory.save(
+            MemoryEntry(
+                content="tool secret payload",
+                type="tool_result",
+                role="tool",
+                session_id=owner.session_id,
+                metadata={
+                    "tool_call_id": "call-1",
+                    "tool_name": "demo_tool",
+                    "execution_id": "exec-1",
+                    "result_status": "succeeded",
+                },
+            )
+        )
+    service = WorkflowContinuationService(workflow_database, settings=Settings(_config_file="/nonexistent"))
+    digest = hashlib.sha256("tool secret payload".encode("utf-8")).hexdigest()
+    with pytest.raises(ValueError):
+        await service.load_tool_result(
+            context=other,
+            result_ref=f"memory://{entry.id}",
+            expected_digest=digest,
+            expected_execution_id="exec-1",
+            expected_tool_call_id="call-1",
+            expected_tool_name="demo_tool",
+        )

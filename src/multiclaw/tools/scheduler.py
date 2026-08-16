@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from pathlib import Path
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ logger = logging.getLogger(__name__)
 APPROVAL_TTL_MS = 120_000
 MAX_CANONICAL_INPUT_BYTES = 262_144
 SECRET_KEY_MARKERS = {"secret", "token", "password", "apikey", "authorization"}
+_APPROVAL_BINDING_NAMESPACE = uuid.UUID("59af7259-9e52-5ad8-a31d-7f13054ba2a7")
 
 
 class ExecutionConflictError(RuntimeError):
@@ -203,6 +205,7 @@ class CoreToolScheduler:
                 approval = await self._persist_approval_request(
                     builder,
                     canonical_input=canonical_input,
+                    approved_roots=decision.approved_roots,
                     recovery_strategy=recovery_metadata.recovery_strategy,
                     idempotency_key=recovery_metadata.idempotency_key,
                     context=context,
@@ -414,6 +417,7 @@ class CoreToolScheduler:
         builder: ToolBuilder,
         *,
         canonical_input: _CanonicalToolInput,
+        approved_roots: list[str],
         recovery_strategy: RecoveryStrategy,
         idempotency_key: str | None,
         context: TenantContext,
@@ -421,9 +425,18 @@ class CoreToolScheduler:
         run_lease_handle: RunLeaseHandle,
     ):
         lease = await run_lease_handle.current()
-        approval_id = str(uuid.uuid4())
         execution_id = str(uuid.uuid4())
-        tool_call_id = call_id or approval_id
+        tool_call_id = call_id or execution_id
+        approval_id = self._approval_binding_id(
+            context=context,
+            tool_call_id=tool_call_id,
+            tool_name=builder.name,
+            tool_kind=getattr(builder, "tool_kind", "native"),
+            input_hash=canonical_input.payload_hash,
+            approved_roots=approved_roots,
+            recovery_strategy=recovery_strategy,
+            idempotency_key=idempotency_key,
+        )
         async with self.database.write_transaction() as conn:
             workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
             transitioned = await workflow.transition_run(lease, RunStatus.AWAITING_USER)
@@ -690,6 +703,16 @@ class CoreToolScheduler:
                     detail=decision.reason,
                 )
             if decision.requires_approval:
+                expected_approval_id = self._approval_binding_id(
+                    context=context,
+                    tool_call_id=execution.tool_call_id,
+                    tool_name=builder.name,
+                    tool_kind=getattr(builder, "tool_kind", "native"),
+                    input_hash=canonical.payload_hash,
+                    approved_roots=decision.approved_roots,
+                    recovery_strategy=metadata.recovery_strategy,
+                    idempotency_key=metadata.idempotency_key,
+                )
                 if execution.approval_id is None:
                     return await self._block_execution(
                         context=context,
@@ -697,6 +720,14 @@ class CoreToolScheduler:
                         run_lease_handle=run_lease_handle,
                         status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
                         detail="approval required under current policy",
+                    )
+                if execution.approval_id != expected_approval_id:
+                    return await self._block_execution(
+                        context=context,
+                        execution=execution,
+                        run_lease_handle=run_lease_handle,
+                        status=ExecutionStatus.BLOCKED_CORRUPT,
+                        detail="approval binding mismatch",
                     )
                 approval = await WorkflowCoordinator(
                     self.database,
@@ -1063,6 +1094,40 @@ class CoreToolScheduler:
         if isinstance(value, tuple):
             return [self._redact_secret_values(item) for item in value]
         return value
+
+    def _approval_binding_id(
+        self,
+        *,
+        context: TenantContext,
+        tool_call_id: str,
+        tool_name: str,
+        tool_kind: str,
+        input_hash: str,
+        approved_roots: list[str],
+        recovery_strategy: RecoveryStrategy,
+        idempotency_key: str | None,
+    ) -> str:
+        payload = json.dumps(
+            {
+                "tenant_id": context.tenant_id,
+                "workspace_id": context.workspace_id,
+                "session_id": context.session_id,
+                "run_id": context.run_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "tool_kind": tool_kind,
+                "input_hash": input_hash,
+                "approved_roots": self._normalized_approved_roots(approved_roots),
+                "recovery_strategy": recovery_strategy.value,
+                "idempotency_key": idempotency_key,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return str(uuid.uuid5(_APPROVAL_BINDING_NAMESPACE, payload))
+
+    def _normalized_approved_roots(self, approved_roots: list[str]) -> list[str]:
+        return sorted({str(Path(root).resolve()) for root in approved_roots})
 
     def _audit_detail(self, result: ToolExecutionResult) -> str:
         allowlisted = self._normalized_audit_fields(result.audit)
