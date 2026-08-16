@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+from dataclasses import dataclass
 import os
 import sys
 from pathlib import Path
+from typing import TypedDict
 from uuid import uuid4
 
 import pytest
@@ -22,14 +25,46 @@ from multiclaw.secrets.envelope import (
 from multiclaw.secrets.keyring import KEYRING_PROVIDER_NAME
 from multiclaw.storage import Database
 from multiclaw.storage.schema import chat_sessions
+from multiclaw.session import ChatSession, SessionStatus
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
-from multiclaw.workflow.models import ApprovalStatus, ExecutionStatus, RecoveryStrategy, VersionConflictError
+from multiclaw.workflow.models import (
+    ApprovalStatus,
+    ExecutionStatus,
+    RecoveryStrategy,
+    RunLease,
+    VersionConflictError,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from database_fixtures import _ORIGINAL_TEST_MYSQL_URL
+
+
+class SessionMessage(TypedDict):
+    role: str
+    content: str
+    created_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class TenantState:
+    base_context: TenantContext
+    session_context: TenantContext
+    run_context: TenantContext
+    lease: RunLease
+    session_id: str
+    session_title: str
+    session_status: SessionStatus
+    last_message_at: int | None
+    messages: list[SessionMessage]
+
+
+@dataclass(frozen=True, slots=True)
+class TenantScopes:
+    alpha: TenantState
+    beta: TenantState
 
 
 def _sqlite_url(tmp_path: Path) -> str:
@@ -55,7 +90,7 @@ def _coordinator(database: Database) -> WorkflowCoordinator:
     return WorkflowCoordinator(database, settings=Settings(_config_file="/nonexistent"))
 
 
-async def _build_tenant_state(database: Database, label: str) -> dict[str, object]:
+async def _build_tenant_state(database: Database, label: str) -> TenantState:
     base_context = await _seed_user(database, f"tenant-e2e-{label}")
     async with TenantUnitOfWork(database, base_context) as uow:
         session = await uow.sessions.create()
@@ -93,29 +128,40 @@ async def _build_tenant_state(database: Database, label: str) -> dict[str, objec
     run_context = base_context.for_run(session.id, str(uuid4()))
     lease = await _coordinator(database).start_run(run_context, runtime_instance_id=f"{label}-runtime")
 
-    return {
-        "base_context": base_context,
-        "session_context": session_context,
-        "run_context": run_context,
-        "lease": lease,
-        "session_id": session.id,
-        "session_title": fetched.title,
-        "session_status": fetched.status,
-        "last_message_at": fetched.last_message_at,
-        "messages": messages,
-    }
+    return TenantState(
+        base_context=base_context,
+        session_context=session_context,
+        run_context=run_context,
+        lease=lease,
+        session_id=session.id,
+        session_title=fetched.title,
+        session_status=fetched.status,
+        last_message_at=fetched.last_message_at,
+        messages=messages,
+    )
 
 
-async def _build_scopes(database: Database) -> dict[str, dict[str, object]]:
-    return {
-        "alpha": await _build_tenant_state(database, "alpha"),
-        "beta": await _build_tenant_state(database, "beta"),
-    }
+async def _build_scopes(database: Database) -> TenantScopes:
+    return TenantScopes(
+        alpha=await _build_tenant_state(database, "alpha"),
+        beta=await _build_tenant_state(database, "beta"),
+    )
 
 
-async def _count_all_sessions(database: Database) -> int:
+async def _count_test_sessions(database: Database, scopes: TenantScopes) -> int:
+    # Shared CI schemas may retain unrelated rows from other tests; scope counts to
+    # the random tenant ids created by this test so historical or parallel tenants
+    # cannot affect this aggregate.
+    tenant_ids = (
+        scopes.alpha.base_context.tenant_id,
+        scopes.beta.base_context.tenant_id,
+    )
     async with database.write_transaction() as conn:
-        total = await conn.scalar(select(func.count()).select_from(chat_sessions))
+        total = await conn.scalar(
+            select(func.count())
+            .select_from(chat_sessions)
+            .where(chat_sessions.c.tenant_id.in_(tenant_ids))
+        )
     return int(total or 0)
 
 
@@ -136,7 +182,7 @@ async def _load_session_snapshot(
     database: Database,
     context: TenantContext,
     session_id: str,
-) -> tuple[object | None, list[dict[str, object]]]:
+) -> tuple[ChatSession | None, list[SessionMessage]]:
     async with TenantUnitOfWork(database, context) as uow:
         session = await uow.sessions.get(session_id)
         messages = await uow.sessions.get_messages(session_id)
@@ -145,41 +191,36 @@ async def _load_session_snapshot(
 
 async def _collect_session_metrics(
     database: Database,
-    scopes: dict[str, dict[str, object]],
+    scopes: TenantScopes,
 ) -> dict[str, int]:
-    alpha = scopes["alpha"]
-    beta = scopes["beta"]
-    alpha_session_context = alpha["session_context"]
-    beta_session_context = beta["session_context"]
-    assert isinstance(alpha_session_context, TenantContext)
-    assert isinstance(beta_session_context, TenantContext)
+    alpha = scopes.alpha
+    beta = scopes.beta
+    total_before = await _count_test_sessions(database, scopes)
+    alpha_before = await _count_scoped_sessions(database, alpha.session_context)
+    beta_before = await _count_scoped_sessions(database, beta.session_context)
 
-    total_before = await _count_all_sessions(database)
-    alpha_before = await _count_scoped_sessions(database, alpha_session_context)
-    beta_before = await _count_scoped_sessions(database, beta_session_context)
-
-    async with TenantUnitOfWork(database, alpha_session_context) as uow:
-        foreign_session = await uow.sessions.get(str(beta["session_id"]))
+    async with TenantUnitOfWork(database, alpha.session_context) as uow:
+        foreign_session = await uow.sessions.get(beta.session_id)
         foreign_list = await uow.sessions.list(include_archived=True)
-        foreign_touch = await uow.sessions.touch_message(str(beta["session_id"]), "foreign touch should fail")
-        foreign_rename = await uow.sessions.rename(str(beta["session_id"]), "foreign rename should fail")
-        foreign_messages = await uow.sessions.get_messages(str(beta["session_id"]))
-        await uow.sessions.delete(str(beta["session_id"]))
+        foreign_touch = await uow.sessions.touch_message(beta.session_id, "foreign touch should fail")
+        foreign_rename = await uow.sessions.rename(beta.session_id, "foreign rename should fail")
+        foreign_messages = await uow.sessions.get_messages(beta.session_id)
+        await uow.sessions.delete(beta.session_id)
 
-    total_after = await _count_all_sessions(database)
-    alpha_after = await _count_scoped_sessions(database, alpha_session_context)
-    beta_after = await _count_scoped_sessions(database, beta_session_context)
+    total_after = await _count_test_sessions(database, scopes)
+    alpha_after = await _count_scoped_sessions(database, alpha.session_context)
+    beta_after = await _count_scoped_sessions(database, beta.session_context)
     beta_session_after, beta_messages_after = await _load_session_snapshot(
         database,
-        beta_session_context,
-        str(beta["session_id"]),
+        beta.session_context,
+        beta.session_id,
     )
 
     assert beta_session_after is not None
-    assert beta_session_after.title == beta["session_title"]
-    assert beta_session_after.status == beta["session_status"]
-    assert beta_session_after.last_message_at == beta["last_message_at"]
-    assert beta_messages_after == beta["messages"]
+    assert beta_session_after.title == beta.session_title
+    assert beta_session_after.status == beta.session_status
+    assert beta_session_after.last_message_at == beta.last_message_at
+    assert beta_messages_after == beta.messages
     assert alpha_before == alpha_after
     assert beta_before == beta_after
 
@@ -191,7 +232,7 @@ async def _collect_session_metrics(
     cross_tenant_reads = sum(
         (
             int(foreign_session is not None),
-            int(any(row.id == beta["session_id"] for row in foreign_list)),
+            int(any(row.id == beta.session_id for row in foreign_list)),
             int(bool(foreign_messages)),
         )
     )
@@ -200,7 +241,7 @@ async def _collect_session_metrics(
             int(foreign_touch is not None),
             int(foreign_rename is not None),
             int(beta_session_after is None),
-            int(beta_messages_after != beta["messages"]),
+            int(beta_messages_after != beta.messages),
         )
     )
     unexpected_session_creations = sum(max(delta, 0) for delta in count_deltas)
@@ -212,22 +253,22 @@ async def _collect_session_metrics(
     }
 
 
-async def _collect_event_metrics(scopes: dict[str, dict[str, object]]) -> dict[str, int]:
+async def _collect_event_metrics(scopes: TenantScopes) -> dict[str, int]:
     router = EventRouter()
-    alpha_run_context = scopes["alpha"]["run_context"]
-    beta_run_context = scopes["beta"]["run_context"]
-    assert isinstance(alpha_run_context, TenantContext)
-    assert isinstance(beta_run_context, TenantContext)
+    alpha_run_context = scopes.alpha.run_context
+    beta_run_context = scopes.beta.run_context
 
     alpha_scope = EventScope.from_context(alpha_run_context)
     beta_scope = EventScope.from_context(beta_run_context)
-    received: dict[str, list[ScopedEvent]] = {"alpha": [], "beta": []}
+    received: dict[str, list[tuple[str, str]]] = {"alpha": [], "beta": []}
 
     async def collect_alpha(event: ScopedEvent) -> None:
-        received["alpha"].append(event)
+        await asyncio.sleep(0)
+        received["alpha"].append((event.event_type, event.run_id))
 
     async def collect_beta(event: ScopedEvent) -> None:
-        received["beta"].append(event)
+        await asyncio.sleep(0)
+        received["beta"].append((event.event_type, event.run_id))
 
     alpha_subscription = router.subscribe(alpha_scope, collect_alpha)
     beta_subscription = router.subscribe(beta_scope, collect_beta)
@@ -250,32 +291,42 @@ async def _collect_event_metrics(scopes: dict[str, dict[str, object]]) -> dict[s
         alpha_subscription.close()
         beta_subscription.close()
 
-    assert [event.run_id for event in received["alpha"]] == [
-        alpha_run_context.run_id,
-        alpha_run_context.run_id,
-    ]
-    assert [event.run_id for event in received["beta"]] == [
-        beta_run_context.run_id,
-        beta_run_context.run_id,
-    ]
+    expected_alpha = Counter(
+        {
+            ("tenant.alpha.started", alpha_run_context.run_id): 1,
+            ("tenant.alpha.finished", alpha_run_context.run_id): 1,
+        }
+    )
+    expected_beta = Counter(
+        {
+            ("tenant.beta.started", beta_run_context.run_id): 1,
+            ("tenant.beta.finished", beta_run_context.run_id): 1,
+        }
+    )
+    assert Counter(received["alpha"]) == expected_alpha
+    assert Counter(received["beta"]) == expected_beta
 
     foreign_sse_events = sum(
-        int(event.run_id != alpha_run_context.run_id) for event in received["alpha"]
-    ) + sum(int(event.run_id != beta_run_context.run_id) for event in received["beta"])
+        count
+        for event_key, count in Counter(received["alpha"]).items()
+        if event_key not in expected_alpha
+    ) + sum(
+        count
+        for event_key, count in Counter(received["beta"]).items()
+        if event_key not in expected_beta
+    )
     return {"foreign_sse_events": foreign_sse_events}
 
 
 async def _collect_approval_metrics(
     database: Database,
-    scopes: dict[str, dict[str, object]],
+    scopes: TenantScopes,
 ) -> dict[str, int]:
     coordinator = _coordinator(database)
-    alpha_run_context = scopes["alpha"]["run_context"]
-    beta_run_context = scopes["beta"]["run_context"]
-    alpha_lease = scopes["alpha"]["lease"]
-    beta_lease = scopes["beta"]["lease"]
-    assert isinstance(alpha_run_context, TenantContext)
-    assert isinstance(beta_run_context, TenantContext)
+    alpha_run_context = scopes.alpha.run_context
+    beta_run_context = scopes.beta.run_context
+    alpha_lease = scopes.alpha.lease
+    beta_lease = scopes.beta.lease
 
     alpha_approval = await coordinator.create_approval(
         alpha_lease,
@@ -364,12 +415,10 @@ async def _collect_approval_metrics(
 
 async def _collect_secret_metrics(
     database: Database,
-    scopes: dict[str, dict[str, object]],
+    scopes: TenantScopes,
 ) -> dict[str, int]:
-    alpha_base_context = scopes["alpha"]["base_context"]
-    beta_base_context = scopes["beta"]["base_context"]
-    assert isinstance(alpha_base_context, TenantContext)
-    assert isinstance(beta_base_context, TenantContext)
+    alpha_base_context = scopes.alpha.base_context
+    beta_base_context = scopes.beta.base_context
 
     alpha_secret_name = "alpha_api_key"
     beta_secret_name = "beta_api_key"
