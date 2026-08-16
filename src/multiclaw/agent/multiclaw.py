@@ -20,6 +20,7 @@ from multiclaw.planner import Planner
 from multiclaw.skills import SkillManager
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.tools import CoreToolScheduler, ToolRegistry
+from multiclaw.workflow.continuation import PersistedToolResult
 from multiclaw.workflow.models import RunLease, RunLeaseHandle
 
 logger = logging.getLogger(__name__)
@@ -429,6 +430,7 @@ class MultiClawAgent(ToolCallAgent):
         run_lease_handle: RunLeaseHandle | None = None,
         workflow_continuation=None,
         workflow_recovery=None,
+        persisted_user_turn_index: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         del run_lease, workflow_recovery
         logger.info("handle_message_stream: %r", user_input[:80])
@@ -475,8 +477,13 @@ class MultiClawAgent(ToolCallAgent):
                     skill_prompts=skill_prompts,
                 )
             )
-            next_turn_index = await self._next_turn_index(context)
-            await self._save_chat_msg(context, "user", user_msg, next_turn_index)
+            next_turn_index = (
+                persisted_user_turn_index
+                if persisted_user_turn_index is not None
+                else await self._next_turn_index(context)
+            )
+            if persisted_user_turn_index is None:
+                await self._save_chat_msg(context, "user", user_msg, next_turn_index)
             tools = self.registry.to_openai_schemas()
             max_rounds = self.settings.agent.max_tool_rounds
             controller = self._build_resilience_controller()
@@ -670,6 +677,59 @@ class MultiClawAgent(ToolCallAgent):
                 except BaseException:
                     logger.exception("failed to reset agent state after run termination")
 
+    async def resume_recovery(
+        self,
+        *,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        workflow_continuation,
+        recovered_tool_result: PersistedToolResult | None = None,
+        recovered_tool_input_json: str | None = None,
+    ) -> str:
+        messages = [{"role": "system", "content": self.settings.agent.system_prompt}]
+        chat_entries = list(
+            reversed(
+                await self.memory.recent(context, limit=500, entry_type="chat_message")
+            )
+        )
+        last_turn_index = 0
+        for entry in chat_entries:
+            if entry.role not in {"user", "assistant"}:
+                continue
+            messages.append({"role": entry.role, "content": entry.content})
+            last_turn_index = max(last_turn_index, entry.turn_index)
+
+        if recovered_tool_result is not None and recovered_tool_input_json is not None:
+            try:
+                tool_arguments = json.loads(recovered_tool_input_json)
+            except json.JSONDecodeError as error:
+                raise ValueError("persisted tool input is not valid JSON") from error
+            messages.append(
+                _build_assistant_tool_calls_msg(
+                    [
+                        {
+                            "id": recovered_tool_result.tool_call_id,
+                            "name": recovered_tool_result.tool_name,
+                            "arguments": tool_arguments,
+                        }
+                    ]
+                )
+            )
+            messages.append(
+                _build_tool_result_msg(
+                    recovered_tool_result.tool_call_id,
+                    recovered_tool_result.content,
+                )
+            )
+
+        return await self._continue_from_messages(
+            messages,
+            context=context,
+            run_lease_handle=run_lease_handle,
+            workflow_continuation=workflow_continuation,
+            next_turn_index=last_turn_index,
+        )
+
     async def _next_turn_index(self, context: TenantContext) -> int:
         if context.session_id is None:
             raise ValueError("session_id is required for chat messages")
@@ -719,3 +779,72 @@ class MultiClawAgent(ToolCallAgent):
             content,
             turn_index,
         )
+
+    async def _continue_from_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        workflow_continuation,
+        next_turn_index: int,
+    ) -> str:
+        tools = self.registry.to_openai_schemas()
+        controller = self._build_resilience_controller()
+        max_rounds = self.settings.agent.max_tool_rounds
+
+        for _ in range(max_rounds):
+            response: LLMResponse = await self.router.completion(
+                model=self.settings.llm.default_model,
+                messages=messages,
+                tools=tools,
+            )
+
+            if not response.tool_calls:
+                await self._persist_stream_assistant_output(
+                    context=context,
+                    content=response.content,
+                    turn_index=next_turn_index + 1,
+                    run_lease_handle=run_lease_handle,
+                    workflow_continuation=workflow_continuation,
+                )
+                return response.content
+
+            normalized_calls = self._normalize_tool_calls(response.tool_calls)
+            if controller is not None:
+                call_decision = controller.observe_calls(normalized_calls)
+                if call_decision.action is ResilienceAction.TERMINATE:
+                    break
+
+            messages.append(
+                _build_assistant_tool_calls_msg(
+                    normalized_calls,
+                    response.reasoning_content,
+                )
+            )
+            outcomes = await self._execute_tool_batch(
+                normalized_calls,
+                context=context,
+                run_lease_handle=run_lease_handle,
+            )
+            for outcome in outcomes:
+                messages.append(
+                    _build_tool_result_msg(
+                        outcome.call_id,
+                        outcome.observation.content,
+                    )
+                )
+                await self.remember(context, outcome.observation.content, "tool_result")
+
+        full_text = await self._generate_final_summary(
+            messages,
+            self._collect_completion_text_response,
+        )
+        await self._persist_stream_assistant_output(
+            context=context,
+            content=full_text,
+            turn_index=next_turn_index + 1,
+            run_lease_handle=run_lease_handle,
+            workflow_continuation=workflow_continuation,
+        )
+        return full_text

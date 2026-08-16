@@ -155,7 +155,11 @@ class MCPClient:
             else:
                 content.append({"type": "text", "text": str(item)})
 
-        return ToolCallResult(content=content, is_error=bool(result.isError))
+        return ToolCallResult(
+            content=content,
+            is_error=bool(result.isError),
+            external_request_id=_extract_external_request_id(result),
+        )
 
     async def call_tool_with_retry(self, tool_name: str, arguments: dict[str, Any]) -> ToolCallResult:
         last_error: Optional[Exception] = None
@@ -215,3 +219,47 @@ def _truncate(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len - 13] + "… [truncated]"
+
+
+def _extract_external_request_id(result: CallToolResult) -> str | None:
+    candidates = []
+    for attr in ("meta", "_meta"):
+        value = getattr(result, attr, None)
+        if value is not None:
+            candidates.append(value)
+    if hasattr(result, "model_dump"):
+        dumped = result.model_dump()
+        if isinstance(dumped, dict):
+            candidates.append(dumped.get("_meta"))
+            candidates.append(dumped.get("meta"))
+    for candidate in candidates:
+        extracted = _search_request_id(candidate)
+        if extracted:
+            return extracted
+    return None
+
+
+def _search_request_id(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in (
+            "requestId",
+            "request_id",
+            "x-request-id",
+            "x_request_id",
+            "external_request_id",
+        ):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                candidate = candidate.strip()
+                if 0 < len(candidate) <= 255:
+                    return candidate
+        for nested in value.values():
+            found = _search_request_id(nested)
+            if found:
+                return found
+    if isinstance(value, list):
+        for nested in value:
+            found = _search_request_id(nested)
+            if found:
+                return found
+    return None

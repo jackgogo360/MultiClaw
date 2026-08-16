@@ -15,12 +15,16 @@ from sqlalchemy import select, text, update
 from multiclaw.cli import alembic_config
 from multiclaw.config import DatabaseSettings, Settings
 from multiclaw.events import EventBus
+from multiclaw.events import EventRouter
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.storage import Database
 from multiclaw.storage.schema import agent_runs, approval_requests, execution_checkpoints, tool_executions
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 from multiclaw.tools import CoreToolScheduler, ToolBuilder, ToolExecutionResult, ToolInvocation, ToolStatus
+from multiclaw.tools import ToolRegistry
+from multiclaw.mcp.tool_adapter import MCPToolBuilder, _extract_text as mcp_extract_text
+from multiclaw.mcp.types import ToolCallResult
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     CheckpointPhase,
@@ -30,6 +34,12 @@ from multiclaw.workflow.models import (
     RunStatus,
 )
 from multiclaw.workflow import recovery as recovery_module
+from multiclaw.agent.multiclaw import MultiClawAgent
+from multiclaw.llm import LLMResponse
+from multiclaw.planner import Planner
+from multiclaw.runtime.factory import _DatabaseBackedMemory
+from multiclaw.runtime.models import TenantRuntime
+from multiclaw.skills import SkillManager
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -292,6 +302,62 @@ class _TrackingRuntimePool:
     async def acquire(self, context: TenantContext):
         self.acquired.append(context)
         return self.runtime
+
+
+class _CompletionRouter:
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    async def completion(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+def _real_runtime(
+    *,
+    database: Database,
+    context: TenantContext,
+    router,
+    builders: list[ToolBuilder],
+) -> TenantRuntime:
+    from multiclaw.config import Settings
+
+    settings = Settings(_config_file="/nonexistent")
+    registry = ToolRegistry()
+    for builder in builders:
+        registry.register(builder)
+    scheduler = _scheduler(database)
+    scheduler.event_router = EventRouter()
+    agent = MultiClawAgent(
+        settings=settings,
+        router=router,
+        registry=registry,
+        scheduler=scheduler,
+        memory=_DatabaseBackedMemory(database),
+        planner=Planner(),
+        event_bus=EventBus(),
+        event_router=EventRouter(),
+        skill_manager=SkillManager(project_root=Path.cwd(), max_active=3),
+    )
+    agent.database = database
+    runtime = TenantRuntime(
+        tenant_id=context.tenant_id,
+        runtime_instance_id="runtime-real",
+        workspace_root=Path.cwd(),
+        agent=agent,
+        event_bus=agent.event_bus,
+        event_router=agent.event_router,
+        scheduler=scheduler,
+        registry=registry,
+        skill_manager=agent.skill_manager,
+        mcp_manager=None,
+        sandbox_controller=None,
+        sandbox_readiness=None,
+        last_used_at_ms=0,
+        recovery_continuation=recovery_module.RuntimeRecoveryContinuationService(),
+    )
+    return runtime
 
 
 async def _expire_run_lease(database: Database, context: TenantContext) -> None:
@@ -971,3 +1037,161 @@ async def test_worker_does_not_revive_terminal_run(
     assert run.status is RunStatus.CANCELLED
     assert runtime.begin_calls == 0
     assert runtime.closed_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_model_uses_real_agent_router_and_completes_run(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-real-resume")
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        await uow.memory.save(
+            __import__("multiclaw.memory", fromlist=["MemoryEntry"]).MemoryEntry(
+                content="resume me",
+                type="chat_message",
+                role="user",
+                session_id=context.session_id,
+                turn_index=1,
+            )
+        )
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-started")
+    await _expire_run_lease(workflow_database, context)
+
+    router = _CompletionRouter(
+        [LLMResponse(content="recovered assistant", tool_calls=[], reasoning_content="")]
+    )
+    runtime = _real_runtime(database=workflow_database, context=context, router=router, builders=[])
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    assert len(router.calls) == 1
+    messages = router.calls[0]["messages"]
+    assert [message for message in messages if message["role"] == "user"] == [
+        {"role": "user", "content": "resume me"}
+    ]
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        recent = await uow.memory.recent(limit=5, entry_type="chat_message")
+    assert [entry.content for entry in reversed(recent)] == ["resume me", "recovered assistant"]
+    run = await coordinator.get_run(context)
+    assert run is not None
+    assert run.status is RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_approved_tool_post_result_continues_model_with_persisted_result(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-approved-continue")
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        await uow.memory.save(
+            __import__("multiclaw.memory", fromlist=["MemoryEntry"]).MemoryEntry(
+                content="run approved tool",
+                type="chat_message",
+                role="user",
+                session_id=context.session_id,
+                turn_index=1,
+            )
+        )
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-approved")
+    scheduler = _scheduler(workflow_database)
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=f"tool:{params.label}")
+
+    result = await scheduler.run(
+        PersistedToolBuilder(
+            name="guarded_mutation",
+            runner=runner,
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        ),
+        {"label": "payload"},
+        context=context,
+        call_id="call-approved",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+    approval_id = result.data["approval_id"]
+    await _coordinator(workflow_database).decide_approval(
+        context,
+        approval_id,
+        approved=True,
+        version=result.data["version"],
+    )
+
+    router = _CompletionRouter(
+        [LLMResponse(content="continued after tool", tool_calls=[], reasoning_content="")]
+    )
+    runtime = _real_runtime(
+        database=workflow_database,
+        context=context,
+        router=router,
+        builders=[
+            PersistedToolBuilder(
+                name="guarded_mutation",
+                runner=runner,
+                recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+            )
+        ],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    assert len(router.calls) == 1
+    messages = router.calls[0]["messages"]
+    tool_result_message = next(message for message in messages if message["role"] == "tool")
+    assert tool_result_message["content"] == "tool:payload"
+    assistant_tool_call = next(message for message in messages if message.get("tool_calls"))
+    assert assistant_tool_call["tool_calls"][0]["id"] == "call-approved"
+    run = await coordinator.get_run(context)
+    assert run is not None
+    assert run.status is RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_real_mcp_adapter_reports_external_id_before_crash_and_recovery_marks_uncertain(
+    workflow_database: Database,
+    monkeypatch,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-mcp-early-id")
+    lease = await _coordinator(workflow_database).start_run_with_checkpoint(context, "runtime-mcp")
+
+    class Manager:
+        def call_tool(self, server_name: str, tool_name: str, arguments: dict) -> ToolCallResult:
+            del server_name, tool_name, arguments
+            return ToolCallResult(
+                content=[{"type": "text", "text": "hello"}],
+                external_request_id="mcp-request-123",
+            )
+
+    builder = MCPToolBuilder(
+        name="mcp__demo__tool",
+        server_name="demo",
+        original_name="tool",
+        description="demo",
+        input_schema={"properties": {"label": {"type": "string"}}},
+        manager=Manager(),
+        read_only=False,
+    )
+    monkeypatch.setattr("multiclaw.mcp.tool_adapter._extract_text", lambda content: (_ for _ in ()).throw(RuntimeError("after-report crash")))
+
+    result = await _scheduler(workflow_database).run(
+        builder,
+        {"label": "x"},
+        context=context,
+        call_id="call-mcp",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+    assert result.status is ToolStatus.ERROR
+
+    row = await _latest_execution_row(workflow_database, context)
+    assert row["external_request_id"] == "mcp-request-123"
+    assert row["execution_status"] == ExecutionStatus.UNCERTAIN.value

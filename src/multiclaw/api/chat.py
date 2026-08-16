@@ -66,6 +66,7 @@ async def iterate_message_stream(
     run_lease_handle: RunLeaseHandle,
     workflow_recovery=None,
     workflow_continuation=None,
+    persisted_user_turn_index: int | None = None,
 ):
     signature = inspect.signature(handler)
     kwargs = {"context": context}
@@ -77,5 +78,7 @@ async def iterate_message_stream(
         kwargs["workflow_recovery"] = workflow_recovery
     if _accepts_keyword(signature, "workflow_continuation") and workflow_continuation is not None:
         kwargs["workflow_continuation"] = workflow_continuation
+    if _accepts_keyword(signature, "persisted_user_turn_index") and persisted_user_turn_index is not None:
+        kwargs["persisted_user_turn_index"] = persisted_user_turn_index
     async for item in handler(user_input, **kwargs):
         yield item

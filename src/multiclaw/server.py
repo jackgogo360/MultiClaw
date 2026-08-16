@@ -102,6 +102,7 @@ from multiclaw.session import SessionStatus
 from multiclaw.runtime import RuntimeFactory, RuntimePool
 from multiclaw.runtime.pool import RuntimeCapacityError, RuntimeUnavailableError
 from multiclaw.storage import Database
+from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
 from multiclaw.tools import (
@@ -138,6 +139,7 @@ from multiclaw.api.chat import (
 )
 from multiclaw.api.approvals import ApprovalDecisionRequest, ApprovalResponse
 from multiclaw.api.dependencies import current_user, tenant_context, tenant_uow
+from multiclaw.memory import MemoryEntry
 from multiclaw.stream import DataStreamEncoder
 from multiclaw.workflow.models import (
     InvalidTransitionError,
@@ -857,6 +859,19 @@ async def chat(
     run_id = str(uuid4())
     run_context = context.for_run(session.id, run_id)
     runtime = await request.app.state.runtime_pool.acquire(run_context)
+    session_context = context.for_session(session.id)
+    session_memory = MemoryRepository(uow.conn, session_context, request.app.state.database.dialect)
+    recent_messages = await session_memory.recent(limit=1, entry_type="chat_message")
+    user_turn_index = (recent_messages[0].turn_index + 1) if recent_messages else 1
+    await session_memory.save(
+        MemoryEntry(
+            content=message,
+            type="chat_message",
+            role="user",
+            session_id=session.id,
+            turn_index=user_turn_index,
+        )
+    )
     workflow = build_workflow_coordinator(
         request.app.state.database,
         request.app.state.settings,
@@ -1064,6 +1079,7 @@ async def chat(
                         run_lease_handle=workflow_lease_handle,
                         workflow_recovery=workflow_recovery,
                         workflow_continuation=workflow_continuation,
+                        persisted_user_turn_index=user_turn_index,
                     ):
                         await token_queue.put(item)
                 except Exception as exc:
