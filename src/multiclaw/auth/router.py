@@ -84,6 +84,7 @@ async def send_code(body: SendCodeRequest, request: Request):
         purpose=LOGIN_CODE_PURPOSE,
         forced_code=forced_code,
     )
+    reserved_code_id: str | None = None
 
     async with AuthUnitOfWork(request.app.state.database) as uow:
         await uow.verification_codes.acquire_rate_limit_lock(
@@ -99,24 +100,54 @@ async def send_code(body: SendCodeRequest, request: Request):
             raise HTTPException(
                 status_code=429, detail="Too many attempts, please try again tomorrow"
             )
-        if not is_mock_enabled(settings):
-            try:
-                await send_verification_code(settings, email, code_issue.code)
-            except Exception as error:
-                logger.error(
-                    "Failed to send verification email to %s: %s",
-                    email,
-                    type(error).__name__,
-                )
-                raise HTTPException(
-                    status_code=502, detail="Failed to send email, please try again later"
-                ) from error
-        await uow.verification_codes.issue_code(
+        reserved_code_id = await uow.verification_codes.issue_code(
             email=email,
             purpose=code_issue.purpose,
             code_digest=code_issue.code_digest,
             ttl_seconds=VERIFICATION_CODE_TTL_SECONDS,
         )
+
+    if is_mock_enabled(settings):
+        return AuthResponse()
+
+    # No-schema tradeoff: if the process crashes after the reservation commits
+    # but before provider result/compensation, an undelivered code can remain
+    # until expiry. We keep provider I/O outside the DB write lock to avoid
+    # stalling unrelated writes, then compensate precisely by code id on error.
+    try:
+        await send_verification_code(settings, email, code_issue.code)
+    except Exception as error:
+        cleanup_error: BaseException | None = None
+        if reserved_code_id is not None:
+            try:
+                async with AuthUnitOfWork(request.app.state.database) as uow:
+                    await uow.verification_codes.delete_code_by_id(
+                        code_id=reserved_code_id,
+                        email=email,
+                        purpose=LOGIN_CODE_PURPOSE,
+                    )
+            except BaseException as delete_error:
+                cleanup_error = delete_error
+                logger.error(
+                    "Failed to delete reserved verification code for %s: %s",
+                    email,
+                    type(delete_error).__name__,
+                )
+
+        logger.error(
+            "Failed to send verification email to %s: %s",
+            email,
+            type(error).__name__,
+        )
+        http_error = HTTPException(
+            status_code=502,
+            detail="Failed to send email, please try again later",
+        )
+        if cleanup_error is not None:
+            http_error.add_note(
+                f"verification code cleanup failed: {type(cleanup_error).__name__}"
+            )
+        raise http_error from error
 
     return AuthResponse()
 

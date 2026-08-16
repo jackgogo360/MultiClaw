@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -438,6 +439,17 @@ def test_send_code_failure_does_not_persist_code_or_consume_quota(
     client.app.state.settings.email.provider = "resend"
     client.app.state.settings.resend.mock = False
     caplog.set_level("ERROR", logger="multiclaw")
+    now_ms = asyncio.run(_db_now_seconds(migrated_database)) * 1000
+    asyncio.run(
+        _seed_verification_row(
+            migrated_database,
+            email=email,
+            code_digest="existing-login-digest",
+            purpose="login",
+            expires_at=now_ms + 60_000,
+            created_at=now_ms - 5_000,
+        )
+    )
 
     async def fail_sender(*_args, **_kwargs):
         raise RuntimeError("smtp failure secret-token")
@@ -452,18 +464,75 @@ def test_send_code_failure_does_not_persist_code_or_consume_quota(
     monkeypatch.setattr(auth_router, "send_verification_code", succeed_sender)
     success_responses = [
         client.post("/auth/send-code", json={"email": email})
-        for _ in range(MAX_SENDS_PER_DAY)
+        for _ in range(MAX_SENDS_PER_DAY - 1)
     ]
     limited = client.post("/auth/send-code", json={"email": email})
     rows_after_success = asyncio.run(_get_verification_rows(migrated_database, email))
 
     assert failed.status_code == 502
-    assert rows_after_failure == []
+    assert len(rows_after_failure) == 1
+    assert rows_after_failure[0]["code_digest"] == "existing-login-digest"
     assert "secret-token" not in caplog.text
-    assert [response.status_code for response in success_responses] == [200] * MAX_SENDS_PER_DAY
+    assert [response.status_code for response in success_responses] == [200] * (MAX_SENDS_PER_DAY - 1)
     assert limited.status_code == 429
     assert limited.json() == {"detail": "Too many attempts, please try again tomorrow"}
     assert [row["purpose"] for row in rows_after_success].count("login") == MAX_SENDS_PER_DAY
+
+
+def test_send_code_provider_io_does_not_hold_sqlite_write_transaction(
+    client: TestClient,
+    migrated_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import multiclaw.auth.router as auth_router
+
+    email = "slow-provider@example.com"
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = False
+    provider_started = threading.Event()
+    release_provider = threading.Event()
+    response_holder: dict[str, object] = {}
+    db_url = migrated_database.engine.url.render_as_string(hide_password=False)
+    fast_writer_db = Database.create(
+        DatabaseSettings(driver="sqlite", url=db_url, sqlite_busy_timeout_ms=100)
+    )
+
+    async def slow_sender(*_args, **_kwargs):
+        provider_started.set()
+        released = await asyncio.to_thread(release_provider.wait, 5)
+        if not released:
+            raise RuntimeError("provider wait timed out")
+
+    def do_request() -> None:
+        response_holder["response"] = client.post("/auth/send-code", json={"email": email})
+
+    async def unrelated_write() -> None:
+        async with fast_writer_db.write_transaction() as conn:
+            await conn.execute(
+                insert(verification_codes).values(
+                    id=str(uuid4()),
+                    email="unrelated@example.com",
+                    code_digest="unrelated-digest",
+                    purpose="login",
+                    expires_at=fast_writer_db.dialect.db_now_ms() + 60_000,
+                    used_at=None,
+                    created_at=fast_writer_db.dialect.db_now_ms(),
+                )
+            )
+
+    monkeypatch.setattr(auth_router, "send_verification_code", slow_sender)
+    request_thread = threading.Thread(target=do_request)
+    request_thread.start()
+    try:
+        assert provider_started.wait(timeout=2)
+        asyncio.run(unrelated_write())
+    finally:
+        release_provider.set()
+        request_thread.join(timeout=5)
+        asyncio.run(fast_writer_db.dispose())
+
+    response = response_holder["response"]
+    assert getattr(response, "status_code", None) == 200
 
 
 def test_deletion_recovery_audience_is_rejected_by_normal_api(
