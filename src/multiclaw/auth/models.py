@@ -25,6 +25,7 @@ VERIFICATION_CODE_TTL_SECONDS = 15 * 60
 DELETION_RECOVERY_TOKEN_TTL_SECONDS = 10 * 60
 RECENT_AUTH_MAX_AGE_SECONDS = 5 * 60
 MAX_SENDS_PER_DAY = 3
+MAX_VERIFICATION_FAILURES_PER_CODE = 5
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 DEFAULT_ALLOWED_ORIGINS = (
     "http://localhost",
@@ -33,6 +34,7 @@ DEFAULT_ALLOWED_ORIGINS = (
     "http://127.0.0.1:5173",
     "http://testserver",
 )
+_VERIFICATION_CODE_FAILURE_DIGEST_PREFIX = "v1"
 
 
 class AuthConfigurationError(RuntimeError):
@@ -54,6 +56,12 @@ class VerificationCodeIssue:
     code_digest: str
     purpose: str
     email: str
+
+
+@dataclass(frozen=True, slots=True)
+class _VerificationCodeDigestState:
+    base_digest: str
+    failures: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +227,45 @@ def issue_verification_code(
 
 def digests_match(expected: str, actual: str) -> bool:
     return hmac.compare_digest(expected, actual)
+
+
+def _parse_verification_code_digest(value: str) -> _VerificationCodeDigestState | None:
+    if _is_hex_digest(value):
+        return _VerificationCodeDigestState(base_digest=value, failures=0)
+
+    prefix = f"{_VERIFICATION_CODE_FAILURE_DIGEST_PREFIX}:"
+    if not value.startswith(prefix):
+        return None
+
+    parts = value.split(":", 2)
+    if len(parts) != 3 or parts[0] != _VERIFICATION_CODE_FAILURE_DIGEST_PREFIX:
+        return None
+    if not parts[1].isdigit():
+        return None
+
+    failures = int(parts[1])
+    base_digest = parts[2]
+    if failures < 0 or failures > MAX_VERIFICATION_FAILURES_PER_CODE:
+        return None
+    if not _is_hex_digest(base_digest):
+        return None
+    return _VerificationCodeDigestState(base_digest=base_digest, failures=failures)
+
+
+def _encode_verification_code_digest(base_digest: str, *, failures: int) -> str:
+    if not _is_hex_digest(base_digest):
+        raise ValueError("verification code digest must be a 64-character hex digest")
+    if failures < 0 or failures > MAX_VERIFICATION_FAILURES_PER_CODE:
+        raise ValueError("verification code failures out of range")
+    if failures == 0:
+        return base_digest
+    return f"{_VERIFICATION_CODE_FAILURE_DIGEST_PREFIX}:{failures}:{base_digest}"
+
+
+def _is_hex_digest(value: str) -> bool:
+    if len(value) != 64:
+        return False
+    return all(ch in "0123456789abcdef" for ch in value)
 
 
 def _load_secret_file(path: Path) -> bytes:

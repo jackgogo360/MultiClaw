@@ -1366,6 +1366,70 @@ def test_deletion_recovery_verify_wrong_code_rejects_without_setting_cookie(
     assert "recovery_token" not in client.cookies
 
 
+def test_login_verify_accepts_correct_code_after_four_failures(
+    client: TestClient,
+    migrated_database: Database,
+):
+    email = "login-four-failures@example.com"
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "112233"
+
+    assert client.post("/auth/send-code", json={"email": email}).status_code == 200
+
+    wrong_responses = [
+        client.post("/auth/verify", json={"email": email, "code": "000000"})
+        for _ in range(4)
+    ]
+    success = client.post("/auth/verify", json={"email": email, "code": "112233"})
+    me_response = client.get("/auth/me")
+    rows = asyncio.run(_get_verification_rows(migrated_database, email))
+
+    assert [response.status_code for response in wrong_responses] == [401, 401, 401, 401]
+    assert success.status_code == 200
+    assert me_response.status_code == 200
+    assert me_response.json()["email"] == email
+    assert len(rows) == 1
+    assert rows[0]["used_at"] is not None
+
+
+def test_login_verify_locks_latest_code_after_five_failures_until_new_issue(
+    client: TestClient,
+    migrated_database: Database,
+):
+    email = "login-lockout@example.com"
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+
+    client.app.state.auth_forced_code = "111111"
+    assert client.post("/auth/send-code", json={"email": email}).status_code == 200
+    client.app.state.auth_forced_code = "222222"
+    assert client.post("/auth/send-code", json={"email": email}).status_code == 200
+
+    wrong_responses = [
+        client.post("/auth/verify", json={"email": email, "code": "000000"})
+        for _ in range(5)
+    ]
+    latest_locked = client.post("/auth/verify", json={"email": email, "code": "222222"})
+    old_still_invalid = client.post("/auth/verify", json={"email": email, "code": "111111"})
+    client.app.state.auth_forced_code = "333333"
+    reset_send = client.post("/auth/send-code", json={"email": email})
+    reset_success = client.post("/auth/verify", json={"email": email, "code": "333333"})
+    client.cookies.clear()
+    locked_code_after_reset = client.post("/auth/verify", json={"email": email, "code": "222222"})
+    old_code_after_reset = client.post("/auth/verify", json={"email": email, "code": "111111"})
+    rows = asyncio.run(_get_verification_rows(migrated_database, email))
+
+    assert [response.status_code for response in wrong_responses] == [401, 401, 401, 401, 401]
+    assert latest_locked.status_code == 401
+    assert old_still_invalid.status_code == 401
+    assert reset_send.status_code == 200
+    assert reset_success.status_code == 200
+    assert locked_code_after_reset.status_code == 401
+    assert old_code_after_reset.status_code == 401
+    assert [row["used_at"] is not None for row in rows] == [False, True, True]
+
+
 def test_deletion_recovery_verify_sets_secure_cookie_flags_in_production(
     migrated_database: Database,
 ):
@@ -1465,16 +1529,126 @@ def test_deletion_recovery_jwt_claim_shape():
     assert payload["exp"] - payload["iat"] == 600
 
 
+def test_deletion_recovery_verify_accepts_correct_code_after_four_failures(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="recovery-four-failures@example.com",
+        )
+    )
+
+    scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert scheduled.status_code == 200
+
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "112233"
+    assert client.post("/auth/deletion-recovery/send-code", json={"email": identity.email}).status_code == 200
+
+    wrong_responses = [
+        client.post("/auth/deletion-recovery/verify", json={"email": identity.email, "code": "000000"})
+        for _ in range(4)
+    ]
+    success = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "112233"},
+    )
+    rows = asyncio.run(_get_verification_rows(migrated_database, identity.email))
+
+    assert [response.status_code for response in wrong_responses] == [401, 401, 401, 401]
+    assert success.status_code == 200
+    assert client.cookies.get("recovery_token") is not None
+    assert rows[-1]["used_at"] is not None
+
+
+def test_deletion_recovery_verify_locks_latest_code_after_five_failures_until_new_issue(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="recovery-lockout@example.com",
+        )
+    )
+
+    scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert scheduled.status_code == 200
+
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "111111"
+    assert client.post("/auth/deletion-recovery/send-code", json={"email": identity.email}).status_code == 200
+    client.app.state.auth_forced_code = "222222"
+    assert client.post("/auth/deletion-recovery/send-code", json={"email": identity.email}).status_code == 200
+
+    wrong_responses = [
+        client.post("/auth/deletion-recovery/verify", json={"email": identity.email, "code": "000000"})
+        for _ in range(5)
+    ]
+    latest_locked = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "222222"},
+    )
+    old_still_invalid = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "111111"},
+    )
+    client.app.state.auth_forced_code = "333333"
+    reset_send = client.post("/auth/deletion-recovery/send-code", json={"email": identity.email})
+    reset_success = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "333333"},
+    )
+    recovery_token = client.cookies.get("recovery_token")
+    client.cookies.clear()
+    locked_code_after_reset = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "222222"},
+    )
+    rows = asyncio.run(_get_verification_rows(migrated_database, identity.email))
+
+    assert [response.status_code for response in wrong_responses] == [401, 401, 401, 401, 401]
+    assert latest_locked.status_code == 401
+    assert old_still_invalid.status_code == 401
+    assert reset_send.status_code == 200
+    assert reset_success.status_code == 200
+    assert recovery_token is not None
+    assert locked_code_after_reset.status_code == 401
+    assert [row["used_at"] is not None for row in rows if row["purpose"] == "deletion_recovery"] == [
+        False,
+        True,
+        True,
+    ]
+
+
 @pytest.mark.asyncio
 async def test_verification_codes_ignore_wrong_purpose_and_are_consumed_once_atomically(
     migrated_database: Database,
 ) -> None:
+    recovery_digest = issue_verification_code(
+        TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        email="atomic@example.com",
+        purpose="deletion_recovery",
+        forced_code="111111",
+    ).code_digest
+    login_digest = issue_verification_code(
+        TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        email="atomic@example.com",
+        purpose="login",
+        forced_code="222222",
+    ).code_digest
     async with AuthUnitOfWork(migrated_database) as uow:
         await uow.conn.execute(
             insert(verification_codes).values(
                 id=str(uuid4()),
                 email="atomic@example.com",
-                code_digest="digest-a",
+                code_digest=recovery_digest,
                 purpose="deletion_recovery",
                 expires_at=uow._database.dialect.db_now_ms() + 60_000,
                 used_at=None,
@@ -1485,7 +1659,7 @@ async def test_verification_codes_ignore_wrong_purpose_and_are_consumed_once_ato
             insert(verification_codes).values(
                 id=str(uuid4()),
                 email="atomic@example.com",
-                code_digest="digest-b",
+                code_digest=login_digest,
                 purpose="login",
                 expires_at=uow._database.dialect.db_now_ms() + 60_000,
                 used_at=None,
@@ -1497,21 +1671,100 @@ async def test_verification_codes_ignore_wrong_purpose_and_are_consumed_once_ato
         assert await uow.verification_codes.consume_latest_code(
             email="atomic@example.com",
             purpose="login",
-            code_digest="digest-a",
+            code_digest=recovery_digest,
         ) is None
         first = await uow.verification_codes.consume_latest_code(
             email="atomic@example.com",
             purpose="login",
-            code_digest="digest-b",
+            code_digest=login_digest,
         )
         second = await uow.verification_codes.consume_latest_code(
             email="atomic@example.com",
             purpose="login",
-            code_digest="digest-b",
+            code_digest=login_digest,
         )
 
     assert first is not None
     assert second is None
+
+
+@pytest.mark.asyncio
+async def test_verification_code_failures_are_purpose_isolated_and_lock_only_matching_latest_code(
+    migrated_database: Database,
+) -> None:
+    email = "purpose-isolation@example.com"
+    login_digest = issue_verification_code(
+        TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        email=email,
+        purpose="login",
+        forced_code="111111",
+    ).code_digest
+    login_wrong_digest = issue_verification_code(
+        TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        email=email,
+        purpose="login",
+        forced_code="000000",
+    ).code_digest
+    recovery_digest = issue_verification_code(
+        TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        email=email,
+        purpose="deletion_recovery",
+        forced_code="222222",
+    ).code_digest
+
+    async with AuthUnitOfWork(migrated_database) as uow:
+        now_ms = await uow.verification_codes.db_now_ms()
+        await uow.conn.execute(
+            insert(verification_codes).values(
+                id=str(uuid4()),
+                email=email,
+                code_digest=login_digest,
+                purpose="login",
+                expires_at=now_ms + 60_000,
+                used_at=None,
+                created_at=now_ms,
+            )
+        )
+        await uow.conn.execute(
+            insert(verification_codes).values(
+                id=str(uuid4()),
+                email=email,
+                code_digest=recovery_digest,
+                purpose="deletion_recovery",
+                expires_at=now_ms + 60_000,
+                used_at=None,
+                created_at=now_ms + 1,
+            )
+        )
+
+    async with AuthUnitOfWork(migrated_database) as uow:
+        for _ in range(5):
+            assert (
+                await uow.verification_codes.consume_latest_code(
+                    email=email,
+                    purpose="login",
+                    code_digest=login_wrong_digest,
+                )
+            ) is None
+        recovery = await uow.verification_codes.consume_latest_code(
+            email=email,
+            purpose="deletion_recovery",
+            code_digest=recovery_digest,
+        )
+        recovery_second = await uow.verification_codes.consume_latest_code(
+            email=email,
+            purpose="deletion_recovery",
+            code_digest=recovery_digest,
+        )
+        locked_login = await uow.verification_codes.consume_latest_code(
+            email=email,
+            purpose="login",
+            code_digest=login_digest,
+        )
+
+    assert recovery is not None
+    assert recovery_second is None
+    assert locked_login is None
 
 
 @pytest.mark.asyncio
@@ -1609,6 +1862,7 @@ def test_only_latest_unused_login_code_is_valid_in_frozen_layout(
     assert new_response.status_code == 200
     assert rows_after_new[0]["used_at"] is None
     assert rows_after_new[1]["used_at"] is not None
+    assert client.post("/auth/verify", json={"email": email, "code": "111111"}).status_code == 401
 
 
 def test_foreign_session_id_is_404_and_does_not_create_session(client: TestClient, two_users: TwoUsers):
