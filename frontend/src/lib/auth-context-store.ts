@@ -7,6 +7,7 @@ export interface AuthState {
   accountStatus: "active" | "pending_purge" | null;
   deletionStatus: AccountDeletionStatus | null;
   pendingDeletionEmail: string | null;
+  reauthEmailHint: string | null;
   isLoading: boolean;
   isAuthenticated: boolean;
   login: (email: string, code: string) => Promise<void>;
@@ -16,6 +17,7 @@ export interface AuthState {
   requestAccountDeletion: () => Promise<AccountDeletionRequest>;
   refreshDeletionStatus: () => Promise<AccountDeletionStatus | null>;
   recoverAccountDeletion: () => Promise<void>;
+  beginRecentAuthRenewal: () => Promise<void>;
   logout: () => Promise<void>;
 }
 

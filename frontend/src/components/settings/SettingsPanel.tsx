@@ -19,7 +19,7 @@ export function SettingsPanel({
 
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/55 px-4 py-8 backdrop-blur-sm">
-      <div className="flex max-h-full w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-border bg-surface shadow-2xl">
+      <div className="settings-panel">
         <div className="flex items-center justify-between border-b border-border px-5 py-4">
           <div>
             <h2 className="text-lg font-semibold text-foreground">Settings</h2>
@@ -58,7 +58,7 @@ export function SettingsPanel({
           </button>
         </div>
 
-        <div className="overflow-y-auto px-5 py-4">
+        <div className="settings-panel__body overflow-y-auto px-5 py-4">
           {tab === "secrets" ? <SecretSettings /> : <DeletionSettings />}
         </div>
       </div>

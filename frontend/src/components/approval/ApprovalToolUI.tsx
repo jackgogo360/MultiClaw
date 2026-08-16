@@ -27,6 +27,25 @@ export function ApprovalToolUI({
   const [approval, setApproval] = useState<ApprovalRecord | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isReloading, setIsReloading] = useState(false);
+
+  const handleReloadApproval = async () => {
+    if (!approvalId) {
+      setError("Approval request id is missing.");
+      return;
+    }
+
+    setIsReloading(true);
+    try {
+      const next = await approveApi.getApproval(approvalId);
+      setApproval(next);
+      setError(null);
+    } catch (nextError) {
+      setError(formatError(nextError));
+    } finally {
+      setIsReloading(false);
+    }
+  };
 
   useEffect(() => {
     if (!approvalId) {
@@ -68,8 +87,7 @@ export function ApprovalToolUI({
     } catch (nextError) {
       if (nextError instanceof ApiError && nextError.status === 409) {
         try {
-          const refreshed = await approveApi.getApproval(approvalId);
-          setApproval(refreshed);
+          await handleReloadApproval();
           setError("Approval state changed on the server. Refreshed latest status.");
         } catch (refreshError) {
           setError(formatError(refreshError));
@@ -77,7 +95,7 @@ export function ApprovalToolUI({
       } else if (nextError instanceof ApiError && nextError.status === 410) {
         setApproval((current) =>
           current
-            ? { ...current, status: "expired", resolved_at: current.resolved_at ?? Date.now() }
+            ? { ...current, status: "expired" }
             : null,
         );
         setError("This approval expired before your decision could be recorded.");
@@ -126,6 +144,13 @@ export function ApprovalToolUI({
             </div>
           ) : null}
         </div>
+        <button
+          className="approval-refresh-button"
+          onClick={() => void handleReloadApproval()}
+          disabled={busy || isReloading || !approvalId}
+        >
+          {isReloading ? "Reloading..." : "Reload status"}
+        </button>
       </div>
 
       <details className="mb-3 rounded border border-border">
@@ -145,11 +170,13 @@ export function ApprovalToolUI({
 
       {resolved || expired ? (
         <div
-          className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${
+          className={
             approval?.status === "approved"
-              ? "border border-success/25 bg-success/10 text-success"
-              : "border border-danger/25 bg-danger/10 text-danger"
-          }`}
+              ? "approval-state approval-state--approved"
+              : expired
+                ? "approval-state approval-state--expired"
+                : "approval-state approval-state--rejected"
+          }
         >
           {approval?.status === "approved"
             ? "Approved"

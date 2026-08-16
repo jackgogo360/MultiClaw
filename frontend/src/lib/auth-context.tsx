@@ -20,6 +20,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [userId, setUserId] = useState<string | null>(null);
   const [accountStatus, setAccountStatus] = useState<"active" | "pending_purge" | null>(null);
   const [pendingDeletionEmail, setPendingDeletionEmail] = useState<string | null>(null);
+  const [reauthEmailHint, setReauthEmailHint] = useState<string | null>(null);
   const [deletionStatus, setDeletionStatus] = useState<AccountDeletionStatus | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -56,6 +57,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setAccountStatus("active");
           setDeletionStatus(null);
           setPendingDeletionEmail(null);
+          setReauthEmailHint(null);
           return;
         }
 
@@ -89,6 +91,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       accountStatus,
       deletionStatus,
       pendingDeletionEmail,
+      reauthEmailHint,
       isLoading,
       isAuthenticated: email !== null && userId !== null,
       sendCode: async (emailAddr: string) => {
@@ -103,6 +106,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setAccountStatus(data.user_id ? "active" : null);
         setDeletionStatus(null);
         setPendingDeletionEmail(null);
+        setReauthEmailHint(null);
         resetServerState();
       },
       sendDeletionRecoveryCode: async (emailAddr: string) => {
@@ -126,6 +130,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           status: scheduled.status,
           purge_after: scheduled.purge_after,
         });
+        setReauthEmailHint(null);
         resetServerState();
         return scheduled;
       },
@@ -136,6 +141,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setSignedOut(null);
         setAccountStatus(null);
         setDeletionStatus(null);
+        setReauthEmailHint(null);
+        resetServerState();
+      },
+      beginRecentAuthRenewal: async () => {
+        const emailHint = email;
+        try {
+          await authApi.logout();
+        } catch {
+          // Clear client state even if the server session already expired.
+        }
+        clearCsrfToken();
+        setSignedOut(null);
+        setAccountStatus(null);
+        setDeletionStatus(null);
+        setReauthEmailHint(emailHint);
         resetServerState();
       },
       logout: async () => {
@@ -144,10 +164,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setSignedOut(null);
         setAccountStatus(null);
         setDeletionStatus(null);
+        setReauthEmailHint(null);
         resetServerState();
       },
     }),
-    [accountStatus, deletionStatus, email, isLoading, pendingDeletionEmail, userId]
+    [accountStatus, deletionStatus, email, isLoading, pendingDeletionEmail, reauthEmailHint, userId]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

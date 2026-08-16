@@ -99,6 +99,8 @@ def test_settings_approval_and_run_scope_contracts_are_present():
     deletion_settings_path = Path("frontend/src/components/settings/DeletionSettings.tsx").resolve()
     session_provider_path = Path("frontend/src/components/session/SessionProvider.tsx").resolve()
     app_layout_path = Path("frontend/src/components/layout/AppLayout.tsx").resolve()
+    index_css_path = Path("frontend/src/index.css").resolve()
+    tsconfig_path = Path("frontend/tsconfig.json").resolve()
     typescript_path = _find_typescript_module().resolve()
     node_script = f"""
 import fs from 'node:fs';
@@ -115,6 +117,8 @@ const files = {{
   settingsPanel: {str(settings_panel_path)!r},
   secretSettings: {str(secret_settings_path)!r},
   deletionSettings: {str(deletion_settings_path)!r},
+  indexCss: {str(index_css_path)!r},
+  tsconfig: {str(tsconfig_path)!r},
 }};
 
 const result = {{}};
@@ -171,6 +175,8 @@ const chatStoreSource = result.chatStoreSource;
 const approvalSource = result.approvalSource;
 const secretSettingsSource = result.secretSettingsSource;
 const deletionSettingsSource = result.deletionSettingsSource;
+const indexCssSource = result.indexCssSource;
+const tsconfig = JSON.parse(result.tsconfigSource);
 
 let chatStoreTracksRunScope = false;
 ts.forEachChild(chatStoreFile, function visit(node) {{
@@ -184,7 +190,8 @@ const approvalUsesPersistedRecord =
   approvalSource.includes('version')
   && approvalSource.includes('getApproval')
   && approvalSource.includes('409')
-  && approvalSource.includes('410');
+  && approvalSource.includes('410')
+  && approvalSource.includes('handleReloadApproval');
 const sessionProviderResetsDerivedState =
   /reset/i.test(sessionProviderSource)
   && /auth/i.test(sessionProviderSource)
@@ -192,7 +199,8 @@ const sessionProviderResetsDerivedState =
 const authContextRefreshesOnAuthChanges =
   authContextSource.includes('authApi.me')
   && authContextSource.includes('logout')
-  && authContextSource.includes('login');
+  && authContextSource.includes('login')
+  && authContextSource.includes('beginRecentAuthRenewal');
 
 const settingsPanelWiredFromFooter =
   result.appLayoutSource.includes('SettingsPanel')
@@ -200,12 +208,32 @@ const settingsPanelWiredFromFooter =
 const secretSettingsUsesTransientInput =
   secretSettingsSource.includes('finally')
   && /set[A-Za-z0-9_]*Value\\(\"\"\\)/.test(secretSettingsSource)
-  && !secretSettingsSource.includes('localStorage.setItem');
-    const deletionSettingsEnforcesRecoveryAndPendingPurge =
-      deletionSettingsSource.includes('pending_purge')
-      && deletionSettingsSource.includes('purge_after')
-      && deletionSettingsSource.includes('recover')
-      && deletionSettingsSource.includes('sendDeletionRecoveryCode');
+  && !secretSettingsSource.includes('localStorage.setItem')
+  && secretSettingsSource.includes('beginRecentAuthRenewal')
+  && secretSettingsSource.includes('requiresRecentAuth')
+  && secretSettingsSource.includes('Re-authenticate');
+const deletionSettingsEnforcesRecoveryAndPendingPurge =
+  deletionSettingsSource.includes('pending_purge')
+  && deletionSettingsSource.includes('purge_after')
+  && deletionSettingsSource.includes('recover')
+  && deletionSettingsSource.includes('sendDeletionRecoveryCode')
+  && deletionSettingsSource.includes('setTimeout')
+  && deletionSettingsSource.includes('clearTimeout')
+  && !deletionSettingsSource.includes('renderedAt');
+const sharedSettingsCssPresent =
+  indexCssSource.includes('.settings-panel')
+  && indexCssSource.includes('.approval-refresh-button')
+  && indexCssSource.includes('.deletion-warning')
+  && indexCssSource.includes('.secret-danger-button')
+  && indexCssSource.includes('.pending-purge-banner');
+const componentsUseSharedCss =
+  result.settingsPanelSource.includes('settings-panel')
+  && secretSettingsSource.includes('secret-danger-button')
+  && deletionSettingsSource.includes('deletion-warning')
+  && approvalSource.includes('approval-refresh-button');
+const tsBuildInfoMovedOutOfRepoRoot =
+  typeof tsconfig.compilerOptions?.tsBuildInfoFile === 'string'
+  && tsconfig.compilerOptions.tsBuildInfoFile.includes('node_modules');
 
 process.stdout.write(JSON.stringify({{
   appCapturesRunControl,
@@ -224,6 +252,9 @@ process.stdout.write(JSON.stringify({{
   settingsPanelWiredFromFooter,
   secretSettingsUsesTransientInput,
   deletionSettingsEnforcesRecoveryAndPendingPurge,
+  sharedSettingsCssPresent,
+  componentsUseSharedCss,
+  tsBuildInfoMovedOutOfRepoRoot,
 }}));
 """
 
@@ -244,3 +275,6 @@ process.stdout.write(JSON.stringify({{
     assert payload["settingsPanelWiredFromFooter"] is True
     assert payload["secretSettingsUsesTransientInput"] is True
     assert payload["deletionSettingsEnforcesRecoveryAndPendingPurge"] is True
+    assert payload["sharedSettingsCssPresent"] is True
+    assert payload["componentsUseSharedCss"] is True
+    assert payload["tsBuildInfoMovedOutOfRepoRoot"] is True
