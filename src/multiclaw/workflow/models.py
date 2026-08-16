@@ -388,9 +388,12 @@ class ExecutionRecoveryRecord:
     execution_id: str
     approval_id: str | None
     tool_call_id: str
+    tool_name: str
+    tool_kind: str
     status: ExecutionStatus
     recovery_strategy: RecoveryStrategy
     idempotency_key: str | None
+    input_payload_json: str
     input_hash: str
     input_ref: str
     external_request_id: str | None

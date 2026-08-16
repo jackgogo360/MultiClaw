@@ -38,17 +38,30 @@ class ToolRecoveryMetadata(BaseModel):
     idempotency_key: str | None = None
 
 
+class ToolProgressRecorder(ABC):
+    @abstractmethod
+    async def record_external_request_id(self, external_request_id: str) -> None:
+        raise NotImplementedError
+
+
 class ToolInvocation(ABC, Generic[TParams]):
     def __init__(self, name: str, params: TParams) -> None:
         self.name = name
         self.params = params
         self.approved_roots: list[Path] = []
+        self.progress_recorder: ToolProgressRecorder | None = None
 
     def configure_permission(
         self,
         approved_roots: Sequence[str | Path] | None = None,
     ) -> None:
         self.approved_roots = [Path(root).resolve() for root in (approved_roots or [])]
+
+    def configure_progress(
+        self,
+        recorder: ToolProgressRecorder | None,
+    ) -> None:
+        self.progress_recorder = recorder
 
     @abstractmethod
     async def execute(self) -> ToolExecutionResult:

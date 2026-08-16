@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -29,12 +30,14 @@ from multiclaw.workflow.models import (
     ExecutionResultObservedPayload,
     ExecutionStatus,
     IncompatibleCheckpointError,
+    InvalidTransitionError,
     ModelOutputPayload,
     PHASE_PAYLOADS,
     LeaseConflictError,
     RecoveryAction,
     RecoveryOutcome,
     RecoveryStrategy,
+    RunLeaseHandle,
     TERMINAL_RUN_STATUSES,
     RunStartedPayload,
     RunRecord,
@@ -540,24 +543,193 @@ class WorkflowRecoveryWorker:
                 )
             )
         )
+        runtime_lease = None
+        begin_run = getattr(runtime, "begin_run", None)
+        if callable(begin_run):
+            runtime_lease = begin_run()
         runtime_instance_id = getattr(runtime, "runtime_instance_id", "recovery-worker")
         coordinator = WorkflowCoordinator(self._database, settings=self._settings)
-        run = await coordinator.get_run(candidate.context)
-        if run is None or run.status in TERMINAL_RUN_STATUSES:
-            return
         try:
-            lease = await coordinator.acquire_run(candidate.context, runtime_instance_id)
-        except LeaseConflictError:
-            return
-        if candidate.awaiting_resolution:
             try:
-                lease = await coordinator.transition_run(lease, RunStatus.RESUMING)
-            except InvalidTransitionError:
+                run = await coordinator.get_run(candidate.context)
+                if run is None or run.status in TERMINAL_RUN_STATUSES:
+                    return
+
+                if candidate.awaiting_resolution and run.status is RunStatus.AWAITING_USER:
+                    lease = await coordinator.resume_waiting_run(candidate.context, runtime_instance_id)
+                else:
+                    lease = await coordinator.acquire_run(candidate.context, runtime_instance_id)
+            except LeaseConflictError:
                 return
-        await self._recovery_service.recover(candidate.context, runtime_instance_id)
+            run_lease_handle = RunLeaseHandle(lease)
+
+            if candidate.awaiting_resolution and await self._resume_approved_plan_if_present(
+                runtime=runtime,
+                context=candidate.context,
+                run_lease_handle=run_lease_handle,
+            ):
+                return
+
+            outcome = await self._recovery_service.recover(candidate.context, runtime_instance_id)
+            await self._consume_outcome(
+                runtime=runtime,
+                context=candidate.context,
+                run_lease_handle=run_lease_handle,
+                outcome=outcome,
+            )
+        finally:
+            if runtime_lease is not None:
+                runtime_lease.close()
+
+    async def _resume_approved_plan_if_present(
+        self,
+        *,
+        runtime,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+    ) -> bool:
+        coordinator = WorkflowCoordinator(self._database, settings=self._settings)
+        checkpoint = await coordinator.get_latest_checkpoint(context)
+        if checkpoint is None or checkpoint.approval_id is None:
+            return False
+        approval = await self._recovery_service._approval(context, checkpoint.approval_id)
+        if approval is None or approval.status is not ApprovalStatus.APPROVED:
+            return False
+        execution = await coordinator.get_execution_by_approval_id(context, checkpoint.approval_id)
+        if execution is None or execution.status is not ExecutionStatus.NOT_STARTED:
+            return False
+        builder = runtime.registry.get(execution.tool_name)
+        if builder is None:
+            await runtime.scheduler._block_execution(
+                context=context,
+                execution=execution,
+                run_lease_handle=run_lease_handle,
+                status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
+                detail="missing builder during recovery",
+            )
+            return True
+        await runtime.scheduler.recover_execution(
+            builder=builder,
+            context=context,
+            execution=execution,
+            action=_dispatch_recovery_action(execution.recovery_strategy),
+            run_lease_handle=run_lease_handle,
+            force_execute=True,
+        )
+        await run_lease_handle.refresh(
+            lambda lease: WorkflowCoordinator(
+                self._database,
+                settings=self._settings,
+            ).transition_run(lease, RunStatus.RUNNING)
+        )
+        return True
+
+    async def _consume_outcome(
+        self,
+        *,
+        runtime,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        outcome: RecoveryOutcome,
+    ) -> None:
+        if outcome.status in {RunStatus.BLOCKED_CORRUPT, RunStatus.BLOCKED_INCOMPATIBLE}:
+            checkpoint = await WorkflowCoordinator(
+                self._database,
+                settings=self._settings,
+            ).get_latest_checkpoint(context)
+            if checkpoint is not None and checkpoint.execution_id is not None:
+                execution = await WorkflowCoordinator(
+                    self._database,
+                    settings=self._settings,
+                ).get_execution_recovery(context, checkpoint.execution_id)
+                if execution is not None:
+                    await runtime.scheduler._block_execution(
+                        context=context,
+                        execution=execution,
+                        run_lease_handle=run_lease_handle,
+                        status=(
+                            ExecutionStatus.BLOCKED_CORRUPT
+                            if outcome.status is RunStatus.BLOCKED_CORRUPT
+                            else ExecutionStatus.BLOCKED_INCOMPATIBLE
+                        ),
+                        detail=outcome.reason or "recovery blocked",
+                    )
+            return
+        if outcome.action is None or outcome.action is RecoveryAction.TERMINAL_NOOP:
+            return
+        if outcome.action is RecoveryAction.AWAIT_USER:
+            return
+
+        coordinator = WorkflowCoordinator(self._database, settings=self._settings)
+        execution = None
+        if outcome.execution_id is not None:
+            execution = await coordinator.get_execution_recovery(context, outcome.execution_id)
+            if execution is None:
+                return
+
+        if outcome.action in {
+            RecoveryAction.REPLAY_READ_ONLY,
+            RecoveryAction.RETRY_IDEMPOTENT,
+            RecoveryAction.MARK_MANUAL_UNCERTAIN,
+        }:
+            if execution is None:
+                return
+            builder = runtime.registry.get(execution.tool_name)
+            if builder is None:
+                await runtime.scheduler._block_execution(
+                    context=context,
+                    execution=execution,
+                    run_lease_handle=run_lease_handle,
+                    status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
+                    detail="missing builder during recovery",
+                )
+                return
+            await runtime.scheduler.recover_execution(
+                builder=builder,
+                context=context,
+                execution=execution,
+                action=outcome.action,
+                run_lease_handle=run_lease_handle,
+            )
+            return
+
+        if outcome.action is RecoveryAction.RESUME_MODEL:
+            continuation = getattr(runtime, "recovery_continuation", None)
+            if continuation is not None and hasattr(continuation, "resume"):
+                await self._maybe_await(
+                    continuation.resume(
+                        runtime=runtime,
+                        context=context,
+                        run_lease_handle=run_lease_handle,
+                        recovery_outcome=outcome,
+                    )
+                )
+            await run_lease_handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    self._database,
+                    settings=self._settings,
+                ).transition_run(lease, RunStatus.RUNNING)
+            )
 
     @staticmethod
     async def _maybe_await(value):
         if inspect.isawaitable(value):
             return await value
         return value
+
+
+class RuntimeRecoveryContinuationService:
+    async def resume(
+        self,
+        *,
+        runtime,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        recovery_outcome: RecoveryOutcome,
+    ) -> None:
+        del context, run_lease_handle, recovery_outcome
+        callback = getattr(getattr(runtime, "agent", None), "resume_recovery", None)
+        if callable(callback):
+            result = callback()
+            if inspect.isawaitable(result):
+                await result

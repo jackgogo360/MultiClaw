@@ -10,19 +10,25 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from pydantic import BaseModel
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
 from multiclaw.cli import alembic_config
 from multiclaw.config import DatabaseSettings, Settings
 from multiclaw.events import EventBus
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.storage import Database
-from multiclaw.storage.schema import approval_requests, execution_checkpoints, tool_executions
+from multiclaw.storage.schema import agent_runs, approval_requests, execution_checkpoints, tool_executions
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 from multiclaw.tools import CoreToolScheduler, ToolBuilder, ToolExecutionResult, ToolInvocation, ToolStatus
 from multiclaw.workflow.coordinator import WorkflowCoordinator
-from multiclaw.workflow.models import ExecutionStatus, RecoveryStrategy, RunLeaseHandle
+from multiclaw.workflow.models import (
+    CheckpointPhase,
+    ExecutionStatus,
+    RecoveryStrategy,
+    RunLeaseHandle,
+    RunStatus,
+)
 from multiclaw.workflow import recovery as recovery_module
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -144,6 +150,10 @@ async def _latest_execution_row(database: Database, context: TenantContext) -> d
     async with database.connect() as conn:
         result = await conn.execute(
             select(
+                tool_executions.c.execution_id,
+                tool_executions.c.approval_id,
+                tool_executions.c.tool_call_id,
+                tool_executions.c.tool_name,
                 tool_executions.c.execution_status,
                 tool_executions.c.recovery_strategy,
                 tool_executions.c.external_request_id,
@@ -151,6 +161,8 @@ async def _latest_execution_row(database: Database, context: TenantContext) -> d
                 tool_executions.c.result_digest,
                 tool_executions.c.input_payload_json,
                 tool_executions.c.input_hash,
+                tool_executions.c.idempotency_key,
+                tool_executions.c.version,
             )
             .where(
                 tool_executions.c.tenant_id == context.tenant_id,
@@ -196,6 +208,14 @@ class PersistedInvocation(ToolInvocation[PersistedParams]):
         return await self._runner(self.params)
 
 
+class ReportingInvocation(PersistedInvocation):
+    async def execute(self) -> ToolExecutionResult:
+        recorder = getattr(self, "progress_recorder", None)
+        assert recorder is not None
+        await recorder.record_external_request_id("request-early")
+        raise RuntimeError("crash after reporting request id")
+
+
 class PersistedToolBuilder(ToolBuilder[PersistedParams]):
     parameters_schema = PersistedParams
 
@@ -218,6 +238,142 @@ class PersistedToolBuilder(ToolBuilder[PersistedParams]):
 
     def build(self, params: PersistedParams) -> ToolInvocation[PersistedParams]:
         return PersistedInvocation(self.name, params, self._runner)
+
+
+class ReportingToolBuilder(PersistedToolBuilder):
+    def build(self, params: PersistedParams) -> ToolInvocation[PersistedParams]:
+        return ReportingInvocation(self.name, params, self._runner)
+
+
+class _TrackingRuntimeLease:
+    def __init__(self, owner: "_TrackingRuntime") -> None:
+        self.owner = owner
+        self.closed = False
+        self.owner.begin_calls += 1
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.owner.closed_calls += 1
+
+
+class _TrackingContinuation:
+    def __init__(self) -> None:
+        self.calls: list[tuple[TenantContext, object]] = []
+
+    async def resume(self, *, runtime, context: TenantContext, run_lease_handle, recovery_outcome) -> None:
+        del runtime, run_lease_handle
+        self.calls.append((context, recovery_outcome))
+
+
+class _TrackingRuntime:
+    def __init__(self, *, runtime_instance_id: str, scheduler: CoreToolScheduler, builders: list[ToolBuilder]) -> None:
+        from multiclaw.tools import ToolRegistry
+
+        self.runtime_instance_id = runtime_instance_id
+        self.scheduler = scheduler
+        self.registry = ToolRegistry()
+        for builder in builders:
+            self.registry.register(builder)
+        self.begin_calls = 0
+        self.closed_calls = 0
+        self.recovery_continuation = _TrackingContinuation()
+
+    def begin_run(self) -> _TrackingRuntimeLease:
+        return _TrackingRuntimeLease(self)
+
+
+class _TrackingRuntimePool:
+    def __init__(self, runtime: _TrackingRuntime) -> None:
+        self.runtime = runtime
+        self.acquired: list[TenantContext] = []
+
+    async def acquire(self, context: TenantContext):
+        self.acquired.append(context)
+        return self.runtime
+
+
+async def _expire_run_lease(database: Database, context: TenantContext) -> None:
+    async with database.write_transaction() as conn:
+        await conn.execute(
+            update(agent_runs)
+            .where(
+                agent_runs.c.tenant_id == context.tenant_id,
+                agent_runs.c.workspace_id == context.workspace_id,
+                agent_runs.c.session_id == context.session_id,
+                agent_runs.c.run_id == context.run_id,
+            )
+            .values(lease_expires_at=database.dialect.db_now_ms() - 1)
+        )
+
+
+async def _seed_dispatch_state(
+    database: Database,
+    *,
+    context: TenantContext,
+    tool_name: str,
+    recovery_strategy: RecoveryStrategy,
+    raw_params: dict[str, object],
+    tool_call_id: str,
+    idempotency_key: str | None = None,
+    external_request_id: str | None = None,
+) -> str:
+    scheduler = _scheduler(database)
+    coordinator = _coordinator(database)
+    lease = await coordinator.start_run_with_checkpoint(context, "seed-runtime")
+    canonical = scheduler._canonicalize_input(raw_params)
+    execution = await coordinator.create_execution(
+        lease,
+        execution_id=str(uuid4()),
+        approval_id=None,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        tool_kind="native",
+        recovery_strategy=recovery_strategy,
+        idempotency_key=idempotency_key,
+        input_payload_json=canonical.payload_json,
+        input_hash=canonical.payload_hash,
+    )
+    assert execution is not None
+    await coordinator.transition_execution(
+        lease,
+        execution.execution_id,
+        expected_status=ExecutionStatus.NOT_STARTED,
+        expected_version=execution.version,
+        target=ExecutionStatus.EXECUTING,
+    )
+    if external_request_id is not None:
+        await coordinator.record_external_request_id(
+            lease,
+            execution.execution_id,
+            expected_status=ExecutionStatus.EXECUTING,
+            expected_version=execution.version + 1,
+            external_request_id=external_request_id,
+        )
+        execution_version = execution.version + 2
+    else:
+        execution_version = execution.version + 1
+    await coordinator.checkpoint(
+        lease,
+        CheckpointPhase.EXECUTION_DISPATCHING,
+        {
+            "run_id": context.run_id,
+            "execution_id": execution.execution_id,
+            "tool_call_id": tool_call_id,
+            "recovery_strategy": recovery_strategy.value,
+            "input_hash": canonical.payload_hash,
+            "input_ref": f"tool_execution:{execution.execution_id}:input_payload_json",
+            "idempotency_key": idempotency_key,
+            "dispatch_cursor": f"dispatch:{context.run_id}:{tool_call_id}",
+            "cursor": f"dispatch:{context.run_id}:{tool_call_id}",
+        },
+        execution_id=execution.execution_id,
+        execution_expected_status=ExecutionStatus.EXECUTING,
+        execution_expected_version=execution_version,
+    )
+    await _expire_run_lease(database, context)
+    return execution.execution_id
 
 
 @pytest.mark.asyncio
@@ -349,15 +505,20 @@ async def test_different_runs_can_overlap_under_same_tenant(workflow_database: D
 
 
 @pytest.mark.asyncio
-async def test_approval_decision_survives_runtime_revoke_without_executing_tool(workflow_database: Database):
+async def test_approval_api_persists_not_started_plan_and_worker_executes_after_run_once(
+    workflow_database: Database,
+):
     import multiclaw.server as server
 
     scheduler = _scheduler(workflow_database)
     context = await _create_run_context(workflow_database, email_suffix="-approval-api")
     lease = await _coordinator(workflow_database).start_run_with_checkpoint(context, "runtime-approval")
+    call_count = 0
 
     async def runner(params: PersistedParams) -> ToolExecutionResult:
-        raise AssertionError("approval API must not execute tools")
+        nonlocal call_count
+        call_count += 1
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
 
     result = await scheduler.run(
         PersistedToolBuilder(
@@ -370,6 +531,7 @@ async def test_approval_decision_survives_runtime_revoke_without_executing_tool(
         call_id="call-approval",
         run_lease_handle=RunLeaseHandle(lease),
     )
+    assert result.status == ToolStatus.AWAITING_APPROVAL
     approval_id = result.data["approval_id"]
 
     request = SimpleNamespace(
@@ -391,13 +553,168 @@ async def test_approval_decision_survives_runtime_revoke_without_executing_tool(
     )
 
     approval_count, execution_count = await _approval_and_execution_counts(workflow_database, context)
+    execution_row = await _latest_execution_row(workflow_database, context)
     assert getattr(response, "status_code", 200) == 200
     assert approval_count == 1
-    assert execution_count == 0
+    assert execution_count == 1
+    assert execution_row["approval_id"] == approval_id
+    assert execution_row["execution_status"] == ExecutionStatus.NOT_STARTED.value
+    assert call_count == 0
+
+    runtime = _TrackingRuntime(
+        runtime_instance_id="runtime-recovered",
+        scheduler=_scheduler(workflow_database),
+        builders=[
+            PersistedToolBuilder(
+                name="guarded_mutation",
+                runner=runner,
+                recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+            )
+        ],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    execution_row = await _latest_execution_row(workflow_database, context)
+    assert call_count == 1
+    assert execution_row["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert runtime.begin_calls == 1
+    assert runtime.closed_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_terminal_execution_recovery_metadata_survives_worker_noop(
+async def test_worker_invokes_runtime_continuation_for_resume_model(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-resume-model")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-resume")
+    await _expire_run_lease(workflow_database, context)
+
+    runtime = _TrackingRuntime(
+        runtime_instance_id="runtime-resume-new",
+        scheduler=_scheduler(workflow_database),
+        builders=[],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    assert runtime.recovery_continuation.calls
+    resumed_context, outcome = runtime.recovery_continuation.calls[0]
+    assert resumed_context == context
+    assert outcome.action is not None
+    assert outcome.action.value == "resume_model"
+    assert runtime.begin_calls == 1
+    assert runtime.closed_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_replays_read_only_dispatch_from_persisted_input(
+    workflow_database: Database,
+):
+    call_count = 0
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        nonlocal call_count
+        call_count += 1
+        return ToolExecutionResult(
+            status=ToolStatus.SUCCESS,
+            content=f"replayed:{params.label}",
+        )
+
+    context = await _create_run_context(workflow_database, email_suffix="-replay")
+    await _seed_dispatch_state(
+        workflow_database,
+        context=context,
+        tool_name="read_only_probe",
+        recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+        raw_params={"label": "replay-me", "delay": 0.0, "idempotency_key": None},
+        tool_call_id="call-replay",
+    )
+
+    runtime = _TrackingRuntime(
+        runtime_instance_id="runtime-replay",
+        scheduler=_scheduler(workflow_database),
+        builders=[
+            PersistedToolBuilder(
+                name="read_only_probe",
+                runner=runner,
+                recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+            )
+        ],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    execution_row = await _latest_execution_row(workflow_database, context)
+    assert call_count == 1
+    assert execution_row["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert runtime.closed_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_idempotent_dispatch_with_same_key(
+    workflow_database: Database,
+):
+    call_keys: list[str | None] = []
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        call_keys.append(params.idempotency_key)
+        return ToolExecutionResult(
+            status=ToolStatus.SUCCESS,
+            content=f"retried:{params.label}",
+        )
+
+    context = await _create_run_context(workflow_database, email_suffix="-retry")
+    await _seed_dispatch_state(
+        workflow_database,
+        context=context,
+        tool_name="idempotent_probe",
+        recovery_strategy=RecoveryStrategy.IDEMPOTENT_RETRY,
+        raw_params={"label": "retry-me", "delay": 0.0, "idempotency_key": "idem-123"},
+        tool_call_id="call-retry",
+        idempotency_key="idem-123",
+    )
+
+    runtime = _TrackingRuntime(
+        runtime_instance_id="runtime-retry",
+        scheduler=_scheduler(workflow_database),
+        builders=[
+            PersistedToolBuilder(
+                name="idempotent_probe",
+                runner=runner,
+                recovery_strategy=RecoveryStrategy.IDEMPOTENT_RETRY,
+                idempotency_key_field="idempotency_key",
+            )
+        ],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    execution_row = await _latest_execution_row(workflow_database, context)
+    assert call_keys == ["idem-123"]
+    assert execution_row["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert execution_row["idempotency_key"] == "idem-123"
+
+
+@pytest.mark.asyncio
+async def test_worker_marks_manual_uncertain_without_recalling_tool(
     workflow_database: Database,
 ):
     call_count = 0
@@ -408,45 +725,164 @@ async def test_terminal_execution_recovery_metadata_survives_worker_noop(
         return ToolExecutionResult(
             status=ToolStatus.SUCCESS,
             content=params.label,
-            external_request_id="request-123",
-            result_ref="workspace://results/tool.json",
-            result_digest="a" * 64,
         )
 
     context = await _create_run_context(workflow_database, email_suffix="-manual-uncertain")
-    lease = await _coordinator(workflow_database).start_run_with_checkpoint(context, "runtime-manual")
-    scheduler = _scheduler(workflow_database)
-    builder = PersistedToolBuilder(
-        name="manual_uncertain_probe",
-        runner=runner,
-        recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
-    )
-
-    result = await scheduler.run(
-        builder,
-        {"label": "once"},
+    await _seed_dispatch_state(
+        workflow_database,
         context=context,
-        call_id="call-uncertain",
-        run_lease_handle=RunLeaseHandle(lease),
+        tool_name="manual_uncertain_probe",
+        recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        raw_params={"label": "once", "delay": 0.0, "idempotency_key": None},
+        tool_call_id="call-uncertain",
+        external_request_id="request-123",
     )
-    assert result.status == ToolStatus.SUCCESS
 
-    phases = await _checkpoint_phases(workflow_database, context)
-    assert "execution_dispatching" in phases
-    row = await _latest_execution_row(workflow_database, context)
-    assert row["external_request_id"] == "request-123"
-    assert row["result_ref"] == "workspace://results/tool.json"
-    assert row["result_digest"] == "a" * 64
-
-    worker_cls = getattr(recovery_module, "WorkflowRecoveryWorker", None)
-    assert worker_cls is not None
-    worker = worker_cls(
+    runtime = _TrackingRuntime(
+        runtime_instance_id="runtime-manual",
+        scheduler=_scheduler(workflow_database),
+        builders=[
+            PersistedToolBuilder(
+                name="manual_uncertain_probe",
+                runner=runner,
+                recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+            )
+        ],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
         database=workflow_database,
         settings=Settings(_config_file="/nonexistent"),
-        runtime_pool=SimpleNamespace(acquire=lambda context: None),
+        runtime_pool=_TrackingRuntimePool(runtime),
     )
     await worker.run_once()
 
-    assert call_count == 1
-    latest = await _latest_execution_row(workflow_database, context)
-    assert latest["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    execution_row = await _latest_execution_row(workflow_database, context)
+    assert call_count == 0
+    assert execution_row["execution_status"] == ExecutionStatus.UNCERTAIN.value
+    assert execution_row["external_request_id"] == "request-123"
+
+
+@pytest.mark.asyncio
+async def test_external_request_id_progress_survives_crash_before_terminal_persist(
+    workflow_database: Database,
+    monkeypatch,
+):
+    scheduler = _scheduler(workflow_database)
+    context = await _create_run_context(workflow_database, email_suffix="-progress-crash")
+    lease = await _coordinator(workflow_database).start_run_with_checkpoint(context, "runtime-progress")
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        del params
+        return ToolExecutionResult(
+            status=ToolStatus.SUCCESS,
+            content="unreachable",
+        )
+
+    async def crash_persist(*args, **kwargs):
+        raise RuntimeError("crash after progress callback")
+
+    monkeypatch.setattr(scheduler, "_persist_execution_result", crash_persist)
+
+    result = await scheduler.run(
+        ReportingToolBuilder(
+            name="progress_probe",
+            runner=runner,
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        ),
+        {"label": "progress"},
+        context=context,
+        call_id="call-progress",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+    assert result.status == ToolStatus.ERROR
+
+    execution_row = await _latest_execution_row(workflow_database, context)
+    assert execution_row["external_request_id"] == "request-early"
+    assert execution_row["execution_status"] == ExecutionStatus.EXECUTING.value
+    await _expire_run_lease(workflow_database, context)
+
+    runtime = _TrackingRuntime(
+        runtime_instance_id="runtime-progress-recovery",
+        scheduler=_scheduler(workflow_database),
+        builders=[
+            ReportingToolBuilder(
+                name="progress_probe",
+                runner=runner,
+                recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+            )
+        ],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    execution_row = await _latest_execution_row(workflow_database, context)
+    assert execution_row["external_request_id"] == "request-early"
+    assert execution_row["execution_status"] == ExecutionStatus.UNCERTAIN.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["hash_mismatch", "missing_builder", "strategy_mismatch"])
+async def test_worker_blocks_fail_closed_for_invalid_replay_inputs(
+    workflow_database: Database,
+    mode: str,
+):
+    call_count = 0
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        nonlocal call_count
+        call_count += 1
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    context = await _create_run_context(workflow_database, email_suffix=f"-blocked-{mode}")
+    execution_id = await _seed_dispatch_state(
+        workflow_database,
+        context=context,
+        tool_name="blocked_probe",
+        recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+        raw_params={"label": "blocked", "delay": 0.0, "idempotency_key": None},
+        tool_call_id=f"call-{mode}",
+    )
+
+    if mode == "hash_mismatch":
+        async with workflow_database.write_transaction() as conn:
+            await conn.execute(
+                update(tool_executions)
+                .where(tool_executions.c.execution_id == execution_id)
+                .values(input_hash="f" * 64)
+            )
+
+    builder_strategy = (
+        RecoveryStrategy.MANUAL_UNCERTAIN if mode == "strategy_mismatch" else RecoveryStrategy.READ_ONLY_REPLAY
+    )
+    builders: list[ToolBuilder] = []
+    if mode != "missing_builder":
+        builders.append(
+            PersistedToolBuilder(
+                name="blocked_probe",
+                runner=runner,
+                recovery_strategy=builder_strategy,
+            )
+        )
+
+    runtime = _TrackingRuntime(
+        runtime_instance_id=f"runtime-{mode}",
+        scheduler=_scheduler(workflow_database),
+        builders=builders,
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    row = await _latest_execution_row(workflow_database, context)
+    assert call_count == 0
+    assert row["execution_status"] in {
+        ExecutionStatus.BLOCKED_CORRUPT.value,
+        ExecutionStatus.BLOCKED_INCOMPATIBLE.value,
+    }
