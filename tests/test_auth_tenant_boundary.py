@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import insert, text
 
 from multiclaw.cli import alembic_config
-from multiclaw.auth.models import issue_verification_code
+from multiclaw.auth.models import MAX_SENDS_PER_DAY, issue_verification_code
 from multiclaw.auth.cleanup import AuthCleanupWorker
 from multiclaw.config.settings import DatabaseSettings
 from multiclaw.storage import Database
@@ -390,6 +390,40 @@ def test_send_code_persists_domain_separated_digest_without_plaintext_leak(
     assert rows[0]["code_digest"] != "654321"
     assert "654321" not in caplog.text
     assert "654321" not in response.text
+
+
+def test_send_code_rate_limits_per_normalized_email_and_login_purpose_only(
+    client: TestClient,
+    migrated_database: Database,
+):
+    email = "rate-limit@example.com"
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+
+    now_ms = asyncio.run(_db_now_seconds(migrated_database)) * 1000
+    asyncio.run(
+        _seed_verification_row(
+            migrated_database,
+            email=email,
+            code_digest="deletion-recovery-digest",
+            purpose="deletion_recovery",
+            expires_at=now_ms + 60_000,
+            created_at=now_ms - 1_000,
+        )
+    )
+
+    responses = [
+        client.post("/auth/send-code", json={"email": f"  {email.upper()}  "})
+        for _ in range(MAX_SENDS_PER_DAY)
+    ]
+    limited = client.post("/auth/send-code", json={"email": email})
+    rows = asyncio.run(_get_verification_rows(migrated_database, email))
+
+    assert [response.status_code for response in responses] == [200] * MAX_SENDS_PER_DAY
+    assert limited.status_code == 429
+    assert limited.json() == {"detail": "Too many attempts, please try again tomorrow"}
+    assert [row["purpose"] for row in rows].count("login") == MAX_SENDS_PER_DAY
+    assert [row["purpose"] for row in rows].count("deletion_recovery") == 1
 
 
 def test_deletion_recovery_audience_is_rejected_by_normal_api(
