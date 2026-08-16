@@ -1068,6 +1068,69 @@ def test_deletion_status_and_recover_accept_recovery_bearer_token(
     )
 
 
+def test_deletion_recovery_success_requires_fresh_normal_login(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="recover-needs-relogin@example.com",
+        )
+    )
+
+    scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert scheduled.status_code == 200
+
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "112233"
+    assert client.post("/auth/deletion-recovery/send-code", json={"email": identity.email}).status_code == 200
+    verify_response = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "112233"},
+    )
+    assert verify_response.status_code == 200
+    recovery_token = client.cookies.get("recovery_token")
+    csrf_token = _latest_cookie_value(client, "csrf_token")
+    assert recovery_token is not None
+    assert csrf_token is not None
+
+    recover_response = client.post(
+        "/api/account/deletion/recover",
+        headers={
+            "Origin": "http://testserver",
+            "X-CSRF-Token": csrf_token,
+        },
+        cookies={"recovery_token": recovery_token, "csrf_token": csrf_token},
+    )
+
+    assert recover_response.status_code == 200
+    assert all(
+        not cookie.startswith("token=") or "Max-Age=0" in cookie
+        for cookie in recover_response.headers.get_list("set-cookie")
+    )
+
+    current_client_access = client.get("/api/sessions")
+    stale_token_access = client.get("/api/sessions", cookies=identity.cookie)
+
+    assert current_client_access.status_code == 401
+    assert stale_token_access.status_code == 401
+
+    client.app.state.auth_forced_code = "654321"
+    assert client.post("/auth/send-code", json={"email": identity.email}).status_code == 200
+    relogin = client.post(
+        "/auth/verify",
+        json={"email": identity.email, "code": "654321"},
+    )
+    restored_access = client.get("/api/sessions")
+
+    assert relogin.status_code == 200
+    assert any(cookie.startswith("token=") for cookie in relogin.headers.get_list("set-cookie"))
+    assert restored_access.status_code == 200
+
+
 def test_deletion_status_rejects_malformed_recovery_claim_types(
     client: TestClient,
     migrated_database: Database,
@@ -1160,6 +1223,81 @@ def test_deletion_recovery_send_code_nonpending_email_is_enumeration_safe(
 
     client.app.state.settings.email.provider = "resend"
     client.app.state.settings.resend.mock = False
+    monkeypatch.setattr(auth_router, "send_verification_code", record_send)
+
+    response = client.post("/auth/deletion-recovery/send-code", json={"email": identity.email})
+    rows = asyncio.run(_get_verification_rows(migrated_database, identity.email))
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert rows == []
+    assert sent == []
+
+
+def test_deletion_recovery_send_code_rate_limits_real_pending_scheduled_email(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="recovery-quota@example.com",
+        )
+    )
+    scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert scheduled.status_code == 200
+
+    now_ms = asyncio.run(_db_now_seconds(migrated_database)) * 1000
+    for offset in range(MAX_SENDS_PER_DAY):
+        asyncio.run(
+            _seed_verification_row(
+                migrated_database,
+                email=identity.email,
+                code_digest=f"recovery-quota-{offset}",
+                purpose="deletion_recovery",
+                expires_at=now_ms + 60_000 + offset,
+                created_at=now_ms - 1_000 + offset,
+            )
+        )
+
+    response = client.post("/auth/deletion-recovery/send-code", json={"email": identity.email})
+    rows = asyncio.run(_get_verification_rows(migrated_database, identity.email))
+
+    assert response.status_code == 429
+    assert response.json() == {"detail": "Too many attempts, please try again tomorrow"}
+    assert [row["purpose"] for row in rows].count("deletion_recovery") == MAX_SENDS_PER_DAY
+
+
+def test_deletion_recovery_send_code_skips_expired_pending_window(
+    client: TestClient,
+    migrated_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import multiclaw.auth.router as auth_router
+
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="expired-send-window@example.com",
+        )
+    )
+    previous_retention = client.app.state.settings.deletion.retention_days
+    client.app.state.settings.deletion.retention_days = 0
+    try:
+        scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    finally:
+        client.app.state.settings.deletion.retention_days = previous_retention
+
+    assert scheduled.status_code == 200
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = False
+    sent: list[tuple[str, str]] = []
+
+    async def record_send(_settings, email: str, code: str) -> None:
+        sent.append((email, code))
+
     monkeypatch.setattr(auth_router, "send_verification_code", record_send)
 
     response = client.post("/auth/deletion-recovery/send-code", json={"email": identity.email})
