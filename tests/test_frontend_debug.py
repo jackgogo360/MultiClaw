@@ -91,10 +91,12 @@ const securityFile = securityExists
 let hasEnsureCsrfImport = false;
     let hasCsrfHeader = false;
     let csrfHeaderUsesEnsureToken = false;
-let approveUsesDecisionRoute = false;
-let approveBodyHasVersion = false;
-let secretMetadataOnly = false;
-let secretSensitiveShapeLeaked = false;
+    let approveUsesDecisionRoute = false;
+    let approveBodyHasVersion = false;
+    let secretMetadataOnly = false;
+    let secretSensitiveShapeLeaked = false;
+    let deletionRequestStatusIsScheduled = false;
+    let deletionStatusIsPendingPurge = false;
 
 function literalValue(node) {{
   return ts.isStringLiteralLike(node) || ts.isNoSubstitutionTemplateLiteral(node)
@@ -147,6 +149,26 @@ function visitApi(node) {{
     }}
   }}
 
+  if (ts.isInterfaceDeclaration(node) && node.name.text === 'AccountDeletionRequest') {{
+    const statusMember = node.members.find((member) =>
+      ts.isPropertySignature(member)
+      && member.name?.getText(apiFile).replace(/['"]/g, '') === 'status'
+    );
+    deletionRequestStatusIsScheduled =
+      !!statusMember
+      && statusMember.type?.getText(apiFile) === '"scheduled"';
+  }}
+
+  if (ts.isInterfaceDeclaration(node) && node.name.text === 'AccountDeletionStatus') {{
+    const statusMember = node.members.find((member) =>
+      ts.isPropertySignature(member)
+      && member.name?.getText(apiFile).replace(/['"]/g, '') === 'status'
+    );
+    deletionStatusIsPendingPurge =
+      !!statusMember
+      && statusMember.type?.getText(apiFile) === '"pending_purge"';
+  }}
+
   ts.forEachChild(node, visitApi);
 }}
 
@@ -188,6 +210,8 @@ process.stdout.write(JSON.stringify({{
   approveBodyHasVersion,
   secretMetadataOnly,
   secretSensitiveShapeLeaked,
+  deletionRequestStatusIsScheduled,
+  deletionStatusIsPendingPurge,
   securityExportsEnsureCsrfToken,
   securityUsesModuleMemory,
   securityTouchesWebStorage,
@@ -203,6 +227,8 @@ process.stdout.write(JSON.stringify({{
     assert payload["approveBodyHasVersion"] is True
     assert payload["secretMetadataOnly"] is True
     assert payload["secretSensitiveShapeLeaked"] is False
+    assert payload["deletionRequestStatusIsScheduled"] is True
+    assert payload["deletionStatusIsPendingPurge"] is True
     assert payload["securityExportsEnsureCsrfToken"] is True
     assert payload["securityUsesModuleMemory"] is True
     assert payload["securityTouchesWebStorage"] is False

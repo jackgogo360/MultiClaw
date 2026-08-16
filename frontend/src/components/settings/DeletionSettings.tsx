@@ -40,7 +40,7 @@ export function DeletionSettings({
   const pendingPurge = accountStatus === "pending_purge";
   const purgeAfter = deletionStatus?.purge_after ?? null;
   const shouldTrackPurgeDeadline =
-    pendingPurge && deletionStatus?.status === "scheduled" && purgeAfter !== null;
+    deletionStatus?.status === "pending_purge" && purgeAfter !== null;
 
   useEffect(() => {
     if (!shouldTrackPurgeDeadline || purgeAfter === null) {
@@ -57,8 +57,7 @@ export function DeletionSettings({
   }, [currentTime, purgeAfter, shouldTrackPurgeDeadline]);
 
   const canRecover =
-    pendingPurge &&
-    deletionStatus?.status === "scheduled" &&
+    deletionStatus?.status === "pending_purge" &&
     purgeAfter !== null &&
     purgeAfter > currentTime;
 
@@ -189,7 +188,7 @@ export function DeletionSettings({
             <div className="text-sm font-medium text-foreground">Recovery</div>
             <p className={canRecover ? "pending-purge-banner" : "text-sm text-muted-foreground"}>
               {canRecover && purgeAfter
-                ? `Server status is scheduled. Recover before ${new Date(purgeAfter).toLocaleString()}.`
+                ? `Server status is pending_purge. Recover before ${new Date(purgeAfter).toLocaleString()}.`
                 : "Use your email and a recovery code to check status or restore access before the purge window closes."}
             </p>
           </div>

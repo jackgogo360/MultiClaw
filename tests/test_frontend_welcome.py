@@ -220,6 +220,14 @@ const deletionSettingsEnforcesRecoveryAndPendingPurge =
   && deletionSettingsSource.includes('setTimeout')
   && deletionSettingsSource.includes('clearTimeout')
   && !deletionSettingsSource.includes('renderedAt');
+const canRecoverMatch = deletionSettingsSource.match(/const canRecover =([\\s\\S]*?);/);
+const standaloneRecoveryNotBlockedByAuthState =
+  !!canRecoverMatch
+  && !canRecoverMatch[1].includes('pendingPurge')
+  && canRecoverMatch[1].includes('deletionStatus?.status === \"pending_purge\"');
+const deletionRequestDoesNotUnlockRecovery =
+  deletionSettingsSource.includes('requestAccountDeletion')
+  && !deletionSettingsSource.includes('status is scheduled. Recover before');
 const sharedSettingsCssPresent =
   indexCssSource.includes('.settings-panel')
   && indexCssSource.includes('.approval-refresh-button')
@@ -252,6 +260,8 @@ process.stdout.write(JSON.stringify({{
   settingsPanelWiredFromFooter,
   secretSettingsUsesTransientInput,
   deletionSettingsEnforcesRecoveryAndPendingPurge,
+  standaloneRecoveryNotBlockedByAuthState,
+  deletionRequestDoesNotUnlockRecovery,
   sharedSettingsCssPresent,
   componentsUseSharedCss,
   tsBuildInfoMovedOutOfRepoRoot,
@@ -275,6 +285,8 @@ process.stdout.write(JSON.stringify({{
     assert payload["settingsPanelWiredFromFooter"] is True
     assert payload["secretSettingsUsesTransientInput"] is True
     assert payload["deletionSettingsEnforcesRecoveryAndPendingPurge"] is True
+    assert payload["standaloneRecoveryNotBlockedByAuthState"] is True
+    assert payload["deletionRequestDoesNotUnlockRecovery"] is True
     assert payload["sharedSettingsCssPresent"] is True
     assert payload["componentsUseSharedCss"] is True
     assert payload["tsBuildInfoMovedOutOfRepoRoot"] is True
