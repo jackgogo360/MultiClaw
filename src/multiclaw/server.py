@@ -54,6 +54,8 @@ logging.basicConfig(
     handlers=[_file_handler],
 )
 logger = logging.getLogger("multiclaw")
+DELETION_POLL_INTERVAL_SECONDS = 1.0
+DELETION_BATCH_SIZE = 8
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -129,6 +131,7 @@ from multiclaw.auth.cleanup import AuthCleanupWorker
 from multiclaw.auth.middleware import AuthMiddleware, require_recent_auth
 from multiclaw.auth.models import build_auth_runtime
 from multiclaw.auth.router import router as auth_router
+from multiclaw.api.account import router as account_router
 from multiclaw.api.chat import (
     build_workflow_continuation_service,
     build_workflow_coordinator,
@@ -154,6 +157,8 @@ from multiclaw.workflow.models import (
     VersionConflictError,
 )
 from multiclaw.workflow.recovery import WorkflowRecoveryWorker
+from multiclaw.deletion.service import DeletionService
+from multiclaw.deletion.worker import DeletionWorker
 
 
 # ---------------------------------------------------------------------------
@@ -518,8 +523,12 @@ async def lifespan(app: FastAPI):
     runtime_factory = None
     runtime_pool = None
     auth_runtime = None
+    deletion_service = None
+    deletion_worker = None
     recovery_stop: asyncio.Event | None = None
     recovery_task: asyncio.Task | None = None
+    deletion_stop: asyncio.Event | None = None
+    deletion_task: asyncio.Task | None = None
     auth_cleanup_stop: asyncio.Event | None = None
     auth_cleanup_task: asyncio.Task | None = None
     try:
@@ -542,10 +551,24 @@ async def lifespan(app: FastAPI):
         app.state.workspace_root = runtime_factory.workspace_resolver.root
         app.state.sandbox_startup_events = startup_events
         app.state.auth_forced_code = None
+        deletion_service = DeletionService(
+            database=runtime_factory.database,
+            runtime_pool=runtime_pool,
+            settings=runtime_factory.settings,
+        )
+        deletion_worker = DeletionWorker(
+            database=runtime_factory.database,
+            runtime_pool=runtime_pool,
+            workspace_resolver=runtime_factory.workspace_resolver,
+            settings=runtime_factory.settings,
+        )
+        app.state.deletion_service = deletion_service
+        app.state.deletion_worker = deletion_worker
         if hasattr(runtime_factory.database, "dialect") and hasattr(runtime_factory.database, "connect"):
             async with runtime_factory.database.connect():
                 pass
             recovery_stop = asyncio.Event()
+            deletion_stop = asyncio.Event()
             auth_cleanup_stop = asyncio.Event()
 
             async def recovery_loop() -> None:
@@ -568,6 +591,14 @@ async def lifespan(app: FastAPI):
                         continue
 
             recovery_task = asyncio.create_task(recovery_loop())
+            if getattr(readiness, "ready", True):
+                deletion_task = asyncio.create_task(
+                    deletion_worker.run_until_stopped(
+                        stop_event=deletion_stop,
+                        batch_size=DELETION_BATCH_SIZE,
+                        interval_seconds=DELETION_POLL_INTERVAL_SECONDS,
+                    )
+                )
 
             async def auth_cleanup_loop() -> None:
                 worker = AuthCleanupWorker(runtime_factory.database)
@@ -581,6 +612,27 @@ async def lifespan(app: FastAPI):
             auth_cleanup_task = asyncio.create_task(auth_cleanup_loop())
     except BaseException as primary:
         try:
+            if recovery_stop is not None:
+                recovery_stop.set()
+            if deletion_stop is not None:
+                deletion_stop.set()
+            if auth_cleanup_stop is not None:
+                auth_cleanup_stop.set()
+            if recovery_task is not None:
+                try:
+                    await recovery_task
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "workflow_recovery.await", error)
+            if deletion_task is not None:
+                try:
+                    await deletion_task
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "deletion_worker.await", error)
+            if auth_cleanup_task is not None:
+                try:
+                    await auth_cleanup_task
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "auth_cleanup.await", error)
             if auth_runtime is not None:
                 try:
                     await auth_runtime.close()
@@ -605,11 +657,18 @@ async def lifespan(app: FastAPI):
 
         if recovery_stop is not None:
             recovery_stop.set()
+        if deletion_stop is not None:
+            deletion_stop.set()
         if auth_cleanup_stop is not None:
             auth_cleanup_stop.set()
         if recovery_task is not None:
             try:
                 await recovery_task
+            except BaseException as error:
+                primary = error if primary is None else primary
+        if deletion_task is not None:
+            try:
+                await deletion_task
             except BaseException as error:
                 primary = error if primary is None else primary
         if auth_cleanup_task is not None:
@@ -650,6 +709,7 @@ app = FastAPI(title="MultiClaw", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 app.include_router(auth_router)
 app.include_router(auth_router, prefix="/api")
+app.include_router(account_router)
 
 api = APIRouter(prefix="/api")
 
