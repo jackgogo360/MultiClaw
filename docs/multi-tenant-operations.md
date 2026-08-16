@@ -82,7 +82,7 @@ There is currently no public key-rotation CLI. Do not invent one in runbooks or 
   - use backup methods that preserve file consistency
   - treat file copies taken during active writes as unsafe unless your platform snapshot method guarantees consistency
 - MySQL:
-  - run MySQL `8.0.36` or newer in the 8.0 series
+  - run MySQL `8.0.36` or newer on major version `8`, including `8.4.x`
   - use InnoDB
   - keep the database and tables on `utf8mb4`
   - keep sessions UTC-compatible
