@@ -3,13 +3,21 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import cast
-from uuid import uuid4
+from uuid import uuid4, uuid7
 
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from multiclaw.auth.models import UserRecord, VerificationCodeRecord, WorkspaceRecord, digests_match
+from multiclaw.auth.models import (
+    MAX_VERIFICATION_FAILURES_PER_CODE,
+    UserRecord,
+    VerificationCodeRecord,
+    WorkspaceRecord,
+    _encode_verification_code_digest,
+    _parse_verification_code_digest,
+    digests_match,
+)
 from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
 from multiclaw.storage.schema import users, verification_codes, workspaces
 from multiclaw.tenancy.context import TenantContext
@@ -97,7 +105,7 @@ class VerificationCodeRepository(_ConnectionBoundRepository):
         code_digest: str,
         ttl_seconds: int,
     ) -> str:
-        code_id = str(uuid4())
+        code_id = str(uuid7())
         now_ms = self._dialect.db_now_ms()
         await self._conn.execute(
             insert(verification_codes).values(
@@ -136,6 +144,7 @@ class VerificationCodeRepository(_ConnectionBoundRepository):
         purpose: str,
         code_digest: str,
     ) -> VerificationCodeRecord | None:
+        await self.acquire_rate_limit_lock(email=email, purpose=purpose)
         result = await self._conn.execute(
             select(
                 verification_codes.c.id,
@@ -149,7 +158,6 @@ class VerificationCodeRepository(_ConnectionBoundRepository):
             .where(
                 verification_codes.c.email == email,
                 verification_codes.c.purpose == purpose,
-                verification_codes.c.used_at.is_(None),
                 verification_codes.c.expires_at > self._dialect.db_now_ms(),
             )
             .order_by(verification_codes.c.created_at.desc(), verification_codes.c.id.desc())
@@ -159,21 +167,48 @@ class VerificationCodeRepository(_ConnectionBoundRepository):
         if row is None:
             return None
         record = VerificationCodeRecord.from_row(row)
-        if not digests_match(record.code_digest, code_digest):
+        if record.used_at is not None:
             return None
+        digest_state = _parse_verification_code_digest(record.code_digest)
+        if digest_state is None:
+            return None
+        if digests_match(digest_state.base_digest, code_digest):
+            updated = await self._conn.execute(
+                update(verification_codes)
+                .where(
+                    verification_codes.c.id == record.id,
+                    verification_codes.c.code_digest == record.code_digest,
+                    verification_codes.c.used_at.is_(None),
+                    verification_codes.c.expires_at > self._dialect.db_now_ms(),
+                )
+                .values(used_at=self._dialect.db_now_ms())
+            )
+            if cast(int | None, updated.rowcount) != 1:
+                return None
+            return record
 
+        next_failures = digest_state.failures + 1
+        updated_values: dict[str, object] = {
+            "code_digest": _encode_verification_code_digest(
+                digest_state.base_digest,
+                failures=min(next_failures, MAX_VERIFICATION_FAILURES_PER_CODE),
+            )
+        }
+        if next_failures >= MAX_VERIFICATION_FAILURES_PER_CODE:
+            updated_values["used_at"] = self._dialect.db_now_ms()
         updated = await self._conn.execute(
             update(verification_codes)
             .where(
                 verification_codes.c.id == record.id,
+                verification_codes.c.code_digest == record.code_digest,
                 verification_codes.c.used_at.is_(None),
                 verification_codes.c.expires_at > self._dialect.db_now_ms(),
             )
-            .values(used_at=self._dialect.db_now_ms())
+            .values(**updated_values)
         )
         if cast(int | None, updated.rowcount) != 1:
             return None
-        return record
+        return None
 
     async def db_now_ms(self) -> int:
         result = await self._conn.execute(select(self._dialect.db_now_ms()))
