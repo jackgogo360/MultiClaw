@@ -31,7 +31,7 @@ from multiclaw.secrets.resolver import SecretResolver, UserSecretInvalidError
 from multiclaw.storage import Database
 from multiclaw.storage.schema import chat_sessions
 from multiclaw.session import ChatSession, SessionStatus
-from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
+from multiclaw.storage.uow import AuthUnitOfWork, DeletionUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
@@ -72,6 +72,14 @@ class TenantScopes:
     beta: TenantState
 
 
+class _TrackingRuntimePool:
+    def __init__(self) -> None:
+        self.revoked: list[str] = []
+
+    async def revoke(self, tenant_id: str) -> None:
+        self.revoked.append(tenant_id)
+
+
 def _sqlite_url(tmp_path: Path) -> str:
     return f"sqlite+aiosqlite:///{tmp_path / 'tenant-e2e.db'}"
 
@@ -102,6 +110,30 @@ async def _seed_user(database: Database, email_prefix: str) -> TenantContext:
         )
         assert user.default_workspace_id is not None
         return TenantContext(user.id, user.default_workspace_id)
+
+
+async def _load_auth_user(database: Database, tenant_id: str):
+    async with AuthUnitOfWork(database, read_only=True) as uow:
+        return await uow.users.get_by_id(tenant_id)
+
+
+async def _load_deletion_user(database: Database, tenant_id: str):
+    async with DeletionUnitOfWork(database, tenant_id, read_only=True) as uow:
+        return await uow.users.get_current()
+
+
+async def _load_current_deletion_job(database: Database, tenant_id: str):
+    async with DeletionUnitOfWork(database, tenant_id, read_only=True) as uow:
+        return await uow.deletions.get_current()
+
+
+def _build_authenticated_request(user, *, request_started_at_ms: int):
+    from starlette.requests import Request
+
+    request = Request({"type": "http", "method": "GET", "path": "/api/sessions", "headers": []})
+    request.state.authenticated_user = user
+    request.state.request_started_at_ms = request_started_at_ms
+    return request
 
 
 def _coordinator(database: Database) -> WorkflowCoordinator:
@@ -617,3 +649,92 @@ async def test_real_tenant_aggregate_isolation_gate(tenant_isolation_database: D
     assert metrics["platform_fallback_calls"] == 0
     assert metrics["foreign_sse_events"] == 0
     assert metrics["unexpected_session_creations"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retention_days", [1, 7], ids=["retention-1-day", "retention-7-days"])
+async def test_real_deletion_recovery_blocks_ordinary_tenant_access(
+    tenant_isolation_database: Database,
+    retention_days: int,
+) -> None:
+    from fastapi import HTTPException
+
+    from multiclaw.api.dependencies import current_user, tenant_context
+    from multiclaw.deletion.service import DeletionService
+
+    base_context = await _seed_user(tenant_isolation_database, f"tenant-deletion-{retention_days}")
+    async with AuthUnitOfWork(tenant_isolation_database) as uow:
+        baseline_user = await uow.users.get_by_id(base_context.tenant_id)
+
+    assert baseline_user is not None
+    assert baseline_user.status == "active"
+    assert baseline_user.auth_epoch == 0
+
+    runtime_pool = _TrackingRuntimePool()
+    service = DeletionService(
+        database=tenant_isolation_database,
+        runtime_pool=runtime_pool,
+        settings=Settings(
+            _config_file="/nonexistent",
+            deletion={"retention_days": retention_days},
+        ),
+    )
+
+    request_started_at_ms = 123_456_789
+    scheduled = await service.request(base_context)
+
+    pending_user = await _load_auth_user(tenant_isolation_database, base_context.tenant_id)
+    pending_deletion_user = await _load_deletion_user(tenant_isolation_database, base_context.tenant_id)
+    pending_job = await _load_current_deletion_job(tenant_isolation_database, base_context.tenant_id)
+
+    assert pending_user is not None
+    assert pending_deletion_user is not None
+    assert pending_job is not None
+    assert scheduled.status == "scheduled"
+    assert scheduled.job_id == pending_job.job_id
+    assert scheduled.requested_at == pending_job.requested_at
+    assert scheduled.purge_after == pending_job.purge_after
+    assert scheduled.purge_after > scheduled.requested_at
+    assert pending_job.status == "scheduled"
+    assert pending_user.status == "pending_purge"
+    assert pending_user.auth_epoch == baseline_user.auth_epoch + 1
+    assert pending_deletion_user.status == "pending_purge"
+    assert pending_deletion_user.auth_epoch == baseline_user.auth_epoch + 1
+    assert pending_deletion_user.purge_requested_at == pending_job.requested_at
+    assert pending_deletion_user.purge_after == pending_job.purge_after
+    assert runtime_pool.revoked == [base_context.tenant_id]
+
+    pending_request = _build_authenticated_request(pending_user, request_started_at_ms=request_started_at_ms)
+    pending_request_user = await current_user(pending_request)
+    with pytest.raises(HTTPException, match="Account unavailable") as exc_info:
+        await tenant_context(pending_request, pending_request_user)
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Account unavailable"
+
+    await service.recover(base_context, scheduled.job_id)
+
+    restored_user = await _load_auth_user(tenant_isolation_database, base_context.tenant_id)
+    restored_deletion_user = await _load_deletion_user(tenant_isolation_database, base_context.tenant_id)
+    restored_job = await _load_current_deletion_job(tenant_isolation_database, base_context.tenant_id)
+
+    assert restored_user is not None
+    assert restored_deletion_user is not None
+    assert restored_job is None
+    assert restored_user.status == "active"
+    assert restored_user.auth_epoch == baseline_user.auth_epoch + 2
+    assert restored_deletion_user.status == "active"
+    assert restored_deletion_user.auth_epoch == baseline_user.auth_epoch + 2
+    assert restored_deletion_user.purge_requested_at is None
+    assert restored_deletion_user.purge_after is None
+    assert runtime_pool.revoked == [base_context.tenant_id, base_context.tenant_id]
+
+    restored_request = _build_authenticated_request(
+        restored_user,
+        request_started_at_ms=request_started_at_ms,
+    )
+    restored_context = await tenant_context(restored_request, await current_user(restored_request))
+
+    assert restored_context.tenant_id == base_context.tenant_id
+    assert restored_context.workspace_id == base_context.workspace_id
+    assert restored_context.request_started_at_ms == request_started_at_ms
