@@ -15,6 +15,8 @@ from multiclaw.storage import Database
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 
+TEST_JWT_SIGNING_KEY = "tenant-sse-jwt-key-material-1234567890"
+
 
 def _sqlite_url(tmp_path: Path) -> str:
     return f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
@@ -39,6 +41,7 @@ def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__URL", _sqlite_url(tmp_path))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_AUTH_JWT_SIGNING_KEY", TEST_JWT_SIGNING_KEY)
     database = asyncio.run(_create_database(tmp_path))
     try:
         yield database
