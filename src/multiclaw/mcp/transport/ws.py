@@ -82,3 +82,6 @@ class WebSocketTransport(BaseTransport):
             self._ws = None
         self._clear_streams()
         logger.debug("WebSocket transport disconnected")
+
+    def scrub_sensitive_state(self) -> None:
+        self._headers.clear()

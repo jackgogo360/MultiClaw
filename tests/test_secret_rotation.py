@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 
 from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings, SecretSettings
@@ -16,9 +17,11 @@ from multiclaw.secrets.keyring import DeploymentKeyring, SecretKeyringError
 from multiclaw.secrets.rotation import SecretRotationService
 from multiclaw.secrets.resolver import SecretResolver
 from multiclaw.storage import Database
-from multiclaw.storage.repositories.secrets import SecretsRepository
+from multiclaw.storage.repositories.secrets import DeploymentSecretUsageRepository, SecretsRepository
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
+
+_ORIGINAL_TEST_MYSQL_URL = os.getenv("MULTICLAW_TEST_MYSQL_URL")
 
 
 def _sqlite_url(tmp_path: Path) -> str:
@@ -29,18 +32,53 @@ async def _upgrade_database(database_url: str) -> None:
     await asyncio.to_thread(command.upgrade, alembic_config(database_url=database_url), "head")
 
 
+async def _create_database(*, driver: str, database_url: str) -> Database:
+    if driver == "sqlite":
+        await _upgrade_database(database_url)
+    return Database.create(DatabaseSettings(driver=driver, url=database_url))
+
+
 @pytest.fixture
 async def rotation_database(tmp_path: Path):
-    database_url = _sqlite_url(tmp_path)
-    await _upgrade_database(database_url)
-    database = Database.create(DatabaseSettings(driver="sqlite", url=database_url))
+    database = await _create_database(driver="sqlite", database_url=_sqlite_url(tmp_path))
     try:
         yield database
     finally:
         await database.dispose()
 
 
-async def _seed_scope(database: Database) -> TenantContext:
+@pytest.fixture(params=("sqlite", "mysql"))
+async def deployment_gate_database(request: pytest.FixtureRequest, tmp_path: Path):
+    if request.param == "sqlite":
+        database = await _create_database(driver="sqlite", database_url=_sqlite_url(tmp_path))
+        try:
+            yield database
+        finally:
+            await database.dispose()
+        return
+
+    database_url = _ORIGINAL_TEST_MYSQL_URL or os.getenv("MULTICLAW_TEST_MYSQL_URL")
+    if not database_url:
+        pytest.skip("MULTICLAW_TEST_MYSQL_URL is not configured")
+
+    admin_database = Database.create(DatabaseSettings(driver="mysql", url=database_url))
+    schema_name = f"multiclaw_task13_gate_{uuid4().hex[:12]}"
+    temporary_url = make_url(database_url).set(database=schema_name).render_as_string(hide_password=False)
+    try:
+        async with admin_database.write_transaction() as conn:
+            await conn.execute(text(f"CREATE DATABASE `{schema_name}` CHARACTER SET utf8mb4"))
+        database = await _create_database(driver="mysql", database_url=temporary_url)
+        try:
+            yield database
+        finally:
+            await database.dispose()
+    finally:
+        async with admin_database.write_transaction() as conn:
+            await conn.execute(text(f"DROP DATABASE IF EXISTS `{schema_name}`"))
+        await admin_database.dispose()
+
+
+async def _seed_scope(database: Database, *, email: str = "tenant@example.com") -> TenantContext:
     tenant_id = str(uuid4())
     workspace_id = str(uuid4())
     async with database.write_transaction() as conn:
@@ -54,7 +92,7 @@ async def _seed_scope(database: Database) -> TenantContext:
                 VALUES (:tenant_id, :email, 0, NULL, 'active', NULL, 1, 1, NULL, NULL)
                 """
             ),
-            {"tenant_id": tenant_id, "email": "tenant@example.com"},
+            {"tenant_id": tenant_id, "email": email},
         )
         await conn.execute(
             text(
@@ -103,6 +141,33 @@ async def _store_old_secret(database: Database, context: TenantContext, *, name:
             secret_name=name,
         ),
         key_version=1,
+    )
+
+    async with TenantUnitOfWork(database, context) as uow:
+        await uow.secrets.put_encrypted(
+            secret_id=secret_id,
+            provider_kind="llm",
+            provider_name="openai",
+            secret_name=name,
+            record=record,
+        )
+    return secret_id
+
+
+async def _store_active_secret(database: Database, context: TenantContext, *, name: str) -> str:
+    keyring = _keyring()
+    envelope = SecretEnvelopeService(keyring, nonce_source=lambda _length: os.urandom(12))
+    secret_id = str(uuid4())
+    record = envelope.encrypt(
+        f"value-for-{name}".encode("utf-8"),
+        EnvelopeFields(
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            secret_id=secret_id,
+            provider_kind="llm",
+            provider_name="openai",
+            secret_name=name,
+        ),
     )
 
     async with TenantUnitOfWork(database, context) as uow:
@@ -243,3 +308,20 @@ async def test_rotation_reference_counts_gate_old_key_removal(rotation_database:
         counts_after = await uow.secrets.count_key_versions()
 
     _keyring(include_old=False).require_versions(counts_after)
+
+
+@pytest.mark.asyncio
+async def test_deployment_key_version_gate_counts_all_tenants(
+    deployment_gate_database: Database,
+) -> None:
+    tenant_a = await _seed_scope(deployment_gate_database, email="tenant-a@example.com")
+    tenant_b = await _seed_scope(deployment_gate_database, email="tenant-b@example.com")
+    await _store_old_secret(deployment_gate_database, tenant_a, name="api_key")
+    await _store_active_secret(deployment_gate_database, tenant_b, name="api_key")
+
+    async with deployment_gate_database.connect() as conn:
+        counts = await DeploymentSecretUsageRepository(conn).count_key_versions_global()
+
+    assert counts == {1: 1, 3: 1}
+    with pytest.raises(SecretKeyringError, match="missing referenced key versions"):
+        _keyring(include_old=False).require_versions(counts)

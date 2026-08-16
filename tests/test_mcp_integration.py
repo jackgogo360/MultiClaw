@@ -234,7 +234,12 @@ async def test_manager_resolves_secret_refs_per_tenant_without_mutating_state(
 
     def fake_create_transport(config, **kwargs):
         del kwargs
-        captured.append({"env": getattr(config, "env", {}), "headers": getattr(config, "headers", {})})
+        captured.append(
+            {
+                "env": dict(getattr(config, "env", {})),
+                "headers": dict(getattr(config, "headers", {})),
+            }
+        )
         return _FakeTransport()
 
     monkeypatch.setattr("multiclaw.mcp.manager.create_transport", fake_create_transport)
@@ -259,10 +264,262 @@ async def test_manager_resolves_secret_refs_per_tenant_without_mutating_state(
     assert captured[0]["env"]["API_TOKEN"] == "tenant-a-token"
     assert captured[1]["env"]["API_TOKEN"] == "tenant-b-token"
     assert config.env["API_TOKEN"] == "secret://mcp/demo/API_TOKEN"
+    assert config.env["VISIBLE_FLAG"] == "literal"
     assert resolver.calls == [
         ("tenant-a", "mcp", "secret://mcp/demo/API_TOKEN"),
         ("tenant-b", "mcp", "secret://mcp/demo/API_TOKEN"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_secret_backed_http_manager_re_resolves_each_tool_call_and_scrubs_plaintext(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_transports: list[object] = []
+    client_instances: list[object] = []
+
+    class _FakeTransport:
+        def __init__(self, headers: dict[str, str]) -> None:
+            self._headers = dict(headers)
+            self.disconnect_calls = 0
+            self.connected = False
+
+        async def connect(self) -> None:
+            self.connected = True
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+            self.connected = False
+
+    class _FakeClient:
+        def __init__(self, name: str, transport) -> None:
+            self.name = name
+            self._transport = transport
+            self.connected = False
+            self.tool_call_count = 0
+            client_instances.append(self)
+
+        def set_on_tools_changed(self, callback) -> None:
+            self._callback = callback
+
+        async def connect(self) -> None:
+            self.connected = True
+            await self._transport.connect()
+
+        async def discover_tools(self) -> list[ToolInfo]:
+            return [
+                ToolInfo(
+                    name="mcp__demo__ping",
+                    server_name="demo",
+                    original_name="ping",
+                    description="ping",
+                    input_schema={},
+                )
+            ]
+
+        async def disconnect(self) -> None:
+            self.connected = False
+            await self._transport.disconnect()
+
+        async def call_tool_with_retry(self, tool_name: str, arguments: dict[str, object]):
+            del tool_name, arguments
+            self.tool_call_count += 1
+            return type("Result", (), {"content": [{"type": "text", "text": "ok"}], "is_error": False, "external_request_id": None})()
+
+    class _FakeResolver:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def resolve_reference(self, context: TenantContext, reference: str) -> ResolvedSecret:
+            self.calls.append((context.tenant_id, reference))
+            token = "tenant-a-token"
+            return ResolvedSecret(
+                provider_kind="mcp",
+                provider_name="demo",
+                secret_name="Authorization",
+                source="user",
+                masked_value="****oken",
+                secret_bytes=SecretBytes(token.encode("utf-8")),
+            )
+
+    def fake_create_transport(config, **kwargs):
+        del kwargs
+        transport = _FakeTransport(getattr(config, "headers", {}))
+        created_transports.append(transport)
+        return transport
+
+    monkeypatch.setattr("multiclaw.mcp.manager.create_transport", fake_create_transport)
+    monkeypatch.setattr("multiclaw.mcp.manager.MCPClient", _FakeClient)
+
+    resolver = _FakeResolver()
+    manager = MCPClientManager(
+        secret_resolver=resolver,
+        tenant_context=TenantContext("tenant-a", "workspace-a"),
+    )
+    config = HTTPServerConfig(
+        url="https://example.com/mcp",
+        headers={"Authorization": "secret://mcp/demo/Authorization"},
+    )
+
+    await manager._connect_server("demo", config)
+    assert resolver.calls == [("tenant-a", "secret://mcp/demo/Authorization")]
+
+    await manager._call_tool_async("demo", "ping", {})
+    await manager._call_tool_async("demo", "ping", {})
+
+    assert resolver.calls == [
+        ("tenant-a", "secret://mcp/demo/Authorization"),
+        ("tenant-a", "secret://mcp/demo/Authorization"),
+        ("tenant-a", "secret://mcp/demo/Authorization"),
+    ]
+    assert all(transport._headers.get("Authorization") != "tenant-a-token" for transport in created_transports)
+    assert all(client.connected is False for client in client_instances)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("boom"), asyncio.CancelledError()])
+async def test_secret_backed_stdio_manager_scrubs_on_failure_or_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    created_transports: list[object] = []
+
+    class _FakeTransport:
+        def __init__(self, env: dict[str, str]) -> None:
+            self._launch_spec = type("LaunchSpec", (), {"env": dict(env)})()
+            self.disconnect_calls = 0
+
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+    class _FakeClient:
+        def __init__(self, name: str, transport) -> None:
+            del name
+            self.connected = False
+            self._transport = transport
+
+        def set_on_tools_changed(self, callback) -> None:
+            self._callback = callback
+
+        async def connect(self) -> None:
+            self.connected = True
+            await self._transport.connect()
+
+        async def discover_tools(self) -> list[ToolInfo]:
+            return []
+
+        async def disconnect(self) -> None:
+            self.connected = False
+            await self._transport.disconnect()
+
+        async def call_tool_with_retry(self, tool_name: str, arguments: dict[str, object]):
+            del tool_name, arguments
+            raise failure
+
+    class _FakeResolver:
+        async def resolve_reference(self, context: TenantContext, reference: str) -> ResolvedSecret:
+            del context, reference
+            return ResolvedSecret(
+                provider_kind="mcp",
+                provider_name="demo",
+                secret_name="API_TOKEN",
+                source="user",
+                masked_value="****oken",
+                secret_bytes=SecretBytes(b"tenant-token"),
+            )
+
+    def fake_create_transport(config, **kwargs):
+        del kwargs
+        transport = _FakeTransport(getattr(config, "env", {}))
+        created_transports.append(transport)
+        return transport
+
+    monkeypatch.setattr("multiclaw.mcp.manager.create_transport", fake_create_transport)
+    monkeypatch.setattr("multiclaw.mcp.manager.MCPClient", _FakeClient)
+
+    manager = MCPClientManager(
+        secret_resolver=_FakeResolver(),
+        tenant_context=TenantContext("tenant-a", "workspace-a"),
+    )
+    config = StdioServerConfig(
+        command="/bin/echo",
+        env={"API_TOKEN": "secret://mcp/demo/API_TOKEN"},
+    )
+
+    await manager._connect_server("demo", config)
+    with pytest.raises(type(failure)):
+        await manager._call_tool_async("demo", "ping", {})
+
+    assert all(transport._launch_spec.env.get("API_TOKEN") != "tenant-token" for transport in created_transports)
+    assert all(transport.disconnect_calls >= 1 for transport in created_transports)
+
+
+@pytest.mark.asyncio
+async def test_literal_http_manager_keeps_reusable_connection_without_secret_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_transports: list[object] = []
+
+    class _FakeTransport:
+        def __init__(self, headers: dict[str, str]) -> None:
+            self._headers = dict(headers)
+
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+    class _FakeClient:
+        def __init__(self, name: str, transport) -> None:
+            del name
+            self.connected = False
+            self._transport = transport
+            self.tool_call_count = 0
+
+        def set_on_tools_changed(self, callback) -> None:
+            self._callback = callback
+
+        async def connect(self) -> None:
+            self.connected = True
+            await self._transport.connect()
+
+        async def discover_tools(self) -> list[ToolInfo]:
+            return []
+
+        async def disconnect(self) -> None:
+            self.connected = False
+            await self._transport.disconnect()
+
+        async def call_tool_with_retry(self, tool_name: str, arguments: dict[str, object]):
+            del tool_name, arguments
+            self.tool_call_count += 1
+            return type("Result", (), {"content": [{"type": "text", "text": "ok"}], "is_error": False, "external_request_id": None})()
+
+    def fake_create_transport(config, **kwargs):
+        del kwargs
+        transport = _FakeTransport(getattr(config, "headers", {}))
+        created_transports.append(transport)
+        return transport
+
+    monkeypatch.setattr("multiclaw.mcp.manager.create_transport", fake_create_transport)
+    monkeypatch.setattr("multiclaw.mcp.manager.MCPClient", _FakeClient)
+
+    manager = MCPClientManager(tenant_context=TenantContext("tenant-a", "workspace-a"))
+    config = HTTPServerConfig(
+        url="https://example.com/mcp",
+        headers={"Authorization": "Bearer literal-token"},
+    )
+
+    await manager._connect_server("demo", config)
+    await manager._call_tool_async("demo", "ping", {})
+    await manager._call_tool_async("demo", "ping", {})
+
+    assert len(created_transports) == 1
+    assert created_transports[0]._headers["Authorization"] == "Bearer literal-token"
 
 
 def test_create_transport_builds_sandboxed_stdio_launch_spec_with_controlled_grants(

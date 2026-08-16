@@ -82,3 +82,6 @@ class StdioTransport(BaseTransport):
             )
         finally:
             self._cleaned_up = True
+
+    def scrub_sensitive_state(self) -> None:
+        object.__setattr__(self._launch_spec, "env", {})
