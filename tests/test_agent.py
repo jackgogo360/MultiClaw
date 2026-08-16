@@ -632,27 +632,22 @@ class TestMultiClawAgent:
         assert "Do not output DSML" in retry_call.kwargs["messages"][0]["content"]
 
     @pytest.mark.asyncio
-    async def test_handle_message_parallel_read_only_batch_overlaps_when_enabled(self):
-        first_started = asyncio.Event()
-        second_started = asyncio.Event()
+    async def test_handle_message_read_only_batch_stays_serial_when_parallel_enabled(self):
         active = 0
         max_active = 0
+        execution_order: list[str] = []
         finished: list[str] = []
 
         async def runner(params: _ScriptedParams) -> ToolExecutionResult:
             nonlocal active, max_active
             label = params.label or ""
+            execution_order.append(f"start:{label}")
             active += 1
             max_active = max(max_active, active)
             try:
-                if label == "first":
-                    first_started.set()
-                    await asyncio.wait_for(second_started.wait(), timeout=0.1)
-                    await asyncio.sleep(0.02)
-                else:
-                    second_started.set()
-                    await asyncio.sleep(0.0)
+                await asyncio.sleep(0.01)
                 finished.append(label)
+                execution_order.append(f"end:{label}")
                 return ToolExecutionResult(
                     status=ToolStatus.SUCCESS,
                     content=f"done:{label}",
@@ -680,10 +675,14 @@ class TestMultiClawAgent:
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "finished"
-        assert first_started.is_set()
-        assert second_started.is_set()
-        assert max_active == 2
-        assert finished == ["second", "first"]
+        assert max_active == 1
+        assert execution_order == [
+            "start:first",
+            "end:first",
+            "start:second",
+            "end:second",
+        ]
+        assert finished == ["first", "second"]
         assert agent.act.await_count == 0
 
     @pytest.mark.asyncio
@@ -745,7 +744,7 @@ class TestMultiClawAgent:
         ]
 
     @pytest.mark.asyncio
-    async def test_handle_message_preserves_original_tool_call_ids_and_result_order(self):
+    async def test_handle_message_preserves_original_tool_call_ids_and_result_order_under_serial_execution(self):
         active = 0
         max_active = 0
         finished: list[str] = []
@@ -789,8 +788,8 @@ class TestMultiClawAgent:
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "finished"
-        assert max_active == 2
-        assert finished == ["second", "first"]
+        assert max_active == 1
+        assert finished == ["first", "second"]
         assert [tool_call["id"] for tool_call in assistant_message["tool_calls"]] == [
             "call_beta",
             "call_alpha",
