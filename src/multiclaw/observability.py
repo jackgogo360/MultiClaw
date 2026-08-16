@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -66,36 +68,41 @@ class TraceEventSink:
         self.events.clear()
 
 
-_BOUND_METRICS = OperationalMetrics()
-_BOUND_TRACE_SINK = TraceEventSink()
+_DEFAULT_METRICS = OperationalMetrics()
+_DEFAULT_TRACE_SINK = TraceEventSink()
+_BOUND_METRICS: ContextVar[OperationalMetrics] = ContextVar("observability_metrics", default=_DEFAULT_METRICS)
+_BOUND_TRACE_SINK: ContextVar[TraceEventSink] = ContextVar("observability_trace_sink", default=_DEFAULT_TRACE_SINK)
 
 
-def bind_observability(
+@asynccontextmanager
+async def observability_scope(
     *,
     metrics: OperationalMetrics | None = None,
     trace_sink: TraceEventSink | None = None,
-) -> None:
-    global _BOUND_METRICS, _BOUND_TRACE_SINK
-    if metrics is not None:
-        _BOUND_METRICS = metrics
-    if trace_sink is not None:
-        _BOUND_TRACE_SINK = trace_sink
+):
+    metric_token = _BOUND_METRICS.set(metrics or _DEFAULT_METRICS)
+    trace_token = _BOUND_TRACE_SINK.set(trace_sink or _DEFAULT_TRACE_SINK)
+    try:
+        yield
+    finally:
+        _BOUND_METRICS.reset(metric_token)
+        _BOUND_TRACE_SINK.reset(trace_token)
 
 
 def current_metrics() -> OperationalMetrics:
-    return _BOUND_METRICS
+    return _BOUND_METRICS.get()
 
 
 def current_trace_sink() -> TraceEventSink:
-    return _BOUND_TRACE_SINK
+    return _BOUND_TRACE_SINK.get()
 
 
 def increment_metric(name: str, *, labels: Mapping[str, object] | None = None, value: int = 1) -> int:
-    return _BOUND_METRICS.increment(name, labels=labels, value=value)
+    return current_metrics().increment(name, labels=labels, value=value)
 
 
 def record_trace_event(name: str, *, attributes: Mapping[str, object]) -> None:
-    _BOUND_TRACE_SINK.record(name, attributes)
+    current_trace_sink().record(name, attributes)
 
 
 def observe_database_error(error: BaseException, *, backend: str, operation: str) -> None:

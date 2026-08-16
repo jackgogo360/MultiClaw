@@ -116,6 +116,35 @@ def test_redact_recursively_scrubs_secret_keys_strings_paths_and_bytes(tmp_path:
     assert "[BINARY REDACTED]" in rendered
 
 
+def test_redact_is_cycle_safe_and_redacts_general_filesystem_paths():
+    from multiclaw.security.redaction import redact
+
+    shared: dict[str, object] = {}
+    shared["self"] = shared
+    sequence = []
+    sequence.append(sequence)
+    payload = {
+        "mapping": shared,
+        "sequence": sequence,
+        "tuple": ("keep", sequence),
+        "posix": "/srv/multiclaw/config/production.toml",
+        "relative": "./config/production.toml",
+        "windows": r"C:\MultiClaw\config\production.toml",
+        "unc": r"\\server\share\secrets\prod.env",
+        "url": "https://example.com/models",
+    }
+
+    redacted = redact(payload)
+    rendered = json.dumps(redacted, default=str)
+
+    assert "[CIRCULAR]" in rendered
+    assert "/srv/multiclaw/config/production.toml" not in rendered
+    assert "./config/production.toml" not in rendered
+    assert r"C:\MultiClaw\config\production.toml" not in rendered
+    assert r"\\server\share\secrets\prod.env" not in rendered
+    assert "https://example.com/models" in rendered
+
+
 @pytest.mark.asyncio
 async def test_scoped_audit_logger_persists_only_redacted_detail(migrated_database: Database, tmp_path: Path):
     from multiclaw.governance.audit import ScopedAuditLogger

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from multiclaw.storage.schema import metadata
 router = APIRouter()
 _SQLITE_MIN_VERSION = (3, 35, 0)
 _MYSQL_MIN_VERSION = (8, 0, 36)
+_VERSION_PREFIX_RE = re.compile(r"^\s*(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)\b")
 
 
 @router.get("/api/health/live")
@@ -115,18 +117,22 @@ def _response(failed: list[str]) -> dict[str, Any]:
 
 
 def _backend_version_ok(backend_name: str, version: str) -> bool:
-    digits = []
-    for part in version.split("."):
-        if not part or not part[0].isdigit():
-            break
-        token = "".join(ch for ch in part if ch.isdigit())
-        if not token:
-            break
-        digits.append(int(token))
-    parsed = tuple(digits[:3])
+    match = _VERSION_PREFIX_RE.match(version)
+    if match is None:
+        return False
+    parsed = (
+        int(match.group("major")),
+        int(match.group("minor")),
+        int(match.group("patch")),
+    )
     if backend_name == "sqlite":
         return parsed >= _SQLITE_MIN_VERSION
     if backend_name == "mysql":
+        lowered = version.lower()
+        if "mariadb" in lowered or "percona" in lowered:
+            return False
+        if parsed[0] != 8:
+            return False
         return parsed >= _MYSQL_MIN_VERSION
     return False
 
@@ -166,22 +172,44 @@ async def _mysql_schema_integrity_ok(conn) -> bool:
             SELECT table_name
             FROM information_schema.tables
             WHERE table_schema = DATABASE()
+              AND table_type = 'BASE TABLE'
             """
         )
     )
     table_names = {str(row["table_name"]) for row in tables.mappings().all()}
     if table_names != set(metadata.tables):
         return False
-    constraints = await conn.execute(
+
+    actual_fk_rows = await conn.execute(
         text(
             """
-            SELECT constraint_name
-            FROM information_schema.referential_constraints
-            WHERE constraint_schema = DATABASE()
+            SELECT
+                table_name,
+                constraint_name,
+                column_name,
+                referenced_table_name,
+                referenced_column_name,
+                ordinal_position
+            FROM information_schema.key_column_usage
+            WHERE table_schema = DATABASE()
+              AND referenced_table_schema = DATABASE()
+              AND referenced_table_name IS NOT NULL
+            ORDER BY table_name, constraint_name, ordinal_position
             """
         )
     )
-    return len(constraints.mappings().all()) >= 1
+    actual = {
+        (
+            str(row["table_name"]),
+            str(row["constraint_name"]),
+            str(row["column_name"]),
+            str(row["referenced_table_name"]),
+            str(row["referenced_column_name"]),
+            int(row["ordinal_position"]),
+        )
+        for row in actual_fk_rows.mappings().all()
+    }
+    return actual == _expected_mysql_fk_rows()
 
 
 async def _mysql_charset_ok(conn) -> bool:
@@ -203,6 +231,27 @@ async def _mysql_charset_ok(conn) -> bool:
     if not rows:
         return False
     return all(str(row["table_collation"] or "").lower().startswith("utf8mb4") for row in rows)
+
+
+def _expected_mysql_fk_rows() -> set[tuple[str, str, str, str, str, int]]:
+    rows: set[tuple[str, str, str, str, str, int]] = set()
+    for table in metadata.tables.values():
+        for constraint in table.foreign_key_constraints:
+            if not constraint.elements or constraint.name is None:
+                return set()
+            referenced_table = next(iter(constraint.elements)).column.table.name
+            for ordinal, element in enumerate(constraint.elements, start=1):
+                rows.add(
+                    (
+                        table.name,
+                        constraint.name,
+                        element.parent.name,
+                        referenced_table,
+                        element.column.name,
+                        ordinal,
+                    )
+                )
+    return rows
 
 
 async def _has_active_default_workspace_integrity_failure(conn) -> bool:

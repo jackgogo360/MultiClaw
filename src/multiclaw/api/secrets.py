@@ -9,6 +9,11 @@ from multiclaw.api.dependencies import tenant_context, tenant_uow
 from multiclaw.auth.middleware import require_recent_auth
 from multiclaw.secrets.envelope import EnvelopeFields, SecretEnvelopeService
 from multiclaw.secrets.resolver import SecretNotConfiguredError
+from multiclaw.secrets.validation import (
+    InvalidSecretCredentialsError,
+    SecretCredentialServiceUnavailableError,
+    UnsupportedSecretValidationTargetError,
+)
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 
@@ -114,12 +119,17 @@ async def test_secret(
 ):
     del _recent_user
     provider_kind, provider_name = _parse_provider(provider)
-    resolver = getattr(request.app.state, "secret_resolver", None)
-    if resolver is None:
+    tester = getattr(request.app.state, "secret_credential_tester", None)
+    if tester is None:
         raise HTTPException(status_code=503, detail="secret storage unavailable")
     try:
-        resolved = await resolver.resolve(context, provider_kind, provider_name, name)
+        result = await tester.validate(context, provider_kind, provider_name, name)
     except SecretNotConfiguredError:
         raise HTTPException(status_code=404, detail="secret not found") from None
-    resolved.close()
-    return {"ok": True}
+    except UnsupportedSecretValidationTargetError:
+        raise HTTPException(status_code=422, detail="unsupported secret validation target") from None
+    except InvalidSecretCredentialsError:
+        raise HTTPException(status_code=422, detail="invalid secret credentials") from None
+    except SecretCredentialServiceUnavailableError:
+        raise HTTPException(status_code=503, detail="secret validation unavailable") from None
+    return {"ok": result.ok}
