@@ -25,6 +25,7 @@ from multiclaw.llm import ModelRouter
 from multiclaw.memory import MemoryEntry, MemoryProtocol
 from multiclaw.planner import Planner
 from multiclaw.runtime.models import RuntimeClock, TenantRuntime
+from multiclaw.secrets.resolver import ResolvedCredentials
 from multiclaw.skills import SkillManager
 from multiclaw.storage import Database
 from multiclaw.storage.repositories.workflow import WorkflowRepository
@@ -132,8 +133,10 @@ class RuntimeFactory:
         self._mcp_manager_factory = mcp_manager_factory
         self._mcp_tool_registrar = mcp_tool_registrar
         self._config_path = config_path
+        self._current_create_context: TenantContext | None = None
 
     async def create(self, context: TenantContext) -> TenantRuntime:
+        self._current_create_context = context
         workspace_root = self.workspace_resolver.resolve(context, create=True)
         event_bus = EventBus()
         event_router = EventRouter()
@@ -179,6 +182,8 @@ class RuntimeFactory:
                 sandbox_controller=sandbox_controller,
             )
             raise
+        finally:
+            self._current_create_context = None
 
         agent.database = self.database
         agent.event_router = event_router
@@ -244,10 +249,9 @@ class RuntimeFactory:
         event_bus: EventBus,
         skill_manager: SkillManager,
     ) -> MultiClawAgent:
-        del context
         return MultiClawAgent(
             settings=self.settings,
-            router=ModelRouter(self.settings),
+            router=self._build_router(context),
             registry=registry,
             scheduler=scheduler,
             memory=_DatabaseBackedMemory(self.database),
@@ -255,6 +259,29 @@ class RuntimeFactory:
             event_bus=event_bus,
             skill_manager=skill_manager,
         )
+
+    def _build_router(self, context: TenantContext) -> ModelRouter:
+        async def credential_resolver(provider_name: str) -> ResolvedCredentials:
+            provider_config = self.settings.llm.providers.get(provider_name, {})
+            base_url = provider_config.get("base_url", "")
+            api_key = provider_config.get("api_key", "")
+            if self.secret_resolver is None:
+                from multiclaw.secrets.resolver import SecretBytes
+
+                return ResolvedCredentials(
+                    provider_name=provider_name,
+                    source="platform",
+                    base_url=base_url,
+                    api_key=SecretBytes(api_key.encode("utf-8")),
+                )
+            return await self.secret_resolver.resolve_credentials(
+                context,
+                provider_name=provider_name,
+                base_url=base_url,
+                platform_value=api_key,
+            )
+
+        return ModelRouter(self.settings, credential_resolver=credential_resolver)
 
     def _build_scheduler(self, event_bus: EventBus) -> CoreToolScheduler:
         return CoreToolScheduler(
@@ -377,9 +404,12 @@ class RuntimeFactory:
         if not self.settings.mcp.enabled:
             return None
 
+        context = self._current_create_context
         manager = self._mcp_manager_factory(
             sandbox_controller=sandbox_controller,
             workspace_root=workspace_root,
+            secret_resolver=self.secret_resolver,
+            tenant_context=context,
         )
         if self._mcp_tool_registrar is not None:
             self._mcp_tool_registrar(

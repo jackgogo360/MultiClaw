@@ -1,15 +1,21 @@
 import asyncio
+import base64
+import json
 from pathlib import Path
 
 import pytest
 from alembic import command
 from sqlalchemy import insert, text
+from unittest.mock import AsyncMock, Mock, patch
 
 from multiclaw.cli import alembic_config
-from multiclaw.config.settings import DatabaseSettings, McpSettings, Settings, SkillSettings
+from multiclaw.config.settings import DatabaseSettings, LLMSettings, McpSettings, SecretSettings, Settings, SkillSettings
+from multiclaw.secrets.envelope import EnvelopeFields, SecretEnvelopeService
+from multiclaw.secrets.keyring import DeploymentKeyring
+from multiclaw.secrets.resolver import SecretResolver
 from multiclaw.storage import Database
 from multiclaw.storage.schema import agent_runs, chat_sessions, execution_checkpoints, workspaces
-from multiclaw.storage.uow import AuthUnitOfWork
+from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
 from multiclaw.workflow.models import RunStatus
 
@@ -22,6 +28,12 @@ def _settings_for_runtime(root: Path) -> Settings:
             driver="sqlite",
             url=f"sqlite+aiosqlite:///{root / 'runtime.db'}",
         ),
+        llm=LLMSettings(
+            default_provider="openai",
+            default_model="gpt-4o-mini",
+            providers={"openai": {"api_key": "platform-key", "base_url": "https://platform.example/v1"}},
+            capability_tags={"gpt-4o-mini": ["text", "function_calling"]},
+        ),
         mcp=McpSettings(enabled=False),
         skill=SkillSettings(enabled=True, max_active=3),
     )
@@ -31,6 +43,82 @@ async def _create_migrated_runtime_database(root: Path) -> Database:
     database_url = f"sqlite+aiosqlite:///{root / 'runtime.db'}"
     await asyncio.to_thread(command.upgrade, alembic_config(database_url=database_url), "head")
     return Database.create(DatabaseSettings(driver="sqlite", url=database_url))
+
+
+def _keyring() -> DeploymentKeyring:
+    payload = base64.b64encode(
+        json.dumps(
+            {
+                "active_key_version": 3,
+                "keys": {
+                    "3": base64.b64encode(bytes(range(32))).decode("ascii"),
+                },
+            }
+        ).encode("utf-8")
+    ).decode("ascii")
+    return DeploymentKeyring.load(
+        SecretSettings(),
+        environ={"MULTICLAW_SECRETS_KEYRING_B64": payload},
+    )
+
+
+async def _seed_runtime_scope(database: Database, tenant_id: str, workspace_id: str) -> None:
+    async with database.write_transaction() as conn:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO users (
+                    id, email, auth_epoch, default_workspace_id, status,
+                    purge_after, created_at, updated_at, disabled_at, purge_requested_at
+                )
+                VALUES (:tenant_id, :email, 0, NULL, 'active', NULL, 1, 1, NULL, NULL)
+                """
+            ),
+            {"tenant_id": tenant_id, "email": f"{tenant_id}@example.com"},
+        )
+        await conn.execute(
+            text(
+                """
+                INSERT INTO workspaces (id, tenant_id, slug, name, status, created_at, updated_at)
+                VALUES (:workspace_id, :tenant_id, :slug, :name, 'active', 1, 1)
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "workspace_id": workspace_id,
+                "slug": workspace_id,
+                "name": workspace_id,
+            },
+        )
+        await conn.execute(
+            text("UPDATE users SET default_workspace_id = :workspace_id WHERE id = :tenant_id"),
+            {"tenant_id": tenant_id, "workspace_id": workspace_id},
+        )
+
+
+async def _store_runtime_secret(database: Database, context: TenantContext, secret_value: bytes) -> None:
+    keyring = _keyring()
+    envelope = SecretEnvelopeService(keyring)
+    secret_id = f"{context.tenant_id}-secret"
+    record = envelope.encrypt(
+        secret_value,
+        EnvelopeFields(
+            tenant_id=context.tenant_id,
+            workspace_id=None,
+            secret_id=secret_id,
+            provider_kind="llm",
+            provider_name="openai",
+            secret_name="api_key",
+        ),
+    )
+    async with TenantUnitOfWork(database, context) as uow:
+        await uow.secrets.put_encrypted(
+            secret_id=secret_id,
+            provider_kind="llm",
+            provider_name="openai",
+            secret_name="api_key",
+            record=record,
+        )
 
 
 @pytest.mark.asyncio
@@ -63,6 +151,72 @@ async def test_runtime_factory_builds_distinct_mutable_components_per_tenant(tmp
     assert runtime_a.registry is not runtime_b.registry
     assert runtime_a.skill_manager is not runtime_b.skill_manager
     assert runtime_a.sandbox_controller is not runtime_b.sandbox_controller
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_isolates_per_tenant_llm_credentials(tmp_path: Path):
+    from multiclaw.runtime.factory import RuntimeFactory
+
+    settings = _settings_for_runtime(tmp_path)
+    database = await _create_migrated_runtime_database(tmp_path)
+    resolver = WorkspaceResolver(tmp_path)
+    secret_resolver = SecretResolver(
+        database=database,
+        settings=SecretSettings(allow_platform_fallback=False),
+        keyring=_keyring(),
+        envelope=SecretEnvelopeService(_keyring()),
+    )
+    context_a = TenantContext("tenant-a", "workspace-a")
+    context_b = TenantContext("tenant-b", "workspace-b")
+    await _seed_runtime_scope(database, context_a.tenant_id, context_a.workspace_id)
+    await _seed_runtime_scope(database, context_b.tenant_id, context_b.workspace_id)
+    await _store_runtime_secret(database, context_a, b"tenant-a-secret")
+    await _store_runtime_secret(database, context_b, b"tenant-b-secret")
+
+    factory = RuntimeFactory(
+        settings=settings,
+        database=database,
+        workspace_resolver=resolver,
+        secret_resolver=secret_resolver,
+        sandbox_controller_factory=lambda workspace_root, event_bus: ReadyRecordingSandboxController(
+            workspace_root=workspace_root
+        ),
+    )
+
+    captured_headers: list[str] = []
+
+    async def fake_post(url, *, headers, json):
+        del url, json
+        captured_headers.append(headers["Authorization"])
+        response = Mock()
+        response.json.return_value = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        response.raise_for_status = Mock()
+        return response
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.post.side_effect = fake_post
+
+    try:
+        runtime_a = await factory.create(context_a)
+        runtime_b = await factory.create(context_b)
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            await runtime_a.agent.router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+            await runtime_b.agent.router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+    finally:
+        await asyncio.gather(runtime_a.close(), runtime_b.close())
+        await database.dispose()
+
+    assert captured_headers == [
+        "Bearer tenant-a-secret",
+        "Bearer tenant-b-secret",
+    ]
 
 
 @pytest.mark.asyncio
