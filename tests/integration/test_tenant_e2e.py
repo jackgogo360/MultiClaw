@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import Counter
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 import json
 import os
@@ -999,8 +999,22 @@ async def test_real_deletion_purge_removes_only_target_tenant_and_closes_recover
     assert survivor.marker_file.exists()
     assert survivor.marker_file.read_text(encoding="utf-8") == survivor.marker_contents
     assert survivor_user.status == "active"
+    assert survivor_user.default_workspace_id == survivor.base_context.workspace_id
     assert survivor_job is None
     assert runtime_pool.revoked == [target.base_context.tenant_id]
+
+    await service.force_job_purge_after(
+        tenant_id=target.base_context.tenant_id,
+        purge_after=0,
+    )
+    refreshed_pending_job = await _load_current_deletion_job(
+        tenant_isolation_database,
+        target.base_context.tenant_id,
+    )
+    assert refreshed_pending_job is not None
+    assert refreshed_pending_job.job_id == scheduled.job_id
+    assert refreshed_pending_job.status == "scheduled"
+    assert refreshed_pending_job.purge_after == 0
 
     worker = DeletionWorker(
         database=tenant_isolation_database,
@@ -1022,22 +1036,30 @@ async def test_real_deletion_purge_removes_only_target_tenant_and_closes_recover
         return await original_purge_job(job)
 
     monkeypatch.setattr(worker, "_purge_job", paused_purge_job)
-    batch_task = asyncio.create_task(worker.run_batch(batch_size=10))
-    await asyncio.wait_for(entered_purge.wait(), timeout=5)
+    batch_task = asyncio.create_task(worker.run_batch(batch_size=1))
+    try:
+        await asyncio.wait_for(entered_purge.wait(), timeout=5)
 
-    running_job = await _load_current_deletion_job(
-        tenant_isolation_database,
-        target.base_context.tenant_id,
-    )
-    assert running_job is not None
-    assert running_job.job_id == scheduled.job_id
-    assert running_job.status == "running"
+        running_job = await _load_current_deletion_job(
+            tenant_isolation_database,
+            target.base_context.tenant_id,
+        )
+        assert running_job is not None
+        assert running_job.job_id == scheduled.job_id
+        assert running_job.status == "running"
 
-    with pytest.raises(RecoveryWindowClosedError):
-        await service.recover(target.base_context, scheduled.job_id)
+        with pytest.raises(RecoveryWindowClosedError):
+            await service.recover(target.base_context, scheduled.job_id)
 
-    release_purge.set()
-    batch = await asyncio.wait_for(batch_task, timeout=10)
+        release_purge.set()
+        batch = await asyncio.wait_for(batch_task, timeout=10)
+    finally:
+        if not release_purge.is_set():
+            release_purge.set()
+        if not batch_task.done():
+            batch_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await batch_task
 
     target_user_after = await _load_auth_user(
         tenant_isolation_database,
@@ -1090,6 +1112,7 @@ async def test_real_deletion_purge_removes_only_target_tenant_and_closes_recover
     assert not target.workspace.exists()
     assert survivor_user_after is not None
     assert survivor_user_after.status == "active"
+    assert survivor_user_after.default_workspace_id == survivor.base_context.workspace_id
     assert survivor_job_after is None
     assert survivor_session_after is not None
     assert survivor_session_after.title == survivor.session_title
