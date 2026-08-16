@@ -22,8 +22,16 @@ from multiclaw.storage.schema import (
     users,
 )
 from multiclaw.storage.repositories.deletions import next_claimable_tenant_id
-from multiclaw.storage.uow import AuthUnitOfWork, DeletionUnitOfWork
-from multiclaw.workflow.models import ApprovalStatus, ExecutionStatus, RecoveryStrategy, RunStatus
+from multiclaw.storage.uow import AuthUnitOfWork, DeletionUnitOfWork, TenantUnitOfWork
+from multiclaw.tenancy import TenantContext
+from multiclaw.workflow.coordinator import WorkflowCoordinator
+from multiclaw.workflow.models import (
+    ApprovalStatus,
+    ExecutionStatus,
+    RecoveryStrategy,
+    RunStatus,
+    TERMINAL_RUN_STATUSES,
+)
 
 from database_fixtures import _ORIGINAL_TEST_MYSQL_URL
 
@@ -67,6 +75,13 @@ async def _seed_user(database: Database, email: str) -> tuple[str, str]:
         user = await uow.users.create_user_with_default_workspace(email)
         assert user.default_workspace_id is not None
         return user.id, user.default_workspace_id
+
+
+async def _create_run_context(database: Database, *, tenant_id: str, workspace_id: str) -> TenantContext:
+    context = TenantContext(tenant_id=tenant_id, workspace_id=workspace_id)
+    async with TenantUnitOfWork(database, context) as uow:
+        session = await uow.sessions.create(title="Deletion workflow session")
+    return context.for_run(session.id, str(uuid4()))
 
 
 async def _db_now_ms(database: Database) -> int:
@@ -433,7 +448,7 @@ async def test_request_rejects_active_runs_tools_or_valid_leases_without_mutatin
             deletion_database,
             tenant_id=tenant_id,
             workspace_id=workspace_id,
-            run_status=RunStatus.COMPLETED.value,
+            run_status=RunStatus.AWAITING_USER.value,
             lease_expires_at=now_ms + 30_000,
         )
 
@@ -450,6 +465,59 @@ async def test_request_rejects_active_runs_tools_or_valid_leases_without_mutatin
     assert user_row["purge_after"] is None, description
     assert job_row is None, description
     assert runtime_pool.revoked == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    sorted(TERMINAL_RUN_STATUSES, key=lambda status: status.value),
+)
+async def test_request_allows_terminal_run_with_unexpired_lease(
+    deletion_database: Database,
+    terminal_status: RunStatus,
+) -> None:
+    tenant_id, workspace_id = await _seed_user(
+        deletion_database,
+        f"terminal-{terminal_status.value}@example.com",
+    )
+    run_context = await _create_run_context(
+        deletion_database,
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+    )
+    coordinator = WorkflowCoordinator(deletion_database, settings=Settings(_config_file="/nonexistent"))
+    lease = await coordinator.start_run_with_checkpoint(run_context, f"runtime-{terminal_status.value}")
+    await coordinator.finish_run_with_checkpoint(lease, terminal_status)
+
+    async with deletion_database.connect() as conn:
+        run_row = (
+            await conn.execute(
+                select(
+                    agent_runs.c.run_status,
+                    agent_runs.c.lease_expires_at,
+                    agent_runs.c.finished_at,
+                ).where(
+                    agent_runs.c.tenant_id == tenant_id,
+                    agent_runs.c.run_id == run_context.run_id,
+                )
+            )
+        ).mappings().one()
+
+    assert run_row["run_status"] == terminal_status.value
+    assert run_row["finished_at"] is not None
+    assert run_row["lease_expires_at"] is not None
+    assert int(run_row["lease_expires_at"]) > await _db_now_ms(deletion_database)
+
+    runtime_pool = _TrackingRuntimePool()
+    service = _service(deletion_database, runtime_pool, retention_days=7)
+
+    scheduled = await service.request(tenant_id, retention_days=7)
+    user_row, job_row = await _user_and_job(deletion_database, tenant_id)
+
+    assert scheduled.status == "scheduled"
+    assert job_row is not None
+    assert user_row["status"] == "pending_purge"
+    assert runtime_pool.revoked == [tenant_id]
 
 
 @pytest.mark.asyncio

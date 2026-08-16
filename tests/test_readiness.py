@@ -233,6 +233,125 @@ def test_readiness_mysql_branch_uses_low_cardinality_contract_failures(monkeypat
 
 
 @pytest.mark.parametrize(
+    ("time_zone", "expected_failed"),
+    [
+        ("+00:00", []),
+        ("UTC", []),
+        ("SYSTEM", ["mysql_time_zone"]),
+    ],
+)
+def test_readiness_mysql_timezone_requires_explicit_utc(
+    monkeypatch: pytest.MonkeyPatch,
+    time_zone: str,
+    expected_failed: list[str],
+):
+    import multiclaw.api.health as health_module
+    from fastapi import FastAPI
+    from starlette.requests import Request
+
+    expected_fk_rows = _expected_mysql_fk_rows(health_module)
+
+    class _FakeConn:
+        async def scalar(self, stmt):
+            sql = str(stmt)
+            lowered = sql.lower()
+            if "version()" in lowered:
+                return "8.0.36"
+            if "@@session.time_zone" in sql:
+                return time_zone
+            if "@@transaction_isolation" in sql:
+                return "READ-COMMITTED"
+            if "@@character_set_database" in sql:
+                return "utf8mb4"
+            if "count(*)" in lowered and "from users" in lowered:
+                return 0
+            return None
+
+        async def execute(self, stmt):
+            sql = str(stmt).lower()
+            if "information_schema.tables" in sql and "engine" in sql:
+                return _MappingsResult(
+                    [
+                        {"engine": "InnoDB", "table_name": name}
+                        for name in health_module.metadata.tables
+                    ]
+                )
+            if "information_schema.tables" in sql and "table_collation" in sql:
+                return _MappingsResult(
+                    [
+                        {"table_name": name, "table_collation": "utf8mb4_0900_ai_ci"}
+                        for name in health_module.metadata.tables
+                    ]
+                )
+            if "information_schema.tables" in sql and "table_name" in sql:
+                return _MappingsResult([{"table_name": name} for name in health_module.metadata.tables])
+            if "information_schema.key_column_usage" in sql:
+                return _MappingsResult(expected_fk_rows)
+            if "information_schema.referential_constraints" in sql:
+                return _MappingsResult([{"constraint_name": "placeholder"}])
+            return _MappingsResult([])
+
+        async def run_sync(self, fn):
+            return fn(SimpleNamespace())
+
+    class _FakeConnect:
+        async def __aenter__(self):
+            return _FakeConn()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeDatabase:
+        dialect = SimpleNamespace(name="mysql")
+
+        def connect(self):
+            return _FakeConnect()
+
+    monkeypatch.setattr(
+        health_module.MigrationContext,
+        "configure",
+        lambda sync_conn: SimpleNamespace(get_current_revision=lambda: "20260815_0001"),
+    )
+    monkeypatch.setattr(
+        health_module.ScriptDirectory,
+        "from_config",
+        lambda config: SimpleNamespace(get_current_head=lambda: "20260815_0001"),
+    )
+    monkeypatch.setattr(
+        health_module.DeploymentKeyring,
+        "load",
+        lambda settings: SimpleNamespace(require_versions=lambda usage: None),
+    )
+
+    app = FastAPI()
+    app.state.database = _FakeDatabase()
+    app.state.settings = SimpleNamespace(
+        database=SimpleNamespace(url="mysql+aiomysql://fake"),
+        secrets=SimpleNamespace(),
+    )
+    app.state.workspace_root = Path.cwd()
+    request = Request({"type": "http", "app": app, "method": "GET", "path": "/api/health/ready", "headers": []})
+
+    response = asyncio.run(health_module.health_ready(request))
+    payload = json.loads(response.body.decode())
+
+    if expected_failed:
+        assert response.status_code == 503
+        assert payload == {
+            "ready": False,
+            "status": "not_ready",
+            "checks_failed": expected_failed,
+        }
+    else:
+        assert response.status_code == 200
+        assert payload == {
+            "ready": True,
+            "status": "ready",
+            "checks_failed": [],
+        }
+
+
+@pytest.mark.parametrize(
     ("database_charset", "table_collations", "expected_failed"),
     [
         ("utf8mb4", ["utf8mb4_0900_ai_ci", "utf8mb4_bin"], []),
