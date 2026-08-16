@@ -103,6 +103,13 @@ def test_workspace_resolver_creates_missing_directories_with_owner_only_permissi
     assert resolved.parent.stat().st_mode & 0o777 == 0o700
 
 
+def test_workspace_resolver_never_accepts_client_supplied_path_segments(tmp_path: Path) -> None:
+    resolver = WorkspaceResolver(tmp_path)
+
+    with pytest.raises(InvalidWorkspaceScope):
+        resolver.resolve(TenantContext("tenant-a", "../../etc"))
+
+
 @pytest.mark.asyncio
 async def test_read_file_builder_uses_resolver_workspace_root(tmp_path: Path) -> None:
     root = tmp_path / "root"
