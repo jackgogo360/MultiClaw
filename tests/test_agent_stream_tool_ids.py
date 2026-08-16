@@ -251,6 +251,54 @@ async def test_handle_message_stream_preserves_tool_call_ids(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_handle_message_stream_stops_at_awaiting_approval_boundary():
+    router = _QueuedStreamRouter(
+        stream_sequences=[
+            [_tool_calls_event("call-await", {"query": "hello"})],
+            [{"type": "token", "content": "must not run"}],
+        ]
+    )
+    agent = _build_custom_stream_agent(
+        router=router,
+        registry=ToolRegistry(),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=2,
+    )
+    agent._execute_tool_batch = AsyncMock(
+        return_value=[
+            SimpleNamespace(
+                call_id="call-await",
+                name="edit_file",
+                observation=SimpleNamespace(content="approval required"),
+                result=SimpleNamespace(
+                    status=ToolStatus.AWAITING_APPROVAL,
+                    data={"approval_id": "approval-1"},
+                ),
+            )
+        ]
+    )
+
+    events = []
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
+        events.append(event)
+
+    assert [event["type"] for event in events] == ["tool_call", "done"]
+    assert events[0]["call_id"] == "call-await"
+    assert events[-1] == {
+        "type": "done",
+        "content": "",
+        "data": {"state": "awaiting_user", "detail": "tool awaiting approval"},
+    }
+    assert len(router.stream_calls) == 1
+    agent._execute_tool_batch.assert_awaited_once()
+    agent.remember.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_handle_message_stream_uses_context_build_with_report_and_only_prompt_messages():
     expected_messages = [
         {"role": "system", "content": "sys"},

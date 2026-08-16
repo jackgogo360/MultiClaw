@@ -3548,6 +3548,87 @@ async def test_chat_forced_summary_persists_assistant_output_and_model_checkpoin
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_awaiting_approval_finishes_without_terminal_completion(
+    migrated_database,
+    monkeypatch,
+):
+    import multiclaw.server as server
+
+    captured: dict[str, object] = {}
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "stream-awaiting-approval@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None
+            workspace_id = user.default_workspace_id
+            assert workspace_id is not None
+        context = TenantContext(user_id, workspace_id)
+        original_acquire = server.app.state.runtime_pool.acquire
+
+        async def acquire_and_patch(request_context):
+            runtime = await original_acquire(request_context)
+            runtime.agent.context_builder = _StaticReportContextBuilder(
+                [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hello"},
+                ]
+            )
+            runtime.agent.router = _QueuedStreamRouter(
+                stream_sequences=[
+                    [
+                        {
+                            "type": "tool_calls",
+                            "calls": [
+                                {
+                                    "id": "call-1",
+                                    "name": "edit_file",
+                                    "arguments": {
+                                        "file_path": "notes.txt",
+                                        "old_string": "",
+                                        "new_string": "hello",
+                                    },
+                                }
+                            ],
+                            "reasoning_content": "",
+                        }
+                    ],
+                    [{"type": "token", "content": "must not run"}],
+                ]
+            )
+            captured["runtime"] = runtime
+            captured["router"] = runtime.agent.router
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        request = Request({"type": "http", "app": server.app, "method": "POST", "path": "/api/chat", "headers": []})
+        async with TenantUnitOfWork(server.app.state.database, context) as uow:
+            response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
+
+        body = "".join([chunk async for chunk in response.body_iterator])
+
+    payloads = _decode_sse_messages(body)
+    run_event = next(payload for payload in payloads if payload["type"] == "data-run")
+    run_context = context.for_run(run_event["data"]["session_id"], run_event["data"]["run_id"])
+    checkpoints = await _checkpoint_rows(migrated_database, run_context)
+    input_payloads = [payload for payload in payloads if payload["type"] == "tool-input-available"]
+    approval_payloads = [payload for payload in payloads if payload["type"] == "tool-approval-request"]
+
+    assert any(payload["toolCallId"] == "call-1" for payload in input_payloads)
+    approval_payload = next(payload for payload in approval_payloads if payload["toolCallId"] == "call-1")
+    assert approval_payload["approvalId"]
+    assert not any(payload["type"] == "tool-output-available" for payload in payloads)
+    assert not any(payload["type"] == "tool-output-error" for payload in payloads)
+    assert not any(payload["type"] == "error" for payload in payloads)
+    assert any(payload["type"] == "finish" for payload in payloads)
+    assert await _assistant_chat_messages(migrated_database, run_context) == []
+    assert await _run_status(migrated_database, run_context) == RunStatus.AWAITING_USER.value
+    assert CheckpointPhase.AWAITING_APPROVAL.value in [row["phase"] for row in checkpoints]
+    assert CheckpointPhase.RUN_TERMINAL.value not in [row["phase"] for row in checkpoints]
+    assert len(captured["router"].stream_sequences) == 1
+
+
+@pytest.mark.asyncio
 async def test_chat_model_output_checkpoint_failure_rolls_back_assistant_message_and_blocks_success(
     migrated_database,
     monkeypatch,
