@@ -376,7 +376,7 @@ def test_chat_returns_retryable_503_when_runtime_pool_is_at_capacity(migrated_da
     assert response.json() == {"detail": "runtime temporarily unavailable"}
 
 
-def test_approve_returns_retryable_503_when_runtime_pool_is_at_capacity(migrated_database, monkeypatch):
+def test_approve_does_not_acquire_runtime_pool(migrated_database, monkeypatch):
     import multiclaw.server as server
     from multiclaw.runtime.pool import RuntimeCapacityError
 
@@ -387,11 +387,13 @@ def test_approve_returns_retryable_503_when_runtime_pool_is_at_capacity(migrated
     with TestClient(server.app) as client:
         client.cookies = _make_auth_cookie(server.app, migrated_database)
         monkeypatch.setattr(server.app.state.runtime_pool, "acquire", fail_acquire)
-        response = client.post("/api/approve", json={"request_id": "req-1", "approved": True})
+        response = client.post(
+            "/api/approve",
+            json={"approval_id": "missing-approval", "approved": True, "version": 1},
+        )
 
-    assert response.status_code == 503
-    assert response.headers["Retry-After"] == "7"
-    assert response.json() == {"detail": "runtime temporarily unavailable"}
+    assert response.status_code == 404
+    assert response.json() == {"detail": "approval not found"}
 
 
 def test_chat_real_memory_path_does_not_lock_sqlite(migrated_database, monkeypatch):

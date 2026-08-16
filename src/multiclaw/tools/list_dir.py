@@ -15,6 +15,7 @@ from multiclaw.tools._common import (
     _success,
 )
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
+from multiclaw.workflow.models import RecoveryStrategy
 
 
 class ListDirParams(BaseModel):
@@ -117,6 +118,7 @@ class ListDirToolBuilder(WorkspaceToolBuilder):
     description = "List a directory in flat or recursive mode."
     parameters_schema = ListDirParams
     read_only = True
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def validate(self, params: dict) -> ListDirParams:
         return ListDirParams(**params)

@@ -25,6 +25,7 @@ from multiclaw.workflow.models import (
     RunLease,
     RunRecord,
     RunStatus,
+    RecoveryStrategy,
     StaleFenceError,
     TenantRunQuotaError,
     VersionConflictError,
@@ -219,6 +220,57 @@ class WorkflowCoordinator:
                 raise VersionConflictError("approval version conflict")
             raise InvalidTransitionError("approval could not be resolved")
 
+    async def create_approval(
+        self,
+        lease: RunLease,
+        *,
+        approval_id: str,
+        tool_call_id: str,
+        expires_at: int,
+    ) -> ApprovalRecord:
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            inserted = await repository._insert_approval(
+                lease,
+                approval_id=approval_id,
+                tool_call_id=tool_call_id,
+                expires_at=expires_at,
+            )
+            if inserted is None:
+                raise StaleFenceError("run lease is stale")
+            return inserted
+
+    async def create_execution(
+        self,
+        lease: RunLease,
+        *,
+        execution_id: str,
+        approval_id: str | None,
+        tool_call_id: str,
+        tool_name: str,
+        tool_kind: str,
+        recovery_strategy: RecoveryStrategy,
+        idempotency_key: str | None,
+        input_payload_json: str,
+        input_hash: str,
+        status: ExecutionStatus = ExecutionStatus.NOT_STARTED,
+    ) -> ExecutionRecord | None:
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            return await repository._insert_execution(
+                lease,
+                execution_id=execution_id,
+                approval_id=approval_id,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                tool_kind=tool_kind,
+                recovery_strategy=recovery_strategy,
+                idempotency_key=idempotency_key,
+                input_payload_json=input_payload_json,
+                input_hash=input_hash,
+                status=status,
+            )
+
     async def transition_execution(
         self,
         lease: RunLease,
@@ -337,6 +389,64 @@ class WorkflowCoordinator:
     async def get_execution(self, context: TenantContext, execution_id: str) -> ExecutionRecord | None:
         async with self._write_connection() as conn:
             return await self._repository(conn).get_execution(context, execution_id)
+
+    async def get_execution_recovery(self, context: TenantContext, execution_id: str):
+        async with self._write_connection() as conn:
+            return await self._repository(conn).get_execution_recovery(context, execution_id)
+
+    async def complete_execution(
+        self,
+        lease: RunLease,
+        execution_id: str,
+        *,
+        expected_status: ExecutionStatus,
+        expected_version: int,
+        target_status: ExecutionStatus,
+        external_request_id: str | None = None,
+        result_ref: str | None = None,
+        result_digest: str | None = None,
+    ):
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            updated = await repository._update_execution_metadata(
+                lease,
+                execution_id,
+                expected_status=expected_status,
+                expected_version=expected_version,
+                external_request_id=external_request_id,
+                result_ref=result_ref,
+                result_digest=result_digest,
+                target_status=target_status,
+            )
+            if updated is not None:
+                return updated
+            if not await repository._has_current_lease(lease):
+                raise StaleFenceError("run lease is stale")
+            raise VersionConflictError("execution version conflict")
+
+    async def record_external_request_id(
+        self,
+        lease: RunLease,
+        execution_id: str,
+        *,
+        expected_status: ExecutionStatus,
+        expected_version: int,
+        external_request_id: str,
+    ):
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            updated = await repository._update_execution_metadata(
+                lease,
+                execution_id,
+                expected_status=expected_status,
+                expected_version=expected_version,
+                external_request_id=external_request_id,
+            )
+            if updated is not None:
+                return updated
+            if not await repository._has_current_lease(lease):
+                raise StaleFenceError("run lease is stale")
+            raise VersionConflictError("execution version conflict")
 
     async def get_runtime_counters(self, context: TenantContext) -> WorkflowRuntimeCounters:
         async with self._write_connection() as conn:

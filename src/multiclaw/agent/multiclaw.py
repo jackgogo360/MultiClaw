@@ -205,6 +205,7 @@ class MultiClawAgent(ToolCallAgent):
         calls: list[dict[str, Any]],
         *,
         context: TenantContext | None = None,
+        run_lease_handle: RunLeaseHandle | None = None,
     ) -> list[ToolCallOutcome]:
         if not calls:
             return []
@@ -212,6 +213,7 @@ class MultiClawAgent(ToolCallAgent):
         return await self._require_tool_batch_executor().execute(
             self._build_tool_call_specs(calls),
             context=context,
+            run_lease_handle=run_lease_handle,
         )
 
     # ------------------------------------------------------------------
@@ -552,6 +554,7 @@ class MultiClawAgent(ToolCallAgent):
                             outcomes = await self._execute_tool_batch(
                                 normalized_calls,
                                 context=context,
+                                run_lease_handle=run_lease_handle,
                             )
                             result_contents: list[str] = []
 

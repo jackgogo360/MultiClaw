@@ -24,6 +24,7 @@ from multiclaw.tools import (
     ToolRegistry,
     ToolStatus,
 )
+from multiclaw.workflow.models import RecoveryStrategy
 
 
 ROOT_CONTEXT = TenantContext(
@@ -163,6 +164,7 @@ class EchoToolBuilder(ToolBuilder[EchoParams]):
     name = "echo"
     description = "Echo tool"
     parameters_schema = EchoParams
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def validate(self, params: dict) -> EchoParams:
         return EchoParams(**params)
@@ -189,11 +191,14 @@ class _ScriptedInvocation(ToolInvocation[_ScriptedParams]):
 class _ScriptedToolBuilder(ToolBuilder[_ScriptedParams]):
     description = "Scripted test tool"
     parameters_schema = _ScriptedParams
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def __init__(self, name: str, runner, *, read_only: bool) -> None:
         self.name = name
         self._runner = runner
         self.read_only = read_only
+        if not read_only:
+            self.recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
     def validate(self, params: dict) -> _ScriptedParams:
         return _ScriptedParams(**params)

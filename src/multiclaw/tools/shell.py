@@ -26,6 +26,7 @@ from multiclaw.tools._common import (
     _success,
 )
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
+from multiclaw.workflow.models import RecoveryStrategy
 
 DEFAULT_TIMEOUT = 120.0
 MAX_TIMEOUT = 600.0
@@ -207,6 +208,7 @@ class ShellToolBuilder(WorkspaceToolBuilder):
     name = "shell"
     description = "Execute a shell command in the workspace with timeout and safety checks."
     parameters_schema = ShellParams
+    recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
     def __init__(
         self,

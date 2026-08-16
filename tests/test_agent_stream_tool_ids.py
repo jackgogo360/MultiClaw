@@ -21,6 +21,7 @@ from multiclaw.tools import (
     ToolRegistry,
     ToolStatus,
 )
+from multiclaw.workflow.models import RecoveryStrategy
 from multiclaw.workflow.models import RunLease, RunLeaseHandle
 
 
@@ -192,11 +193,14 @@ class _ScriptedInvocation(ToolInvocation[_ScriptedParams]):
 class _ScriptedToolBuilder(ToolBuilder[_ScriptedParams]):
     description = "Scripted stream test tool"
     parameters_schema = _ScriptedParams
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def __init__(self, name: str, runner, *, read_only: bool) -> None:
         self.name = name
         self._runner = runner
         self.read_only = read_only
+        if not read_only:
+            self.recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
     def validate(self, params: dict) -> _ScriptedParams:
         return _ScriptedParams(**params)
@@ -396,10 +400,8 @@ async def test_handle_message_stream_retries_when_final_summary_contains_dsml():
 
 
 @pytest.mark.asyncio
-async def test_handle_message_stream_parallel_read_only_batch_overlaps_when_enabled():
+async def test_handle_message_stream_batches_run_serially_but_keep_tool_call_ids():
     timeline: list[str] = []
-    first_started = asyncio.Event()
-    second_started = asyncio.Event()
     active = 0
     max_active = 0
 
@@ -410,13 +412,7 @@ async def test_handle_message_stream_parallel_read_only_batch_overlaps_when_enab
         active += 1
         max_active = max(max_active, active)
         try:
-            if label == "first":
-                first_started.set()
-                await asyncio.wait_for(second_started.wait(), timeout=0.1)
-                await asyncio.sleep(0.02)
-            else:
-                second_started.set()
-                await asyncio.sleep(0.0)
+            await asyncio.sleep(0.01)
             return ToolExecutionResult(
                 status=ToolStatus.SUCCESS,
                 content=f"done:{label}",
@@ -455,10 +451,9 @@ async def test_handle_message_stream_parallel_read_only_batch_overlaps_when_enab
         if event["type"] == "tool_result":
             timeline.append(f"ui_result:{event['call_id']}")
 
-    assert first_started.is_set()
-    assert second_started.is_set()
-    assert max_active == 2
+    assert max_active == 1
     assert timeline[:2] == ["ui_call:call_1", "ui_call:call_2"]
+    assert timeline[2:] == ["exec:first", "exec:second", "ui_result:call_1", "ui_result:call_2"]
     assert [event["call_id"] for event in events if event["type"] == "tool_result"] == [
         "call_1",
         "call_2",
@@ -597,8 +592,8 @@ async def test_handle_message_stream_preserves_original_tool_call_ids_and_result
     )
     tool_messages = [message for message in followup_messages if message["role"] == "tool"]
 
-    assert max_active == 2
-    assert finished == ["second", "first"]
+    assert max_active == 1
+    assert finished == ["first", "second"]
     assert [event["call_id"] for event in events if event["type"] == "tool_result"] == [
         "call_beta",
         "call_alpha",

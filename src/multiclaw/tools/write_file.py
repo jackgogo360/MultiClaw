@@ -19,6 +19,7 @@ from multiclaw.tools._common import (
 )
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
 from multiclaw.tools.read_file import ReadFileToolBuilder
+from multiclaw.workflow.models import RecoveryStrategy
 
 
 class WriteFileParams(BaseModel):
@@ -118,6 +119,7 @@ class WriteFileToolBuilder(WorkspaceToolBuilder):
     name = "write_file"
     description = "Write full file content to the workspace. Existing files must be read first."
     parameters_schema = WriteFileParams
+    recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
     def __init__(
         self,

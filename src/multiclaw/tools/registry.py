@@ -3,6 +3,7 @@ import threading
 from pydantic import BaseModel
 
 from multiclaw.tools.base import ToolBuilder
+from multiclaw.workflow.models import RecoveryStrategy
 
 
 class ToolRegistry:
@@ -11,6 +12,7 @@ class ToolRegistry:
         self._lock = threading.RLock()
 
     def register(self, builder: ToolBuilder[BaseModel]) -> None:
+        self._validate_builder(builder)
         with self._lock:
             self._tools[builder.name] = builder
 
@@ -19,6 +21,8 @@ class ToolRegistry:
             self._tools.pop(name, None)
 
     def replace_namespace(self, prefix: str, builders: list[ToolBuilder[BaseModel]]) -> None:
+        for builder in builders:
+            self._validate_builder(builder)
         with self._lock:
             for name in [name for name in self._tools if name.startswith(prefix)]:
                 del self._tools[name]
@@ -54,3 +58,18 @@ class ToolRegistry:
                 }
             schemas.append(schema)
         return schemas
+
+    @staticmethod
+    def _validate_builder(builder: ToolBuilder[BaseModel]) -> None:
+        strategy = getattr(builder, "recovery_strategy", None)
+        if not isinstance(strategy, RecoveryStrategy):
+            raise ValueError(
+                f"tool {builder.name!r} must declare recovery_strategy explicitly"
+            )
+        if (
+            strategy is RecoveryStrategy.IDEMPOTENT_RETRY
+            and not getattr(builder, "idempotency_key_field", None)
+        ):
+            raise ValueError(
+                f"tool {builder.name!r} must declare idempotency_key_field for idempotent_retry"
+            )

@@ -136,9 +136,11 @@ from multiclaw.api.chat import (
     encode_session_metadata,
     iterate_message_stream,
 )
+from multiclaw.api.approvals import ApprovalDecisionRequest, ApprovalResponse
 from multiclaw.api.dependencies import current_user, tenant_context, tenant_uow
 from multiclaw.stream import DataStreamEncoder
 from multiclaw.workflow.models import (
+    InvalidTransitionError,
     LeaseConflictError,
     RecoveryAction,
     RecoveryOutcome,
@@ -146,7 +148,9 @@ from multiclaw.workflow.models import (
     RunStatus,
     StaleFenceError,
     TenantRunQuotaError,
+    VersionConflictError,
 )
+from multiclaw.workflow.recovery import WorkflowRecoveryWorker
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +509,8 @@ async def lifespan(app: FastAPI):
     runtime_factory = None
     runtime_pool = None
     auth_store = None
+    recovery_stop: asyncio.Event | None = None
+    recovery_task: asyncio.Task | None = None
     try:
         runtime_factory = create_runtime_factory()
         runtime_pool = RuntimePool(
@@ -523,6 +529,29 @@ async def lifespan(app: FastAPI):
         app.state.sandbox_readiness = readiness
         app.state.workspace_root = runtime_factory.workspace_resolver.root
         app.state.sandbox_startup_events = startup_events
+        if hasattr(runtime_factory.database, "dialect") and hasattr(runtime_factory.database, "connect"):
+            recovery_stop = asyncio.Event()
+
+            async def recovery_loop() -> None:
+                worker = WorkflowRecoveryWorker(
+                    database=runtime_factory.database,
+                    settings=runtime_factory.settings,
+                    runtime_pool=runtime_pool,
+                )
+                workflow_settings = getattr(runtime_factory.settings, "workflow", None)
+                heartbeat_ms = getattr(workflow_settings, "heartbeat_ms", 1_000)
+                interval_seconds = max(
+                    1.0,
+                    heartbeat_ms / 1000,
+                )
+                while not recovery_stop.is_set():
+                    await worker.run_once()
+                    try:
+                        await asyncio.wait_for(recovery_stop.wait(), timeout=interval_seconds)
+                    except asyncio.TimeoutError:
+                        continue
+
+            recovery_task = asyncio.create_task(recovery_loop())
     except BaseException as primary:
         try:
             if auth_store is not None:
@@ -546,6 +575,14 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         primary: BaseException | None = None
+
+        if recovery_stop is not None:
+            recovery_stop.set()
+        if recovery_task is not None:
+            try:
+                await recovery_task
+            except BaseException as error:
+                primary = error if primary is None else primary
 
         if auth_store is not None:
             try:
@@ -651,11 +688,6 @@ class SessionRenameRequest(BaseModel):
     title: str
 
 
-class ApproveRequest(BaseModel):
-    request_id: str
-    approved: bool
-
-
 @app.get("/health/ready")
 async def health_ready(request: Request):
     readiness = getattr(request.app.state, "sandbox_readiness", None)
@@ -687,13 +719,31 @@ async def health_ready(request: Request):
 
 @api.post("/approve")
 async def approve(
-    req: ApproveRequest,
+    req: ApprovalDecisionRequest,
     request: Request,
     context: TenantContext = Depends(tenant_context),
 ):
-    runtime = await request.app.state.runtime_pool.acquire(context)
-    ok = runtime.scheduler.resolve_approval(req.request_id, req.approved)
-    return {"ok": ok}
+    coordinator = build_workflow_coordinator(
+        request.app.state.database,
+        request.app.state.settings,
+    )
+    try:
+        record = await coordinator.decide_approval(
+            context=context,
+            approval_id=req.approval_id,
+            approved=req.approved,
+            version=req.version,
+        )
+    except InvalidTransitionError as error:
+        if str(error) == "approval expired":
+            raise HTTPException(status_code=410, detail="approval expired") from error
+        raise HTTPException(status_code=409, detail="approval already resolved") from error
+    except VersionConflictError as error:
+        message = str(error)
+        if message == "approval record not found":
+            raise HTTPException(status_code=404, detail="approval not found") from error
+        raise HTTPException(status_code=409, detail=message) from error
+    return ApprovalResponse.from_record(record)
 
 
 @api.get("/sessions")

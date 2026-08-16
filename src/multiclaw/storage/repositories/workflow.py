@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import and_, exists, func, insert, select, update
+from sqlalchemy import and_, exists, func, insert, literal, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -39,6 +39,11 @@ from multiclaw.workflow.models import (
 Dialect = SQLiteDialect | MySQLDialect
 ACTIVE_RUN_STATUSES = (RunStatus.RUNNING.value, RunStatus.AWAITING_USER.value, RunStatus.RESUMING.value)
 TAKEOVER_ELIGIBLE_STATUSES = {RunStatus.RUNNING, RunStatus.AWAITING_USER, RunStatus.RESUMING}
+NONTERMINAL_EXECUTION_STATUSES = tuple(
+    status.value
+    for status in ExecutionStatus
+    if status not in TERMINAL_EXECUTION_STATUSES
+)
 
 
 def current_lease_predicate(lease: RunLease, dialect: Dialect) -> ColumnElement[bool]:
@@ -421,6 +426,37 @@ class WorkflowRepository:
         row = result.mappings().first()
         return None if row is None else self._execution_recovery_from_row(context, row)
 
+    async def get_execution_by_tool_call_id(
+        self,
+        context: TenantContext,
+        tool_call_id: str,
+    ) -> ExecutionRecoveryRecord | None:
+        result = await self._conn.execute(
+            select(
+                tool_executions.c.execution_id,
+                tool_executions.c.approval_id,
+                tool_executions.c.tool_call_id,
+                tool_executions.c.execution_status,
+                tool_executions.c.recovery_strategy,
+                tool_executions.c.idempotency_key,
+                tool_executions.c.input_hash,
+                tool_executions.c.external_request_id,
+                tool_executions.c.result_ref,
+                tool_executions.c.result_digest,
+                tool_executions.c.version,
+            )
+            .where(
+                tool_executions.c.tenant_id == context.tenant_id,
+                tool_executions.c.workspace_id == context.workspace_id,
+                tool_executions.c.session_id == context.session_id,
+                tool_executions.c.run_id == context.run_id,
+                tool_executions.c.tool_call_id == tool_call_id,
+            )
+            .limit(1)
+        )
+        row = result.mappings().first()
+        return None if row is None else self._execution_recovery_from_row(context, row)
+
     async def get_approval(self, context: TenantContext, approval_id: str) -> ApprovalRecord | None:
         result = await self._conn.execute(
             select(
@@ -545,6 +581,130 @@ class WorkflowRepository:
         assert resolved is not None
         return resolved
 
+    async def _insert_approval(
+        self,
+        lease: RunLease,
+        *,
+        approval_id: str,
+        tool_call_id: str,
+        expires_at: int,
+    ) -> ApprovalRecord | None:
+        await self._dialect.lock_run(self._conn, lease.context)
+        if not await self._has_current_lease(lease):
+            return None
+
+        now_ms = self._dialect.db_now_ms()
+        await self._conn.execute(
+            insert(approval_requests).values(
+                approval_id=approval_id,
+                tenant_id=lease.context.tenant_id,
+                workspace_id=lease.context.workspace_id,
+                session_id=lease.context.session_id,
+                run_id=lease.context.run_id,
+                tool_call_id=tool_call_id,
+                approval_status=ApprovalStatus.AWAITING_USER.value,
+                requested_at=now_ms,
+                resolved_at=None,
+                expires_at=expires_at,
+                version=1,
+            )
+        )
+        inserted = await self.get_approval(lease.context, approval_id)
+        assert inserted is not None
+        return inserted
+
+    async def _insert_execution(
+        self,
+        lease: RunLease,
+        *,
+        execution_id: str,
+        approval_id: str | None,
+        tool_call_id: str,
+        tool_name: str,
+        tool_kind: str,
+        recovery_strategy: RecoveryStrategy,
+        idempotency_key: str | None,
+        input_payload_json: str,
+        input_hash: str,
+        status: ExecutionStatus = ExecutionStatus.NOT_STARTED,
+    ) -> ExecutionRecord | None:
+        await self._dialect.lock_run(self._conn, lease.context)
+        if not await self._has_current_lease(lease):
+            return None
+
+        now_ms = self._dialect.db_now_ms()
+        selectable = select(
+            literal(execution_id),
+            literal(lease.context.tenant_id),
+            literal(lease.context.workspace_id),
+            literal(lease.context.session_id),
+            literal(lease.context.run_id),
+            literal(approval_id),
+            literal(tool_call_id),
+            literal(tool_name),
+            literal(tool_kind),
+            literal(status.value),
+            literal(recovery_strategy.value),
+            literal(idempotency_key),
+            literal(input_payload_json),
+            literal(input_hash),
+            literal(None),
+            literal(None),
+            literal(None),
+            literal(1),
+            literal(1),
+            now_ms,
+            now_ms,
+            literal(None),
+        ).where(
+            ~exists(
+                select(1)
+                .select_from(tool_executions)
+                .where(
+                    tool_executions.c.tenant_id == lease.context.tenant_id,
+                    tool_executions.c.workspace_id == lease.context.workspace_id,
+                    tool_executions.c.session_id == lease.context.session_id,
+                    tool_executions.c.run_id == lease.context.run_id,
+                    tool_executions.c.execution_status.in_(NONTERMINAL_EXECUTION_STATUSES),
+                )
+            )
+        )
+
+        result = await self._conn.execute(
+            insert(tool_executions).from_select(
+                [
+                    tool_executions.c.execution_id,
+                    tool_executions.c.tenant_id,
+                    tool_executions.c.workspace_id,
+                    tool_executions.c.session_id,
+                    tool_executions.c.run_id,
+                    tool_executions.c.approval_id,
+                    tool_executions.c.tool_call_id,
+                    tool_executions.c.tool_name,
+                    tool_executions.c.tool_kind,
+                    tool_executions.c.execution_status,
+                    tool_executions.c.recovery_strategy,
+                    tool_executions.c.idempotency_key,
+                    tool_executions.c.input_payload_json,
+                    tool_executions.c.input_hash,
+                    tool_executions.c.external_request_id,
+                    tool_executions.c.result_ref,
+                    tool_executions.c.result_digest,
+                    tool_executions.c.schema_version,
+                    tool_executions.c.version,
+                    tool_executions.c.created_at,
+                    tool_executions.c.updated_at,
+                    tool_executions.c.finished_at,
+                ],
+                selectable,
+            )
+        )
+        if result.rowcount != 1:
+            return None
+        inserted = await self.get_execution(lease.context, execution_id)
+        assert inserted is not None
+        return inserted
+
     async def _transition_execution(
         self,
         lease: RunLease,
@@ -592,6 +752,72 @@ class WorkflowRepository:
         transitioned = await self.get_execution(lease.context, execution_id)
         assert transitioned is not None
         return transitioned
+
+    async def _update_execution_metadata(
+        self,
+        lease: RunLease,
+        execution_id: str,
+        *,
+        expected_status: ExecutionStatus,
+        expected_version: int,
+        external_request_id: str | None = None,
+        result_ref: str | None = None,
+        result_digest: str | None = None,
+        target_status: ExecutionStatus | None = None,
+    ) -> ExecutionRecoveryRecord | None:
+        await self._dialect.lock_run(self._conn, lease.context)
+        if not await self._has_current_lease(lease):
+            return None
+
+        now_ms = self._dialect.db_now_ms()
+        values: dict[str, object] = {
+            "updated_at": now_ms,
+            "version": tool_executions.c.version + 1,
+        }
+        if external_request_id is not None:
+            values["external_request_id"] = external_request_id
+        if result_ref is not None:
+            values["result_ref"] = result_ref
+        if result_digest is not None:
+            values["result_digest"] = result_digest
+        if target_status is not None:
+            allowed = LEGAL_EXECUTION_TRANSITIONS.get(expected_status, frozenset())
+            if target_status not in allowed:
+                raise InvalidTransitionError(
+                    f"illegal execution transition: {expected_status.value} -> {target_status.value}"
+                )
+            values["execution_status"] = target_status.value
+            if target_status in TERMINAL_EXECUTION_STATUSES:
+                values["finished_at"] = now_ms
+
+        result = await self._conn.execute(
+            update(tool_executions)
+            .where(
+                tool_executions.c.tenant_id == lease.context.tenant_id,
+                tool_executions.c.workspace_id == lease.context.workspace_id,
+                tool_executions.c.session_id == lease.context.session_id,
+                tool_executions.c.run_id == lease.context.run_id,
+                tool_executions.c.execution_id == execution_id,
+                tool_executions.c.execution_status == expected_status.value,
+                tool_executions.c.version == expected_version,
+                exists(select(1).select_from(agent_runs).where(current_lease_predicate(lease, self._dialect))),
+                (tool_executions.c.external_request_id.is_(None) | (tool_executions.c.external_request_id == external_request_id))
+                if external_request_id is not None
+                else literal(True),
+                (tool_executions.c.result_ref.is_(None) | (tool_executions.c.result_ref == result_ref))
+                if result_ref is not None
+                else literal(True),
+                (tool_executions.c.result_digest.is_(None) | (tool_executions.c.result_digest == result_digest))
+                if result_digest is not None
+                else literal(True),
+            )
+            .values(**values)
+        )
+        if result.rowcount != 1:
+            return None
+        updated = await self.get_execution_recovery(lease.context, execution_id)
+        assert updated is not None
+        return updated
 
     async def _insert_checkpoint(
         self,
