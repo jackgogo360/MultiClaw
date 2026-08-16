@@ -17,23 +17,29 @@ from multiclaw.config import DatabaseSettings, Settings
 from multiclaw.events import EventBus
 from multiclaw.events import EventRouter
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
+from multiclaw.governance.models import PermissionDecision
 from multiclaw.storage import Database
 from multiclaw.storage.schema import agent_runs, approval_requests, execution_checkpoints, tool_executions
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 from multiclaw.tools import CoreToolScheduler, ToolBuilder, ToolExecutionResult, ToolInvocation, ToolStatus
 from multiclaw.tools import ToolRegistry
+from multiclaw.tools.read_file import ReadFileToolBuilder
 from multiclaw.mcp.tool_adapter import MCPToolBuilder, _extract_text as mcp_extract_text
 from multiclaw.mcp.types import ToolCallResult
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     CheckpointPhase,
     ExecutionStatus,
+    LeaseConflictError,
     RecoveryStrategy,
     RunLeaseHandle,
     RunStatus,
+    StaleFenceError,
+    VersionConflictError,
 )
 from multiclaw.workflow import recovery as recovery_module
+from multiclaw.workflow.continuation import WorkflowContinuationService
 from multiclaw.agent.multiclaw import MultiClawAgent
 from multiclaw.llm import LLMResponse
 from multiclaw.planner import Planner
@@ -272,8 +278,17 @@ class _TrackingContinuation:
     def __init__(self) -> None:
         self.calls: list[tuple[TenantContext, object]] = []
 
-    async def resume(self, *, runtime, context: TenantContext, run_lease_handle, recovery_outcome) -> None:
-        del runtime, run_lease_handle
+    async def resume(
+        self,
+        *,
+        runtime,
+        context: TenantContext,
+        run_lease_handle,
+        recovery_outcome,
+        recovered_tool_result=None,
+        recovered_tool_input_json=None,
+    ) -> None:
+        del runtime, run_lease_handle, recovered_tool_result, recovered_tool_input_json
         self.calls.append((context, recovery_outcome))
 
 
@@ -1358,3 +1373,370 @@ async def test_real_mcp_adapter_reports_external_id_before_crash_and_recovery_ma
     row = await _latest_execution_row(workflow_database, context)
     assert row["external_request_id"] == "mcp-request-123"
     assert row["execution_status"] == ExecutionStatus.UNCERTAIN.value
+
+
+@pytest.mark.asyncio
+async def test_recovery_external_read_uses_current_approved_roots(
+    workflow_database: Database,
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside text\n", encoding="utf-8")
+    context = await _create_run_context(workflow_database, email_suffix="-external-read")
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        from multiclaw.memory import MemoryEntry
+
+        await uow.memory.save(
+            MemoryEntry(
+                content="read outside",
+                type="chat_message",
+                role="user",
+                session_id=context.session_id,
+                turn_index=1,
+            )
+        )
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-external-read")
+    scheduler = _scheduler(workflow_database)
+    builder = ReadFileToolBuilder(str(workspace))
+    result = await scheduler.run(
+        builder,
+        {"file_path": str(outside)},
+        context=context,
+        call_id="call-read-outside",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+    await coordinator.decide_approval(
+        context,
+        result.data["approval_id"],
+        approved=True,
+        version=result.data["version"],
+    )
+
+    router = _CompletionRouter([LLMResponse(content="read complete", tool_calls=[], reasoning_content="")])
+    runtime = _real_runtime(database=workflow_database, context=context, router=router, builders=[ReadFileToolBuilder(str(workspace))])
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    row = await _latest_execution_row(workflow_database, context)
+    assert row["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    loaded = await WorkflowContinuationService(workflow_database, settings=Settings(_config_file="/nonexistent")).load_tool_result(
+        context=context,
+        result_ref=str(row["result_ref"]),
+        expected_digest=str(row["result_digest"]),
+        expected_execution_id=str(row["execution_id"]),
+        expected_tool_call_id=str(row["tool_call_id"]),
+        expected_tool_name=str(row["tool_name"]),
+    )
+    assert "outside text" in loaded.content
+
+
+@pytest.mark.asyncio
+async def test_recovery_policy_change_denies_external_read_fails_closed(
+    workflow_database: Database,
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside text\n", encoding="utf-8")
+    context = await _create_run_context(workflow_database, email_suffix="-external-deny")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-external-deny")
+    result = await _scheduler(workflow_database).run(
+        ReadFileToolBuilder(str(workspace)),
+        {"file_path": str(outside)},
+        context=context,
+        call_id="call-read-deny",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+    await coordinator.decide_approval(
+        context,
+        result.data["approval_id"],
+        approved=True,
+        version=result.data["version"],
+    )
+
+    router = _CompletionRouter([LLMResponse(content="should not run", tool_calls=[], reasoning_content="")])
+    runtime = _real_runtime(database=workflow_database, context=context, router=router, builders=[ReadFileToolBuilder(str(workspace))])
+
+    async def deny(*args, **kwargs):
+        del args, kwargs
+        return PermissionDecision(allow=False, requires_approval=False, reason="policy_changed")
+
+    monkeypatch.setattr(runtime.scheduler.permission_checker, "check", deny)
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    row = await _latest_execution_row(workflow_database, context)
+    assert row["execution_status"] == ExecutionStatus.BLOCKED_INCOMPATIBLE.value
+    assert router.calls == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_approval_is_candidate_immediately_and_resumes_without_execution(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-reject-now")
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        from multiclaw.memory import MemoryEntry
+
+        await uow.memory.save(
+            MemoryEntry(
+                content="reject this",
+                type="chat_message",
+                role="user",
+                session_id=context.session_id,
+                turn_index=1,
+            )
+        )
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-reject")
+    executed = 0
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        nonlocal executed
+        executed += 1
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    result = await _scheduler(workflow_database).run(
+        PersistedToolBuilder(
+            name="guarded_mutation",
+            runner=runner,
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        ),
+        {"label": "danger"},
+        context=context,
+        call_id="call-reject",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+    await coordinator.decide_approval(
+        context,
+        result.data["approval_id"],
+        approved=False,
+        version=result.data["version"],
+    )
+
+    router = _CompletionRouter([LLMResponse(content="rejection handled", tool_calls=[], reasoning_content="")])
+    runtime = _real_runtime(
+        database=workflow_database,
+        context=context,
+        router=router,
+        builders=[
+            PersistedToolBuilder(
+                name="guarded_mutation",
+                runner=runner,
+                recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+            )
+        ],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    run = await coordinator.get_run(context)
+    assert run is not None
+    assert run.status is RunStatus.COMPLETED
+    assert executed == 0
+    assert len(router.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_unresolved_awaiting_user_approval_is_not_candidate(
+    workflow_database: Database,
+):
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        raise AssertionError("must not run")
+
+    context = await _create_run_context(workflow_database, email_suffix="-awaiting-not-candidate")
+    lease = await _coordinator(workflow_database).start_run_with_checkpoint(context, "runtime-awaiting")
+    result = await _scheduler(workflow_database).run(
+        PersistedToolBuilder(
+            name="guarded_mutation",
+            runner=runner,
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        ),
+        {"label": "danger"},
+        context=context,
+        call_id="call-awaiting",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+    assert result.status is ToolStatus.AWAITING_APPROVAL
+
+    runtime = _TrackingRuntime(
+        runtime_instance_id="runtime-awaiting",
+        scheduler=_scheduler(workflow_database),
+        builders=[],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+    assert runtime.begin_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_real_mcp_adapter_stale_fence_during_early_id_propagates(
+    workflow_database: Database,
+    monkeypatch,
+):
+    import multiclaw.tools.scheduler as scheduler_module
+
+    context = await _create_run_context(workflow_database, email_suffix="-mcp-stale")
+    lease = await _coordinator(workflow_database).start_run_with_checkpoint(context, "runtime-mcp-stale")
+
+    class Manager:
+        def call_tool(self, server_name: str, tool_name: str, arguments: dict) -> ToolCallResult:
+            del server_name, tool_name, arguments
+            return ToolCallResult(
+                content=[{"type": "text", "text": "hello"}],
+                external_request_id="mcp-stale-123",
+            )
+
+    builder = MCPToolBuilder(
+        name="mcp__demo__tool",
+        server_name="demo",
+        original_name="tool",
+        description="demo",
+        input_schema={"properties": {"label": {"type": "string"}}},
+        manager=Manager(),
+        read_only=False,
+    )
+
+    original_record = scheduler_module._ExecutionProgressRecorder.record_external_request_id
+
+    async def stale_then_record(self, external_request_id: str):
+        await _expire_run_lease(workflow_database, context)
+        await _coordinator(workflow_database).acquire_run(context, "takeover-owner")
+        return await original_record(self, external_request_id)
+
+    monkeypatch.setattr(
+        scheduler_module._ExecutionProgressRecorder,
+        "record_external_request_id",
+        stale_then_record,
+    )
+
+    with pytest.raises((StaleFenceError, VersionConflictError, LeaseConflictError)):
+        await _scheduler(workflow_database).run(
+            builder,
+            {"label": "x"},
+            context=context,
+            call_id="call-mcp-stale",
+            run_lease_handle=RunLeaseHandle(lease),
+        )
+
+    row = await _latest_execution_row(workflow_database, context)
+    assert row["execution_status"] == ExecutionStatus.EXECUTING.value
+    assert row["result_ref"] is None
+    phases = await _checkpoint_phases(workflow_database, context)
+    assert "execution_result_observed" not in phases
+
+
+@pytest.mark.asyncio
+async def test_memory_tool_result_loader_rejects_type_confusion_and_noncanonical_refs(
+    workflow_database: Database,
+):
+    from multiclaw.memory import MemoryEntry
+
+    context = await _create_run_context(workflow_database, email_suffix="-memory-loader")
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        chat = await uow.memory.save(
+            MemoryEntry(
+                content="same digest payload",
+                type="chat_message",
+                role="user",
+                session_id=context.session_id,
+                turn_index=1,
+            )
+        )
+        tool = await uow.memory.save(
+            MemoryEntry(
+                content="tool secret payload",
+                type="tool_result",
+                role="tool",
+                session_id=context.session_id,
+                metadata={
+                    "tool_call_id": "call-1",
+                    "tool_name": "demo_tool",
+                    "execution_id": "exec-1",
+                    "result_status": "succeeded",
+                },
+            )
+        )
+    service = WorkflowContinuationService(workflow_database, settings=Settings(_config_file="/nonexistent"))
+    digest = __import__("hashlib").sha256("same digest payload".encode("utf-8")).hexdigest()
+    with pytest.raises(ValueError):
+        await service.load_tool_result(
+            context=context,
+            result_ref=f"memory://{chat.id}",
+            expected_digest=digest,
+            expected_execution_id="exec-1",
+            expected_tool_call_id="call-1",
+            expected_tool_name="demo_tool",
+        )
+    for ref in ("memory://", f"memory://{tool.id}?q=1", f"memory:///{tool.id}", "file://abc"):
+        with pytest.raises(ValueError):
+            await service.load_tool_result(
+                context=context,
+                result_ref=ref,
+                expected_digest=digest,
+            )
+
+
+@pytest.mark.asyncio
+async def test_generic_memory_history_and_query_exclude_tool_results(
+    workflow_database: Database,
+):
+    from multiclaw.memory import MemoryEntry
+
+    context = await _create_run_context(workflow_database, email_suffix="-memory-filter")
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        await uow.memory.save(
+            MemoryEntry(
+                content="hello user",
+                type="chat_message",
+                role="user",
+                session_id=context.session_id,
+                turn_index=1,
+            )
+        )
+        await uow.memory.save(MemoryEntry(content="workspace note", type="note"))
+        await uow.memory.save(
+            MemoryEntry(
+                content="tool secret payload",
+                type="tool_result",
+                role="tool",
+                session_id=context.session_id,
+                metadata={
+                    "tool_call_id": "call-1",
+                    "tool_name": "demo_tool",
+                    "execution_id": "exec-1",
+                    "result_status": "succeeded",
+                },
+            )
+        )
+        recent = await uow.memory.recent(limit=10)
+        scoped = await uow.memory.context(max_chars=10_000, limit=10)
+        queried = await uow.memory.query("tool secret payload", top_k=10)
+        explicit = await uow.memory.recent(limit=10, entry_type="tool_result")
+
+    assert all(entry.type != "tool_result" for entry in recent)
+    assert all(entry.type != "tool_result" for entry in scoped)
+    assert queried == []
+    assert [entry.type for entry in explicit] == ["tool_result"]

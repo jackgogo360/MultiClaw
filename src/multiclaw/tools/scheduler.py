@@ -22,15 +22,18 @@ from multiclaw.tools.base import (
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.continuation import WorkflowContinuationService
 from multiclaw.workflow.models import (
+    ApprovalStatus,
     CheckpointPhase,
     ExecutionRecoveryRecord,
     RecoveryAction,
     ExecutionStatus,
     InvalidTransitionError,
+    LeaseConflictError,
     RecoveryStrategy,
     RunLease,
     RunLeaseHandle,
     RunStatus,
+    StaleFenceError,
     VersionConflictError,
 )
 
@@ -292,7 +295,7 @@ class CoreToolScheduler:
                     run_lease_handle=run_lease_handle,
                 )
                 return result
-        except ExecutionConflictError:
+        except (ExecutionConflictError, StaleFenceError, VersionConflictError, LeaseConflictError):
             raise
         except Exception as exc:
             del exc
@@ -673,6 +676,40 @@ class CoreToolScheduler:
                     status=ExecutionStatus.BLOCKED_CORRUPT,
                     detail="idempotency key mismatch",
                 )
+            decision = await self.permission_checker.check(
+                builder.name,
+                params_data,
+                workspace_root=getattr(builder, "workspace_root", None),
+            )
+            if not decision.allow:
+                return await self._block_execution(
+                    context=context,
+                    execution=execution,
+                    run_lease_handle=run_lease_handle,
+                    status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
+                    detail=decision.reason,
+                )
+            if decision.requires_approval:
+                if execution.approval_id is None:
+                    return await self._block_execution(
+                        context=context,
+                        execution=execution,
+                        run_lease_handle=run_lease_handle,
+                        status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
+                        detail="approval required under current policy",
+                    )
+                approval = await WorkflowCoordinator(
+                    self.database,
+                    settings=self.settings,
+                ).get_approval(context, execution.approval_id)
+                if approval is None or approval.status is not ApprovalStatus.APPROVED:
+                    return await self._block_execution(
+                        context=context,
+                        execution=execution,
+                        run_lease_handle=run_lease_handle,
+                        status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
+                        detail="approval not currently approved",
+                    )
 
             if action is RecoveryAction.MARK_MANUAL_UNCERTAIN and not force_execute:
                 return await self._mark_uncertain_execution(
@@ -695,7 +732,7 @@ class CoreToolScheduler:
                     state=progress_state,
                 )
             )
-            invocation.configure_permission([])
+            invocation.configure_permission(decision.approved_roots)
             prepared = await self._prepare_recovery_execution(
                 context=context,
                 execution=execution,
@@ -713,7 +750,7 @@ class CoreToolScheduler:
                 run_lease_handle=run_lease_handle,
             )
             return result
-        except (ExecutionConflictError, asyncio.CancelledError):
+        except (ExecutionConflictError, asyncio.CancelledError, StaleFenceError, VersionConflictError, LeaseConflictError):
             raise
         except Exception:
             result = ToolExecutionResult(status=ToolStatus.ERROR, content="tool execution failed")
@@ -896,36 +933,59 @@ class CoreToolScheduler:
         status: ExecutionStatus,
         detail: str,
     ) -> ToolExecutionResult:
-        prepared = _PreparedExecution(
-            lease=await run_lease_handle.current(),
-            execution_id=execution.execution_id,
-            approval_id=execution.approval_id,
-            progress_state=_ExecutionProgressState(
-                run_lease_handle=run_lease_handle,
-                execution_id=execution.execution_id,
-                execution_version=execution.version,
-                external_request_id=execution.external_request_id,
-            ),
-            input_payload_json=execution.input_payload_json,
-            input_hash=execution.input_hash,
-            recovery_strategy=execution.recovery_strategy,
-            idempotency_key=execution.idempotency_key,
-        )
         result = ToolExecutionResult(
             status=ToolStatus.ERROR,
             content=detail,
             external_request_id=execution.external_request_id,
-            result_ref=f"tool_execution:{execution.execution_id}:blocked",
-            result_digest=hashlib.sha256(detail.encode("utf-8")).hexdigest(),
         )
-        await self._persist_execution_result(
-            prepared,
-            tool_name=execution.tool_name,
+        lease = await run_lease_handle.current()
+        async with self.database.write_transaction() as conn:
+            workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
+            continuation = WorkflowContinuationService(self.database, settings=self.settings)
+            persisted_result = await continuation.persist_tool_result(
+                repository=MemoryRepository(conn, context, self.database.dialect),
+                context=context,
+                content=detail,
+                tool_call_id=execution.tool_call_id,
+                tool_name=execution.tool_name,
+                execution_id=execution.execution_id,
+                result_status=status.value,
+            )
+            updated = await workflow.complete_execution(
+                lease,
+                execution.execution_id,
+                expected_status=execution.status,
+                expected_version=execution.version,
+                target_status=status,
+                external_request_id=execution.external_request_id,
+                result_ref=persisted_result.result_ref,
+                result_digest=persisted_result.result_digest,
+            )
+            await workflow.checkpoint(
+                lease,
+                CheckpointPhase.EXECUTION_RESULT_OBSERVED,
+                {
+                    "run_id": context.run_id,
+                    "execution_id": execution.execution_id,
+                    "result_status": status.value,
+                    "result_digest": persisted_result.result_digest,
+                    "result_ref": persisted_result.result_ref,
+                    "external_request_id": updated.external_request_id,
+                    "resume_cursor": self._result_cursor(context.run_id, execution.tool_call_id),
+                    "cursor": self._result_cursor(context.run_id, execution.tool_call_id),
+                },
+                approval_id=execution.approval_id,
+                execution_id=execution.execution_id,
+                execution_expected_status=status,
+                execution_expected_version=updated.version,
+            )
+        await self._finalize_terminal_result(
+            execution.tool_name,
+            result,
             context=context,
             call_id=execution.tool_call_id,
-            result=result,
-            run_lease_handle=run_lease_handle,
-            terminal_status=status,
+            audit_detail=detail,
+            error_label=detail,
         )
         return result
 
