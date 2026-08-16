@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import stat
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -62,16 +63,28 @@ class DeploymentKeyring:
 
     @staticmethod
     def _load_from_file(path: Path) -> str:
+        fd: int | None = None
         try:
-            mode = stat.S_IMODE(path.stat().st_mode)
-        except OSError as exc:
-            raise SecretKeyringError("secrets keyring file is unavailable") from exc
-        if mode & 0o077:
-            raise SecretKeyringError("secrets keyring file permissions are too broad")
-        try:
-            return path.read_text(encoding="utf-8")
+            if not hasattr(os, "O_NOFOLLOW"):
+                raise SecretKeyringError("secrets keyring file cannot be read safely")
+            fd = os.open(
+                os.fspath(path),
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+            )
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise SecretKeyringError("secrets keyring file is unavailable")
+            mode = stat.S_IMODE(file_stat.st_mode)
+            if mode & 0o077:
+                raise SecretKeyringError("secrets keyring file permissions are too broad")
+            with os.fdopen(fd, "r", encoding="utf-8", closefd=True) as handle:
+                fd = None
+                return handle.read(65536)
         except OSError as exc:
             raise SecretKeyringError("secrets keyring file cannot be read") from exc
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     @classmethod
     def _parse_payload(cls, raw_json: str) -> dict[str, object]:
@@ -86,7 +99,7 @@ class DeploymentKeyring:
 
         active = payload.get("active_key_version")
         keys = payload.get("keys")
-        if not isinstance(active, int) or active <= 0:
+        if type(active) is not int or active <= 0:
             raise SecretKeyringError("invalid active key version")
         if not isinstance(keys, dict) or not keys:
             raise SecretKeyringError("invalid keyring keys")
