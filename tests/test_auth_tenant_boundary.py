@@ -1628,6 +1628,70 @@ def test_deletion_recovery_verify_locks_latest_code_after_five_failures_until_ne
     ]
 
 
+def test_deletion_recovery_code_does_not_authorize_a_new_deletion_cycle(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="recovery-replay@example.com",
+        )
+    )
+
+    first_scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert first_scheduled.status_code == 200
+
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "112233"
+    assert client.post("/auth/deletion-recovery/send-code", json={"email": identity.email}).status_code == 200
+
+    asyncio.run(
+        client.app.state.deletion_service.recover_account_deletion(
+            tenant_id=identity.tenant_id,
+            job_id=first_scheduled.json()["job_id"],
+        )
+    )
+
+    first_verify = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "112233"},
+    )
+    assert first_verify.status_code == 401
+    assert first_verify.json() == {"detail": "Invalid or expired verification code"}
+    assert "recovery_token" not in client.cookies
+
+    client.app.state.auth_forced_code = "654321"
+    assert client.post("/auth/send-code", json={"email": identity.email}).status_code == 200
+    relogin = client.post("/auth/verify", json={"email": identity.email, "code": "654321"})
+    csrf_token = _latest_cookie_value(client, "csrf_token")
+    assert csrf_token is not None
+    second_scheduled = client.post(
+        "/api/account/deletion",
+        headers={"Origin": "http://testserver", "X-CSRF-Token": csrf_token},
+        cookies={"csrf_token": csrf_token},
+    )
+    second_verify = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "112233"},
+    )
+    rows_after_second_verify = [
+        row
+        for row in asyncio.run(_get_verification_rows(migrated_database, identity.email))
+        if row["purpose"] == "deletion_recovery"
+    ]
+
+    assert relogin.status_code == 200
+    assert second_scheduled.status_code == 200
+    assert second_verify.status_code == 401
+    assert second_verify.json() == {"detail": "Invalid or expired verification code"}
+    assert "recovery_token" not in client.cookies
+    assert len(rows_after_second_verify) == 1
+    assert rows_after_second_verify[0]["used_at"] is not None
+
+
 @pytest.mark.asyncio
 async def test_verification_codes_ignore_wrong_purpose_and_are_consumed_once_atomically(
     migrated_database: Database,

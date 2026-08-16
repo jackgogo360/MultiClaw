@@ -318,6 +318,20 @@ async def verify_deletion_recovery_code(body: VerifyRequest, request: Request, r
         raise HTTPException(status_code=422, detail="Invalid code format")
 
     async with AuthUnitOfWork(request.app.state.database) as uow:
+        code_digest = issue_verification_code(
+            request.app.state.auth.signing_key,
+            email=email,
+            purpose=DELETION_RECOVERY_CODE_PURPOSE,
+            forced_code=code,
+        ).code_digest
+        vc = await uow.verification_codes.consume_latest_code(
+            email=email,
+            purpose=DELETION_RECOVERY_CODE_PURPOSE,
+            code_digest=code_digest,
+        )
+        if vc is None:
+            await uow.commit()
+            raise HTTPException(status_code=401, detail="Invalid or expired verification code")
         now_ms = await uow.verification_codes.db_now_ms()
         row = (
             await uow.conn.execute(
@@ -338,19 +352,6 @@ async def verify_deletion_recovery_code(body: VerifyRequest, request: Request, r
             )
         ).mappings().first()
         if row is None:
-            raise HTTPException(status_code=401, detail="Invalid or expired verification code")
-        code_digest = issue_verification_code(
-            request.app.state.auth.signing_key,
-            email=email,
-            purpose=DELETION_RECOVERY_CODE_PURPOSE,
-            forced_code=code,
-        ).code_digest
-        vc = await uow.verification_codes.consume_latest_code(
-            email=email,
-            purpose=DELETION_RECOVERY_CODE_PURPOSE,
-            code_digest=code_digest,
-        )
-        if vc is None:
             await uow.commit()
             raise HTTPException(status_code=401, detail="Invalid or expired verification code")
         now_seconds = now_ms // 1000
