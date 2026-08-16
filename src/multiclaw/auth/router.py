@@ -116,7 +116,7 @@ async def send_code(body: SendCodeRequest, request: Request):
     # stalling unrelated writes, then compensate precisely by code id on error.
     try:
         await send_verification_code(settings, email, code_issue.code)
-    except Exception as error:
+    except BaseException as error:
         cleanup_error: BaseException | None = None
         if reserved_code_id is not None:
             try:
@@ -129,14 +129,19 @@ async def send_code(body: SendCodeRequest, request: Request):
             except BaseException as delete_error:
                 cleanup_error = delete_error
                 logger.error(
-                    "Failed to delete reserved verification code for %s: %s",
-                    email,
+                    "Failed to delete reserved verification code: %s",
                     type(delete_error).__name__,
                 )
 
+        if not isinstance(error, Exception):
+            if cleanup_error is not None:
+                error.add_note(
+                    f"verification code cleanup failed: {type(cleanup_error).__name__}"
+                )
+            raise error
+
         logger.error(
-            "Failed to send verification email to %s: %s",
-            email,
+            "Failed to send verification email: %s",
             type(error).__name__,
         )
         http_error = HTTPException(

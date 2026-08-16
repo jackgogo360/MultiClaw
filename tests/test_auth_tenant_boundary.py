@@ -535,6 +535,41 @@ def test_send_code_provider_io_does_not_hold_sqlite_write_transaction(
     assert getattr(response, "status_code", None) == 200
 
 
+def test_send_code_cancellation_compensates_only_reserved_row(
+    client: TestClient,
+    migrated_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import multiclaw.auth.router as auth_router
+
+    email = "cancelled-send@example.com"
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = False
+    now_ms = asyncio.run(_db_now_seconds(migrated_database)) * 1000
+    asyncio.run(
+        _seed_verification_row(
+            migrated_database,
+            email=email,
+            code_digest="existing-login-digest",
+            purpose="login",
+            expires_at=now_ms + 60_000,
+            created_at=now_ms - 5_000,
+        )
+    )
+
+    async def cancel_sender(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(auth_router, "send_verification_code", cancel_sender)
+
+    with pytest.raises((asyncio.CancelledError, RuntimeError)):
+        client.post("/auth/send-code", json={"email": email})
+
+    rows = asyncio.run(_get_verification_rows(migrated_database, email))
+    assert len(rows) == 1
+    assert rows[0]["code_digest"] == "existing-login-digest"
+
+
 def test_deletion_recovery_audience_is_rejected_by_normal_api(
     client: TestClient,
     migrated_database: Database,
