@@ -511,6 +511,14 @@ def test_auth_flows_are_public(tmp_path, monkeypatch):
         assert client.get("/multiclaw.png").status_code != 401
 
 
+def test_lifespan_worker_tolerates_missing_workflow_tables_for_public_routes(tmp_path, monkeypatch):
+    monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
+    from multiclaw.server import app
+
+    with TestClient(app) as client:
+        assert client.get("/auth/me").status_code != 500
+
+
 class _LeakyUnavailableSandboxController:
     def __init__(self, workspace_root: Path) -> None:
         secret_value = "secret-dummy-value"

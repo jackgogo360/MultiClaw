@@ -5,10 +5,12 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import exists, or_, select
+from sqlalchemy import exc as sa_exc
 
 from pydantic import ValidationError
 
@@ -51,6 +53,11 @@ from multiclaw.workflow.models import (
 
 SECRET_KEY_MARKERS = {"secret", "token", "password", "apikey", "authorization"}
 logger = logging.getLogger(__name__)
+_SQLITE_MISSING_TABLE_RE = re.compile(r"no such table:\s*(?P<table>[^\s]+)", re.IGNORECASE)
+_MYSQL_MISSING_TABLE_RE = re.compile(
+    r"table\s+'[^']+\.(?P<table>[^'.`]+)'\s+doesn't exist",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,6 +458,7 @@ class WorkflowRecoveryWorker:
         self._runtime_pool = runtime_pool
         self._batch_size = batch_size
         self._recovery_service = RecoveryService(database, settings=self._settings)
+        self._schema_unavailable_logged = False
 
     async def run_once(self) -> None:
         candidates = await self._load_candidates()
@@ -468,62 +476,71 @@ class WorkflowRecoveryWorker:
 
     async def _load_candidates(self) -> list[_RecoveryCandidate]:
         now_ms = self._database.dialect.db_now_ms()
-        async with self._database.connect() as conn:
-            result = await conn.execute(
-                select(
-                    agent_runs.c.tenant_id,
-                    agent_runs.c.workspace_id,
-                    agent_runs.c.session_id,
-                    agent_runs.c.run_id,
-                    exists(
-                        select(1)
-                        .select_from(approval_requests)
-                        .where(
-                            approval_requests.c.tenant_id == agent_runs.c.tenant_id,
-                            approval_requests.c.workspace_id == agent_runs.c.workspace_id,
-                            approval_requests.c.session_id == agent_runs.c.session_id,
-                            approval_requests.c.run_id == agent_runs.c.run_id,
-                            approval_requests.c.approval_status.in_(("approved", "expired", "rejected")),
-                        )
-                    ).label("awaiting_resolution"),
-                )
-                .where(
-                    or_(
-                        (
-                            (agent_runs.c.run_status == RunStatus.AWAITING_USER.value)
-                            & exists(
-                                select(1)
-                                .select_from(approval_requests)
-                                .where(
-                                    approval_requests.c.tenant_id == agent_runs.c.tenant_id,
-                                    approval_requests.c.workspace_id == agent_runs.c.workspace_id,
-                                    approval_requests.c.session_id == agent_runs.c.session_id,
-                                    approval_requests.c.run_id == agent_runs.c.run_id,
-                                    approval_requests.c.approval_status.in_(("approved", "expired", "rejected")),
-                                )
+        try:
+            async with self._database.connect() as conn:
+                result = await conn.execute(
+                    select(
+                        agent_runs.c.tenant_id,
+                        agent_runs.c.workspace_id,
+                        agent_runs.c.session_id,
+                        agent_runs.c.run_id,
+                        exists(
+                            select(1)
+                            .select_from(approval_requests)
+                            .where(
+                                approval_requests.c.tenant_id == agent_runs.c.tenant_id,
+                                approval_requests.c.workspace_id == agent_runs.c.workspace_id,
+                                approval_requests.c.session_id == agent_runs.c.session_id,
+                                approval_requests.c.run_id == agent_runs.c.run_id,
+                                approval_requests.c.approval_status.in_(("approved", "expired", "rejected")),
                             )
-                        ),
-                        (
-                            agent_runs.c.run_status.in_(
-                                (
-                                    RunStatus.RUNNING.value,
-                                    RunStatus.AWAITING_USER.value,
-                                    RunStatus.RESUMING.value,
-                                )
-                            )
-                            & (agent_runs.c.lease_expires_at <= now_ms)
-                        ),
+                        ).label("awaiting_resolution"),
                     )
+                    .where(
+                        or_(
+                            (
+                                (agent_runs.c.run_status == RunStatus.AWAITING_USER.value)
+                                & exists(
+                                    select(1)
+                                    .select_from(approval_requests)
+                                    .where(
+                                        approval_requests.c.tenant_id == agent_runs.c.tenant_id,
+                                        approval_requests.c.workspace_id == agent_runs.c.workspace_id,
+                                        approval_requests.c.session_id == agent_runs.c.session_id,
+                                        approval_requests.c.run_id == agent_runs.c.run_id,
+                                        approval_requests.c.approval_status.in_(("approved", "expired", "rejected")),
+                                    )
+                                )
+                            ),
+                            (
+                                agent_runs.c.run_status.in_(
+                                    (
+                                        RunStatus.RUNNING.value,
+                                        RunStatus.AWAITING_USER.value,
+                                        RunStatus.RESUMING.value,
+                                    )
+                                )
+                                & (agent_runs.c.lease_expires_at <= now_ms)
+                            ),
+                        )
+                    )
+                    .order_by(
+                        agent_runs.c.tenant_id.asc(),
+                        agent_runs.c.workspace_id.asc(),
+                        agent_runs.c.session_id.asc(),
+                        agent_runs.c.run_id.asc(),
+                    )
+                    .limit(self._batch_size)
                 )
-                .order_by(
-                    agent_runs.c.tenant_id.asc(),
-                    agent_runs.c.workspace_id.asc(),
-                    agent_runs.c.session_id.asc(),
-                    agent_runs.c.run_id.asc(),
-                )
-                .limit(self._batch_size)
-            )
-            rows = result.mappings().all()
+                rows = result.mappings().all()
+        except (sa_exc.OperationalError, sa_exc.ProgrammingError) as error:
+            missing = self._missing_workflow_table_name(error)
+            if missing in {"agent_runs", "approval_requests", "tool_executions", "execution_checkpoints"}:
+                if not self._schema_unavailable_logged:
+                    logger.info("workflow recovery worker disabled until workflow schema exists")
+                    self._schema_unavailable_logged = True
+                return []
+            raise
         return [
             _RecoveryCandidate(
                 context=TenantContext(
@@ -761,6 +778,24 @@ class WorkflowRecoveryWorker:
         if inspect.isawaitable(value):
             return await value
         return value
+
+    @staticmethod
+    def _missing_workflow_table_name(error: BaseException) -> str | None:
+        messages = []
+        original = getattr(error, "orig", None)
+        if original is not None:
+            messages.extend(str(part) for part in getattr(original, "args", ()) if part is not None)
+            messages.append(str(original))
+        messages.append(str(error))
+
+        for message in messages:
+            sqlite_match = _SQLITE_MISSING_TABLE_RE.search(message)
+            if sqlite_match:
+                return sqlite_match.group("table").split(".")[-1].strip("`\"' ")
+            mysql_match = _MYSQL_MISSING_TABLE_RE.search(message)
+            if mysql_match:
+                return mysql_match.group("table").strip("`\"' ")
+        return None
 
 
 class RuntimeRecoveryContinuationService:
