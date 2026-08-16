@@ -178,6 +178,18 @@ const deletionSettingsSource = result.deletionSettingsSource;
 const indexCssSource = result.indexCssSource;
 const tsconfig = JSON.parse(result.tsconfigSource);
 
+const appImportsEnsureCsrfToken =
+  result.appSource.includes('ensureCsrfToken');
+const appChatFetchInjectsCsrfHeader =
+  result.appSource.includes('headers.set("X-CSRF-Token"')
+  && result.appSource.includes('await ensureCsrfToken()');
+const appChatFetchPreservesCredentialsInclude =
+  result.appSource.includes('credentials: "include"');
+const appChatFetchMergesExistingHeaders =
+  result.appSource.includes('input instanceof Request ? input.headers : undefined')
+  && result.appSource.includes('new Headers(baseHeaders)')
+  && result.appSource.includes('for (const [key, value] of new Headers(init?.headers).entries())');
+
 let chatStoreTracksRunScope = false;
 ts.forEachChild(chatStoreFile, function visit(node) {{
   if (ts.isVariableDeclaration(node) && /activeRun/i.test(node.name.getText(chatStoreFile))) {{
@@ -251,6 +263,10 @@ process.stdout.write(JSON.stringify({{
   authModelsPendingPurge,
   authAvoidsSecretPlaintext,
   chatStoreTracksRunScope,
+  appImportsEnsureCsrfToken,
+  appChatFetchInjectsCsrfHeader,
+  appChatFetchPreservesCredentialsInclude,
+  appChatFetchMergesExistingHeaders,
   approvalUsesPersistedRecord,
   sessionProviderResetsDerivedState,
   authContextRefreshesOnAuthChanges,
@@ -276,6 +292,10 @@ process.stdout.write(JSON.stringify({{
     assert payload["authModelsPendingPurge"] is True
     assert payload["authAvoidsSecretPlaintext"] is True
     assert payload["chatStoreTracksRunScope"] is True
+    assert payload["appImportsEnsureCsrfToken"] is True
+    assert payload["appChatFetchInjectsCsrfHeader"] is True
+    assert payload["appChatFetchPreservesCredentialsInclude"] is True
+    assert payload["appChatFetchMergesExistingHeaders"] is True
     assert payload["approvalUsesPersistedRecord"] is True
     assert payload["sessionProviderResetsDerivedState"] is True
     assert payload["authContextRefreshesOnAuthChanges"] is True
