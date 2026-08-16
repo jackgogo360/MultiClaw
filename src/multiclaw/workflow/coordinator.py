@@ -19,6 +19,7 @@ from multiclaw.workflow.models import (
     ExecutionDispatchingPayload,
     ExecutionResultObservedPayload,
     ExecutionRecord,
+    CheckpointRecord,
     ExecutionStatus,
     InvalidTransitionError,
     LeaseConflictError,
@@ -116,6 +117,17 @@ class WorkflowCoordinator:
             )
             if lease is None:
                 raise LeaseConflictError("run lease is still current")
+            return lease
+
+    async def resume_waiting_run(self, context: TenantContext, runtime_instance_id: str) -> RunLease:
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            lease = await repository._resume_waiting_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+            )
+            if lease is None:
+                raise LeaseConflictError("awaiting_user run could not be resumed")
             return lease
 
     async def heartbeat(self, lease: RunLease) -> RunLease:
@@ -393,6 +405,14 @@ class WorkflowCoordinator:
     async def get_execution_recovery(self, context: TenantContext, execution_id: str):
         async with self._write_connection() as conn:
             return await self._repository(conn).get_execution_recovery(context, execution_id)
+
+    async def get_execution_by_approval_id(self, context: TenantContext, approval_id: str):
+        async with self._write_connection() as conn:
+            return await self._repository(conn).get_execution_by_approval_id(context, approval_id)
+
+    async def get_latest_checkpoint(self, context: TenantContext) -> CheckpointRecord | None:
+        async with self._write_connection() as conn:
+            return await self._repository(conn).get_latest_checkpoint(context)
 
     async def complete_execution(
         self,

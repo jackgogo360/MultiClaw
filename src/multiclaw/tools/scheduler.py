@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from multiclaw.config import Settings
@@ -12,15 +12,24 @@ from multiclaw.events import Event, EventBus, EventRouter, ScopedEvent
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.storage.engine import Database
 from multiclaw.tenancy import TenantContext
-from multiclaw.tools.base import ToolBuilder, ToolExecutionResult, ToolStatus
+from multiclaw.tools.base import (
+    ToolBuilder,
+    ToolExecutionResult,
+    ToolProgressRecorder,
+    ToolStatus,
+)
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     CheckpointPhase,
+    ExecutionRecoveryRecord,
+    RecoveryAction,
     ExecutionStatus,
+    InvalidTransitionError,
     RecoveryStrategy,
     RunLease,
     RunLeaseHandle,
     RunStatus,
+    VersionConflictError,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,11 +53,62 @@ class _PreparedExecution:
     lease: RunLease
     execution_id: str
     approval_id: str | None
-    execution_version: int
+    progress_state: "_ExecutionProgressState"
     input_payload_json: str
     input_hash: str
     recovery_strategy: RecoveryStrategy
     idempotency_key: str | None
+
+
+@dataclass(slots=True)
+class _ExecutionProgressState:
+    run_lease_handle: RunLeaseHandle
+    execution_id: str
+    execution_version: int
+    external_request_id: str | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class _ExecutionProgressRecorder(ToolProgressRecorder):
+    def __init__(
+        self,
+        *,
+        database: Database,
+        settings: Settings,
+        state: _ExecutionProgressState,
+    ) -> None:
+        self._database = database
+        self._settings = settings
+        self._state = state
+
+    async def record_external_request_id(self, external_request_id: str) -> None:
+        external_request_id = external_request_id.strip()
+        if not external_request_id or len(external_request_id) > 255:
+            raise ValueError("external_request_id must be 1-255 characters")
+
+        async with self._state.lock:
+            if self._state.external_request_id is not None:
+                if self._state.external_request_id != external_request_id:
+                    raise ValueError("external_request_id conflict")
+                return
+
+            async with self._database.write_transaction() as conn:
+                workflow = WorkflowCoordinator(
+                    self._database,
+                    settings=self._settings,
+                    connection=conn,
+                )
+                updated = await self._state.run_lease_handle.use_current(
+                    lambda lease: workflow.record_external_request_id(
+                        lease,
+                        self._state.execution_id,
+                        expected_status=ExecutionStatus.EXECUTING,
+                        expected_version=self._state.execution_version,
+                        external_request_id=external_request_id,
+                    )
+                )
+            self._state.execution_version = updated.version
+            self._state.external_request_id = external_request_id
 
 
 class CoreToolScheduler:
@@ -137,7 +197,9 @@ class CoreToolScheduler:
             if decision.requires_approval:
                 approval = await self._persist_approval_request(
                     builder,
-                    raw_params,
+                    canonical_input=canonical_input,
+                    recovery_strategy=recovery_metadata.recovery_strategy,
+                    idempotency_key=recovery_metadata.idempotency_key,
                     context=context,
                     call_id=call_id,
                     run_lease_handle=run_lease_handle,
@@ -148,8 +210,7 @@ class CoreToolScheduler:
                         "approval_id": approval.approval_id,
                         "version": approval.version,
                         "tool": builder.name,
-                        "params": raw_params,
-                        "description": builder.approval_description(raw_params),
+                        "description": self._safe_approval_description(builder, raw_params),
                         **({"call_id": call_id} if call_id else {}),
                     },
                     context=context,
@@ -166,6 +227,7 @@ class CoreToolScheduler:
                         "approval_id": approval.approval_id,
                         "version": approval.version,
                         "expires_at_ms": approval.expires_at,
+                        "tool_call_id": call_id or approval.approval_id,
                     },
                 )
 
@@ -282,8 +344,7 @@ class CoreToolScheduler:
                     {
                         "approval_id": approval_id,
                         "tool": builder.name,
-                        "params": raw_params,
-                        "description": builder.approval_description(raw_params),
+                        "description": self._safe_approval_description(builder, raw_params),
                         **({"call_id": call_id} if call_id else {}),
                     },
                     context=context,
@@ -346,23 +407,42 @@ class CoreToolScheduler:
     async def _persist_approval_request(
         self,
         builder: ToolBuilder,
-        raw_params: dict[str, Any],
         *,
+        canonical_input: _CanonicalToolInput,
+        recovery_strategy: RecoveryStrategy,
+        idempotency_key: str | None,
         context: TenantContext,
         call_id: str | None,
         run_lease_handle: RunLeaseHandle,
     ):
         lease = await run_lease_handle.current()
         approval_id = str(uuid.uuid4())
+        execution_id = str(uuid.uuid4())
+        tool_call_id = call_id or approval_id
         async with self.database.write_transaction() as conn:
             workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
             transitioned = await workflow.transition_run(lease, RunStatus.AWAITING_USER)
             approval = await workflow.create_approval(
                 transitioned,
                 approval_id=approval_id,
-                tool_call_id=call_id or approval_id,
+                tool_call_id=tool_call_id,
                 expires_at=self.database.dialect.db_now_ms() + APPROVAL_TTL_MS,
             )
+            created = await workflow.create_execution(
+                transitioned,
+                execution_id=execution_id,
+                approval_id=approval.approval_id,
+                tool_call_id=tool_call_id,
+                tool_name=builder.name,
+                tool_kind=getattr(builder, "tool_kind", "native"),
+                recovery_strategy=recovery_strategy,
+                idempotency_key=idempotency_key,
+                input_payload_json=canonical_input.payload_json,
+                input_hash=canonical_input.payload_hash,
+                status=ExecutionStatus.NOT_STARTED,
+            )
+            if created is None:
+                raise ExecutionConflictError("another execution is already active for this run")
             approval_cursor = self._approval_cursor(context.run_id, call_id or approval.approval_id)
             await workflow.checkpoint(
                 transitioned,
@@ -370,7 +450,7 @@ class CoreToolScheduler:
                 {
                     "run_id": context.run_id,
                     "approval_id": approval.approval_id,
-                    "tool_call_id": call_id or approval.approval_id,
+                    "tool_call_id": tool_call_id,
                     "approval_expires_at_ms": approval.expires_at,
                     "resume_cursor": approval_cursor,
                     "cursor": approval_cursor,
@@ -437,11 +517,23 @@ class CoreToolScheduler:
                 execution_expected_status=ExecutionStatus.EXECUTING,
                 execution_expected_version=created.version + 1,
             )
+        progress_state = _ExecutionProgressState(
+            run_lease_handle=run_lease_handle,
+            execution_id=execution_id,
+            execution_version=created.version + 1,
+        )
+        invocation.configure_progress(
+            _ExecutionProgressRecorder(
+                database=self.database,
+                settings=self.settings,
+                state=progress_state,
+            )
+        )
         return _PreparedExecution(
             lease=lease,
             execution_id=execution_id,
             approval_id=None,
-            execution_version=created.version + 1,
+            progress_state=progress_state,
             input_payload_json=canonical_input.payload_json,
             input_hash=canonical_input.payload_hash,
             recovery_strategy=recovery_strategy,
@@ -460,6 +552,14 @@ class CoreToolScheduler:
         terminal_status: ExecutionStatus | None = None,
     ) -> None:
         resolved_status = terminal_status or self._terminal_execution_status(result)
+        recorded_external_request_id = prepared.progress_state.external_request_id
+        if (
+            recorded_external_request_id is not None
+            and result.external_request_id is not None
+            and recorded_external_request_id != result.external_request_id
+        ):
+            raise ValueError("external_request_id conflict")
+        external_request_id = result.external_request_id or recorded_external_request_id
         result_ref = result.result_ref or f"tool_execution:{prepared.execution_id}:result.content"
         result_digest = result.result_digest or hashlib.sha256(
             result.content.encode("utf-8")
@@ -470,12 +570,14 @@ class CoreToolScheduler:
                 prepared.lease,
                 prepared.execution_id,
                 expected_status=ExecutionStatus.EXECUTING,
-                expected_version=prepared.execution_version,
+                expected_version=prepared.progress_state.execution_version,
                 target_status=resolved_status,
-                external_request_id=result.external_request_id,
+                external_request_id=external_request_id,
                 result_ref=result_ref,
                 result_digest=result_digest,
             )
+            prepared.progress_state.execution_version = updated.version
+            prepared.progress_state.external_request_id = updated.external_request_id
             resume_cursor = self._result_cursor(context.run_id, call_id or prepared.execution_id)
             await workflow.checkpoint(
                 prepared.lease,
@@ -490,6 +592,7 @@ class CoreToolScheduler:
                     "resume_cursor": resume_cursor,
                     "cursor": resume_cursor,
                 },
+                approval_id=prepared.approval_id,
                 execution_id=prepared.execution_id,
                 execution_expected_status=resolved_status,
                 execution_expected_version=updated.version,
@@ -504,6 +607,319 @@ class CoreToolScheduler:
             audit_detail="tool execution failed" if result.status is ToolStatus.ERROR else None,
             error_label="tool execution failed" if result.status is ToolStatus.ERROR else None,
         )
+
+    async def recover_execution(
+        self,
+        *,
+        builder: ToolBuilder,
+        context: TenantContext,
+        execution: ExecutionRecoveryRecord,
+        action: RecoveryAction,
+        run_lease_handle: RunLeaseHandle,
+        force_execute: bool = False,
+    ) -> ToolExecutionResult:
+        try:
+            params_data = json.loads(execution.input_payload_json)
+            if not isinstance(params_data, dict):
+                raise ValueError("persisted input payload must decode to an object")
+            canonical = self._canonicalize_input(params_data)
+            if canonical.payload_hash != execution.input_hash:
+                return await self._block_execution(
+                    context=context,
+                    execution=execution,
+                    run_lease_handle=run_lease_handle,
+                    status=ExecutionStatus.BLOCKED_CORRUPT,
+                    detail="input hash mismatch",
+                )
+            if builder.name != execution.tool_name:
+                return await self._block_execution(
+                    context=context,
+                    execution=execution,
+                    run_lease_handle=run_lease_handle,
+                    status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
+                    detail="tool name mismatch",
+                )
+            if getattr(builder, "tool_kind", "native") != execution.tool_kind:
+                return await self._block_execution(
+                    context=context,
+                    execution=execution,
+                    run_lease_handle=run_lease_handle,
+                    status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
+                    detail="tool kind mismatch",
+                )
+            params = builder.validate(params_data)
+            metadata = builder.recovery_metadata(params)
+            if metadata.recovery_strategy is not execution.recovery_strategy:
+                return await self._block_execution(
+                    context=context,
+                    execution=execution,
+                    run_lease_handle=run_lease_handle,
+                    status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
+                    detail="recovery strategy mismatch",
+                )
+            if metadata.idempotency_key != execution.idempotency_key:
+                return await self._block_execution(
+                    context=context,
+                    execution=execution,
+                    run_lease_handle=run_lease_handle,
+                    status=ExecutionStatus.BLOCKED_CORRUPT,
+                    detail="idempotency key mismatch",
+                )
+
+            if action is RecoveryAction.MARK_MANUAL_UNCERTAIN and not force_execute:
+                return await self._mark_uncertain_execution(
+                    context=context,
+                    execution=execution,
+                    run_lease_handle=run_lease_handle,
+                )
+
+            invocation = builder.build(params)
+            progress_state = _ExecutionProgressState(
+                run_lease_handle=run_lease_handle,
+                execution_id=execution.execution_id,
+                execution_version=execution.version,
+                external_request_id=execution.external_request_id,
+            )
+            invocation.configure_progress(
+                _ExecutionProgressRecorder(
+                    database=self.database,
+                    settings=self.settings,
+                    state=progress_state,
+                )
+            )
+            invocation.configure_permission([])
+            prepared = await self._prepare_recovery_execution(
+                context=context,
+                execution=execution,
+                canonical_input=canonical,
+                progress_state=progress_state,
+                run_lease_handle=run_lease_handle,
+            )
+            result = await self.execution_guard.run(invocation.execute)
+            await self._persist_execution_result(
+                prepared,
+                tool_name=builder.name,
+                context=context,
+                call_id=execution.tool_call_id,
+                result=result,
+                run_lease_handle=run_lease_handle,
+            )
+            return result
+        except (ExecutionConflictError, asyncio.CancelledError):
+            raise
+        except Exception:
+            result = ToolExecutionResult(status=ToolStatus.ERROR, content="tool execution failed")
+            terminal_status = (
+                ExecutionStatus.UNCERTAIN
+                if execution.recovery_strategy is RecoveryStrategy.MANUAL_UNCERTAIN
+                else ExecutionStatus.FAILED_TERMINAL
+            )
+            prepared = _PreparedExecution(
+                lease=await run_lease_handle.current(),
+                execution_id=execution.execution_id,
+                approval_id=execution.approval_id,
+                progress_state=_ExecutionProgressState(
+                    run_lease_handle=run_lease_handle,
+                    execution_id=execution.execution_id,
+                    execution_version=execution.version,
+                    external_request_id=execution.external_request_id,
+                ),
+                input_payload_json=execution.input_payload_json,
+                input_hash=execution.input_hash,
+                recovery_strategy=execution.recovery_strategy,
+                idempotency_key=execution.idempotency_key,
+            )
+            await self._persist_execution_result(
+                prepared,
+                tool_name=builder.name,
+                context=context,
+                call_id=execution.tool_call_id,
+                result=result,
+                run_lease_handle=run_lease_handle,
+                terminal_status=terminal_status,
+            )
+            return result
+
+    async def _prepare_recovery_execution(
+        self,
+        *,
+        context: TenantContext,
+        execution: ExecutionRecoveryRecord,
+        canonical_input: _CanonicalToolInput,
+        progress_state: _ExecutionProgressState,
+        run_lease_handle: RunLeaseHandle,
+    ) -> _PreparedExecution:
+        current_execution = execution
+        async with self.database.write_transaction() as conn:
+            workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
+            if execution.status is ExecutionStatus.NOT_STARTED:
+                current_execution = await workflow.get_execution_recovery(context, execution.execution_id)
+                assert current_execution is not None
+                if execution.recovery_strategy is RecoveryStrategy.READ_ONLY_REPLAY:
+                    await workflow.transition_execution(
+                        await run_lease_handle.current(),
+                        execution.execution_id,
+                        expected_status=ExecutionStatus.NOT_STARTED,
+                        expected_version=current_execution.version,
+                        target=ExecutionStatus.REPLAYING,
+                    )
+                    replaying = await workflow.get_execution_recovery(context, execution.execution_id)
+                    assert replaying is not None
+                    dispatch_version = replaying.version
+                    expected_status = ExecutionStatus.REPLAYING
+                    await workflow.checkpoint(
+                        await run_lease_handle.current(),
+                        CheckpointPhase.EXECUTION_DISPATCHING,
+                        {
+                            "run_id": context.run_id,
+                            "execution_id": execution.execution_id,
+                            "tool_call_id": execution.tool_call_id,
+                            "recovery_strategy": execution.recovery_strategy.value,
+                            "input_hash": canonical_input.payload_hash,
+                            "input_ref": execution.input_ref,
+                            "idempotency_key": execution.idempotency_key,
+                            "dispatch_cursor": self._dispatch_cursor(context.run_id, execution.tool_call_id),
+                            "cursor": self._dispatch_cursor(context.run_id, execution.tool_call_id),
+                        },
+                        approval_id=execution.approval_id,
+                        execution_id=execution.execution_id,
+                        execution_expected_status=expected_status,
+                        execution_expected_version=dispatch_version,
+                    )
+                    await workflow.transition_execution(
+                        await run_lease_handle.current(),
+                        execution.execution_id,
+                        expected_status=ExecutionStatus.REPLAYING,
+                        expected_version=dispatch_version,
+                        target=ExecutionStatus.EXECUTING,
+                    )
+                else:
+                    await workflow.transition_execution(
+                        await run_lease_handle.current(),
+                        execution.execution_id,
+                        expected_status=ExecutionStatus.NOT_STARTED,
+                        expected_version=current_execution.version,
+                        target=ExecutionStatus.EXECUTING,
+                    )
+                    dispatch_version = current_execution.version + 1
+                    await workflow.checkpoint(
+                        await run_lease_handle.current(),
+                        CheckpointPhase.EXECUTION_DISPATCHING,
+                        {
+                            "run_id": context.run_id,
+                            "execution_id": execution.execution_id,
+                            "tool_call_id": execution.tool_call_id,
+                            "recovery_strategy": execution.recovery_strategy.value,
+                            "input_hash": canonical_input.payload_hash,
+                            "input_ref": execution.input_ref,
+                            "idempotency_key": execution.idempotency_key,
+                            "dispatch_cursor": self._dispatch_cursor(context.run_id, execution.tool_call_id),
+                            "cursor": self._dispatch_cursor(context.run_id, execution.tool_call_id),
+                        },
+                        approval_id=execution.approval_id,
+                        execution_id=execution.execution_id,
+                        execution_expected_status=ExecutionStatus.EXECUTING,
+                        execution_expected_version=dispatch_version,
+                    )
+                refreshed = await workflow.get_execution_recovery(context, execution.execution_id)
+                assert refreshed is not None
+                current_execution = refreshed
+
+        progress_state.execution_version = current_execution.version
+        progress_state.external_request_id = current_execution.external_request_id
+        return _PreparedExecution(
+            lease=await run_lease_handle.current(),
+            execution_id=current_execution.execution_id,
+            approval_id=current_execution.approval_id,
+            progress_state=progress_state,
+            input_payload_json=current_execution.input_payload_json,
+            input_hash=current_execution.input_hash,
+            recovery_strategy=current_execution.recovery_strategy,
+            idempotency_key=current_execution.idempotency_key,
+        )
+
+    async def _mark_uncertain_execution(
+        self,
+        *,
+        context: TenantContext,
+        execution: ExecutionRecoveryRecord,
+        run_lease_handle: RunLeaseHandle,
+    ) -> ToolExecutionResult:
+        prepared = _PreparedExecution(
+            lease=await run_lease_handle.current(),
+            execution_id=execution.execution_id,
+            approval_id=execution.approval_id,
+            progress_state=_ExecutionProgressState(
+                run_lease_handle=run_lease_handle,
+                execution_id=execution.execution_id,
+                execution_version=execution.version,
+                external_request_id=execution.external_request_id,
+            ),
+            input_payload_json=execution.input_payload_json,
+            input_hash=execution.input_hash,
+            recovery_strategy=execution.recovery_strategy,
+            idempotency_key=execution.idempotency_key,
+        )
+        result = ToolExecutionResult(
+            status=ToolStatus.ERROR,
+            content="tool execution failed",
+            external_request_id=execution.external_request_id,
+            result_ref=execution.result_ref or f"tool_execution:{execution.execution_id}:uncertain",
+            result_digest=execution.result_digest
+            or hashlib.sha256(b"uncertain").hexdigest(),
+        )
+        await self._persist_execution_result(
+            prepared,
+            tool_name=execution.tool_name,
+            context=context,
+            call_id=execution.tool_call_id,
+            result=result,
+            run_lease_handle=run_lease_handle,
+            terminal_status=ExecutionStatus.UNCERTAIN,
+        )
+        return result
+
+    async def _block_execution(
+        self,
+        *,
+        context: TenantContext,
+        execution: ExecutionRecoveryRecord,
+        run_lease_handle: RunLeaseHandle,
+        status: ExecutionStatus,
+        detail: str,
+    ) -> ToolExecutionResult:
+        prepared = _PreparedExecution(
+            lease=await run_lease_handle.current(),
+            execution_id=execution.execution_id,
+            approval_id=execution.approval_id,
+            progress_state=_ExecutionProgressState(
+                run_lease_handle=run_lease_handle,
+                execution_id=execution.execution_id,
+                execution_version=execution.version,
+                external_request_id=execution.external_request_id,
+            ),
+            input_payload_json=execution.input_payload_json,
+            input_hash=execution.input_hash,
+            recovery_strategy=execution.recovery_strategy,
+            idempotency_key=execution.idempotency_key,
+        )
+        result = ToolExecutionResult(
+            status=ToolStatus.ERROR,
+            content=detail,
+            external_request_id=execution.external_request_id,
+            result_ref=f"tool_execution:{execution.execution_id}:blocked",
+            result_digest=hashlib.sha256(detail.encode("utf-8")).hexdigest(),
+        )
+        await self._persist_execution_result(
+            prepared,
+            tool_name=execution.tool_name,
+            context=context,
+            call_id=execution.tool_call_id,
+            result=result,
+            run_lease_handle=run_lease_handle,
+            terminal_status=status,
+        )
+        return result
 
     @staticmethod
     def _approval_cursor(run_id: str | None, tool_call_id: str) -> str:
@@ -524,6 +940,13 @@ class CoreToolScheduler:
         if result.status is ToolStatus.ERROR:
             return ExecutionStatus.FAILED_TERMINAL
         return ExecutionStatus.FAILED_TERMINAL
+
+    def _safe_approval_description(
+        self,
+        builder: ToolBuilder,
+        raw_params: dict[str, Any],
+    ) -> str:
+        return builder.approval_description(self._redact_secret_values(raw_params))
 
     def _canonicalize_input(self, value: dict[str, Any]) -> _CanonicalToolInput:
         self._reject_secret_fields(value)
@@ -556,6 +979,22 @@ class CoreToolScheduler:
         if isinstance(value, tuple):
             for item in value:
                 self._reject_secret_fields(item)
+
+    def _redact_secret_values(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted: dict[str, Any] = {}
+            for key, item in value.items():
+                normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
+                if any(marker in normalized for marker in SECRET_KEY_MARKERS):
+                    redacted[key] = "[REDACTED]"
+                else:
+                    redacted[key] = self._redact_secret_values(item)
+            return redacted
+        if isinstance(value, list):
+            return [self._redact_secret_values(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._redact_secret_values(item) for item in value]
+        return value
 
     def _audit_detail(self, result: ToolExecutionResult) -> str:
         allowlisted = self._normalized_audit_fields(result.audit)

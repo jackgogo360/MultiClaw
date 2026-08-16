@@ -289,6 +289,41 @@ class WorkflowRepository:
             current.version + 1,
         )
 
+    async def _resume_waiting_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+    ) -> RunLease | None:
+        await self._dialect.lock_run(self._conn, context)
+        current = await self.get_run(context)
+        if current is None or current.status is not RunStatus.AWAITING_USER:
+            return None
+
+        now_ms = self._dialect.db_now_ms()
+        result = await self._conn.execute(
+            update(agent_runs)
+            .where(_context_predicate(context), agent_runs.c.run_status == RunStatus.AWAITING_USER.value)
+            .values(
+                run_status=RunStatus.RESUMING.value,
+                runtime_instance_id=runtime_instance_id,
+                lease_owner=runtime_instance_id,
+                fencing_token=agent_runs.c.fencing_token + 1,
+                version=agent_runs.c.version + 1,
+                heartbeat_at=now_ms,
+                lease_expires_at=now_ms + self._lease_ttl_ms,
+                updated_at=now_ms,
+            )
+        )
+        if result.rowcount != 1:
+            return None
+        return await self.require_lease(
+            context,
+            runtime_instance_id,
+            current.fencing_token + 1,
+            current.version + 1,
+        )
+
     async def _refresh_lease(self, lease: RunLease) -> RunLease | None:
         now_ms = self._dialect.db_now_ms()
         result = await self._conn.execute(
@@ -405,9 +440,12 @@ class WorkflowRepository:
                 tool_executions.c.execution_id,
                 tool_executions.c.approval_id,
                 tool_executions.c.tool_call_id,
+                tool_executions.c.tool_name,
+                tool_executions.c.tool_kind,
                 tool_executions.c.execution_status,
                 tool_executions.c.recovery_strategy,
                 tool_executions.c.idempotency_key,
+                tool_executions.c.input_payload_json,
                 tool_executions.c.input_hash,
                 tool_executions.c.external_request_id,
                 tool_executions.c.result_ref,
@@ -436,9 +474,12 @@ class WorkflowRepository:
                 tool_executions.c.execution_id,
                 tool_executions.c.approval_id,
                 tool_executions.c.tool_call_id,
+                tool_executions.c.tool_name,
+                tool_executions.c.tool_kind,
                 tool_executions.c.execution_status,
                 tool_executions.c.recovery_strategy,
                 tool_executions.c.idempotency_key,
+                tool_executions.c.input_payload_json,
                 tool_executions.c.input_hash,
                 tool_executions.c.external_request_id,
                 tool_executions.c.result_ref,
@@ -451,6 +492,40 @@ class WorkflowRepository:
                 tool_executions.c.session_id == context.session_id,
                 tool_executions.c.run_id == context.run_id,
                 tool_executions.c.tool_call_id == tool_call_id,
+            )
+            .limit(1)
+        )
+        row = result.mappings().first()
+        return None if row is None else self._execution_recovery_from_row(context, row)
+
+    async def get_execution_by_approval_id(
+        self,
+        context: TenantContext,
+        approval_id: str,
+    ) -> ExecutionRecoveryRecord | None:
+        result = await self._conn.execute(
+            select(
+                tool_executions.c.execution_id,
+                tool_executions.c.approval_id,
+                tool_executions.c.tool_call_id,
+                tool_executions.c.tool_name,
+                tool_executions.c.tool_kind,
+                tool_executions.c.execution_status,
+                tool_executions.c.recovery_strategy,
+                tool_executions.c.idempotency_key,
+                tool_executions.c.input_payload_json,
+                tool_executions.c.input_hash,
+                tool_executions.c.external_request_id,
+                tool_executions.c.result_ref,
+                tool_executions.c.result_digest,
+                tool_executions.c.version,
+            )
+            .where(
+                tool_executions.c.tenant_id == context.tenant_id,
+                tool_executions.c.workspace_id == context.workspace_id,
+                tool_executions.c.session_id == context.session_id,
+                tool_executions.c.run_id == context.run_id,
+                tool_executions.c.approval_id == approval_id,
             )
             .limit(1)
         )
@@ -946,9 +1021,12 @@ class WorkflowRepository:
             execution_id=execution_id,
             approval_id=None if row["approval_id"] is None else str(row["approval_id"]),
             tool_call_id=str(row["tool_call_id"]),
+            tool_name=str(row["tool_name"]),
+            tool_kind=str(row["tool_kind"]),
             status=ExecutionStatus(str(row["execution_status"])),
             recovery_strategy=RecoveryStrategy(str(row["recovery_strategy"])),
             idempotency_key=None if row["idempotency_key"] is None else str(row["idempotency_key"]),
+            input_payload_json=str(row["input_payload_json"]),
             input_hash=str(row["input_hash"]),
             input_ref=f"tool_execution:{execution_id}:input_payload_json",
             external_request_id=None

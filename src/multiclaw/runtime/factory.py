@@ -44,6 +44,7 @@ from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
 
 from multiclaw.mcp import MCPClientManager
+from multiclaw.workflow.recovery import RuntimeRecoveryContinuationService
 
 
 _SQLITE_MISSING_TABLE_RE = re.compile(r"no such table:\s*(?P<table>[^\s]+)", re.IGNORECASE)
@@ -198,6 +199,7 @@ class RuntimeFactory:
             mcp_manager=mcp_manager,
             sandbox_controller=sandbox_controller,
             sandbox_readiness=readiness,
+            recovery_continuation=RuntimeRecoveryContinuationService(),
             last_used_at_ms=self.clock.now_ms(),
             clock=self.clock,
         )

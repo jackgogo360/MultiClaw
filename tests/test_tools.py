@@ -399,7 +399,6 @@ class TestCoreToolScheduler:
                 {
                     "approval_id": "req-5",
                     "tool": "delete_file",
-                    "params": {"text": "danger"},
                     "description": '{"text": "danger"}',
                 },
             ),
