@@ -30,10 +30,10 @@ from multiclaw.secrets.envelope import (
 from multiclaw.secrets.keyring import DeploymentKeyring, KEYRING_PROVIDER_NAME
 from multiclaw.secrets.resolver import SecretResolver, UserSecretInvalidError
 from multiclaw.storage import Database
-from multiclaw.storage.schema import chat_sessions
+from multiclaw.storage.schema import chat_sessions, deletion_jobs, memory_entries, users, workspaces
 from multiclaw.session import ChatSession, SessionStatus
 from multiclaw.storage.uow import AuthUnitOfWork, DeletionUnitOfWork, TenantUnitOfWork
-from multiclaw.tenancy import TenantContext
+from multiclaw.tenancy import TenantContext, WorkspaceResolver
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     ApprovalStatus,
@@ -73,6 +73,20 @@ class TenantState:
 class TenantScopes:
     alpha: TenantState
     beta: TenantState
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionTenantState:
+    base_context: TenantContext
+    session_context: TenantContext
+    session_id: str
+    session_title: str
+    session_status: SessionStatus
+    last_message_at: int | None
+    messages: list[SessionMessage]
+    workspace: Path
+    marker_file: Path
+    marker_contents: str
 
 
 class _TrackingRuntimePool:
@@ -244,6 +258,107 @@ async def _build_scopes(database: Database) -> TenantScopes:
         alpha=await _build_tenant_state(database, "alpha"),
         beta=await _build_tenant_state(database, "beta"),
     )
+
+
+async def _build_deletion_tenant_state(
+    database: Database,
+    workspace_resolver: WorkspaceResolver,
+    label: str,
+) -> DeletionTenantState:
+    base_context = await _seed_user(database, f"tenant-deletion-purge-{label}")
+    async with TenantUnitOfWork(database, base_context) as uow:
+        session = await uow.sessions.create()
+
+    session_context = base_context.for_session(session.id)
+    async with TenantUnitOfWork(database, session_context) as uow:
+        await uow.memory.save(
+            MemoryEntry(
+                content=f"{label} user message",
+                type="chat_message",
+                role="user",
+                turn_index=1,
+            )
+        )
+        await uow.memory.save(
+            MemoryEntry(
+                content=f"{label} assistant reply",
+                type="chat_message",
+                role="assistant",
+                turn_index=2,
+            )
+        )
+        session_snapshot = await uow.sessions.get(session.id)
+        messages = await uow.sessions.get_messages(session.id)
+
+    assert session_snapshot is not None
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+
+    workspace = workspace_resolver.resolve(base_context, create=True)
+    marker_file = workspace / "marker.txt"
+    marker_contents = f"{label}-workspace-marker-{uuid4().hex}"
+    marker_file.write_text(marker_contents, encoding="utf-8")
+
+    return DeletionTenantState(
+        base_context=base_context,
+        session_context=session_context,
+        session_id=session.id,
+        session_title=session_snapshot.title,
+        session_status=session_snapshot.status,
+        last_message_at=session_snapshot.last_message_at,
+        messages=messages,
+        workspace=workspace,
+        marker_file=marker_file,
+        marker_contents=marker_contents,
+    )
+
+
+async def _count_deletion_scope_rows(
+    database: Database,
+    state: DeletionTenantState,
+) -> dict[str, int]:
+    async with database.connect() as conn:
+        user_count = await conn.scalar(
+            select(func.count()).select_from(users).where(users.c.id == state.base_context.tenant_id)
+        )
+        job_count = await conn.scalar(
+            select(func.count())
+            .select_from(deletion_jobs)
+            .where(deletion_jobs.c.tenant_id == state.base_context.tenant_id)
+        )
+        workspace_count = await conn.scalar(
+            select(func.count())
+            .select_from(workspaces)
+            .where(
+                workspaces.c.tenant_id == state.base_context.tenant_id,
+                workspaces.c.id == state.base_context.workspace_id,
+            )
+        )
+        session_count = await conn.scalar(
+            select(func.count())
+            .select_from(chat_sessions)
+            .where(
+                chat_sessions.c.tenant_id == state.base_context.tenant_id,
+                chat_sessions.c.workspace_id == state.base_context.workspace_id,
+                chat_sessions.c.id == state.session_id,
+            )
+        )
+        memory_count = await conn.scalar(
+            select(func.count())
+            .select_from(memory_entries)
+            .where(
+                memory_entries.c.tenant_id == state.base_context.tenant_id,
+                memory_entries.c.workspace_id == state.base_context.workspace_id,
+                memory_entries.c.session_id == state.session_id,
+            )
+        )
+
+    return {
+        "users": int(user_count or 0),
+        "deletion_jobs": int(job_count or 0),
+        "workspaces": int(workspace_count or 0),
+        "sessions": int(session_count or 0),
+        "memory_entries": int(memory_count or 0),
+    }
 
 
 async def _count_test_sessions(database: Database, scopes: TenantScopes) -> int:
@@ -787,3 +902,213 @@ async def test_real_deletion_recovery_blocks_ordinary_tenant_access(
     assert restored_context.tenant_id == base_context.tenant_id
     assert restored_context.workspace_id == base_context.workspace_id
     assert restored_context.request_started_at_ms == request_started_at_ms
+
+
+@pytest.mark.asyncio
+async def test_real_deletion_purge_removes_only_target_tenant_and_closes_recovery_when_running(
+    tenant_isolation_database: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from multiclaw.deletion.service import DeletionService, RecoveryWindowClosedError
+    from multiclaw.deletion.worker import DeletionWorker
+
+    workspace_root = tmp_path / "deletion-workspaces"
+    workspace_root.mkdir()
+    workspace_resolver = WorkspaceResolver(workspace_root)
+    target = await _build_deletion_tenant_state(
+        tenant_isolation_database,
+        workspace_resolver,
+        "target",
+    )
+    survivor = await _build_deletion_tenant_state(
+        tenant_isolation_database,
+        workspace_resolver,
+        "survivor",
+    )
+
+    runtime_pool = _TrackingRuntimePool()
+    service = DeletionService(
+        database=tenant_isolation_database,
+        runtime_pool=runtime_pool,
+        settings=Settings(
+            _config_file="/nonexistent",
+            deletion={"retention_days": 0},
+        ),
+    )
+
+    scheduled = await service.request(target.base_context)
+
+    pending_job = await _load_current_deletion_job(
+        tenant_isolation_database,
+        target.base_context.tenant_id,
+    )
+    pending_user = await _load_auth_user(
+        tenant_isolation_database,
+        target.base_context.tenant_id,
+    )
+    pending_deletion_user = await _load_deletion_user(
+        tenant_isolation_database,
+        target.base_context.tenant_id,
+    )
+    survivor_user = await _load_auth_user(
+        tenant_isolation_database,
+        survivor.base_context.tenant_id,
+    )
+    survivor_job = await _load_current_deletion_job(
+        tenant_isolation_database,
+        survivor.base_context.tenant_id,
+    )
+    target_counts_before_worker = await _count_deletion_scope_rows(
+        tenant_isolation_database,
+        target,
+    )
+    survivor_counts_before_worker = await _count_deletion_scope_rows(
+        tenant_isolation_database,
+        survivor,
+    )
+
+    assert pending_job is not None
+    assert pending_user is not None
+    assert pending_deletion_user is not None
+    assert survivor_user is not None
+    assert scheduled.status == "scheduled"
+    assert scheduled.job_id == pending_job.job_id
+    assert scheduled.purge_after == scheduled.requested_at
+    assert pending_job.status == "scheduled"
+    assert pending_user.status == "pending_purge"
+    assert pending_deletion_user.status == "pending_purge"
+    assert target_counts_before_worker == {
+        "users": 1,
+        "deletion_jobs": 1,
+        "workspaces": 1,
+        "sessions": 1,
+        "memory_entries": 2,
+    }
+    assert survivor_counts_before_worker == {
+        "users": 1,
+        "deletion_jobs": 0,
+        "workspaces": 1,
+        "sessions": 1,
+        "memory_entries": 2,
+    }
+    assert target.workspace.exists()
+    assert target.marker_file.exists()
+    assert target.marker_file.read_text(encoding="utf-8") == target.marker_contents
+    assert survivor.workspace.exists()
+    assert survivor.marker_file.exists()
+    assert survivor.marker_file.read_text(encoding="utf-8") == survivor.marker_contents
+    assert survivor_user.status == "active"
+    assert survivor_job is None
+    assert runtime_pool.revoked == [target.base_context.tenant_id]
+
+    worker = DeletionWorker(
+        database=tenant_isolation_database,
+        runtime_pool=runtime_pool,
+        workspace_resolver=workspace_resolver,
+        settings=Settings(
+            _config_file="/nonexistent",
+            deletion={"retention_days": 0},
+        ),
+        worker_id="worker-tenant-e2e-purge",
+    )
+    entered_purge = asyncio.Event()
+    release_purge = asyncio.Event()
+    original_purge_job = worker._purge_job
+
+    async def paused_purge_job(job):
+        entered_purge.set()
+        await release_purge.wait()
+        return await original_purge_job(job)
+
+    monkeypatch.setattr(worker, "_purge_job", paused_purge_job)
+    batch_task = asyncio.create_task(worker.run_batch(batch_size=10))
+    await asyncio.wait_for(entered_purge.wait(), timeout=5)
+
+    running_job = await _load_current_deletion_job(
+        tenant_isolation_database,
+        target.base_context.tenant_id,
+    )
+    assert running_job is not None
+    assert running_job.job_id == scheduled.job_id
+    assert running_job.status == "running"
+
+    with pytest.raises(RecoveryWindowClosedError):
+        await service.recover(target.base_context, scheduled.job_id)
+
+    release_purge.set()
+    batch = await asyncio.wait_for(batch_task, timeout=10)
+
+    target_user_after = await _load_auth_user(
+        tenant_isolation_database,
+        target.base_context.tenant_id,
+    )
+    target_deletion_user_after = await _load_deletion_user(
+        tenant_isolation_database,
+        target.base_context.tenant_id,
+    )
+    target_job_after = await _load_current_deletion_job(
+        tenant_isolation_database,
+        target.base_context.tenant_id,
+    )
+    survivor_user_after = await _load_auth_user(
+        tenant_isolation_database,
+        survivor.base_context.tenant_id,
+    )
+    survivor_job_after = await _load_current_deletion_job(
+        tenant_isolation_database,
+        survivor.base_context.tenant_id,
+    )
+    survivor_session_after, survivor_messages_after = await _load_session_snapshot(
+        tenant_isolation_database,
+        survivor.session_context,
+        survivor.session_id,
+    )
+    target_counts_after = await _count_deletion_scope_rows(
+        tenant_isolation_database,
+        target,
+    )
+    survivor_counts_after = await _count_deletion_scope_rows(
+        tenant_isolation_database,
+        survivor,
+    )
+
+    assert batch.claimed == 1
+    assert batch.completed == 1
+    assert batch.failed == 0
+    assert target_user_after is None
+    assert target_deletion_user_after is None
+    assert target_job_after is None
+    assert target_counts_after == {
+        "users": 0,
+        "deletion_jobs": 0,
+        "workspaces": 0,
+        "sessions": 0,
+        "memory_entries": 0,
+    }
+    assert not target.marker_file.exists()
+    assert not target.workspace.exists()
+    assert survivor_user_after is not None
+    assert survivor_user_after.status == "active"
+    assert survivor_job_after is None
+    assert survivor_session_after is not None
+    assert survivor_session_after.title == survivor.session_title
+    assert survivor_session_after.status == survivor.session_status
+    assert survivor_session_after.last_message_at == survivor.last_message_at
+    assert survivor_messages_after == survivor.messages
+    assert survivor_counts_after == {
+        "users": 1,
+        "deletion_jobs": 0,
+        "workspaces": 1,
+        "sessions": 1,
+        "memory_entries": 2,
+    }
+    assert survivor.marker_file.exists()
+    assert survivor.marker_file.read_text(encoding="utf-8") == survivor.marker_contents
+    assert runtime_pool.revoked == [
+        target.base_context.tenant_id,
+        target.base_context.tenant_id,
+    ]
+
+    with pytest.raises(RecoveryWindowClosedError):
+        await service.recover(target.base_context, scheduled.job_id)
