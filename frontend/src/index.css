@@ -23,6 +23,140 @@
   }
 }
 
+.settings-panel {
+  max-height: 100%;
+  width: min(100%, 64rem);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: 1rem;
+  background: var(--color-surface);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.35);
+}
+
+.settings-panel__body {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 88%, transparent), transparent 24%),
+    radial-gradient(circle at top right, color-mix(in srgb, var(--color-accent) 12%, transparent), transparent 28%);
+}
+
+.settings-feedback {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-radius: 0.75rem;
+  padding: 0.75rem 0.9rem;
+  font-size: 0.9rem;
+}
+
+.settings-feedback--success {
+  border: 1px solid color-mix(in srgb, var(--color-success) 35%, transparent);
+  background: color-mix(in srgb, var(--color-success) 12%, transparent);
+  color: var(--color-success);
+}
+
+.settings-feedback--danger {
+  border: 1px solid color-mix(in srgb, var(--color-danger) 35%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 12%, transparent);
+  color: var(--color-danger);
+}
+
+.settings-feedback--warning {
+  border: 1px solid color-mix(in srgb, var(--color-accent) 35%, transparent);
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  color: var(--color-foreground);
+}
+
+.settings-action-button {
+  border: 1px solid color-mix(in srgb, var(--color-accent) 45%, transparent);
+  border-radius: 0.65rem;
+  padding: 0.45rem 0.8rem;
+  font-size: 0.85rem;
+  color: var(--color-foreground);
+  background: color-mix(in srgb, var(--color-accent) 18%, transparent);
+}
+
+.settings-action-button:hover {
+  background: color-mix(in srgb, var(--color-accent) 24%, transparent);
+}
+
+.secret-entry {
+  border: 1px solid var(--color-border);
+  border-radius: 0.95rem;
+  background: color-mix(in srgb, var(--color-background) 82%, transparent);
+  padding: 1rem;
+}
+
+.secret-danger-button {
+  border: 1px solid color-mix(in srgb, var(--color-danger) 35%, transparent);
+  border-radius: 0.5rem;
+  padding: 0.375rem 0.75rem;
+  font-size: 0.875rem;
+  color: var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 10%, transparent);
+}
+
+.secret-danger-button:hover {
+  background: color-mix(in srgb, var(--color-danger) 16%, transparent);
+}
+
+.deletion-warning {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  border: 1px solid color-mix(in srgb, var(--color-danger) 28%, transparent);
+  border-radius: 1rem;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--color-danger) 11%, transparent), transparent 55%),
+    color-mix(in srgb, var(--color-danger) 5%, transparent);
+  padding: 1rem;
+}
+
+.pending-purge-banner {
+  border-left: 3px solid var(--color-danger);
+  padding-left: 0.75rem;
+  color: var(--color-foreground);
+}
+
+.approval-refresh-button {
+  border: 1px solid color-mix(in srgb, var(--color-accent) 40%, transparent);
+  border-radius: 0.65rem;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.75rem;
+  color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  white-space: nowrap;
+}
+
+.approval-refresh-button:hover {
+  background: color-mix(in srgb, var(--color-accent) 18%, transparent);
+}
+
+.approval-state {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: 0.75rem;
+  padding: 0.6rem 0.85rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.approval-state--approved {
+  border: 1px solid color-mix(in srgb, var(--color-success) 35%, transparent);
+  background: color-mix(in srgb, var(--color-success) 10%, transparent);
+  color: var(--color-success);
+}
+
+.approval-state--rejected,
+.approval-state--expired {
+  border: 1px solid color-mix(in srgb, var(--color-danger) 35%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 10%, transparent);
+  color: var(--color-danger);
+}
+
 .aui-md {
   line-height: 1.7;
   word-break: break-word;

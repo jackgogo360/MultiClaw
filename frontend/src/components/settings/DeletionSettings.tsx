@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context-store";
 
@@ -35,15 +35,32 @@ export function DeletionSettings({
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [renderedAt] = useState(() => Date.now());
+  const [currentTime, setCurrentTime] = useState(() => Date.now());
 
   const pendingPurge = accountStatus === "pending_purge";
   const purgeAfter = deletionStatus?.purge_after ?? null;
+  const shouldTrackPurgeDeadline =
+    pendingPurge && deletionStatus?.status === "scheduled" && purgeAfter !== null;
+
+  useEffect(() => {
+    if (!shouldTrackPurgeDeadline || purgeAfter === null) {
+      return;
+    }
+    const remainingMs = purgeAfter - currentTime;
+    if (remainingMs <= 0) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setCurrentTime(Date.now());
+    }, Math.min(remainingMs, 1_000));
+    return () => window.clearTimeout(timer);
+  }, [currentTime, purgeAfter, shouldTrackPurgeDeadline]);
+
   const canRecover =
     pendingPurge &&
     deletionStatus?.status === "scheduled" &&
     purgeAfter !== null &&
-    purgeAfter > renderedAt;
+    purgeAfter > currentTime;
 
   const handleDeletionRequest = async () => {
     setBusy(true);
@@ -167,10 +184,10 @@ export function DeletionSettings({
       ) : null}
 
       {(pendingPurge || standalone) && (
-        <div className="space-y-4 rounded-xl border border-danger/20 bg-danger/5 p-4">
+        <div className="deletion-warning">
           <div className="space-y-1">
             <div className="text-sm font-medium text-foreground">Recovery</div>
-            <p className="text-sm text-muted-foreground">
+            <p className={canRecover ? "pending-purge-banner" : "text-sm text-muted-foreground"}>
               {canRecover && purgeAfter
                 ? `Server status is scheduled. Recover before ${new Date(purgeAfter).toLocaleString()}.`
                 : "Use your email and a recovery code to check status or restore access before the purge window closes."}

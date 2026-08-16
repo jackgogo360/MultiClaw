@@ -6,9 +6,9 @@ function getErrorMessage(error: unknown, fallback: string): string {
 }
 
 export function LoginOverlay() {
-  const { isAuthenticated, isLoading, sendCode, login } = useAuth();
+  const { isAuthenticated, isLoading, sendCode, login, reauthEmailHint } = useAuth();
   const [step, setStep] = useState<"email" | "code">("email");
-  const [email, setEmail] = useState("");
+  const [email, setEmail] = useState(() => reauthEmailHint ?? "");
   const [code, setCode] = useState(["", "", "", "", "", ""]);
   const [error, setError] = useState("");
   const [sending, setSending] = useState(false);

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { ApiError, secretApi, type SecretMetadata } from "@/lib/api";
+import { useAuth } from "@/lib/auth-context-store";
 
 const DEFAULT_SECRET = {
   providerKind: "llm",
@@ -14,7 +15,19 @@ function formatError(error: unknown) {
   return error instanceof Error ? error.message : "Request failed.";
 }
 
+function requiresRecentAuth(error: unknown) {
+  if (!(error instanceof ApiError)) {
+    return false;
+  }
+  if (error.status !== 401 && error.status !== 403) {
+    return false;
+  }
+  const message = error.message.toLowerCase();
+  return message.includes("recent authentication required") || message.includes("unauthorized");
+}
+
 export function SecretSettings() {
+  const { beginRecentAuthRenewal } = useAuth();
   const [secrets, setSecrets] = useState<SecretMetadata[]>([]);
   const [providerKind, setProviderKind] = useState(DEFAULT_SECRET.providerKind);
   const [providerName, setProviderName] = useState(DEFAULT_SECRET.providerName);
@@ -23,6 +36,7 @@ export function SecretSettings() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [reauthMessage, setReauthMessage] = useState<string | null>(null);
 
   const loadSecrets = async () => {
     try {
@@ -62,12 +76,19 @@ export function SecretSettings() {
     setBusy(true);
     setMessage(null);
     setError(null);
+    setReauthMessage(null);
     try {
       await secretApi.put(providerKind, providerName, secretName, secretValue);
       await loadSecrets();
       setMessage("Secret saved.");
     } catch (nextError) {
-      setError(formatError(nextError));
+      if (requiresRecentAuth(nextError)) {
+        setReauthMessage(
+          "Recent authentication expired. Sign out, request a fresh email code, sign back in, then retry within 5 minutes.",
+        );
+      } else {
+        setError(formatError(nextError));
+      }
     } finally {
       setSecretValue("");
       setBusy(false);
@@ -78,6 +99,7 @@ export function SecretSettings() {
     setBusy(true);
     setMessage(null);
     setError(null);
+    setReauthMessage(null);
     try {
       const result = await secretApi.test(
         entry.providerKind,
@@ -86,7 +108,13 @@ export function SecretSettings() {
       );
       setMessage(result.ok ? "Secret validation succeeded." : "Secret validation failed.");
     } catch (nextError) {
-      setError(formatError(nextError));
+      if (requiresRecentAuth(nextError)) {
+        setReauthMessage(
+          "Recent authentication expired. Sign out, request a fresh email code, sign back in, then retry within 5 minutes.",
+        );
+      } else {
+        setError(formatError(nextError));
+      }
     } finally {
       setSecretValue("");
       setBusy(false);
@@ -97,12 +125,19 @@ export function SecretSettings() {
     setBusy(true);
     setMessage(null);
     setError(null);
+    setReauthMessage(null);
     try {
       await secretApi.del(entry.providerKind, entry.providerName, entry.secretName);
       await loadSecrets();
       setMessage("Secret deleted.");
     } catch (nextError) {
-      setError(formatError(nextError));
+      if (requiresRecentAuth(nextError)) {
+        setReauthMessage(
+          "Recent authentication expired. Sign out, request a fresh email code, sign back in, then retry within 5 minutes.",
+        );
+      } else {
+        setError(formatError(nextError));
+      }
     } finally {
       setSecretValue("");
       setBusy(false);
@@ -174,12 +209,24 @@ export function SecretSettings() {
       </div>
 
       {error ? (
-        <div className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
+        <div className="settings-feedback settings-feedback--danger">
           {error}
         </div>
       ) : null}
+      {reauthMessage ? (
+        <div className="settings-feedback settings-feedback--warning">
+          <div>{reauthMessage}</div>
+          <button
+            className="settings-action-button"
+            onClick={() => void beginRecentAuthRenewal()}
+            disabled={busy}
+          >
+            Re-authenticate
+          </button>
+        </div>
+      ) : null}
       {message ? (
-        <div className="rounded-lg border border-success/30 bg-success/10 px-3 py-2 text-sm text-success">
+        <div className="settings-feedback settings-feedback--success">
           {message}
         </div>
       ) : null}
@@ -193,7 +240,7 @@ export function SecretSettings() {
           secrets.map((entry) => (
             <article
               key={`${entry.providerKind}:${entry.providerName}:${entry.secretName}`}
-              className="rounded-xl border border-border bg-background/70 p-4"
+              className="secret-entry"
             >
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
@@ -216,7 +263,7 @@ export function SecretSettings() {
                   Test
                 </button>
                 <button
-                  className="rounded-lg border border-border px-3 py-1.5 text-sm text-muted-foreground hover:border-danger hover:text-danger"
+                  className="secret-danger-button"
                   onClick={() => void handleDelete(entry)}
                   disabled={busy}
                 >
