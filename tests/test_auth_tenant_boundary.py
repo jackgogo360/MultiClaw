@@ -426,6 +426,46 @@ def test_send_code_rate_limits_per_normalized_email_and_login_purpose_only(
     assert [row["purpose"] for row in rows].count("deletion_recovery") == 1
 
 
+def test_send_code_failure_does_not_persist_code_or_consume_quota(
+    client: TestClient,
+    migrated_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    import multiclaw.auth.router as auth_router
+
+    email = "send-failure@example.com"
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = False
+    caplog.set_level("ERROR", logger="multiclaw")
+
+    async def fail_sender(*_args, **_kwargs):
+        raise RuntimeError("smtp failure secret-token")
+
+    async def succeed_sender(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(auth_router, "send_verification_code", fail_sender)
+    failed = client.post("/auth/send-code", json={"email": email})
+    rows_after_failure = asyncio.run(_get_verification_rows(migrated_database, email))
+
+    monkeypatch.setattr(auth_router, "send_verification_code", succeed_sender)
+    success_responses = [
+        client.post("/auth/send-code", json={"email": email})
+        for _ in range(MAX_SENDS_PER_DAY)
+    ]
+    limited = client.post("/auth/send-code", json={"email": email})
+    rows_after_success = asyncio.run(_get_verification_rows(migrated_database, email))
+
+    assert failed.status_code == 502
+    assert rows_after_failure == []
+    assert "secret-token" not in caplog.text
+    assert [response.status_code for response in success_responses] == [200] * MAX_SENDS_PER_DAY
+    assert limited.status_code == 429
+    assert limited.json() == {"detail": "Too many attempts, please try again tomorrow"}
+    assert [row["purpose"] for row in rows_after_success].count("login") == MAX_SENDS_PER_DAY
+
+
 def test_deletion_recovery_audience_is_rejected_by_normal_api(
     client: TestClient,
     migrated_database: Database,

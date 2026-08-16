@@ -9,7 +9,7 @@ from multiclaw.storage.uow import AuthUnitOfWork
 from sqlalchemy import select
 
 
-PUBLIC_PREFIXES = ("/auth/", "/api/auth/")
+PUBLIC_PREFIXES = ("/auth/", "/api/auth/", "/assets/")
 PUBLIC_EXACT = {"/multiclaw.png", "/health/ready"}
 
 

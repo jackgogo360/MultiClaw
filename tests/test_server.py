@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -530,6 +531,27 @@ def test_auth_flows_are_public(tmp_path, monkeypatch):
         assert client.get("/auth/me").status_code != 401
         assert client.get("/").status_code != 401
         assert client.get("/multiclaw.png").status_code != 401
+
+
+def test_assets_subtree_is_public_but_similar_prefix_is_not(migrated_database):
+    del migrated_database
+    from multiclaw.server import app
+
+    with TestClient(app) as client:
+        index_response = client.get("/")
+        assert index_response.status_code == 200
+        match = re.search(r'(?:src|href)="(/assets/[^"]+)"', index_response.text)
+        assert match is not None
+        asset_path = match.group(1)
+
+        asset_response = client.get(asset_path)
+        evil_response = client.get("/assets-evil")
+
+    assert asset_response.status_code == 200
+    assert asset_response.headers["content-type"].startswith(
+        ("application/javascript", "text/javascript", "text/css")
+    )
+    assert evil_response.status_code == 401
 
 
 def test_lifespan_worker_tolerates_missing_workflow_tables_for_public_routes(tmp_path, monkeypatch):

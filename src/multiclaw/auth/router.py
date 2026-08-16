@@ -86,6 +86,10 @@ async def send_code(body: SendCodeRequest, request: Request):
     )
 
     async with AuthUnitOfWork(request.app.state.database) as uow:
+        await uow.verification_codes.acquire_rate_limit_lock(
+            email=email,
+            purpose=LOGIN_CODE_PURPOSE,
+        )
         recent = await uow.verification_codes.count_recent_codes(
             email,
             purpose=LOGIN_CODE_PURPOSE,
@@ -95,21 +99,24 @@ async def send_code(body: SendCodeRequest, request: Request):
             raise HTTPException(
                 status_code=429, detail="Too many attempts, please try again tomorrow"
             )
+        if not is_mock_enabled(settings):
+            try:
+                await send_verification_code(settings, email, code_issue.code)
+            except Exception as error:
+                logger.error(
+                    "Failed to send verification email to %s: %s",
+                    email,
+                    type(error).__name__,
+                )
+                raise HTTPException(
+                    status_code=502, detail="Failed to send email, please try again later"
+                ) from error
         await uow.verification_codes.issue_code(
             email=email,
             purpose=code_issue.purpose,
             code_digest=code_issue.code_digest,
             ttl_seconds=VERIFICATION_CODE_TTL_SECONDS,
         )
-
-    if not is_mock_enabled(settings):
-        try:
-            await send_verification_code(settings, email, code_issue.code)
-        except Exception:
-            logger.exception("Failed to send verification email to %s", email)
-            raise HTTPException(
-                status_code=502, detail="Failed to send email, please try again later"
-            )
 
     return AuthResponse()
 

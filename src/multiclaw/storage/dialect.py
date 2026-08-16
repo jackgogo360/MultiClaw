@@ -1,3 +1,4 @@
+import hashlib
 from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import BigInteger, cast, func, select
@@ -23,6 +24,25 @@ class SQLiteDialect:
     async def lock_run(self, connection: AsyncConnection, context: "TenantContext") -> None:
         return None
 
+    async def acquire_verification_codes_lock(
+        self,
+        connection: AsyncConnection,
+        *,
+        purpose: str,
+        email: str,
+        timeout_seconds: int,
+    ) -> None:
+        del connection, purpose, email, timeout_seconds
+        return None
+
+    async def release_verification_codes_lock(
+        self,
+        connection: AsyncConnection,
+        lock_name: str,
+    ) -> None:
+        del connection, lock_name
+        return None
+
 
 class MySQLDialect:
     name: Literal["mysql"] = "mysql"
@@ -46,3 +66,34 @@ class MySQLDialect:
             )
             .with_for_update()
         )
+
+    async def acquire_verification_codes_lock(
+        self,
+        connection: AsyncConnection,
+        *,
+        purpose: str,
+        email: str,
+        timeout_seconds: int,
+    ) -> str:
+        lock_name = _verification_codes_lock_name(purpose=purpose, email=email)
+        result = await connection.execute(select(func.get_lock(lock_name, timeout_seconds)))
+        acquired = result.scalar_one()
+        if int(acquired or 0) != 1:
+            raise RuntimeError("verification code rate limit lock unavailable")
+        return lock_name
+
+    async def release_verification_codes_lock(
+        self,
+        connection: AsyncConnection,
+        lock_name: str,
+    ) -> None:
+        result = await connection.execute(select(func.release_lock(lock_name)))
+        released = result.scalar_one()
+        if int(released or 0) != 1:
+            raise RuntimeError("verification code rate limit lock release failed")
+
+
+def _verification_codes_lock_name(*, purpose: str, email: str) -> str:
+    normalized = email.strip().lower()
+    digest = hashlib.sha256(f"{purpose}\0{normalized}".encode("utf-8")).hexdigest()
+    return f"mc_vcode_{digest[:55]}"
