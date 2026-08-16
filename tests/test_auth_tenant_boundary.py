@@ -114,6 +114,14 @@ def _make_cookie(
     return {"token": jwt.encode(claims, signing_key, algorithm="HS256")}
 
 
+def _latest_cookie_value(client: TestClient, name: str) -> str | None:
+    value: str | None = None
+    for cookie in client.cookies.jar:
+        if cookie.name == name:
+            value = cookie.value
+    return value
+
+
 def _force_default_workspace_id(database: Database, user_id: str, workspace_id: str) -> None:
     database_path = database.engine.url.database
     assert database_path is not None
@@ -261,6 +269,121 @@ async def _seed_verification_row(
 async def _db_now_seconds(database: Database) -> int:
     async with AuthUnitOfWork(database, read_only=True) as uow:
         return await uow.verification_codes.db_now_ms() // 1000
+
+
+async def _get_deletion_state(database: Database, tenant_id: str) -> dict[str, object] | None:
+    async with database.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT
+                        users.status AS user_status,
+                        users.auth_epoch AS auth_epoch,
+                        users.purge_after AS user_purge_after,
+                        deletion_jobs.job_id AS job_id,
+                        deletion_jobs.status AS job_status,
+                        deletion_jobs.requested_at AS requested_at,
+                        deletion_jobs.purge_after AS job_purge_after
+                    FROM users
+                    LEFT JOIN deletion_jobs ON deletion_jobs.tenant_id = users.id
+                    WHERE users.id = :tenant_id
+                    """
+                ),
+                {"tenant_id": tenant_id},
+            )
+        ).mappings().first()
+    return None if row is None else dict(row)
+
+
+async def _seed_active_run(
+    database: Database,
+    *,
+    tenant_id: str,
+    workspace_id: str,
+    lease_expires_at: int,
+) -> None:
+    session_id = str(uuid4())
+    run_id = str(uuid4())
+    async with database.write_transaction() as conn:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO chat_sessions (
+                    id,
+                    tenant_id,
+                    workspace_id,
+                    title,
+                    status,
+                    created_at,
+                    updated_at,
+                    last_message_at,
+                    metadata_json
+                ) VALUES (
+                    :session_id,
+                    :tenant_id,
+                    :workspace_id,
+                    'Blocking run',
+                    'active',
+                    1,
+                    1,
+                    NULL,
+                    '{}'
+                )
+                """
+            ),
+            {
+                "session_id": session_id,
+                "tenant_id": tenant_id,
+                "workspace_id": workspace_id,
+            },
+        )
+        await conn.execute(
+            text(
+                """
+                INSERT INTO agent_runs (
+                    run_id,
+                    tenant_id,
+                    workspace_id,
+                    session_id,
+                    run_status,
+                    runtime_instance_id,
+                    lease_owner,
+                    fencing_token,
+                    lease_expires_at,
+                    heartbeat_at,
+                    schema_version,
+                    version,
+                    created_at,
+                    updated_at,
+                    finished_at
+                ) VALUES (
+                    :run_id,
+                    :tenant_id,
+                    :workspace_id,
+                    :session_id,
+                    'running',
+                    'runtime-blocking',
+                    'runtime-blocking',
+                    1,
+                    :lease_expires_at,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    NULL
+                )
+                """
+            ),
+            {
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "lease_expires_at": lease_expires_at,
+            },
+        )
 
 
 @pytest.fixture
@@ -595,6 +718,562 @@ def test_deletion_recovery_audience_is_rejected_by_normal_api(
     assert response.json() == {"detail": "Unauthorized"}
 
 
+def test_pending_purge_normal_cookie_is_blocked_from_non_recovery_api(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="pending-normal@example.com",
+        )
+    )
+
+    deletion_response = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert deletion_response.status_code == 200
+
+    user_row = asyncio.run(_get_user_row(migrated_database, identity.email))
+    pending_cookie = _make_cookie(
+        TEST_JWT_SIGNING_KEY,
+        user_id=identity.tenant_id,
+        email=identity.email,
+        auth_epoch=int(user_row["auth_epoch"]),
+    )
+    blocked = client.get("/api/sessions", cookies=pending_cookie)
+
+    assert blocked.status_code == 403
+    assert blocked.json() == {"detail": "Account pending deletion"}
+
+
+def test_account_deletion_boundary_recent_auth_and_active_run_contracts(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="boundary-delete@example.com",
+        )
+    )
+    now_seconds = asyncio.run(_db_now_seconds(migrated_database))
+    boundary_cookie = _make_cookie(
+        TEST_JWT_SIGNING_KEY,
+        user_id=identity.tenant_id,
+        email=identity.email,
+        auth_epoch=identity.auth_epoch,
+        issued_at=now_seconds - 300,
+        expires_at=now_seconds + 3600,
+    )
+    stale_cookie = _make_cookie(
+        TEST_JWT_SIGNING_KEY,
+        user_id=identity.tenant_id,
+        email=identity.email,
+        auth_epoch=identity.auth_epoch,
+        issued_at=now_seconds - 301,
+        expires_at=now_seconds + 3600,
+    )
+
+    boundary = client.post("/api/account/deletion", cookies=boundary_cookie)
+    stale = client.post("/api/account/deletion", cookies=stale_cookie)
+
+    assert boundary.status_code == 200
+    assert stale.status_code == 401
+    assert stale.json() == {"detail": "Recent authentication required"}
+
+    active_identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="active-run-delete@example.com",
+        )
+    )
+    now_ms = asyncio.run(_db_now_seconds(migrated_database)) * 1000
+    asyncio.run(
+        _seed_active_run(
+            migrated_database,
+            tenant_id=active_identity.tenant_id,
+            workspace_id=str(active_identity.workspace_id),
+            lease_expires_at=now_ms + 60_000,
+        )
+    )
+
+    active_run = client.post("/api/account/deletion", cookies=active_identity.cookie)
+
+    assert active_run.status_code == 409
+    assert active_run.json() == {
+        "detail": {
+            "code": "ACTIVE_RUNS",
+            "message": "Active runs must finish first",
+        }
+    }
+
+
+def test_account_deletion_with_retention_zero_stays_pending_until_worker_purges(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="retention-zero@example.com",
+        )
+    )
+    previous_retention = client.app.state.settings.deletion.retention_days
+    client.app.state.settings.deletion.retention_days = 0
+    try:
+        response = client.post("/api/account/deletion", cookies=identity.cookie)
+    finally:
+        client.app.state.settings.deletion.retention_days = previous_retention
+
+    state = asyncio.run(_get_deletion_state(migrated_database, identity.tenant_id))
+
+    assert response.status_code == 200
+    assert state is not None
+    assert response.json()["purge_after"] == response.json()["requested_at"]
+    assert state["user_status"] == "pending_purge"
+    assert state["job_status"] == "scheduled"
+    assert state["job_id"] == response.json()["job_id"]
+
+
+def test_duplicate_account_deletion_returns_existing_schedule_for_recent_pending_token(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="duplicate-delete-route@example.com",
+        )
+    )
+
+    first = client.post("/api/account/deletion", cookies=identity.cookie)
+    user_row = asyncio.run(_get_user_row(migrated_database, identity.email))
+    now_seconds = asyncio.run(_db_now_seconds(migrated_database))
+    pending_cookie = _make_cookie(
+        TEST_JWT_SIGNING_KEY,
+        user_id=identity.tenant_id,
+        email=identity.email,
+        auth_epoch=int(user_row["auth_epoch"]),
+        issued_at=now_seconds,
+        expires_at=now_seconds + 3600,
+    )
+
+    second = client.post("/api/account/deletion", cookies=pending_cookie)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json() == first.json()
+
+
+def test_deletion_request_clears_normal_cookie_and_old_jwt_keeps_pending_semantics(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="old-cookie-pending@example.com",
+        )
+    )
+
+    deletion_response = client.post("/api/account/deletion", cookies=identity.cookie)
+    blocked = client.get("/api/sessions", cookies=identity.cookie)
+
+    assert deletion_response.status_code == 200
+    assert any(
+        cookie.startswith("token=") and "Max-Age=0" in cookie
+        for cookie in deletion_response.headers.get_list("set-cookie")
+    )
+    assert blocked.status_code == 403
+    assert blocked.json() == {"detail": "Account pending deletion"}
+
+
+def test_deletion_recovery_verify_sets_recovery_cookie_without_normal_session(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="pending-recovery@example.com",
+        )
+    )
+
+    scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert scheduled.status_code == 200
+
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "112233"
+    send_response = client.post(
+        "/auth/deletion-recovery/send-code",
+        json={"email": identity.email},
+    )
+    verify_response = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "112233"},
+    )
+
+    assert send_response.status_code == 200
+    assert verify_response.status_code == 200
+    cookies = verify_response.headers.get_list("set-cookie")
+    assert any(cookie.startswith("recovery_token=") for cookie in cookies)
+    assert all(not cookie.startswith("token=") for cookie in cookies)
+
+
+def test_deletion_recovery_unknown_email_is_enumeration_safe_and_does_not_send(
+    client: TestClient,
+    migrated_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import multiclaw.auth.router as auth_router
+
+    sent: list[tuple[str, str]] = []
+
+    async def record_send(_settings, email: str, code: str) -> None:
+        sent.append((email, code))
+
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = False
+    monkeypatch.setattr(auth_router, "send_verification_code", record_send)
+
+    response = client.post("/auth/deletion-recovery/send-code", json={"email": "unknown@example.com"})
+    rows = asyncio.run(_get_verification_rows(migrated_database, "unknown@example.com"))
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert rows == []
+    assert sent == []
+
+
+def test_deletion_status_with_recovery_token_returns_limited_view(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="status-view@example.com",
+        )
+    )
+
+    scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert scheduled.status_code == 200
+
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "112233"
+    assert client.post("/auth/deletion-recovery/send-code", json={"email": identity.email}).status_code == 200
+    assert (
+        client.post("/auth/deletion-recovery/verify", json={"email": identity.email, "code": "112233"}).status_code
+        == 200
+    )
+
+    recovery_token = client.cookies.get("recovery_token")
+    assert recovery_token is not None
+    client.cookies.clear()
+    status_response = client.get("/api/account/deletion", cookies={"recovery_token": recovery_token})
+
+    assert status_response.status_code == 200
+    assert status_response.json() == {
+        "status": "pending_purge",
+        "purge_after": scheduled.json()["purge_after"],
+    }
+
+
+def test_deletion_status_rejects_normal_session_and_requires_recovery_token(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="normal-status-rejected@example.com",
+        )
+    )
+
+    response = client.get("/api/account/deletion", cookies=identity.cookie)
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
+
+
+def test_deletion_status_and_recover_accept_recovery_bearer_token(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="recovery-bearer@example.com",
+        )
+    )
+
+    scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert scheduled.status_code == 200
+
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "112233"
+    assert client.post("/auth/deletion-recovery/send-code", json={"email": identity.email}).status_code == 200
+    verify_response = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "112233"},
+    )
+    assert verify_response.status_code == 200
+    recovery_token = client.cookies.get("recovery_token")
+    csrf_token = _latest_cookie_value(client, "csrf_token")
+    assert recovery_token is not None
+    assert csrf_token is not None
+
+    status_response = client.get(
+        "/api/account/deletion",
+        headers={"Authorization": f"Bearer {recovery_token}"},
+    )
+    recover_response = client.post(
+        "/api/account/deletion/recover",
+        headers={
+            "Authorization": f"Bearer {recovery_token}",
+            "Origin": "http://testserver",
+            "X-CSRF-Token": csrf_token,
+        },
+        cookies={"csrf_token": csrf_token},
+    )
+
+    user_row = asyncio.run(_get_user_row(migrated_database, identity.email))
+    deletion_state = asyncio.run(_get_deletion_state(migrated_database, identity.tenant_id))
+
+    assert status_response.status_code == 200
+    assert status_response.json() == {
+        "status": "pending_purge",
+        "purge_after": scheduled.json()["purge_after"],
+    }
+    assert recover_response.status_code == 200
+    assert recover_response.json() == {"ok": True}
+    assert user_row["status"] == "active"
+    assert deletion_state is not None
+    assert deletion_state["job_id"] is None
+    assert any(
+        cookie.startswith("recovery_token=") and "Max-Age=0" in cookie
+        for cookie in recover_response.headers.get_list("set-cookie")
+    )
+
+
+def test_deletion_status_rejects_malformed_recovery_claim_types(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="malformed-recovery@example.com",
+        )
+    )
+    scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert scheduled.status_code == 200
+
+    now_seconds = asyncio.run(_db_now_seconds(migrated_database))
+    token = jwt.encode(
+        {
+            "sub": identity.tenant_id,
+            "email": identity.email,
+            "aud": "multiclaw-deletion-recovery",
+            "purpose": "deletion_recovery",
+            "job_id": scheduled.json()["job_id"],
+            "iat": "1700000000",
+            "exp": now_seconds + 600,
+        },
+        TEST_JWT_SIGNING_KEY,
+        algorithm="HS256",
+    )
+
+    response = client.get("/api/account/deletion", cookies={"recovery_token": token})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
+
+
+def test_deletion_status_returns_410_once_recovery_window_is_closed(
+    client: TestClient,
+    migrated_database: Database,
+):
+    import multiclaw.auth.router as auth_router
+
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="closed-window@example.com",
+        )
+    )
+    previous_retention = client.app.state.settings.deletion.retention_days
+    client.app.state.settings.deletion.retention_days = 0
+    try:
+        scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    finally:
+        client.app.state.settings.deletion.retention_days = previous_retention
+
+    assert scheduled.status_code == 200
+    now_seconds = asyncio.run(_db_now_seconds(migrated_database))
+    token = auth_router._make_deletion_recovery_jwt(
+        user_id=identity.tenant_id,
+        email=identity.email,
+        job_id=scheduled.json()["job_id"],
+        signing_key=TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        issued_at=now_seconds,
+    )
+
+    response = client.get("/api/account/deletion", cookies={"recovery_token": token})
+
+    assert response.status_code == 410
+    assert response.json() == {"detail": "Deletion recovery window expired"}
+
+
+def test_deletion_recovery_send_code_nonpending_email_is_enumeration_safe(
+    client: TestClient,
+    migrated_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import multiclaw.auth.router as auth_router
+
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="active-no-recovery@example.com",
+        )
+    )
+    sent: list[tuple[str, str]] = []
+
+    async def record_send(_settings, email: str, code: str) -> None:
+        sent.append((email, code))
+
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = False
+    monkeypatch.setattr(auth_router, "send_verification_code", record_send)
+
+    response = client.post("/auth/deletion-recovery/send-code", json={"email": identity.email})
+    rows = asyncio.run(_get_verification_rows(migrated_database, identity.email))
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert rows == []
+    assert sent == []
+
+
+def test_deletion_recovery_verify_wrong_code_rejects_without_setting_cookie(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="wrong-recovery-code@example.com",
+        )
+    )
+
+    scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    assert scheduled.status_code == 200
+
+    client.app.state.settings.email.provider = "resend"
+    client.app.state.settings.resend.mock = True
+    client.app.state.auth_forced_code = "112233"
+    assert client.post("/auth/deletion-recovery/send-code", json={"email": identity.email}).status_code == 200
+
+    response = client.post(
+        "/auth/deletion-recovery/verify",
+        json={"email": identity.email, "code": "000000"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid or expired verification code"}
+    assert "recovery_token" not in client.cookies
+
+
+def test_deletion_recovery_verify_sets_secure_cookie_flags_in_production(
+    migrated_database: Database,
+):
+    import multiclaw.server as server
+
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="recovery-cookie-flags@example.com",
+        )
+    )
+
+    with TestClient(server.app, base_url="https://app.example") as client:
+        scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+        assert scheduled.status_code == 200
+
+        client.app.state.settings.email.provider = "resend"
+        client.app.state.settings.resend.mock = True
+        client.app.state.auth_forced_code = "112233"
+        assert client.post("/auth/deletion-recovery/send-code", json={"email": identity.email}).status_code == 200
+        response = client.post(
+            "/auth/deletion-recovery/verify",
+            json={"email": identity.email, "code": "112233"},
+        )
+
+    cookies = response.headers.get_list("set-cookie")
+    recovery_cookie = next(value for value in cookies if value.startswith("recovery_token="))
+    csrf_cookie = next(value for value in cookies if value.startswith("csrf_token="))
+    assert "Secure" in recovery_cookie
+    assert "SameSite=lax" in recovery_cookie
+    assert "HttpOnly" in recovery_cookie
+    assert "Secure" in csrf_cookie
+    assert "SameSite=lax" in csrf_cookie
+    assert "HttpOnly" not in csrf_cookie
+
+
+def test_deletion_recovery_recover_returns_410_once_window_is_closed(
+    client: TestClient,
+    migrated_database: Database,
+):
+    import multiclaw.auth.router as auth_router
+
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="recover-window-closed@example.com",
+        )
+    )
+    previous_retention = client.app.state.settings.deletion.retention_days
+    client.app.state.settings.deletion.retention_days = 0
+    try:
+        scheduled = client.post("/api/account/deletion", cookies=identity.cookie)
+    finally:
+        client.app.state.settings.deletion.retention_days = previous_retention
+
+    assert scheduled.status_code == 200
+    now_seconds = asyncio.run(_db_now_seconds(migrated_database))
+    token = auth_router._make_deletion_recovery_jwt(
+        user_id=identity.tenant_id,
+        email=identity.email,
+        job_id=scheduled.json()["job_id"],
+        signing_key=TEST_JWT_SIGNING_KEY.encode("utf-8"),
+        issued_at=now_seconds,
+    )
+
+    response = client.post("/api/account/deletion/recover", cookies={"recovery_token": token})
+
+    assert response.status_code == 410
+    assert response.json() == {"detail": "Deletion recovery window expired"}
+
+
 def test_deletion_recovery_jwt_claim_shape():
     from multiclaw.auth.router import _make_deletion_recovery_jwt
 
@@ -820,7 +1499,7 @@ def test_explicit_empty_session_id_takes_precedence_over_valid_id_and_does_not_c
     assert after == before
 
 
-@pytest.mark.parametrize("status", ["disabled", "pending_purge"])
+@pytest.mark.parametrize("status", ["disabled"])
 def test_unavailable_user_status_returns_401(
     client: TestClient,
     migrated_database: Database,
@@ -839,6 +1518,25 @@ def test_unavailable_user_status_returns_401(
 
     assert response.status_code == 401
     assert response.json() == {"detail": "Unauthorized"}
+
+
+def test_seeded_pending_purge_user_returns_403(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="seeded-pending@example.com",
+            status="pending_purge",
+        )
+    )
+
+    response = client.get("/api/sessions", cookies=identity.cookie)
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Account pending deletion"}
 
 
 @pytest.mark.parametrize("workspace_mode", ["null", "missing"])
