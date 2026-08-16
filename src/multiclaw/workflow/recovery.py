@@ -661,6 +661,22 @@ class WorkflowRecoveryWorker:
             force_execute=True,
         )
         refreshed = await coordinator.get_execution_recovery(context, execution.execution_id)
+        if refreshed is not None and refreshed.status in {
+            ExecutionStatus.BLOCKED_CORRUPT,
+            ExecutionStatus.BLOCKED_INCOMPATIBLE,
+        }:
+            await run_lease_handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    self._database,
+                    settings=self._settings,
+                ).finish_run_with_checkpoint(
+                    lease,
+                    RunStatus.BLOCKED_CORRUPT
+                    if refreshed.status is ExecutionStatus.BLOCKED_CORRUPT
+                    else RunStatus.BLOCKED_INCOMPATIBLE,
+                )
+            )
+            return True
         if refreshed is not None and refreshed.status is ExecutionStatus.SUCCEEDED:
             await self._invoke_continuation(runtime=runtime, context=context, run_lease_handle=run_lease_handle)
         return True

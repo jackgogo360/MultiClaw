@@ -784,32 +784,50 @@ class CoreToolScheduler:
         except (ExecutionConflictError, asyncio.CancelledError, StaleFenceError, VersionConflictError, LeaseConflictError):
             raise
         except Exception:
+            current_execution = await WorkflowCoordinator(
+                self.database,
+                settings=self.settings,
+            ).get_execution_recovery(context, execution.execution_id)
+            if current_execution is None:
+                raise
+            if current_execution.status in {
+                ExecutionStatus.NOT_STARTED,
+                ExecutionStatus.REPLAYING,
+            }:
+                return await self._block_execution(
+                    context=context,
+                    execution=current_execution,
+                    run_lease_handle=run_lease_handle,
+                    status=ExecutionStatus.BLOCKED_CORRUPT,
+                    detail="tool execution failed",
+                )
+
             result = ToolExecutionResult(status=ToolStatus.ERROR, content="tool execution failed")
             terminal_status = (
                 ExecutionStatus.UNCERTAIN
-                if execution.recovery_strategy is RecoveryStrategy.MANUAL_UNCERTAIN
+                if current_execution.recovery_strategy is RecoveryStrategy.MANUAL_UNCERTAIN
                 else ExecutionStatus.FAILED_TERMINAL
             )
             prepared = _PreparedExecution(
                 lease=await run_lease_handle.current(),
-                execution_id=execution.execution_id,
-                approval_id=execution.approval_id,
+                execution_id=current_execution.execution_id,
+                approval_id=current_execution.approval_id,
                 progress_state=_ExecutionProgressState(
                     run_lease_handle=run_lease_handle,
-                    execution_id=execution.execution_id,
-                    execution_version=execution.version,
-                    external_request_id=execution.external_request_id,
+                    execution_id=current_execution.execution_id,
+                    execution_version=current_execution.version,
+                    external_request_id=current_execution.external_request_id,
                 ),
-                input_payload_json=execution.input_payload_json,
-                input_hash=execution.input_hash,
-                recovery_strategy=execution.recovery_strategy,
-                idempotency_key=execution.idempotency_key,
+                input_payload_json=current_execution.input_payload_json,
+                input_hash=current_execution.input_hash,
+                recovery_strategy=current_execution.recovery_strategy,
+                idempotency_key=current_execution.idempotency_key,
             )
             await self._persist_execution_result(
                 prepared,
                 tool_name=builder.name,
                 context=context,
-                call_id=execution.tool_call_id,
+                call_id=current_execution.tool_call_id,
                 result=result,
                 run_lease_handle=run_lease_handle,
                 terminal_status=terminal_status,
