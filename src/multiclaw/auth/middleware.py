@@ -10,7 +10,12 @@ from sqlalchemy import select
 
 
 PUBLIC_PREFIXES = ("/auth/", "/api/auth/", "/assets/")
-PUBLIC_EXACT = {"/multiclaw.png", "/health/ready"}
+PUBLIC_EXACT = {
+    "/multiclaw.png",
+    "/health/ready",
+    "/api/health/live",
+    "/api/health/ready",
+}
 RECOVERY_ROUTE_METHODS = {
     ("GET", "/api/account/deletion"),
     ("POST", "/api/account/deletion/recover"),

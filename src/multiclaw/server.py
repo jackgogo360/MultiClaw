@@ -132,6 +132,7 @@ from multiclaw.auth.middleware import AuthMiddleware, require_recent_auth
 from multiclaw.auth.models import build_auth_runtime
 from multiclaw.auth.router import router as auth_router
 from multiclaw.api.account import router as account_router
+from multiclaw.api.approvals import ApprovalDecisionRequest, ApprovalResponse, router as approvals_router
 from multiclaw.api.chat import (
     build_workflow_continuation_service,
     build_workflow_coordinator,
@@ -140,8 +141,12 @@ from multiclaw.api.chat import (
     encode_scoped_event,
     encode_session_metadata,
     iterate_message_stream,
+    router as chat_router,
 )
-from multiclaw.api.approvals import ApprovalDecisionRequest, ApprovalResponse
+from multiclaw.api.health import health_ready as readiness_response
+from multiclaw.api.health import router as health_router
+from multiclaw.api.secrets import router as secrets_router
+from multiclaw.api.sessions import router as sessions_router
 from multiclaw.api.dependencies import current_user, tenant_context, tenant_uow
 from multiclaw.memory import MemoryEntry
 from multiclaw.stream import DataStreamEncoder
@@ -159,6 +164,8 @@ from multiclaw.workflow.models import (
 from multiclaw.workflow.recovery import WorkflowRecoveryWorker
 from multiclaw.deletion.service import DeletionService
 from multiclaw.deletion.worker import DeletionWorker
+from multiclaw.secrets.keyring import DeploymentKeyring, SecretKeyringError
+from multiclaw.secrets.resolver import SecretResolver
 
 
 # ---------------------------------------------------------------------------
@@ -494,10 +501,22 @@ def create_runtime_factory(
     resolved_workspace_resolver = workspace_resolver or WorkspaceResolver(
         _resolve_workspace_root(resolved_settings, config_path)
     )
+    secret_resolver = None
+    secret_keyring = None
+    try:
+        secret_keyring = DeploymentKeyring.load(resolved_settings.secrets)
+        secret_resolver = SecretResolver(
+            database=resolved_database,
+            settings=resolved_settings.secrets,
+            keyring=secret_keyring,
+        )
+    except SecretKeyringError:
+        secret_resolver = None
     return RuntimeFactory(
         settings=resolved_settings,
         database=resolved_database,
         workspace_resolver=resolved_workspace_resolver,
+        secret_resolver=secret_resolver,
         sandbox_controller_factory=sandbox_controller_factory,
         mcp_manager_factory=mcp_manager_factory,
         mcp_tool_registrar=_register_mcp_tools,
@@ -547,6 +566,8 @@ async def lifespan(app: FastAPI):
         app.state.runtime_pool = runtime_pool
         app.state.workspace_resolver = runtime_factory.workspace_resolver
         app.state.settings = runtime_factory.settings
+        app.state.secret_resolver = getattr(runtime_factory, "secret_resolver", None)
+        app.state.secret_keyring = getattr(app.state.secret_resolver, "_keyring", None)
         app.state.sandbox_readiness = readiness
         app.state.workspace_root = runtime_factory.workspace_resolver.root
         app.state.sandbox_startup_events = startup_events
@@ -710,6 +731,11 @@ app.add_middleware(AuthMiddleware)
 app.include_router(auth_router)
 app.include_router(auth_router, prefix="/api")
 app.include_router(account_router)
+app.include_router(health_router)
+app.include_router(approvals_router)
+app.include_router(sessions_router)
+app.include_router(chat_router)
+app.include_router(secrets_router)
 
 api = APIRouter(prefix="/api")
 
@@ -784,31 +810,7 @@ class SessionRenameRequest(BaseModel):
 
 @app.get("/health/ready")
 async def health_ready(request: Request):
-    readiness = getattr(request.app.state, "sandbox_readiness", None)
-    if readiness is None:
-        payload = {
-            "ready": False,
-            "mode": "auto",
-            "backend_name": "unknown",
-            "probe": {
-                "backend_name": "unknown",
-                "available": False,
-                "capabilities": {},
-                "reason": "readiness unavailable",
-            },
-            "profiles": {},
-            "skipped_capabilities": {"sandbox_readiness": "readiness unavailable"},
-            "unsafe_fallback_active": False,
-        }
-        return JSONResponse(payload, status_code=503)
-
-    workspace_root = getattr(request.app.state, "workspace_root", None)
-    public_readiness = _sanitize_public_readiness(
-        readiness,
-        workspace_root=workspace_root.resolve() if isinstance(workspace_root, Path) else workspace_root,
-    )
-    payload = public_readiness.model_dump(mode="json")
-    return JSONResponse(payload, status_code=200 if readiness.ready else 503)
+    return await readiness_response(request)
 
 
 @api.post("/approve")
@@ -1422,6 +1424,3 @@ app.mount("/assets", StaticFiles(directory=str(_STATIC_DIR / "assets")), name="a
 @app.get("/multiclaw.png")
 async def favicon():
     return FileResponse(_PNG_PATH, media_type="image/png")
-
-
-app.include_router(api)

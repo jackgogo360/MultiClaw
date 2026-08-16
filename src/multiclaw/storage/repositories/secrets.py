@@ -156,6 +156,39 @@ class SecretsRepository:
         )
         return {int(version): int(count) for version, count in result.all()}
 
+    async def list_metadata(self) -> list[SecretMetadata]:
+        result = await self._conn.execute(
+            select(user_secrets)
+            .where(user_secrets.c.tenant_id == self._context.tenant_id)
+            .order_by(user_secrets.c.updated_at.desc(), user_secrets.c.id.desc())
+        )
+        return [
+            SecretMetadata(
+                secret_id=str(row["id"]),
+                workspace_id=row["workspace_id"],
+                provider_kind=str(row["provider_kind"]),
+                provider_name=str(row["provider_name"]),
+                secret_name=str(row["secret_name"]),
+                masked_value=_mask_value(str(row["secret_name"])),
+                key_version=int(row["key_version"]),
+                created_at=int(row["created_at"]),
+                updated_at=int(row["updated_at"]),
+                rotated_at=int(row["rotated_at"]) if row["rotated_at"] is not None else None,
+            )
+            for row in result.mappings().all()
+        ]
+
+    async def delete(self, provider_kind: str, provider_name: str, secret_name: str) -> bool:
+        result = await self._conn.execute(
+            user_secrets.delete().where(
+                user_secrets.c.tenant_id == self._context.tenant_id,
+                user_secrets.c.provider_kind == provider_kind,
+                user_secrets.c.provider_name == provider_name,
+                user_secrets.c.secret_name == secret_name,
+            )
+        )
+        return bool(result.rowcount)
+
     async def compare_and_swap_rotation(
         self,
         secret_id: str,

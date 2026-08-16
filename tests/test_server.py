@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -47,6 +48,19 @@ from multiclaw.tools.shell import ShellToolBuilder
 from sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
 
 TEST_JWT_SIGNING_KEY = "test-jwt-signing-key-material-1234567890"
+
+
+def _keyring_payload() -> str:
+    return base64.b64encode(
+        json.dumps(
+            {
+                "active_key_version": 3,
+                "keys": {
+                    "3": base64.b64encode(bytes(range(32))).decode("ascii"),
+                },
+            }
+        ).encode("utf-8")
+    ).decode("ascii")
 
 
 class _RecordHandler(logging.Handler):
@@ -699,6 +713,7 @@ def test_health_ready_is_public_and_uses_app_state(tmp_path, monkeypatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_SECRETS_KEYRING_B64", _keyring_payload())
 
     import multiclaw.server as server_module
 
@@ -711,10 +726,11 @@ def test_health_ready_is_public_and_uses_app_state(tmp_path, monkeypatch):
     monkeypatch.setattr(server_module, "create_runtime_factory", lambda: factory)
 
     with TestClient(server_module.app) as client:
-        response = client.get("/health/ready")
+        response = client.get("/api/health/ready")
 
-        assert response.status_code == 200
-        assert response.json()["ready"] is True
+        assert response.status_code == 503
+        assert response.json()["ready"] is False
+        assert "schema_revision" in response.json()["checks_failed"]
         assert server_module.app.state.sandbox_readiness.ready is True
         assert server_module.app.state.sandbox_readiness is controller.finalize_readiness()
 
@@ -723,6 +739,7 @@ def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch,
     monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
     monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
     monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
+    monkeypatch.setenv("MULTICLAW_SECRETS_KEYRING_B64", _keyring_payload())
 
     import multiclaw.server as server_module
 
@@ -736,20 +753,20 @@ def test_health_ready_redacts_sensitive_readiness_details(tmp_path, monkeypatch,
 
     with caplog.at_level("INFO"):
         with TestClient(server_module.app) as client:
-            response = client.get("/health/ready")
+            response = client.get("/api/health/ready")
 
-        assert response.status_code == 503
-        assert response.json()["ready"] is False
-        assert server_module.app.state.sandbox_readiness.ready is False
-        assert str(tmp_path) not in response.text
-        assert str(tmp_path / "private-root") not in response.text
-        assert str(tmp_path / ".env.secret") not in response.text
-        assert "secret-dummy-value" not in response.text
-        assert "password-dummy-value" not in response.text
-        assert "bearer-dummy-value" not in response.text
-        assert "secret-dummy-value" not in caplog.text
-        assert "password-dummy-value" not in caplog.text
-        assert "bearer-dummy-value" not in caplog.text
+    assert response.status_code == 503
+    assert response.json()["ready"] is False
+    assert server_module.app.state.sandbox_readiness.ready is False
+    assert str(tmp_path) not in response.text
+    assert str(tmp_path / "private-root") not in response.text
+    assert str(tmp_path / ".env.secret") not in response.text
+    assert "secret-dummy-value" not in response.text
+    assert "password-dummy-value" not in response.text
+    assert "bearer-dummy-value" not in response.text
+    assert "secret-dummy-value" not in caplog.text
+    assert "password-dummy-value" not in caplog.text
+    assert "bearer-dummy-value" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -761,7 +778,7 @@ async def test_health_ready_reads_request_app_state_and_sanitizes_response(tmp_p
     controller = _LeakyUnavailableSandboxController(tmp_path)
     app.state.sandbox_readiness = controller.finalize_readiness()
     app.state.workspace_root = tmp_path
-    request = Request({"type": "http", "app": app, "method": "GET", "path": "/health/ready", "headers": []})
+    request = Request({"type": "http", "app": app, "method": "GET", "path": "/api/health/ready", "headers": []})
 
     response = await server_module.health_ready(request)
 
@@ -772,6 +789,16 @@ async def test_health_ready_reads_request_app_state_and_sanitizes_response(tmp_p
     assert "password-dummy-value" not in body
     assert "bearer-dummy-value" not in body
     assert app.state.sandbox_readiness is controller.finalize_readiness()
+
+
+def test_application_exposes_no_superadmin_or_break_glass_route(migrated_database):
+    from multiclaw.server import app
+
+    route_paths = {route.path for route in app.routes}
+
+    assert "/admin" not in route_paths
+    assert "/superadmin" not in route_paths
+    assert "/break-glass" not in route_paths
 
 
 @pytest.mark.parametrize(
