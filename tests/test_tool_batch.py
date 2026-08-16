@@ -389,3 +389,39 @@ async def test_unknown_tool_matches_agent_convention(
     assert outcomes[0].observation.content == "unknown tool: missing_tool"
     assert outcomes[1].observation.type == ObservationType.TOOL_RESULT
     assert outcomes[1].observation.content == "known"
+
+
+@pytest.mark.asyncio
+async def test_executor_stops_after_awaiting_approval_boundary(
+    tmp_path: Path,
+    registry: ToolRegistry,
+) -> None:
+    executed: list[str] = []
+
+    async def runner(params: ScriptedParams) -> ToolExecutionResult:
+        executed.append(params.label)
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    registry.register(
+        ScriptedToolBuilder("guarded_mutation", runner, tmp_path, read_only=False)
+    )
+    registry.register(
+        ScriptedToolBuilder("read_probe", runner, tmp_path, read_only=True)
+    )
+    guarded_scheduler = CoreToolScheduler(
+        permission_checker=PermissionChecker(guarded_tools={"guarded_mutation"}),
+        execution_guard=ExecutionGuard(timeout=1.0),
+        audit_logger=InMemoryAuditLogger(),
+        event_bus=EventBus(),
+    )
+    executor = _executor(registry, guarded_scheduler)
+
+    outcomes = await executor.execute(
+        [
+            ToolCallSpec(call_id="call-1", name="guarded_mutation", arguments={"label": "needs-approval"}),
+            ToolCallSpec(call_id="call-2", name="read_probe", arguments={"label": "must-not-run"}),
+        ]
+    )
+
+    assert [outcome.result.status for outcome in outcomes] == [ToolStatus.AWAITING_APPROVAL]
+    assert executed == []

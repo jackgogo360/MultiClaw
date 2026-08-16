@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from enum import StrEnum
 
 from multiclaw.memory import MemoryEntry
 from multiclaw.config import Settings
@@ -29,6 +30,19 @@ class PersistedToolResult:
     content: str
     tool_call_id: str
     tool_name: str
+
+
+class ContinuationState(StrEnum):
+    COMPLETED = "completed"
+    AWAITING_USER = "awaiting_user"
+    FAILED_TERMINAL = "failed_terminal"
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuationOutcome:
+    state: ContinuationState
+    assistant_content: str | None = None
+    detail: str = ""
 
 
 class WorkflowContinuationService:

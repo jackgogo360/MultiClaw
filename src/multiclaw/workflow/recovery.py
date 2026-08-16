@@ -18,6 +18,7 @@ from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.storage.schema import agent_runs, approval_requests
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.continuation import WorkflowContinuationService
+from multiclaw.workflow.continuation import ContinuationOutcome, ContinuationState
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     ApprovalStatus,
@@ -766,15 +767,6 @@ class RuntimeRecoveryContinuationService:
                         result_ref=result_payload.result_ref,
                         expected_digest=result_payload.result_digest,
                     )
-        result = callback(
-            context=context,
-            run_lease_handle=run_lease_handle,
-            workflow_continuation=continuation,
-            recovered_tool_result=recovered_tool_result,
-            recovered_tool_input_json=recovered_tool_input_json,
-        )
-        if inspect.isawaitable(result):
-            await result
         current_run = await WorkflowCoordinator(database, settings=settings).get_run(context)
         if current_run is not None and current_run.status is RunStatus.RESUMING:
             await run_lease_handle.refresh(
@@ -783,9 +775,45 @@ class RuntimeRecoveryContinuationService:
                     settings=settings,
                 ).transition_run(lease, RunStatus.RUNNING)
             )
-        await run_lease_handle.refresh(
-            lambda lease: WorkflowCoordinator(
-                database,
-                settings=settings,
-            ).finish_run_with_checkpoint(lease, RunStatus.COMPLETED)
-        )
+        try:
+            result = callback(
+                context=context,
+                run_lease_handle=run_lease_handle,
+                workflow_continuation=continuation,
+                recovered_tool_result=recovered_tool_result,
+                recovered_tool_input_json=recovered_tool_input_json,
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            if not isinstance(result, ContinuationOutcome):
+                raise RuntimeError("resume_recovery must return ContinuationOutcome")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await run_lease_handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    database,
+                    settings=settings,
+                ).finish_run_with_checkpoint(lease, RunStatus.FAILED_TERMINAL)
+            )
+            return
+
+        if result.state is ContinuationState.AWAITING_USER:
+            return
+
+        if result.state is ContinuationState.FAILED_TERMINAL:
+            await run_lease_handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    database,
+                    settings=settings,
+                ).finish_run_with_checkpoint(lease, RunStatus.FAILED_TERMINAL)
+            )
+            return
+
+        if result.state is ContinuationState.COMPLETED:
+            await run_lease_handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    database,
+                    settings=settings,
+                ).finish_run_with_checkpoint(lease, RunStatus.COMPLETED)
+            )

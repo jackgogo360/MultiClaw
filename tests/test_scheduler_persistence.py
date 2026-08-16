@@ -311,7 +311,10 @@ class _CompletionRouter:
 
     async def completion(self, **kwargs):
         self.calls.append(kwargs)
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def _real_runtime(
@@ -1154,6 +1157,166 @@ async def test_approved_tool_post_result_continues_model_with_persisted_result(
     run = await coordinator.get_run(context)
     assert run is not None
     assert run.status is RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_approved_tool_continuation_stops_at_new_awaiting_user_boundary(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-approved-awaiting")
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        await uow.memory.save(
+            __import__("multiclaw.memory", fromlist=["MemoryEntry"]).MemoryEntry(
+                content="resume into approval",
+                type="chat_message",
+                role="user",
+                session_id=context.session_id,
+                turn_index=1,
+            )
+        )
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-approved-awaiting")
+    scheduler = _scheduler(workflow_database)
+    executed = 0
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        nonlocal executed
+        executed += 1
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=f"tool:{params.label}")
+
+    result = await scheduler.run(
+        PersistedToolBuilder(
+            name="guarded_mutation",
+            runner=runner,
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        ),
+        {"label": "payload"},
+        context=context,
+        call_id="call-approved-awaiting",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+    await coordinator.decide_approval(
+        context,
+        result.data["approval_id"],
+        approved=True,
+        version=result.data["version"],
+    )
+
+    router = _CompletionRouter(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-followup",
+                        "name": "guarded_mutation",
+                        "arguments": {"label": "followup"},
+                    }
+                ],
+                reasoning_content="",
+            )
+        ]
+    )
+    runtime = _real_runtime(
+        database=workflow_database,
+        context=context,
+        router=router,
+        builders=[
+            PersistedToolBuilder(
+                name="guarded_mutation",
+                runner=runner,
+                recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+            )
+        ],
+    )
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    run = await coordinator.get_run(context)
+    assert run is not None
+    assert run.status is RunStatus.AWAITING_USER
+    approvals, executions = await _approval_and_execution_counts(workflow_database, context)
+    assert approvals == 2
+    assert executions == 2
+    latest = await _latest_execution_row(workflow_database, context)
+    assert latest["tool_call_id"] == "call-followup"
+    assert latest["execution_status"] == ExecutionStatus.NOT_STARTED.value
+    phases = await _checkpoint_phases(workflow_database, context)
+    assert "run_terminal" not in phases
+    assert executed == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_model_router_failure_marks_failed_terminal(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-resume-fail")
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        await uow.memory.save(
+            __import__("multiclaw.memory", fromlist=["MemoryEntry"]).MemoryEntry(
+                content="resume and fail",
+                type="chat_message",
+                role="user",
+                session_id=context.session_id,
+                turn_index=1,
+            )
+        )
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_run_with_checkpoint(context, "runtime-resume-fail")
+    await _expire_run_lease(workflow_database, context)
+
+    router = _CompletionRouter([RuntimeError("router failed")])
+    runtime = _real_runtime(database=workflow_database, context=context, router=router, builders=[])
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    await worker.run_once()
+
+    run = await coordinator.get_run(context)
+    assert run is not None
+    assert run.status is RunStatus.FAILED_TERMINAL
+
+
+@pytest.mark.asyncio
+async def test_resume_model_cancellation_does_not_false_terminalize(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-resume-cancel")
+    async with TenantUnitOfWork(workflow_database, context) as uow:
+        await uow.memory.save(
+            __import__("multiclaw.memory", fromlist=["MemoryEntry"]).MemoryEntry(
+                content="resume and cancel",
+                type="chat_message",
+                role="user",
+                session_id=context.session_id,
+                turn_index=1,
+            )
+        )
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_run_with_checkpoint(context, "runtime-resume-cancel")
+    await _expire_run_lease(workflow_database, context)
+
+    router = _CompletionRouter([asyncio.CancelledError()])
+    runtime = _real_runtime(database=workflow_database, context=context, router=router, builders=[])
+    worker = recovery_module.WorkflowRecoveryWorker(
+        database=workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        runtime_pool=_TrackingRuntimePool(runtime),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run_once()
+
+    run = await coordinator.get_run(context)
+    assert run is not None
+    assert run.status in {RunStatus.RUNNING, RunStatus.RESUMING}
+    phases = await _checkpoint_phases(workflow_database, context)
+    assert "run_terminal" not in phases
 
 
 @pytest.mark.asyncio
