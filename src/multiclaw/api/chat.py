@@ -452,7 +452,7 @@ async def chat(
                                     yield chunk
                                 for chunk in close_step():
                                     yield chunk
-                                yield enc.finish("stop")
+                                yield enc.finish("tool-calls")
                                 return
                             if fence_lost:
                                 continue

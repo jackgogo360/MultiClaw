@@ -43,6 +43,12 @@ export interface ApprovalRecord {
   resolved_at: number | null;
 }
 
+export interface PendingApprovalRecord extends ApprovalRecord {
+  tool_call_id: string;
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+}
+
 type ApiOptions = RequestInit & {
   basePath?: string;
   csrf?: boolean;
@@ -239,6 +245,8 @@ export const sessionApi = {
     }),
   del: (id: string) => request<{ ok: boolean }>(`/sessions/${id}`, { method: "DELETE" }),
   messages: (id: string) => request<Message[]>(`/sessions/${id}/messages`),
+  pendingApprovals: (id: string) =>
+    request<PendingApprovalRecord[]>(`/sessions/${id}/pending-approvals`),
 };
 
 export const secretApi = {

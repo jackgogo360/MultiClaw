@@ -39,12 +39,15 @@ from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
 from multiclaw.workflow.models import (
     CheckpointPhase,
+    ExecutionStatus,
     RecoveryAction,
     RecoveryOutcome,
+    RecoveryStrategy,
     RunLease,
     RunLeaseHandle,
     RunStatus,
 )
+from multiclaw.tools.base import ToolStatus
 from multiclaw.tools.code_exec import CodeExecToolBuilder
 from multiclaw.tools.shell import ShellToolBuilder
 from sandbox_fakes import ReadyRecordingSandboxController, UnavailableSandboxController
@@ -385,6 +388,116 @@ def test_session_lifecycle_endpoints(migrated_database):
     assert listed == []
     assert [session["id"] for session in all_sessions] == [created["id"]]
     assert restored["status"] == "active"
+
+
+def test_session_pending_approvals_are_hydratable_and_tenant_scoped(migrated_database):
+    from multiclaw.server import app
+    from multiclaw.workflow.coordinator import WorkflowCoordinator
+
+    async def seed_pending_approval(
+        *,
+        tenant_id: str,
+        workspace_id: str,
+        session_id: str,
+    ) -> tuple[str, int]:
+        context = TenantContext(tenant_id, workspace_id).for_run(session_id, str(uuid4()))
+        coordinator = WorkflowCoordinator(migrated_database, settings=app.state.settings)
+        lease = await coordinator.start_run_with_checkpoint(context, "runtime-approval-hydration")
+        approval_id = str(uuid4())
+        tool_call_id = "call-hydrate-approval"
+        approval = await coordinator.create_approval(
+            lease,
+            approval_id=approval_id,
+            tool_call_id=tool_call_id,
+            expires_at=lease.lease_expires_at + 60_000,
+        )
+        decoy_payload_json = json.dumps(
+            {"api_key": "decoy-must-not-hydrate"},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        decoy = await coordinator.create_execution(
+            lease,
+            execution_id=str(uuid4()),
+            approval_id=approval_id,
+            tool_call_id="call-decoy",
+            tool_name="should_not_hydrate",
+            tool_kind="native",
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+            idempotency_key=None,
+            input_payload_json=decoy_payload_json,
+            input_hash=hashlib.sha256(decoy_payload_json.encode()).hexdigest(),
+            status=ExecutionStatus.SUCCEEDED,
+        )
+        assert decoy is not None
+        input_payload_json = json.dumps(
+            {
+                "file_path": "/tmp/private/approval.txt",
+                "api_key": "must-not-leak",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        execution = await coordinator.create_execution(
+            lease,
+            execution_id=str(uuid4()),
+            approval_id=approval_id,
+            tool_call_id=tool_call_id,
+            tool_name="edit_file",
+            tool_kind="native",
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+            idempotency_key=None,
+            input_payload_json=input_payload_json,
+            input_hash=hashlib.sha256(input_payload_json.encode()).hexdigest(),
+            status=ExecutionStatus.NOT_STARTED,
+        )
+        assert execution is not None
+        return approval_id, approval.expires_at
+
+    with TestClient(app) as client:
+        client.cookies = _make_auth_cookie(app, migrated_database, email="approval-owner@example.com")
+        me = client.get("/api/auth/me").json()
+        session = client.post("/api/sessions", json={"title": "Pending approval"}).json()
+        async def workspace_id_for_user() -> str:
+            async with AuthUnitOfWork(migrated_database) as uow:
+                user = await uow.users.get_by_id(me["user_id"])
+                assert user is not None
+                assert user.default_workspace_id is not None
+                return user.default_workspace_id
+
+        workspace_id = asyncio.run(workspace_id_for_user())
+        approval_id, approval_expires_at = asyncio.run(
+            seed_pending_approval(
+                tenant_id=me["user_id"],
+                workspace_id=workspace_id,
+                session_id=session["id"],
+            )
+        )
+
+        response = client.get(f"/api/sessions/{session['id']}/pending-approvals")
+
+        client.cookies = _make_auth_cookie(app, migrated_database, email="approval-foreign@example.com")
+        foreign_response = client.get(f"/api/sessions/{session['id']}/pending-approvals")
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "approval_id": approval_id,
+            "status": "awaiting_user",
+            "version": 1,
+            "expires_at": approval_expires_at,
+            "resolved_at": None,
+            "tool_call_id": "call-hydrate-approval",
+            "tool_name": "edit_file",
+            "tool_input": {
+                "file_path": "[REDACTED PATH]",
+                "api_key": "[REDACTED]",
+            },
+        }
+    ]
+    assert "must-not-leak" not in response.text
+    assert foreign_response.status_code == 404
+    assert foreign_response.json() == {"detail": "session not found"}
 
 
 def test_chat_without_session_emits_session_event(migrated_database):
@@ -3496,6 +3609,7 @@ async def test_chat_forced_summary_persists_assistant_output_and_model_checkpoin
                         call_id="call-1",
                         name="web_search",
                         observation=SimpleNamespace(content="tool result"),
+                        result=SimpleNamespace(status=ToolStatus.SUCCESS),
                     )
                 ]
             )
@@ -3620,7 +3734,12 @@ async def test_chat_stream_awaiting_approval_finishes_without_terminal_completio
     assert not any(payload["type"] == "tool-output-available" for payload in payloads)
     assert not any(payload["type"] == "tool-output-error" for payload in payloads)
     assert not any(payload["type"] == "error" for payload in payloads)
-    assert any(payload["type"] == "finish" for payload in payloads)
+    finish_payload = next(payload for payload in payloads if payload["type"] == "finish")
+    assert finish_payload["finishReason"] == "tool-calls"
+    event_types = [payload["type"] for payload in payloads]
+    assert event_types.index("tool-input-available") < event_types.index("tool-approval-request")
+    assert event_types.index("tool-approval-request") < event_types.index("finish-step")
+    assert event_types.index("finish-step") < event_types.index("finish")
     assert await _assistant_chat_messages(migrated_database, run_context) == []
     assert await _run_status(migrated_database, run_context) == RunStatus.AWAITING_USER.value
     assert CheckpointPhase.AWAITING_APPROVAL.value in [row["phase"] for row in checkpoints]
@@ -3741,6 +3860,7 @@ async def test_chat_forced_summary_checkpoint_failure_rolls_back_assistant_messa
                         call_id="call-1",
                         name="web_search",
                         observation=SimpleNamespace(content="tool result"),
+                        result=SimpleNamespace(status=ToolStatus.SUCCESS),
                     )
                 ]
             )

@@ -29,6 +29,13 @@ export function ApprovalToolUI({
   const [error, setError] = useState<string | null>(null);
   const [isReloading, setIsReloading] = useState(false);
 
+  const loadApproval = async (): Promise<ApprovalRecord> => {
+    if (!approvalId) {
+      throw new Error("Approval request id is missing.");
+    }
+    return approveApi.getApproval(approvalId);
+  };
+
   const handleReloadApproval = async () => {
     if (!approvalId) {
       setError("Approval request id is missing.");
@@ -37,7 +44,7 @@ export function ApprovalToolUI({
 
     setIsReloading(true);
     try {
-      const next = await approveApi.getApproval(approvalId);
+      const next = await loadApproval();
       setApproval(next);
       setError(null);
     } catch (nextError) {
@@ -79,24 +86,28 @@ export function ApprovalToolUI({
 
     setBusy(true);
     setError(null);
+    let currentApproval = approval;
     try {
-      const current = approval ?? (await approveApi.getApproval(approvalId));
-      const result = await approveApi.submit(approvalId, approved, current.version);
+      currentApproval ??= await loadApproval();
+      const result = await approveApi.submit(
+        approvalId,
+        approved,
+        currentApproval.version,
+      );
       setApproval(result);
       respondToApproval?.({ approved });
     } catch (nextError) {
       if (nextError instanceof ApiError && nextError.status === 409) {
         try {
-          await handleReloadApproval();
+          const refreshed = await loadApproval();
+          setApproval(refreshed);
           setError("Approval state changed on the server. Refreshed latest status.");
         } catch (refreshError) {
           setError(formatError(refreshError));
         }
       } else if (nextError instanceof ApiError && nextError.status === 410) {
-        setApproval((current) =>
-          current
-            ? { ...current, status: "expired" }
-            : null,
+        setApproval(
+          currentApproval ? { ...currentApproval, status: "expired" } : null,
         );
         setError("This approval expired before your decision could be recorded.");
       } else {

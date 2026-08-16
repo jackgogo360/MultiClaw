@@ -1,12 +1,17 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import and_, delete, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from multiclaw.session.models import ChatSession, InvalidSessionTitleError, SessionStatus
 from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
-from multiclaw.storage.schema import chat_sessions, memory_entries
+from multiclaw.storage.schema import (
+    approval_requests,
+    chat_sessions,
+    memory_entries,
+    tool_executions,
+)
 from multiclaw.tenancy.context import TenantContext
 
 
@@ -177,6 +182,44 @@ class SessionRepository:
             }
             for row in rows
         ]
+
+    async def list_pending_approvals(self, session_id: str) -> list[dict[str, object]]:
+        result = await self._conn.execute(
+            select(
+                approval_requests.c.approval_id,
+                approval_requests.c.approval_status,
+                approval_requests.c.version,
+                approval_requests.c.expires_at,
+                approval_requests.c.resolved_at,
+                approval_requests.c.tool_call_id,
+                tool_executions.c.tool_name,
+                tool_executions.c.input_payload_json,
+            )
+            .select_from(
+                approval_requests.join(
+                    tool_executions,
+                    and_(
+                        tool_executions.c.tenant_id == approval_requests.c.tenant_id,
+                        tool_executions.c.workspace_id == approval_requests.c.workspace_id,
+                        tool_executions.c.session_id == approval_requests.c.session_id,
+                        tool_executions.c.run_id == approval_requests.c.run_id,
+                        tool_executions.c.approval_id == approval_requests.c.approval_id,
+                        tool_executions.c.tool_call_id == approval_requests.c.tool_call_id,
+                    ),
+                )
+            )
+            .where(
+                approval_requests.c.tenant_id == self._context.tenant_id,
+                approval_requests.c.workspace_id == self._context.workspace_id,
+                approval_requests.c.session_id == session_id,
+                approval_requests.c.approval_status == "awaiting_user",
+            )
+            .order_by(
+                approval_requests.c.requested_at.asc(),
+                approval_requests.c.approval_id.asc(),
+            )
+        )
+        return [dict(row) for row in result.mappings().all()]
 
     async def touch_message(self, session_id: str, content: str) -> ChatSession | None:
         current = await self.get(session_id)
