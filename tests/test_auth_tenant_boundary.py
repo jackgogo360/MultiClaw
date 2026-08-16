@@ -750,7 +750,7 @@ def test_account_deletion_boundary_recent_auth_and_active_run_contracts(
     client: TestClient,
     migrated_database: Database,
 ):
-    identity = asyncio.run(
+    boundary_identity = asyncio.run(
         _seed_identity(
             migrated_database,
             TEST_JWT_SIGNING_KEY,
@@ -760,17 +760,24 @@ def test_account_deletion_boundary_recent_auth_and_active_run_contracts(
     now_seconds = asyncio.run(_db_now_seconds(migrated_database))
     boundary_cookie = _make_cookie(
         TEST_JWT_SIGNING_KEY,
-        user_id=identity.tenant_id,
-        email=identity.email,
-        auth_epoch=identity.auth_epoch,
+        user_id=boundary_identity.tenant_id,
+        email=boundary_identity.email,
+        auth_epoch=boundary_identity.auth_epoch,
         issued_at=now_seconds - 300,
         expires_at=now_seconds + 3600,
     )
+    stale_identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="stale-delete@example.com",
+        )
+    )
     stale_cookie = _make_cookie(
         TEST_JWT_SIGNING_KEY,
-        user_id=identity.tenant_id,
-        email=identity.email,
-        auth_epoch=identity.auth_epoch,
+        user_id=stale_identity.tenant_id,
+        email=stale_identity.email,
+        auth_epoch=stale_identity.auth_epoch,
         issued_at=now_seconds - 301,
         expires_at=now_seconds + 3600,
     )
@@ -891,6 +898,26 @@ def test_deletion_request_clears_normal_cookie_and_old_jwt_keeps_pending_semanti
     )
     assert blocked.status_code == 403
     assert blocked.json() == {"detail": "Account pending deletion"}
+
+
+def test_deletion_request_rejects_reusing_same_old_normal_cookie(
+    client: TestClient,
+    migrated_database: Database,
+):
+    identity = asyncio.run(
+        _seed_identity(
+            migrated_database,
+            TEST_JWT_SIGNING_KEY,
+            email="old-cookie-reuse@example.com",
+        )
+    )
+
+    first = client.post("/api/account/deletion", cookies=identity.cookie)
+    second = client.post("/api/account/deletion", cookies=identity.cookie)
+
+    assert first.status_code == 200
+    assert second.status_code in {401, 403}
+    assert second.status_code != 200
 
 
 def test_deletion_recovery_verify_sets_recovery_cookie_without_normal_session(
