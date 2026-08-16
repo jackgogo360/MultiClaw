@@ -48,6 +48,9 @@ class BaseTransport(abc.ABC):
     async def disconnect(self) -> None:
         ...
 
+    def scrub_sensitive_state(self) -> None:
+        return None
+
     async def __aenter__(self) -> "BaseTransport":
         return await self.connect()
 

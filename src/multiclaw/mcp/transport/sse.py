@@ -38,3 +38,6 @@ class SSETransport(BaseTransport):
                 self._context = None
         self._clear_streams()
         logger.debug("SSE transport disconnected")
+
+    def scrub_sensitive_state(self) -> None:
+        self._headers.clear()

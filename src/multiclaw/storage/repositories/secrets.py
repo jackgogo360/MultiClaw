@@ -221,3 +221,14 @@ class SecretsRepository:
             updated_at=int(row["updated_at"]),
             rotated_at=int(row["rotated_at"]) if row["rotated_at"] is not None else None,
         )
+
+
+@dataclass(slots=True)
+class DeploymentSecretUsageRepository:
+    _conn: AsyncConnection
+
+    async def count_key_versions_global(self) -> dict[int, int]:
+        result = await self._conn.execute(
+            select(user_secrets.c.key_version, func.count()).group_by(user_secrets.c.key_version)
+        )
+        return {int(version): int(count) for version, count in result.all()}
