@@ -130,8 +130,8 @@ from multiclaw.api.sessions import router as sessions_router
 from multiclaw.observability import (
     OperationalMetrics,
     TraceEventSink,
-    bind_observability,
     increment_metric,
+    observability_scope,
     observe_database_error,
     record_trace_event,
 )
@@ -140,6 +140,7 @@ from multiclaw.deletion.service import DeletionService
 from multiclaw.deletion.worker import DeletionWorker
 from multiclaw.secrets.keyring import DeploymentKeyring, SecretKeyringError
 from multiclaw.secrets.resolver import SecretResolver
+from multiclaw.secrets.validation import SecretCredentialTester
 
 
 # ---------------------------------------------------------------------------
@@ -542,12 +543,16 @@ async def lifespan(app: FastAPI):
         app.state.settings = runtime_factory.settings
         app.state.operational_metrics = OperationalMetrics()
         app.state.trace_sink = TraceEventSink()
-        bind_observability(
-            metrics=app.state.operational_metrics,
-            trace_sink=app.state.trace_sink,
-        )
         app.state.secret_resolver = getattr(runtime_factory, "secret_resolver", None)
         app.state.secret_keyring = getattr(app.state.secret_resolver, "_keyring", None)
+        app.state.secret_credential_tester = (
+            SecretCredentialTester(
+                resolver=app.state.secret_resolver,
+                settings=runtime_factory.settings,
+            )
+            if app.state.secret_resolver is not None
+            else None
+        )
         app.state.sandbox_readiness = readiness
         app.state.workspace_root = runtime_factory.workspace_resolver.root
         app.state.sandbox_startup_events = startup_events
@@ -573,23 +578,27 @@ async def lifespan(app: FastAPI):
             auth_cleanup_stop = asyncio.Event()
 
             async def recovery_loop() -> None:
-                worker = WorkflowRecoveryWorker(
-                    database=runtime_factory.database,
-                    settings=runtime_factory.settings,
-                    runtime_pool=runtime_pool,
-                )
-                workflow_settings = getattr(runtime_factory.settings, "workflow", None)
-                heartbeat_ms = getattr(workflow_settings, "heartbeat_ms", 1_000)
-                interval_seconds = max(
-                    1.0,
-                    heartbeat_ms / 1000,
-                )
-                while not recovery_stop.is_set():
-                    await worker.run_once()
-                    try:
-                        await asyncio.wait_for(recovery_stop.wait(), timeout=interval_seconds)
-                    except asyncio.TimeoutError:
-                        continue
+                async with observability_scope(
+                    metrics=app.state.operational_metrics,
+                    trace_sink=app.state.trace_sink,
+                ):
+                    worker = WorkflowRecoveryWorker(
+                        database=runtime_factory.database,
+                        settings=runtime_factory.settings,
+                        runtime_pool=runtime_pool,
+                    )
+                    workflow_settings = getattr(runtime_factory.settings, "workflow", None)
+                    heartbeat_ms = getattr(workflow_settings, "heartbeat_ms", 1_000)
+                    interval_seconds = max(
+                        1.0,
+                        heartbeat_ms / 1000,
+                    )
+                    while not recovery_stop.is_set():
+                        await worker.run_once()
+                        try:
+                            await asyncio.wait_for(recovery_stop.wait(), timeout=interval_seconds)
+                        except asyncio.TimeoutError:
+                            continue
 
             recovery_task = asyncio.create_task(recovery_loop())
             if getattr(readiness, "ready", True):
@@ -602,13 +611,17 @@ async def lifespan(app: FastAPI):
                 )
 
             async def auth_cleanup_loop() -> None:
-                worker = AuthCleanupWorker(runtime_factory.database)
-                while not auth_cleanup_stop.is_set():
-                    await worker.run_once()
-                    try:
-                        await asyncio.wait_for(auth_cleanup_stop.wait(), timeout=60.0)
-                    except asyncio.TimeoutError:
-                        continue
+                async with observability_scope(
+                    metrics=app.state.operational_metrics,
+                    trace_sink=app.state.trace_sink,
+                ):
+                    worker = AuthCleanupWorker(runtime_factory.database)
+                    while not auth_cleanup_stop.is_set():
+                        await worker.run_once()
+                        try:
+                            await asyncio.wait_for(auth_cleanup_stop.wait(), timeout=60.0)
+                        except asyncio.TimeoutError:
+                            continue
 
             auth_cleanup_task = asyncio.create_task(auth_cleanup_loop())
     except BaseException as primary:
@@ -766,32 +779,36 @@ async def handle_runtime_unavailable_error(
 
 @app.middleware("http")
 async def log_http_requests(request, call_next):
-    started = perf_counter()
-    request.state.request_started_at_ms = int(time() * 1000)
-    try:
-        response = await call_next(request)
-    except Exception as error:
+    async with observability_scope(
+        metrics=getattr(request.app.state, "operational_metrics", None),
+        trace_sink=getattr(request.app.state, "trace_sink", None),
+    ):
+        started = perf_counter()
+        request.state.request_started_at_ms = int(time() * 1000)
+        try:
+            response = await call_next(request)
+        except Exception as error:
+            duration_ms = (perf_counter() - started) * 1000
+            database = getattr(request.app.state, "database", None)
+            backend = getattr(getattr(database, "dialect", None), "name", "unknown")
+            observe_database_error(error, backend=backend, operation=request.url.path)
+            logger.exception(
+                "HTTP %s %s -> 500 (%.1fms)",
+                request.method,
+                request.url.path,
+                duration_ms,
+            )
+            raise
+
         duration_ms = (perf_counter() - started) * 1000
-        database = getattr(request.app.state, "database", None)
-        backend = getattr(getattr(database, "dialect", None), "name", "unknown")
-        observe_database_error(error, backend=backend, operation=request.url.path)
-        logger.exception(
-            "HTTP %s %s -> 500 (%.1fms)",
+        logger.info(
+            "HTTP %s %s -> %d (%.1fms)",
             request.method,
             request.url.path,
+            response.status_code,
             duration_ms,
         )
-        raise
-
-    duration_ms = (perf_counter() - started) * 1000
-    logger.info(
-        "HTTP %s %s -> %d (%.1fms)",
-        request.method,
-        request.url.path,
-        response.status_code,
-        duration_ms,
-    )
-    return response
+        return response
 
 
 # ---------------------------------------------------------------------------

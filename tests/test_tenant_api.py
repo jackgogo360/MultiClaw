@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import jwt
@@ -364,6 +366,9 @@ def test_secret_api_only_returns_metadata_and_requires_recent_reauth(migrated_da
 
     with TestClient(server.app) as client:
         client.cookies = fresh.cookie
+        client.app.state.secret_credential_tester = SimpleNamespace(
+            validate=AsyncMock(return_value=SimpleNamespace(ok=True))
+        )
         listed = client.get("/api/secrets")
         stored = client.put(
             "/api/secrets/llm:openai/secondary_key",
@@ -373,6 +378,9 @@ def test_secret_api_only_returns_metadata_and_requires_recent_reauth(migrated_da
 
     with TestClient(server.app) as client:
         client.cookies = stale.cookie
+        client.app.state.secret_credential_tester = SimpleNamespace(
+            validate=AsyncMock(return_value=SimpleNamespace(ok=True))
+        )
         stale_put = client.put(
             "/api/secrets/llm:openai/api_key",
             json={"value": "new-plain-secret"},
@@ -407,6 +415,34 @@ def test_secret_api_only_returns_metadata_and_requires_recent_reauth(migrated_da
     assert stale_put.status_code == 401
     assert stale_delete.status_code == 401
     assert stale_test.status_code == 401
+
+
+def test_secret_test_route_maps_invalid_credentials_and_unsupported_provider(migrated_database: Database):
+    import multiclaw.server as server
+    from multiclaw.secrets.validation import (
+        InvalidSecretCredentialsError,
+        UnsupportedSecretValidationTargetError,
+    )
+
+    identity = asyncio.run(_seed_identity(migrated_database, email="validator-route@example.com"))
+
+    async def invalid_validate(*args, **kwargs):
+        raise InvalidSecretCredentialsError("bad")
+
+    async def unsupported_validate(*args, **kwargs):
+        raise UnsupportedSecretValidationTargetError("bad")
+
+    with TestClient(server.app) as client:
+        client.cookies = identity.cookie
+        client.app.state.secret_credential_tester = SimpleNamespace(validate=invalid_validate)
+        invalid = client.post("/api/secrets/llm:openai/api_key/test")
+        client.app.state.secret_credential_tester = SimpleNamespace(validate=unsupported_validate)
+        unsupported = client.post("/api/secrets/mcp:demo/api_key/test")
+
+    assert invalid.status_code == 422
+    assert invalid.json() == {"detail": "invalid secret credentials"}
+    assert unsupported.status_code == 422
+    assert unsupported.json() == {"detail": "unsupported secret validation target"}
 
 
 def test_secret_api_is_tenant_scoped(migrated_database: Database):

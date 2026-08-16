@@ -11,7 +11,7 @@ from starlette.requests import Request
 
 from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings
-from multiclaw.observability import OperationalMetrics, TraceEventSink, bind_observability
+from multiclaw.observability import OperationalMetrics, TraceEventSink, observability_scope
 from multiclaw.storage import Database
 from multiclaw.storage.uow import AuthUnitOfWork
 
@@ -171,9 +171,10 @@ async def test_log_http_requests_records_sqlite_busy_metric():
 
     metrics = OperationalMetrics()
     trace_sink = TraceEventSink()
-    bind_observability(metrics=metrics, trace_sink=trace_sink)
     app = FastAPI()
     app.state.database = type("Database", (), {"dialect": type("Dialect", (), {"name": "sqlite"})()})()
+    app.state.operational_metrics = metrics
+    app.state.trace_sink = trace_sink
     request = Request({"type": "http", "app": app, "method": "GET", "path": "/busy", "headers": []})
 
     async def fail(_request):
@@ -191,9 +192,10 @@ async def test_log_http_requests_records_mysql_lock_timeout_metric():
 
     metrics = OperationalMetrics()
     trace_sink = TraceEventSink()
-    bind_observability(metrics=metrics, trace_sink=trace_sink)
     app = FastAPI()
     app.state.database = type("Database", (), {"dialect": type("Dialect", (), {"name": "mysql"})()})()
+    app.state.operational_metrics = metrics
+    app.state.trace_sink = trace_sink
     request = Request({"type": "http", "app": app, "method": "GET", "path": "/lock-timeout", "headers": []})
 
     async def fail(_request):

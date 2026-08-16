@@ -1,16 +1,24 @@
 from __future__ import annotations
 
-import os
 import re
-import tempfile
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Any
 
 
 REDACTED = "[REDACTED]"
 BINARY_REDACTED = "[BINARY REDACTED]"
 REDACTED_PATH = "[REDACTED PATH]"
+CIRCULAR = "[CIRCULAR]"
+_TRACE_FORBIDDEN_KEYS = {
+    "tenant_id",
+    "workspace_id",
+    "session_id",
+    "run_id",
+    "request_id",
+    "email",
+    "provider_name",
+    "path",
+}
 _SECRET_KEY_RE = re.compile(
     r"(?i)(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
 )
@@ -26,34 +34,63 @@ _STRING_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(sk|ghp)_[A-Za-z0-9_\-]+\b"), REDACTED),
 )
 _PATH_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?:(?:[A-Za-z]:)?[\\/][^\s]+)+"),
-)
-_PRIVATE_PATH_MARKERS = (
-    str(Path.home()),
-    tempfile.gettempdir(),
-    "/private/",
-    "/tmp/",
-    "\\Users\\",
-    "\\Temp\\",
+    re.compile(r"(?<![A-Za-z0-9:.])/(?!/)[^\s,;\"']+"),
+    re.compile(r"(?<![A-Za-z0-9])\.\.?/[^\s,;\"']+"),
+    re.compile(r"\b[A-Za-z]:\\[^\s,;\"']+"),
+    re.compile(r"(?<![A-Za-z0-9])\\\\[^\s,;\"']+"),
 )
 
 
 def redact(value: Any) -> Any:
+    return _redact(value, seen=set())
+
+
+def _redact(value: Any, *, seen: set[int]) -> Any:
     if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            return CIRCULAR
+        seen.add(identity)
         redacted: dict[str, Any] = {}
-        for key, item in value.items():
-            key_text = str(key)
-            if _SECRET_KEY_RE.search(key_text):
-                redacted[key_text] = REDACTED
-            else:
-                redacted[key_text] = redact(item)
-        return redacted
+        try:
+            for key, item in value.items():
+                key_text = str(key)
+                if _SECRET_KEY_RE.search(key_text):
+                    redacted[key_text] = REDACTED
+                else:
+                    redacted[key_text] = _redact(item, seen=seen)
+            return redacted
+        finally:
+            seen.remove(identity)
     if isinstance(value, list):
-        return [redact(item) for item in value]
+        identity = id(value)
+        if identity in seen:
+            return CIRCULAR
+        seen.add(identity)
+        try:
+            return [_redact(item, seen=seen) for item in value]
+        finally:
+            seen.remove(identity)
     if isinstance(value, tuple):
+        identity = id(value)
+        if identity in seen:
+            return CIRCULAR
         if len(value) == 2 and isinstance(value[0], str) and _SECRET_KEY_RE.search(value[0]):
             return (value[0], REDACTED)
-        return tuple(redact(item) for item in value)
+        seen.add(identity)
+        try:
+            return tuple(_redact(item, seen=seen) for item in value)
+        finally:
+            seen.remove(identity)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, memoryview)):
+        identity = id(value)
+        if identity in seen:
+            return CIRCULAR
+        seen.add(identity)
+        try:
+            return [_redact(item, seen=seen) for item in value]
+        finally:
+            seen.remove(identity)
     if isinstance(value, (bytes, bytearray, memoryview)):
         return BINARY_REDACTED
     if isinstance(value, str):
@@ -76,14 +113,28 @@ def public_error_message(exc: BaseException) -> str:
 
 
 def redact_trace_attributes(attributes: Mapping[str, Any]) -> dict[str, Any]:
-    return {str(key): redact(value) for key, value in attributes.items()}
+    sanitized: dict[str, Any] = {}
+    for key, value in attributes.items():
+        key_text = str(key)
+        if key_text in _TRACE_FORBIDDEN_KEYS or _SECRET_KEY_RE.search(key_text):
+            sanitized[key_text] = REDACTED
+        else:
+            sanitized[key_text] = redact(value)
+    return sanitized
 
 
 def _redact_string(value: str) -> str:
     result = value
     for pattern, replacement in _STRING_PATTERNS:
         result = pattern.sub(replacement, result)
-    if any(marker in result for marker in _PRIVATE_PATH_MARKERS) or "/." in result or "\\." in result:
-        for pattern in _PATH_PATTERNS:
-            result = pattern.sub(REDACTED_PATH, result)
+    for pattern in _PATH_PATTERNS:
+        result = pattern.sub(lambda match: _replace_path_match(match, result), result)
     return result
+
+
+def _replace_path_match(match: re.Match[str], source: str) -> str:
+    if match.start() >= 3 and source[match.start() - 3 : match.start()] == "://":
+        return match.group(0)
+    if match.start() >= 2 and source[match.start() - 1] == "/" and source[match.start() - 2] == ":":
+        return match.group(0)
+    return REDACTED_PATH
