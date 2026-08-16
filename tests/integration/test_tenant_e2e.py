@@ -554,19 +554,17 @@ async def _collect_secret_metrics(
         ),
     )
 
-    unexpected_platform_resolutions = 0
     try:
         resolved = await resolver.resolve(alpha_base_context, "llm", "openai", invalid_secret_name)
     except UserSecretInvalidError:
         resolved = None
     else:
-        unexpected_platform_resolutions += int(resolved.source == "platform")
         resolved.close()
 
     assert resolved is None
     return {
         "cross_tenant_secret_reads": cross_tenant_secret_reads,
-        "platform_fallback_calls": len(platform_lookup_calls) + unexpected_platform_resolutions,
+        "platform_fallback_calls": len(platform_lookup_calls),
     }
 
 
