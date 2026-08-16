@@ -13,6 +13,11 @@ from multiclaw.storage.repositories.auth import (
     VerificationCodeRepository,
     WorkspaceRepository,
 )
+from multiclaw.storage.repositories.deletions import (
+    DeletionJobRepository,
+    DeletionUserRepository,
+    DeletionWorkflowRepository,
+)
 from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.repositories.secrets import SecretsRepository
 from multiclaw.storage.repositories.sessions import SessionRepository
@@ -199,3 +204,25 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
             self._workflow_settings.heartbeat_ms,
             self._workflow_settings.lease_ttl_ms,
         )
+
+
+class DeletionUnitOfWork(_BaseUnitOfWork["DeletionUnitOfWork"]):
+    users: DeletionUserRepository
+    deletions: DeletionJobRepository
+    workflow: DeletionWorkflowRepository
+
+    def __init__(
+        self,
+        database: Database,
+        tenant_id: str,
+        *,
+        read_only: bool = False,
+    ) -> None:
+        super().__init__(database, read_only=read_only)
+        self._tenant_id = tenant_id
+
+    def _bind_repositories(self) -> None:
+        assert self.conn is not None
+        self.users = DeletionUserRepository(self.conn, self._database.dialect, self._tenant_id)
+        self.deletions = DeletionJobRepository(self.conn, self._database.dialect, self._tenant_id)
+        self.workflow = DeletionWorkflowRepository(self.conn, self._database.dialect, self._tenant_id)
