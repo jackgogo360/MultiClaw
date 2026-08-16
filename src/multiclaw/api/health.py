@@ -74,6 +74,8 @@ async def _build_readiness_payload(request: Request) -> dict[str, Any]:
                     failed.append("mysql_isolation")
                 if not await _mysql_innodb_ok(conn):
                     failed.append("mysql_innodb")
+                if not await _mysql_charset_ok(conn):
+                    failed.append("mysql_charset")
                 if not await _mysql_schema_integrity_ok(conn):
                     failed.append("schema_integrity")
 
@@ -180,6 +182,27 @@ async def _mysql_schema_integrity_ok(conn) -> bool:
         )
     )
     return len(constraints.mappings().all()) >= 1
+
+
+async def _mysql_charset_ok(conn) -> bool:
+    database_charset = str(await conn.scalar(text("SELECT @@character_set_database")) or "").lower()
+    if database_charset != "utf8mb4":
+        return False
+
+    result = await conn.execute(
+        text(
+            """
+            SELECT table_name, table_collation
+            FROM information_schema.tables
+            WHERE table_schema = DATABASE()
+              AND table_type = 'BASE TABLE'
+            """
+        )
+    )
+    rows = result.mappings().all()
+    if not rows:
+        return False
+    return all(str(row["table_collation"] or "").lower().startswith("utf8mb4") for row in rows)
 
 
 async def _has_active_default_workspace_integrity_failure(conn) -> bool:
