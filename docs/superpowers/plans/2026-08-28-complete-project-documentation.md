@@ -299,7 +299,7 @@ State cookie, Origin, double-submit CSRF, tenant-scope and error-shape rules. Li
 ```bash
 uv run pytest tests/test_documentation.py -q
 uv run python scripts/check_docs.py
-rg -n '`/health/(live|ready)`|aiosqlite\.connect|SqliteRepository|database\.path' README.md docs frontend/README.md
+rg -n '`/health/(live|ready)`|aiosqlite\.connect|SqliteRepository|database\.path' README.md docs/*.md frontend/README.md
 ```
 
 Expected: documentation tests and checker pass except for remaining operations documents; the legacy scan returns no matches.
@@ -362,7 +362,7 @@ Each item uses “症状 / 常见原因 / 检查 / 处理” and never recommend
 ```bash
 uv run pytest tests/test_documentation.py -q
 uv run python scripts/check_docs.py
-rg -n 'xkeysib-[A-Za-z0-9_-]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|Bearer [A-Za-z0-9._-]{20,}' README.md CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md CHANGELOG.md docs frontend/README.md
+rg -n 'xkeysib-[A-Za-z0-9_-]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|Bearer [A-Za-z0-9._-]{20,}' README.md CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md CHANGELOG.md docs/*.md frontend/README.md
 ```
 
 Expected: tests and checker pass; secret scan returns no matches.
@@ -511,9 +511,9 @@ Expected: install, audit, lint and build exit `0`; rebuilding static assets leav
 - [ ] **Step 6: Run final repository scans**
 
 ```bash
-rg -n 'TO''DO|TB''D|FI''XME|待''定|待''确认' README.md CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md CHANGELOG.md docs frontend/README.md scripts/check_docs.py tests/test_documentation.py
-rg -n '`/health/(live|ready)`|aiosqlite\.connect|SqliteRepository|database\.path' README.md docs frontend/README.md
-rg -n 'xkeysib-[A-Za-z0-9_-]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|Bearer [A-Za-z0-9._-]{20,}' README.md CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md CHANGELOG.md docs frontend/README.md
+rg -n 'TO''DO|TB''D|FI''XME|待''定|待''确认' README.md CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md CHANGELOG.md docs/*.md frontend/README.md
+rg -n '`/health/(live|ready)`|aiosqlite\.connect|SqliteRepository|database\.path' README.md docs/*.md frontend/README.md
+rg -n 'xkeysib-[A-Za-z0-9_-]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|Bearer [A-Za-z0-9._-]{20,}' README.md CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md CHANGELOG.md docs/*.md frontend/README.md
 git hash-object alembic/versions/20260815_0001_multi_tenant_baseline.py
 git status --short
 ```
