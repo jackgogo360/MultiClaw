@@ -140,6 +140,7 @@ class ToolInfo:
 class ToolCallResult:
     content: list[dict[str, Any]]
     is_error: bool = False
+    external_request_id: str | None = None
 
 
 @dataclass

@@ -5,15 +5,17 @@ from types import SimpleNamespace
 
 from pydantic import BaseModel
 
+from multiclaw.agent.base import BaseAgent
 from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.agent.tool_batch import ToolBatchExecutor
 from multiclaw.config import Settings
 from multiclaw.context import ContextBuildReport, ContextBuildResult
-from multiclaw.events import EventBus
+from multiclaw.events import AgentState, AgentStateEvent, EventBus
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.llm import LLMResponse, ModelRouter, ToolCall
-from multiclaw.memory import InMemoryMemory
+from multiclaw.memory import MemoryEntry
 from multiclaw.planner import Planner
+from multiclaw.tenancy.context import TenantContext
 from multiclaw.tools import (
     CoreToolScheduler,
     ToolBuilder,
@@ -22,6 +24,111 @@ from multiclaw.tools import (
     ToolRegistry,
     ToolStatus,
 )
+from multiclaw.workflow.models import RecoveryStrategy
+
+
+ROOT_CONTEXT = TenantContext(
+    tenant_id="00000000-0000-0000-0000-000000000001",
+    workspace_id="00000000-0000-0000-0000-000000000002",
+)
+SESSION_CONTEXT = ROOT_CONTEXT.for_session("00000000-0000-0000-0000-000000000101")
+OTHER_SESSION_CONTEXT = ROOT_CONTEXT.for_session("00000000-0000-0000-0000-000000000102")
+ALT_SESSION_CONTEXT = ROOT_CONTEXT.for_session("00000000-0000-0000-0000-000000000103")
+
+
+class _ScopedMemoryFake:
+    def __init__(self) -> None:
+        self._entries: list[tuple[TenantContext, MemoryEntry]] = []
+
+    async def save(self, context: TenantContext, entry: MemoryEntry) -> MemoryEntry:
+        if entry.type == "chat_message":
+            if context.session_id is None:
+                raise ValueError("session_id is required for chat_message entries")
+            session_id = context.session_id if entry.session_id is None else entry.session_id
+            if session_id != context.session_id:
+                raise ValueError("session_id must match the current context")
+            entry = entry.model_copy(update={"session_id": session_id})
+        elif entry.session_id is not None:
+            if context.session_id is None or entry.session_id != context.session_id:
+                raise ValueError("session_id must match the current context")
+        self._entries.append((context, entry))
+        return entry
+
+    async def query(
+        self,
+        context: TenantContext,
+        query: str,
+        top_k: int,
+        entry_type: str | None = None,
+    ) -> list[MemoryEntry]:
+        terms = set(query.lower().split())
+        matches: list[tuple[int, int, MemoryEntry]] = []
+        for index, (scope, entry) in enumerate(self._entries):
+            if scope.tenant_id != context.tenant_id or scope.workspace_id != context.workspace_id:
+                continue
+            if entry_type is not None and entry.type != entry_type:
+                continue
+            if context.session_id is None:
+                if entry.session_id is not None:
+                    continue
+            elif entry.session_id not in {None, context.session_id}:
+                continue
+            score = len(terms & set(entry.content.lower().split()))
+            if score > 0:
+                matches.append((score, index, entry))
+        matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [entry for _, _, entry in matches[:top_k]]
+
+    async def recent(
+        self,
+        context: TenantContext,
+        limit: int,
+        entry_type: str | None = None,
+    ) -> list[MemoryEntry]:
+        if entry_type == "chat_message" and context.session_id is None:
+            raise ValueError("session_id is required for chat_message recent lookups")
+        results: list[MemoryEntry] = []
+        for scope, entry in reversed(self._entries):
+            if scope.tenant_id != context.tenant_id or scope.workspace_id != context.workspace_id:
+                continue
+            if entry_type is not None and entry.type != entry_type:
+                continue
+            if context.session_id is None:
+                if entry.session_id is not None:
+                    continue
+            elif entry_type == "chat_message" and entry.session_id != context.session_id:
+                continue
+            results.append(entry)
+        return results[:limit]
+
+    async def context(
+        self,
+        context: TenantContext,
+        max_chars: int,
+        limit: int,
+        entry_type: str | None = None,
+    ) -> list[MemoryEntry]:
+        selected: list[MemoryEntry] = []
+        used = 0
+        for entry in await self.recent(context, limit=limit, entry_type=entry_type):
+            entry_len = len(entry.content)
+            separator = 1 if selected else 0
+            if used + separator + entry_len > max_chars:
+                continue
+            selected.append(entry)
+            used += separator + entry_len
+        return list(reversed(selected))
+
+    async def forget(self, context: TenantContext, entry_id: str) -> None:
+        self._entries = [
+            (scope, entry)
+            for scope, entry in self._entries
+            if not (
+                scope.tenant_id == context.tenant_id
+                and scope.workspace_id == context.workspace_id
+                and entry.id == entry_id
+            )
+        ]
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +164,7 @@ class EchoToolBuilder(ToolBuilder[EchoParams]):
     name = "echo"
     description = "Echo tool"
     parameters_schema = EchoParams
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def validate(self, params: dict) -> EchoParams:
         return EchoParams(**params)
@@ -83,11 +191,14 @@ class _ScriptedInvocation(ToolInvocation[_ScriptedParams]):
 class _ScriptedToolBuilder(ToolBuilder[_ScriptedParams]):
     description = "Scripted test tool"
     parameters_schema = _ScriptedParams
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def __init__(self, name: str, runner, *, read_only: bool) -> None:
         self.name = name
         self._runner = runner
         self.read_only = read_only
+        if not read_only:
+            self.recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
     def validate(self, params: dict) -> _ScriptedParams:
         return _ScriptedParams(**params)
@@ -103,7 +214,7 @@ class _BatchScheduler:
     async def can_run_concurrently(self, builder, raw_params: dict) -> bool:
         return builder.read_only
 
-    async def run(self, builder, raw_params: dict) -> ToolExecutionResult:
+    async def run(self, builder, raw_params: dict, **_kwargs) -> ToolExecutionResult:
         self.run_calls.append((builder.name, raw_params))
         params = builder.validate(raw_params)
         return await builder.build(params).execute()
@@ -127,7 +238,7 @@ def agent(test_config_path):
         router=ModelRouter(settings),
         registry=registry,
         scheduler=scheduler,
-        memory=InMemoryMemory(),
+        memory=_ScopedMemoryFake(),
         planner=Planner(),
         event_bus=EventBus(),
     )
@@ -175,12 +286,12 @@ class TestMultiClawAgent:
         mock_client.post.side_effect = [tool_call_response, final_response]
 
         with patch("httpx.AsyncClient", return_value=mock_client):
-            observation = await agent.handle_message("echo hello")
+            observation = await agent.handle_message("echo hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert "hello" in observation.content
         # Tool result stored in memory
-        matches = await agent.memory.query("hello", top_k=5)
+        matches = await agent.memory.query(SESSION_CONTEXT, "hello", top_k=5)
         tool_results = [m for m in matches if m.type == "tool_result"]
         assert len(tool_results) == 1
         assert tool_results[0].content == "hello"
@@ -190,7 +301,8 @@ class TestMultiClawAgent:
         from multiclaw.agent import ObservationType
 
         observation = await agent.handle_message(
-            "plan: collect facts and summarize findings"
+            "plan: collect facts and summarize findings",
+            context=SESSION_CONTEXT,
         )
 
         assert observation.type == ObservationType.USER_RESPONSE
@@ -200,26 +312,70 @@ class TestMultiClawAgent:
     async def test_plain_message_returns_llm_text(self, agent):
         from multiclaw.agent import ObservationType
 
-        observation = await agent.handle_message("hello")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert "mock_response" in observation.content
 
     @pytest.mark.asyncio
     async def test_saves_user_messages_to_memory(self, agent):
-        await agent.handle_message("remember this")
+        await agent.handle_message("remember this", context=SESSION_CONTEXT)
 
-        matches = await agent.memory.query("remember", top_k=5)
+        matches = await agent.memory.query(SESSION_CONTEXT, "remember", top_k=5)
 
         assert len(matches) == 1
         assert matches[0].content == "remember this"
 
     @pytest.mark.asyncio
-    async def test_injects_relevant_memory_before_user_message(self, agent):
-        from multiclaw.memory import MemoryEntry
+    async def test_tool_results_stay_in_session_scope_and_base_remember_rejects_missing_session(self, agent):
+        tool_call_response = Mock()
+        tool_call_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "function": {
+                                    "name": "echo",
+                                    "arguments": '{"text": "scoped_tool_result"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ],
+        }
+        tool_call_response.raise_for_status = Mock()
 
+        final_response = Mock()
+        final_response.json.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "done"}}]
+        }
+        final_response.raise_for_status = Mock()
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.side_effect = [tool_call_response, final_response]
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            await agent.handle_message("echo local", context=SESSION_CONTEXT)
+
+        assert [entry.content for entry in await agent.memory.query(SESSION_CONTEXT, "scoped_tool_result", top_k=5)] == [
+            "scoped_tool_result"
+        ]
+        assert await agent.memory.query(OTHER_SESSION_CONTEXT, "scoped_tool_result", top_k=5) == []
+
+        with pytest.raises(ValueError, match="session_id"):
+            await agent.remember(ROOT_CONTEXT, "orphan tool result", "tool_result")
+
+    @pytest.mark.asyncio
+    async def test_injects_relevant_memory_before_user_message(self, agent):
         await agent.memory.save(
-            MemoryEntry(content="alpha project uses SQLite memory", type="note")
+            SESSION_CONTEXT,
+            MemoryEntry(content="alpha project uses SQLite memory", type="note"),
         )
 
         mock_response = Mock()
@@ -233,7 +389,7 @@ class TestMultiClawAgent:
         mock_client.post.return_value = mock_response
 
         with patch("httpx.AsyncClient", return_value=mock_client):
-            await agent.handle_message("what does alpha use?")
+            await agent.handle_message("what does alpha use?", context=SESSION_CONTEXT)
 
         request_body = mock_client.post.call_args.kwargs["json"]
         messages = request_body["messages"]
@@ -257,8 +413,6 @@ class TestMultiClawAgent:
 
     @pytest.mark.asyncio
     async def test_agent_saves_user_and_assistant_messages_with_session_id(self, agent):
-        from multiclaw.memory import MemoryEntry
-
         mock_response = Mock()
         mock_response.json.return_value = {
             "choices": [{"message": {"role": "assistant", "content": "response"}}]
@@ -270,10 +424,15 @@ class TestMultiClawAgent:
         mock_client.post.return_value = mock_response
 
         with patch("httpx.AsyncClient", return_value=mock_client):
-            await agent.handle_message("hello", session_id="session-1")
+            await agent.handle_message(
+                "hello",
+                context=ROOT_CONTEXT.for_session("00000000-0000-0000-0000-000000000111"),
+            )
 
         recent = await agent.memory.recent(
-            limit=2, entry_type="chat_message", session_id="session-1"
+            ROOT_CONTEXT.for_session("00000000-0000-0000-0000-000000000111"),
+            limit=2,
+            entry_type="chat_message",
         )
 
         assert [entry.role for entry in recent] == ["assistant", "user"]
@@ -281,14 +440,14 @@ class TestMultiClawAgent:
 
     @pytest.mark.asyncio
     async def test_agent_uses_recent_chat_history_for_same_session(self, agent):
-        from multiclaw.memory import MemoryEntry
-
         # Pre-populate chat history for two different sessions
         await agent.memory.save(
-            MemoryEntry(content="session one user", type="chat_message", session_id="s1", role="user", turn_index=1)
+            SESSION_CONTEXT,
+            MemoryEntry(content="session one user", type="chat_message", role="user", turn_index=1),
         )
         await agent.memory.save(
-            MemoryEntry(content="session two user", type="chat_message", session_id="s2", role="user", turn_index=1)
+            OTHER_SESSION_CONTEXT,
+            MemoryEntry(content="session two user", type="chat_message", role="user", turn_index=1),
         )
 
         mock_response = Mock()
@@ -302,7 +461,7 @@ class TestMultiClawAgent:
         mock_client.post.return_value = mock_response
 
         with patch("httpx.AsyncClient", return_value=mock_client):
-            await agent.handle_message("follow-up", session_id="s1")
+            await agent.handle_message("follow-up", context=SESSION_CONTEXT)
 
         payload = mock_client.post.call_args.kwargs["json"]["messages"]
         contents = [msg["content"] for msg in payload if "content" in msg and msg["content"] is not None]
@@ -328,7 +487,7 @@ class TestMultiClawAgent:
             max_reflections=1,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "changed approach"
@@ -355,7 +514,7 @@ class TestMultiClawAgent:
             max_reflections=1,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "forced summary"
@@ -390,7 +549,7 @@ class TestMultiClawAgent:
             max_reflections=1,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "done"
@@ -419,7 +578,7 @@ class TestMultiClawAgent:
             max_reflections=1,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "forced summary"
@@ -461,7 +620,7 @@ class TestMultiClawAgent:
         )
         agent.settings.agent.max_tool_rounds = 1
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation == Observation(
             type=ObservationType.USER_RESPONSE,
@@ -473,27 +632,22 @@ class TestMultiClawAgent:
         assert "Do not output DSML" in retry_call.kwargs["messages"][0]["content"]
 
     @pytest.mark.asyncio
-    async def test_handle_message_parallel_read_only_batch_overlaps_when_enabled(self):
-        first_started = asyncio.Event()
-        second_started = asyncio.Event()
+    async def test_handle_message_read_only_batch_stays_serial_when_parallel_enabled(self):
         active = 0
         max_active = 0
+        execution_order: list[str] = []
         finished: list[str] = []
 
         async def runner(params: _ScriptedParams) -> ToolExecutionResult:
             nonlocal active, max_active
             label = params.label or ""
+            execution_order.append(f"start:{label}")
             active += 1
             max_active = max(max_active, active)
             try:
-                if label == "first":
-                    first_started.set()
-                    await asyncio.wait_for(second_started.wait(), timeout=0.1)
-                    await asyncio.sleep(0.02)
-                else:
-                    second_started.set()
-                    await asyncio.sleep(0.0)
+                await asyncio.sleep(0.01)
                 finished.append(label)
+                execution_order.append(f"end:{label}")
                 return ToolExecutionResult(
                     status=ToolStatus.SUCCESS,
                     content=f"done:{label}",
@@ -517,14 +671,18 @@ class TestMultiClawAgent:
             parallel_enabled=True,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "finished"
-        assert first_started.is_set()
-        assert second_started.is_set()
-        assert max_active == 2
-        assert finished == ["second", "first"]
+        assert max_active == 1
+        assert execution_order == [
+            "start:first",
+            "end:first",
+            "start:second",
+            "end:second",
+        ]
+        assert finished == ["first", "second"]
         assert agent.act.await_count == 0
 
     @pytest.mark.asyncio
@@ -566,7 +724,7 @@ class TestMultiClawAgent:
             parallel_enabled=True,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "finished"
@@ -579,14 +737,14 @@ class TestMultiClawAgent:
             "start:read-2",
             "end:read-2",
         ]
-        assert [call.args[0] for call in agent.remember.await_args_list] == [
+        assert [call.args[1] for call in agent.remember.await_args_list] == [
             "read-1",
             "write",
             "read-2",
         ]
 
     @pytest.mark.asyncio
-    async def test_handle_message_preserves_original_tool_call_ids_and_result_order(self):
+    async def test_handle_message_preserves_original_tool_call_ids_and_result_order_under_serial_execution(self):
         active = 0
         max_active = 0
         finished: list[str] = []
@@ -621,7 +779,7 @@ class TestMultiClawAgent:
             parallel_enabled=True,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
         second_call_messages = agent.router.completion.await_args_list[1].kwargs["messages"]
         assistant_message = next(
             message for message in second_call_messages if message.get("tool_calls")
@@ -630,8 +788,8 @@ class TestMultiClawAgent:
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "finished"
-        assert max_active == 2
-        assert finished == ["second", "first"]
+        assert max_active == 1
+        assert finished == ["first", "second"]
         assert [tool_call["id"] for tool_call in assistant_message["tool_calls"]] == [
             "call_beta",
             "call_alpha",
@@ -644,7 +802,7 @@ class TestMultiClawAgent:
             "result:first",
             "result:second",
         ]
-        assert [call.args[0] for call in agent.remember.await_args_list] == [
+        assert [call.args[1] for call in agent.remember.await_args_list] == [
             "result:first",
             "result:second",
         ]
@@ -686,7 +844,7 @@ class TestMultiClawAgent:
             parallel_enabled=False,
         )
 
-        observation = await agent.handle_message("hello", session_id="s1")
+        observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation.type == ObservationType.USER_RESPONSE
         assert observation.content == "finished"
@@ -714,7 +872,7 @@ class TestMultiClawAgent:
         agent.context_builder = _ReportOnlyContextBuilder(expected_messages)
 
         with patch("multiclaw.agent.multiclaw.logger.info") as mock_info:
-            observation = await agent.handle_message("hello", session_id="s1")
+            observation = await agent.handle_message("hello", context=SESSION_CONTEXT)
 
         assert observation == Observation(
             type=ObservationType.USER_RESPONSE,
@@ -723,7 +881,7 @@ class TestMultiClawAgent:
         agent.context_builder.build_with_report.assert_awaited_once()
         request = agent.context_builder.build_with_report.await_args.args[0]
         assert request.user_input == "hello"
-        assert request.session_id == "s1"
+        assert request.context == SESSION_CONTEXT
         assert request.context_window_limit == 1000
         assert request.skill_prompts == []
         assert agent.router.completion.await_args_list[0].kwargs["messages"] == expected_messages
@@ -737,6 +895,77 @@ class TestMultiClawAgent:
         assert all(
             set(message.keys()) <= {"role", "content"} for message in expected_messages
         )
+
+    @pytest.mark.asyncio
+    async def test_handle_message_resets_state_after_tool_round_before_next_run(self):
+        registry = ToolRegistry()
+        registry.register(EchoToolBuilder())
+        agent, state_events = _build_stateful_batch_agent(
+            completion_responses=[
+                _tool_batch_response(("call_1", "echo", {"text": "first"})),
+                LLMResponse(content="done-1"),
+                _tool_batch_response(("call_2", "echo", {"text": "second"})),
+                LLMResponse(content="done-2"),
+            ],
+            registry=registry,
+            scheduler=_BatchScheduler(),
+            parallel_enabled=True,
+        )
+
+        first = await agent.handle_message("hello-1", context=SESSION_CONTEXT)
+        second = await agent.handle_message("hello-2", context=SESSION_CONTEXT)
+
+        assert first == Observation(
+            type=ObservationType.USER_RESPONSE,
+            content="done-1",
+        )
+        assert agent.state == AgentState.IDLE
+        assert second == Observation(
+            type=ObservationType.USER_RESPONSE,
+            content="done-2",
+        )
+        assert [(event.from_state, event.to_state) for event in state_events] == [
+            (AgentState.IDLE, AgentState.ACTING),
+            (AgentState.ACTING, AgentState.IDLE),
+            (AgentState.IDLE, AgentState.ACTING),
+            (AgentState.ACTING, AgentState.IDLE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_handle_message_resets_state_after_forced_summary_before_next_run(self):
+        registry = ToolRegistry()
+        registry.register(EchoToolBuilder())
+        agent, state_events = _build_stateful_batch_agent(
+            completion_responses=[
+                _tool_batch_response(("call_1", "echo", {"text": "first"})),
+                LLMResponse(content="forced summary"),
+                _tool_batch_response(("call_2", "echo", {"text": "second"})),
+                LLMResponse(content="done-2"),
+            ],
+            registry=registry,
+            scheduler=_BatchScheduler(),
+            parallel_enabled=True,
+        )
+        agent.settings.agent.max_tool_rounds = 1
+
+        first = await agent.handle_message("hello-1", context=SESSION_CONTEXT)
+        second = await agent.handle_message("hello-2", context=SESSION_CONTEXT)
+
+        assert first == Observation(
+            type=ObservationType.USER_RESPONSE,
+            content="forced summary",
+        )
+        assert agent.state == AgentState.IDLE
+        assert second == Observation(
+            type=ObservationType.USER_RESPONSE,
+            content="done-2",
+        )
+        assert [(event.from_state, event.to_state) for event in state_events] == [
+            (AgentState.IDLE, AgentState.ACTING),
+            (AgentState.ACTING, AgentState.IDLE),
+            (AgentState.IDLE, AgentState.ACTING),
+            (AgentState.ACTING, AgentState.IDLE),
+        ]
 
     def test_constructor_wires_progressive_context_settings(self, test_config_path):
         from multiclaw.agent import MultiClawAgent
@@ -759,7 +988,7 @@ class TestMultiClawAgent:
             router=ModelRouter(settings),
             registry=registry,
             scheduler=scheduler,
-            memory=InMemoryMemory(),
+            memory=_ScopedMemoryFake(),
             planner=Planner(),
             event_bus=EventBus(),
         )
@@ -820,8 +1049,13 @@ class _StubRegistry:
 
 
 class _StubMemory:
-    async def save(self, _entry):
+    async def save(self, _context, _entry):
         return None
+
+    async def recent(self, _context, limit: int, entry_type: str | None = None):
+        assert limit >= 1
+        assert entry_type == "chat_message"
+        return []
 
 
 def _build_stub_agent(
@@ -911,6 +1145,9 @@ def _build_custom_batch_agent(
     agent.scheduler = scheduler
     agent.memory = _StubMemory()
     agent.router = SimpleNamespace(completion=AsyncMock(side_effect=completion_responses))
+    agent.state = AgentState.IDLE
+    agent.event_bus = EventBus()
+    agent.event_router = None
     agent.settings = SimpleNamespace(
         **_stub_settings(
             resilience_enabled=resilience_enabled,
@@ -935,6 +1172,42 @@ def _build_custom_batch_agent(
         side_effect=AssertionError("legacy per-call act path should not run")
     )
     return agent
+
+
+def _build_stateful_batch_agent(
+    *,
+    completion_responses: list[LLMResponse],
+    registry: ToolRegistry,
+    scheduler,
+    parallel_enabled: bool,
+    resilience_enabled: bool = False,
+    repeat_limit: int = 3,
+    max_reflections: int = 1,
+):
+    from multiclaw.agent.multiclaw import MultiClawAgent
+
+    agent = _build_custom_batch_agent(
+        completion_responses=completion_responses,
+        registry=registry,
+        scheduler=scheduler,
+        parallel_enabled=parallel_enabled,
+        resilience_enabled=resilience_enabled,
+        repeat_limit=repeat_limit,
+        max_reflections=max_reflections,
+    )
+    event_bus = EventBus()
+    state_events: list[AgentStateEvent] = []
+
+    async def collect(event):
+        if isinstance(event, AgentStateEvent):
+            state_events.append(event)
+
+    event_bus.subscribe("agent.state_change", collect)
+    agent.event_bus = event_bus
+    agent.event_router = None
+    agent.state = AgentState.IDLE
+    agent.transition = BaseAgent.transition.__get__(agent, MultiClawAgent)
+    return agent, state_events
 
 
 def _find_reflection_call(calls):

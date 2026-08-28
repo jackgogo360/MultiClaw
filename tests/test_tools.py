@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from multiclaw.tools import glob as glob_module
 from multiclaw.tools import grep as grep_module
 from multiclaw.tools import list_dir as list_dir_module
 from multiclaw.events import EventBus
+from multiclaw.tenancy import TenantContext
 from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.tools import (
     CoreToolScheduler,
@@ -26,6 +28,7 @@ from multiclaw.tools.grep import GrepToolBuilder
 from multiclaw.tools.list_dir import ListDirToolBuilder
 from multiclaw.tools.read_file import ReadFileToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
+from multiclaw.workflow.models import RecoveryStrategy
 from sandbox_fakes import (
     ReadyRecordingSandboxController,
     UnavailableSandboxController,
@@ -97,6 +100,7 @@ class EchoToolBuilder(ToolBuilder[EchoParams]):
     name = "echo"
     description = "Echoes the supplied text"
     parameters_schema = EchoParams
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def validate(self, params: dict) -> EchoParams:
         return EchoParams(**params)
@@ -107,6 +111,7 @@ class EchoToolBuilder(ToolBuilder[EchoParams]):
 
 class DeleteToolBuilder(EchoToolBuilder):
     name = "delete_file"
+    recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
 
 class AuditedEchoToolBuilder(EchoToolBuilder):
@@ -201,6 +206,43 @@ class TestToolBaseTypes:
         assert isinstance(invocation, ToolInvocation)
         assert invocation.params == EchoParams(text="hello")
 
+    def test_tool_builder_requires_explicit_recovery_declaration(self):
+        assert hasattr(ToolBuilder, "recovery_metadata")
+        assert hasattr(EchoToolBuilder, "recovery_strategy")
+        metadata = EchoToolBuilder().recovery_metadata(EchoParams(text="hello"))
+        assert metadata.tool_kind == "native"
+        assert metadata.recovery_strategy == EchoToolBuilder.recovery_strategy
+        assert metadata.idempotency_key is None
+
+    def test_idempotent_tool_builder_reads_declared_idempotency_key_field(self):
+        class IdempotentParams(BaseModel):
+            request_id: str
+
+        class IdempotentBuilder(ToolBuilder[IdempotentParams]):
+            name = "idempotent_echo"
+            description = "Idempotent test tool"
+            parameters_schema = IdempotentParams
+            recovery_strategy = RecoveryStrategy.IDEMPOTENT_RETRY
+            idempotency_key_field = "request_id"
+
+            def validate(self, params: dict) -> IdempotentParams:
+                return IdempotentParams(**params)
+
+            def build(self, params: IdempotentParams) -> ToolInvocation[IdempotentParams]:
+                class _Invocation(ToolInvocation[IdempotentParams]):
+                    async def execute(self_inner) -> ToolExecutionResult:
+                        return ToolExecutionResult(
+                            status=ToolStatus.SUCCESS,
+                            content=self_inner.params.request_id,
+                        )
+
+                return _Invocation(name=self.name, params=params)
+
+        metadata = IdempotentBuilder().recovery_metadata(
+            IdempotentParams(request_id="req-123")
+        )
+        assert metadata.idempotency_key == "req-123"
+
     def test_tools_package_exports_expected_surface(self):
         assert tools.CoreToolScheduler is CoreToolScheduler
         assert tools.ToolBuilder is ToolBuilder
@@ -224,13 +266,31 @@ class TestToolRegistry:
         monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
         monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
         monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
-        from multiclaw.server import create_agent
+        from multiclaw.config.settings import DatabaseSettings, McpSettings, Settings, SkillSettings
+        from multiclaw.runtime.factory import RuntimeFactory
+        from multiclaw.storage import Database
+        from multiclaw.tenancy import TenantContext, WorkspaceResolver
 
-        agent = create_agent(
-            sandbox_controller=ReadyRecordingSandboxController(workspace_root=tmp_path)
+        settings = Settings(
+            database=DatabaseSettings(
+                driver="sqlite",
+                url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
+            ),
+            mcp=McpSettings(enabled=False),
+            skill=SkillSettings(enabled=False),
+        )
+        database = Database.create(settings.database)
+        factory = RuntimeFactory(
+            settings=settings,
+            database=database,
+            workspace_resolver=WorkspaceResolver(tmp_path),
+            sandbox_controller_factory=lambda workspace_root, event_bus: ReadyRecordingSandboxController(
+                workspace_root=workspace_root
+            ),
         )
 
-        assert [tool.name for tool in agent.registry.list_all()] == [
+        runtime = asyncio.run(factory.create(TenantContext("tenant-a", "workspace-a")))
+        assert [tool.name for tool in runtime.registry.list_all()] == [
             "code_exec",
             "edit_file",
             "find_dir",
@@ -244,22 +304,45 @@ class TestToolRegistry:
             "web_search",
             "write_file",
         ]
+        asyncio.run(runtime.close())
+        asyncio.run(database.dispose())
 
     def test_runtime_registry_skips_unready_execution_tools(self, monkeypatch, tmp_path):
         monkeypatch.setenv("MULTICLAW_DATABASE__PATH", str(tmp_path / "app.db"))
         monkeypatch.setenv("MULTICLAW_MCP__ENABLED", "false")
         monkeypatch.setenv("MULTICLAW_SKILL__ENABLED", "false")
-        from multiclaw.server import create_agent
+        from multiclaw.config.settings import DatabaseSettings, McpSettings, Settings, SkillSettings
+        from multiclaw.runtime.factory import RuntimeFactory
+        from multiclaw.storage import Database
+        from multiclaw.tenancy import TenantContext, WorkspaceResolver
 
-        agent = create_agent(sandbox_controller=UnavailableSandboxController())
-        names = [tool.name for tool in agent.registry.list_all()]
+        settings = Settings(
+            database=DatabaseSettings(
+                driver="sqlite",
+                url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
+            ),
+            mcp=McpSettings(enabled=False),
+            skill=SkillSettings(enabled=False),
+        )
+        database = Database.create(settings.database)
+        factory = RuntimeFactory(
+            settings=settings,
+            database=database,
+            workspace_resolver=WorkspaceResolver(tmp_path),
+            sandbox_controller_factory=lambda workspace_root, event_bus: UnavailableSandboxController(),
+        )
+
+        runtime = asyncio.run(factory.create(TenantContext("tenant-a", "workspace-a")))
+        names = [tool.name for tool in runtime.registry.list_all()]
 
         assert "shell" not in names
         assert "code_exec" not in names
         assert "read_file" in names
         assert "web_fetch" in names
-        assert agent.sandbox_readiness.ready is False
-        assert agent.sandbox_controller is not None
+        assert runtime.sandbox_readiness.ready is False
+        assert runtime.sandbox_controller is not None
+        asyncio.run(runtime.close())
+        asyncio.run(database.dispose())
 
 
 class TestCoreToolScheduler:
@@ -281,51 +364,14 @@ class TestCoreToolScheduler:
         assert result.data == {"echoed": "hello"}
 
     @pytest.mark.asyncio
-    async def test_guarded_tool_blocks_for_approval(self, scheduler):
-        import asyncio
-        import uuid
+    async def test_guarded_tool_blocks_for_persisted_approval(self, scheduler):
+        result = await scheduler.run(DeleteToolBuilder(), {"text": "danger"})
 
-        async def run():
-            return await scheduler.run(DeleteToolBuilder(), {"text": "danger"})
-
-        orig = uuid.uuid4
-        uuid.uuid4 = lambda: type("FakeUUID", (), {"hex": "req-1"})()
-
-        try:
-            run_task = asyncio.create_task(run())
-            await asyncio.sleep(0.02)
-            scheduler.resolve_approval("req-1", True)
-            result = await run_task
-        finally:
-            uuid.uuid4 = orig
-
-        assert result.status == ToolStatus.SUCCESS
+        assert result.status == ToolStatus.AWAITING_APPROVAL
+        assert result.content == "approval required"
 
     @pytest.mark.asyncio
-    async def test_guarded_tool_rejected_by_user(self, scheduler):
-        import asyncio
-        import uuid
-
-        async def run():
-            return await scheduler.run(DeleteToolBuilder(), {"text": "danger"})
-
-        orig = uuid.uuid4
-        uuid.uuid4 = lambda: type("FakeUUID", (), {"hex": "req-2"})()
-
-        try:
-            run_task = asyncio.create_task(run())
-            await asyncio.sleep(0.02)
-            scheduler.resolve_approval("req-2", False)
-            result = await run_task
-        finally:
-            uuid.uuid4 = orig
-
-        assert result.status == ToolStatus.CANCELLED
-        assert "rejected" in result.content
-
-    @pytest.mark.asyncio
-    async def test_guarded_tool_rejected_by_user_emits_single_terminal_cancelled_audit_and_event(self, scheduler):
-        import asyncio
+    async def test_guarded_tool_emits_single_awaiting_approval_audit_and_event(self, scheduler):
         import uuid
 
         events = []
@@ -335,97 +381,39 @@ class TestCoreToolScheduler:
                 events.append((event.type.removeprefix("tool."), event.data))
 
         scheduler.event_bus.subscribe("*", handler)
-
-        async def run():
-            return await scheduler.run(DeleteToolBuilder(), {"text": "danger"})
 
         orig = uuid.uuid4
         uuid.uuid4 = lambda: type("FakeUUID", (), {"hex": "req-5"})()
-
-        try:
-            run_task = asyncio.create_task(run())
-            await asyncio.sleep(0.02)
-            scheduler.resolve_approval("req-5", False)
-            result = await run_task
-        finally:
-            uuid.uuid4 = orig
-
-        assert result.status == ToolStatus.CANCELLED
-        assert events == [
-            ("scheduled", {"tool": "delete_file"}),
-            ("validating", {"tool": "delete_file"}),
-            (
-                "awaiting_approval",
-                {
-                    "request_id": "req-5",
-                    "tool": "delete_file",
-                    "params": {"text": "danger"},
-                    "description": '{"text": "danger"}',
-                },
-            ),
-            ("error", {"tool": "delete_file", "error": "tool returned cancelled"}),
-        ]
-        entries = await scheduler.audit_logger.list_entries()
-        assert [entry.status for entry in entries] == [
-            ToolStatus.AWAITING_APPROVAL.value,
-            ToolStatus.CANCELLED.value,
-        ]
-        assert entries[-1].detail == "rejected by user"
-
-    @pytest.mark.asyncio
-    async def test_guarded_tool_timeout_emits_single_terminal_cancelled_audit_and_event(
-        self,
-        scheduler,
-        monkeypatch,
-    ):
-        import asyncio
-        import multiclaw.tools.scheduler as scheduler_module
-        import uuid
-
-        events = []
-
-        async def handler(event):
-            if event.type.startswith("tool."):
-                events.append((event.type.removeprefix("tool."), event.data))
-
-        scheduler.event_bus.subscribe("*", handler)
-
-        async def fake_wait_for(awaitable, timeout):
-            del timeout
-            awaitable.close()
-            raise asyncio.TimeoutError
-
-        orig = uuid.uuid4
-        uuid.uuid4 = lambda: type("FakeUUID", (), {"hex": "req-6"})()
-        monkeypatch.setattr(scheduler_module.asyncio, "wait_for", fake_wait_for)
 
         try:
             result = await scheduler.run(DeleteToolBuilder(), {"text": "danger"})
         finally:
             uuid.uuid4 = orig
 
-        assert result.status == ToolStatus.CANCELLED
-        assert result.content == "Approval timed out after 120s."
+        assert result.status == ToolStatus.AWAITING_APPROVAL
         assert events == [
             ("scheduled", {"tool": "delete_file"}),
             ("validating", {"tool": "delete_file"}),
             (
                 "awaiting_approval",
                 {
-                    "request_id": "req-6",
+                    "approval_id": "req-5",
                     "tool": "delete_file",
-                    "params": {"text": "danger"},
                     "description": '{"text": "danger"}',
                 },
             ),
-            ("error", {"tool": "delete_file", "error": "tool returned cancelled"}),
         ]
         entries = await scheduler.audit_logger.list_entries()
-        assert [entry.status for entry in entries] == [
-            ToolStatus.AWAITING_APPROVAL.value,
-            ToolStatus.CANCELLED.value,
-        ]
-        assert entries[-1].detail == "Approval timed out after 120s."
+        assert [entry.status for entry in entries] == [ToolStatus.AWAITING_APPROVAL.value]
+        assert entries[-1].detail == "approval required, approval_id=req-5"
+
+    @pytest.mark.asyncio
+    async def test_guarded_tool_does_not_execute_before_approval(self, scheduler):
+        result = await scheduler.run(GuardedAuditedToolBuilder(), {"text": "danger"})
+
+        assert result.status == ToolStatus.AWAITING_APPROVAL
+        entries = await scheduler.audit_logger.list_entries()
+        assert [entry.status for entry in entries] == [ToolStatus.AWAITING_APPROVAL.value]
 
     @pytest.mark.asyncio
     async def test_records_audit_entries(self, scheduler):
@@ -462,33 +450,6 @@ class TestCoreToolScheduler:
         assert "forged=true" not in entries[-1].detail
         assert "top-secret-value" not in entries[-1].detail
         assert "['not-a-bool']" not in entries[-1].detail
-
-    @pytest.mark.asyncio
-    async def test_records_allowlisted_audit_prefix_after_approval(self, scheduler):
-        import asyncio
-        import uuid
-
-        async def run():
-            return await scheduler.run(GuardedAuditedToolBuilder(), {"text": "danger"})
-
-        orig = uuid.uuid4
-        uuid.uuid4 = lambda: type("FakeUUID", (), {"hex": "req-4"})()
-
-        try:
-            run_task = asyncio.create_task(run())
-            await asyncio.sleep(0.02)
-            scheduler.resolve_approval("req-4", True)
-            result = await run_task
-        finally:
-            uuid.uuid4 = orig
-
-        assert result.status == ToolStatus.SUCCESS
-        entries = await scheduler.audit_logger.list_entries()
-        assert entries[-1].detail == (
-            "[audit] sandbox_backend=recording sandbox_profile=shell_workspace "
-            "unsafe_fallback_used=False\n"
-            "danger"
-        )
 
     @pytest.mark.asyncio
     async def test_records_allowlisted_audit_prefix_for_mcp_results(self, scheduler):
@@ -544,7 +505,7 @@ class TestCoreToolScheduler:
             "mcp audit"
         )
         assert "OPENAI_API_KEY" not in entries[-1].detail
-        assert events == ["scheduled", "validating", "completed"]
+        assert events == ["scheduled", "validating", "executing", "completed"]
 
     @pytest.mark.asyncio
     async def test_returned_error_uses_error_audit_status_and_error_event(self, scheduler):
@@ -624,6 +585,7 @@ class TestCoreToolScheduler:
         assert events == [
             ("scheduled", {"tool": "mcp__demo__tool"}),
             ("validating", {"tool": "mcp__demo__tool"}),
+            ("executing", {"tool": "mcp__demo__tool"}),
             ("error", {"tool": "mcp__demo__tool", "error": "tool returned error"}),
         ]
         entries = await scheduler.audit_logger.list_entries()
@@ -687,6 +649,7 @@ class TestCoreToolScheduler:
         assert events == [
             ("scheduled", {"tool": "mcp__demo__tool"}),
             ("validating", {"tool": "mcp__demo__tool"}),
+            ("executing", {"tool": "mcp__demo__tool"}),
             ("error", {"tool": "mcp__demo__tool", "error": "tool execution failed"}),
         ]
         assert "dummy-secret-token" not in str(events)
@@ -749,7 +712,48 @@ class TestCoreToolScheduler:
         )
 
     @pytest.mark.asyncio
-    async def test_external_read_allowed_after_approval(self, tmp_path):
+    async def test_incomplete_scope_context_skips_event_router_but_keeps_runtime_bus_events(self):
+        class RecordingRouter:
+            def __init__(self) -> None:
+                self.published: list[object] = []
+
+            async def publish(self, event) -> None:
+                self.published.append(event)
+
+        event_bus = EventBus()
+        scheduler = CoreToolScheduler(
+            permission_checker=PermissionChecker(guarded_tools={"delete_file"}),
+            execution_guard=ExecutionGuard(),
+            audit_logger=InMemoryAuditLogger(),
+            event_bus=event_bus,
+            event_router=RecordingRouter(),
+        )
+        events: list[tuple[str, dict]] = []
+
+        async def handler(event):
+            if event.type.startswith("tool."):
+                events.append((event.type.removeprefix("tool."), event.data))
+
+        event_bus.subscribe("*", handler)
+
+        result = await scheduler.run(
+            EchoToolBuilder(),
+            {"text": "hello"},
+            context=TenantContext("tenant-a", "workspace-a").for_session("session-a"),
+            call_id="call-123",
+        )
+
+        assert result.status == ToolStatus.SUCCESS
+        assert events == [
+            ("scheduled", {"tool": "echo", "call_id": "call-123"}),
+            ("validating", {"tool": "echo", "call_id": "call-123"}),
+            ("executing", {"tool": "echo", "call_id": "call-123"}),
+            ("completed", {"tool": "echo", "call_id": "call-123"}),
+        ]
+        assert scheduler.event_router.published == []
+
+    @pytest.mark.asyncio
+    async def test_external_read_requires_approval(self, tmp_path):
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         outside = tmp_path / "outside.txt"
@@ -763,27 +767,12 @@ class TestCoreToolScheduler:
         )
         builder = ReadFileToolBuilder(str(workspace))
 
-        import asyncio
-        import uuid
+        result = await scheduler.run(builder, {"file_path": str(outside)})
 
-        orig = uuid.uuid4
-        uuid.uuid4 = lambda: type("FakeUUID", (), {"hex": "req-3"})()
-
-        try:
-            run_task = asyncio.create_task(
-                scheduler.run(builder, {"file_path": str(outside)})
-            )
-            await asyncio.sleep(0.02)
-            scheduler.resolve_approval("req-3", True)
-            result = await run_task
-        finally:
-            uuid.uuid4 = orig
-
-        assert result.status == ToolStatus.SUCCESS
-        assert "outside text" in result.content
+        assert result.status == ToolStatus.AWAITING_APPROVAL
 
     @pytest.mark.asyncio
-    async def test_dangerous_external_write_stays_blocked_after_approval(self, tmp_path):
+    async def test_dangerous_external_write_requires_approval(self, tmp_path):
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         dangerous_dir = tmp_path / ".ssh"
@@ -798,27 +787,12 @@ class TestCoreToolScheduler:
         )
         builder = WriteFileToolBuilder(str(workspace))
 
-        import asyncio
-        import uuid
+        result = await scheduler.run(
+            builder,
+            {"file_path": str(dangerous_file), "content": "Host *\n"},
+        )
 
-        orig = uuid.uuid4
-        uuid.uuid4 = lambda: type("FakeUUID", (), {"hex": "req-4"})()
-
-        try:
-            run_task = asyncio.create_task(
-                scheduler.run(
-                    builder,
-                    {"file_path": str(dangerous_file), "content": "Host *\n"},
-                )
-            )
-            await asyncio.sleep(0.02)
-            scheduler.resolve_approval("req-4", True)
-            result = await run_task
-        finally:
-            uuid.uuid4 = orig
-
-        assert result.status == ToolStatus.ERROR
-        assert "dangerous path" in result.content
+        assert result.status == ToolStatus.AWAITING_APPROVAL
 
 
 class TestFileTools:

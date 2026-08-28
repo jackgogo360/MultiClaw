@@ -21,6 +21,7 @@ from multiclaw.tools import (
     ToolRegistry,
     ToolStatus,
 )
+from multiclaw.workflow.models import RecoveryStrategy
 from multiclaw.tools.find_dir import FindDirToolBuilder
 from multiclaw.tools.glob import GlobToolBuilder
 from multiclaw.tools.grep import GrepToolBuilder
@@ -54,12 +55,15 @@ class ScriptedInvocation(ToolInvocation[ScriptedParams]):
 class ScriptedToolBuilder(ToolBuilder[ScriptedParams]):
     description = "Scriptable test tool"
     parameters_schema = ScriptedParams
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def __init__(self, name: str, runner, workspace_root: Path, read_only: bool) -> None:
         self.name = name
         self._runner = runner
         self.workspace_root = workspace_root
         self.read_only = read_only
+        if not read_only:
+            self.recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
     def validate(self, params: dict) -> ScriptedParams:
         return ScriptedParams(**params)
@@ -156,22 +160,23 @@ def test_mcp_tool_builder_requires_safe_annotations_for_read_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_two_consecutive_eligible_reads_overlap_and_preserve_call_order(
+async def test_read_only_calls_run_strictly_in_input_order(
     tmp_path: Path,
     registry: ToolRegistry,
     scheduler: CoreToolScheduler,
 ) -> None:
     active = 0
     max_active = 0
-    finished: list[str] = []
+    execution_order: list[str] = []
 
     async def runner(params: ScriptedParams) -> ToolExecutionResult:
         nonlocal active, max_active
+        execution_order.append(f"start:{params.label}")
         active += 1
         max_active = max(max_active, active)
         try:
             await asyncio.sleep(params.delay)
-            finished.append(params.label)
+            execution_order.append(f"end:{params.label}")
             return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
         finally:
             active -= 1
@@ -183,13 +188,18 @@ async def test_two_consecutive_eligible_reads_overlap_and_preserve_call_order(
 
     outcomes = await executor.execute(
         [
-            ToolCallSpec(call_id="call-1", name="read_probe", arguments={"label": "first", "delay": 0.05}),
-            ToolCallSpec(call_id="call-2", name="read_probe", arguments={"label": "second", "delay": 0.01}),
+            ToolCallSpec(call_id="call-1", name="read_probe", arguments={"label": "first", "delay": 0.02}),
+            ToolCallSpec(call_id="call-2", name="read_probe", arguments={"label": "second", "delay": 0.0}),
         ]
     )
 
-    assert max_active == 2
-    assert finished == ["second", "first"]
+    assert max_active == 1
+    assert execution_order == [
+        "start:first",
+        "end:first",
+        "start:second",
+        "end:second",
+    ]
     assert [outcome.call_id for outcome in outcomes] == ["call-1", "call-2"]
     assert [outcome.observation.content for outcome in outcomes] == ["first", "second"]
     assert [outcome.observation.type for outcome in outcomes] == [
@@ -315,20 +325,17 @@ async def test_disabled_executor_preserves_serial_behavior(
 
 
 @pytest.mark.asyncio
-async def test_cancellation_cleans_up_child_tasks(
+async def test_cancellation_stops_before_starting_later_calls(
     tmp_path: Path,
     registry: ToolRegistry,
     scheduler: CoreToolScheduler,
 ) -> None:
-    started = 0
-    both_started = asyncio.Event()
+    first_started = asyncio.Event()
     cleaned: list[str] = []
 
     async def runner(params: ScriptedParams) -> ToolExecutionResult:
-        nonlocal started
-        started += 1
-        if started == 2:
-            both_started.set()
+        if params.label == "first":
+            first_started.set()
         try:
             await asyncio.Event().wait()
         finally:
@@ -348,13 +355,13 @@ async def test_cancellation_cleans_up_child_tasks(
         )
     )
 
-    await asyncio.wait_for(both_started.wait(), timeout=0.2)
+    await asyncio.wait_for(first_started.wait(), timeout=0.2)
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert sorted(cleaned) == ["first", "second"]
+    assert cleaned == ["first"]
 
 
 @pytest.mark.asyncio
@@ -382,3 +389,39 @@ async def test_unknown_tool_matches_agent_convention(
     assert outcomes[0].observation.content == "unknown tool: missing_tool"
     assert outcomes[1].observation.type == ObservationType.TOOL_RESULT
     assert outcomes[1].observation.content == "known"
+
+
+@pytest.mark.asyncio
+async def test_executor_stops_after_awaiting_approval_boundary(
+    tmp_path: Path,
+    registry: ToolRegistry,
+) -> None:
+    executed: list[str] = []
+
+    async def runner(params: ScriptedParams) -> ToolExecutionResult:
+        executed.append(params.label)
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    registry.register(
+        ScriptedToolBuilder("guarded_mutation", runner, tmp_path, read_only=False)
+    )
+    registry.register(
+        ScriptedToolBuilder("read_probe", runner, tmp_path, read_only=True)
+    )
+    guarded_scheduler = CoreToolScheduler(
+        permission_checker=PermissionChecker(guarded_tools={"guarded_mutation"}),
+        execution_guard=ExecutionGuard(timeout=1.0),
+        audit_logger=InMemoryAuditLogger(),
+        event_bus=EventBus(),
+    )
+    executor = _executor(registry, guarded_scheduler)
+
+    outcomes = await executor.execute(
+        [
+            ToolCallSpec(call_id="call-1", name="guarded_mutation", arguments={"label": "needs-approval"}),
+            ToolCallSpec(call_id="call-2", name="read_probe", arguments={"label": "must-not-run"}),
+        ]
+    )
+
+    assert [outcome.result.status for outcome in outcomes] == [ToolStatus.AWAITING_APPROVAL]
+    assert executed == []

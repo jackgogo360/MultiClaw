@@ -14,6 +14,7 @@ from multiclaw.tools.base import (
     ToolInvocation,
     ToolStatus,
 )
+from multiclaw.workflow.models import RecoveryStrategy
 
 if TYPE_CHECKING:
     from multiclaw.mcp.manager import MCPClientManager
@@ -98,6 +99,7 @@ def _is_read_only_tool_info(tool_info: Any) -> bool:
 
 
 class MCPToolBuilder(ToolBuilder):
+    tool_kind = "mcp"
     name: str
     description: str
     parameters_schema: type[BaseModel]
@@ -144,6 +146,14 @@ class MCPToolBuilder(ToolBuilder):
     def approval_description(self, params: dict[str, Any]) -> str:
         return f"Call MCP tool {self.name} with {json.dumps(params, ensure_ascii=False)}"
 
+    @property
+    def recovery_strategy(self) -> RecoveryStrategy:
+        return (
+            RecoveryStrategy.READ_ONLY_REPLAY
+            if self.read_only
+            else RecoveryStrategy.MANUAL_UNCERTAIN
+        )
+
     @classmethod
     def from_tool_info(cls, tool_info: Any, manager: MCPClientManager) -> "MCPToolBuilder":
         return cls(
@@ -178,11 +188,6 @@ class MCPToolInvocation(ToolInvocation):
                 self._tool_name,
                 self.params.model_dump(),
             )
-            text = _extract_text(result.content)
-            return ToolExecutionResult(
-                status=ToolStatus.ERROR if result.is_error else ToolStatus.SUCCESS,
-                content=text,
-            )
         except Exception as exc:
             logger.error(
                 "MCP tool call failed: %s/%s - %s",
@@ -192,3 +197,12 @@ class MCPToolInvocation(ToolInvocation):
                 status=ToolStatus.ERROR,
                 content=str(exc),
             )
+
+        if result.external_request_id is not None and self.progress_recorder is not None:
+            await self.progress_recorder.record_external_request_id(result.external_request_id)
+        text = _extract_text(result.content)
+        return ToolExecutionResult(
+            status=ToolStatus.ERROR if result.is_error else ToolStatus.SUCCESS,
+            content=text,
+            external_request_id=result.external_request_id,
+        )

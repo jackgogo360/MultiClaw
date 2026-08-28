@@ -323,7 +323,7 @@ def test_auto_initialize_probes_once_and_marks_only_proven_profiles_ready(
     manager = SandboxManager.create(
         settings=_settings(),
         debug=False,
-        workspace_root=tmp_path,
+        workspace_root=tmp_path / ".",
         backend_override=backend,
     )
 
@@ -333,6 +333,7 @@ def test_auto_initialize_probes_once_and_marks_only_proven_profiles_ready(
     finalized = manager.finalize_readiness()
 
     assert len(backend.probe_calls) == 1
+    assert backend.probe_calls[0]["workspace_root"] == tmp_path.resolve()
     assert provisional.ready is True
     assert provisional.profiles == {
         "shell_workspace": True,
@@ -761,10 +762,13 @@ def test_build_launch_spec_requires_ready_profile_and_uses_scrubbed_platform_pat
     spec = manager.build_launch_spec(_request(tmp_path, env_overrides={"custom_flag": "1"}))
 
     environment = backend.build_calls[-1]["environment"]
+    request = backend.build_calls[-1]["request"]
     assert spec.env["PATH"] == expected_path
     assert environment.env["PATH"] == expected_path
     assert environment.env["LANG"] == "C.UTF-8"
     assert environment.env["CUSTOM_FLAG"] == "1"
+    assert request.workspace_root == tmp_path.resolve()
+    assert request.cwd == tmp_path.resolve()
     assert "SSH_AUTH_SOCK" not in environment.env
     assert spec.private_root.parent == _manager_root(manager)
 

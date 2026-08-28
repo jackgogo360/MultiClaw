@@ -71,3 +71,6 @@ class StreamableHTTPTransport(BaseTransport):
             finally:
                 self._context = None
         self._clear_streams()
+
+    def scrub_sensitive_state(self) -> None:
+        self._headers.clear()

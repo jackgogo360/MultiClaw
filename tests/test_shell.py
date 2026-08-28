@@ -36,6 +36,7 @@ class TestShellTool:
         assert request.mode == "shell_string"
         assert request.command == "echo hello"
         assert request.profile_name == "shell_workspace"
+        assert request.workspace_root == workspace.resolve()
         assert request.cwd == workspace.resolve()
 
     @pytest.mark.asyncio

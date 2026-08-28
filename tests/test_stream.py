@@ -62,6 +62,52 @@ def test_encode_data_session():
     assert payload["type"] == "data-session"
 
 
+def test_encode_data_run():
+    payload = _decode_sse(
+        DataStreamEncoder.data_part(
+            "data-run",
+            {"session_id": "s1", "run_id": "r1"},
+            transient=True,
+        )
+    )
+    assert payload == {
+        "type": "data-run",
+        "data": {"session_id": "s1", "run_id": "r1"},
+        "transient": True,
+    }
+
+
+def test_encode_scoped_event():
+    payload = _decode_sse(
+        DataStreamEncoder.data_part(
+            "data-event",
+            {
+                "tenant_id": "t1",
+                "workspace_id": "w1",
+                "session_id": "s1",
+                "run_id": "r1",
+                "event_type": "tool.completed",
+                "occurred_at_ms": 123,
+                "data": {"tool": "echo"},
+            },
+            transient=True,
+        )
+    )
+    assert payload == {
+        "type": "data-event",
+        "data": {
+            "tenant_id": "t1",
+            "workspace_id": "w1",
+            "session_id": "s1",
+            "run_id": "r1",
+            "event_type": "tool.completed",
+            "occurred_at_ms": 123,
+            "data": {"tool": "echo"},
+        },
+        "transient": True,
+    }
+
+
 def test_encode_finish():
     payload = _decode_sse(DataStreamEncoder.finish("stop"))
     assert payload == {"type": "finish", "finishReason": "stop"}

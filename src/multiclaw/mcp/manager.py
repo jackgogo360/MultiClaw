@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+from dataclasses import replace
 import logging
 import threading
 import time
@@ -13,7 +14,17 @@ from typing import Any, Callable, Optional
 from .circuit_breaker import CircuitBreaker
 from .client import MCPClient
 from .transport.factory import create_transport
-from .types import ServerConfig, ServerState, ServerStatus, ToolCallResult, ToolInfo
+from .types import (
+    HTTPServerConfig,
+    SSEServerConfig,
+    StdioServerConfig,
+    ServerConfig,
+    ServerState,
+    ServerStatus,
+    ToolCallResult,
+    ToolInfo,
+    WebSocketServerConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +52,15 @@ class MCPClientManager:
         remote_batch_size: int = _REMOTE_BATCH_SIZE,
         sandbox_controller=None,
         workspace_root: Path | None = None,
+        secret_resolver=None,
+        tenant_context=None,
     ) -> None:
         self._local_batch_size = local_batch_size
         self._remote_batch_size = remote_batch_size
         self._sandbox_controller = sandbox_controller
         self._workspace_root = workspace_root
+        self._secret_resolver = secret_resolver
+        self._tenant_context = tenant_context
         self._clients: dict[str, MCPClient] = {}
         self._states: dict[str, ServerState] = {}
         self._breakers: dict[str, CircuitBreaker] = {}
@@ -80,6 +95,10 @@ class MCPClientManager:
         if self._thread:
             self._thread.join(timeout=5.0)
         self._started = False
+        self._states.clear()
+        self._breakers.clear()
+        self._loop = None
+        self._thread = None
         logger.info("MCP event loop stopped")
 
     def connect_servers(self, configs: dict[str, ServerConfig]) -> dict[str, ServerState]:
@@ -156,25 +175,64 @@ class MCPClientManager:
         self._breakers.setdefault(name, CircuitBreaker())
 
         try:
-            transport = create_transport(
-                config,
-                sandbox_controller=self._sandbox_controller,
-                workspace_root=self._workspace_root,
-                server_name=name,
-            )
-            client = MCPClient(name=name, transport=transport)
-            client.set_on_tools_changed(self._on_tools_changed)
-            await client.connect()
-            tools = await client.discover_tools()
-            self._clients[name] = client
+            if self._config_uses_secret_refs(config):
+                tools = await self._discover_tools_with_secret_config(name, config)
+            else:
+                transport = create_transport(
+                    config,
+                    sandbox_controller=self._sandbox_controller,
+                    workspace_root=self._workspace_root,
+                    server_name=name,
+                )
+                client = MCPClient(name=name, transport=transport)
+                client.set_on_tools_changed(self._on_tools_changed)
+                await client.connect()
+                tools = await client.discover_tools()
+                self._clients[name] = client
             state.status = ServerStatus.CONNECTED
             state.tools = tools
-            self._register_tools(name, tools, client)
+            self._register_tools(name, tools, self._clients.get(name))
             logger.info("Server '%s' connected with %d tools", name, len(tools))
         except Exception as e:
             state.status = ServerStatus.FAILED
             state.error = _sanitize_error(str(e))
             logger.warning("Server '%s' connection failed: %s", name, state.error)
+
+    async def _resolve_config_secrets(self, config: ServerConfig) -> ServerConfig:
+        if self._secret_resolver is None or self._tenant_context is None:
+            return config
+        match config:
+            case StdioServerConfig():
+                return replace(
+                    config,
+                    env=await self._resolve_mapping(config.env),
+                )
+            case SSEServerConfig() | HTTPServerConfig() | WebSocketServerConfig():
+                return replace(
+                    config,
+                    headers=await self._resolve_mapping(config.headers),
+                )
+            case _:
+                return config
+
+    async def _resolve_mapping(self, values: dict[str, str]) -> dict[str, str]:
+        resolved: dict[str, str] = {}
+        for key, value in values.items():
+            if isinstance(value, str) and value.startswith("secret://"):
+                secret = await self._secret_resolver.resolve_reference(self._tenant_context, value)
+                with secret.reveal() as plaintext:
+                    resolved[key] = bytes(plaintext).decode("utf-8")
+            else:
+                resolved[key] = value
+        return resolved
+
+    async def _discover_tools_with_secret_config(self, name: str, config: ServerConfig) -> list[ToolInfo]:
+        client, resolved_config = await self._build_secret_client(name, config)
+        try:
+            await client.connect()
+            return await client.discover_tools()
+        finally:
+            await self._dispose_secret_client(client, resolved_config)
 
     async def _disconnect_all(self) -> None:
         tasks = []
@@ -194,23 +252,110 @@ class MCPClientManager:
 
     async def _call_tool_async(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> ToolCallResult:
         client = self._clients.get(server_name)
-        if not client or not client.connected:
+        if client and client.connected:
+            return await client.call_tool_with_retry(tool_name, arguments)
+
+        state = self._states.get(server_name)
+        if state is None or not self._config_uses_secret_refs(state.config):
             raise RuntimeError(f"Server '{server_name}' not connected")
-        return await client.call_tool_with_retry(tool_name, arguments)
+
+        secret_client, resolved_config = await self._build_secret_client(server_name, state.config)
+        try:
+            await secret_client.connect()
+            return await secret_client.call_tool_with_retry(tool_name, arguments)
+        finally:
+            await self._dispose_secret_client(secret_client, resolved_config)
 
     async def _refresh_server(self, server_name: str) -> list[ToolInfo]:
         client = self._clients.get(server_name)
-        if not client or not client.connected:
+        state = self._states.get(server_name)
+        if state is None:
+            raise RuntimeError(f"Server '{server_name}' not connected")
+        if client and client.connected:
+            tools = await client.refresh_tools()
+            self._register_tools(server_name, tools, client)
+            if server_name in self._states:
+                self._states[server_name].tools = tools
+            return tools
+
+        if not self._config_uses_secret_refs(state.config):
             raise RuntimeError(f"Server '{server_name}' not connected")
 
-        tools = await client.refresh_tools()
-        self._register_tools(server_name, tools, client)
-        if server_name in self._states:
-            self._states[server_name].tools = tools
+        secret_client, resolved_config = await self._build_secret_client(server_name, state.config)
+        try:
+            await secret_client.connect()
+            tools = await secret_client.discover_tools()
+        finally:
+            await self._dispose_secret_client(secret_client, resolved_config)
+        self._register_tools(server_name, tools, None)
+        self._on_tools_changed(server_name, tools)
         return tools
 
     def _register_tools(self, server_name: str, tools: list[ToolInfo], client: MCPClient) -> None:
         pass  # tools are registered externally via tool_adapter.py
+
+    async def _build_secret_client(
+        self,
+        server_name: str,
+        config: ServerConfig,
+    ) -> tuple[MCPClient, ServerConfig]:
+        resolved_config = await self._resolve_config_secrets(config)
+        transport = create_transport(
+            resolved_config,
+            sandbox_controller=self._sandbox_controller,
+            workspace_root=self._workspace_root,
+            server_name=server_name,
+        )
+        client = MCPClient(name=server_name, transport=transport)
+        client.set_on_tools_changed(self._on_tools_changed)
+        return client, resolved_config
+
+    async def _dispose_secret_client(self, client: MCPClient, resolved_config: ServerConfig) -> None:
+        try:
+            await client.disconnect()
+        finally:
+            transport = getattr(client, "_transport", None)
+            self._scrub_transport_state(transport)
+            self._scrub_resolved_config(resolved_config)
+
+    @staticmethod
+    def _scrub_resolved_config(config: ServerConfig) -> None:
+        match config:
+            case StdioServerConfig():
+                config.env.clear()
+            case SSEServerConfig() | HTTPServerConfig() | WebSocketServerConfig():
+                config.headers.clear()
+            case _:
+                return None
+
+    @staticmethod
+    def _scrub_transport_state(transport: Any) -> None:
+        if transport is None:
+            return None
+        if hasattr(transport, "scrub_sensitive_state"):
+            try:
+                transport.scrub_sensitive_state()
+            except Exception:
+                logger.debug("secret transport scrub failed", exc_info=True)
+        headers = getattr(transport, "_headers", None)
+        if isinstance(headers, dict):
+            headers.clear()
+        launch_spec = getattr(transport, "_launch_spec", None)
+        env = getattr(launch_spec, "env", None)
+        if isinstance(env, dict):
+            env.clear()
+
+    @staticmethod
+    def _config_uses_secret_refs(config: ServerConfig) -> bool:
+        values: list[str] = []
+        match config:
+            case StdioServerConfig():
+                values = list(config.env.values())
+            case SSEServerConfig() | HTTPServerConfig() | WebSocketServerConfig():
+                values = list(config.headers.values())
+            case _:
+                return False
+        return any(isinstance(value, str) and value.startswith("secret://") for value in values)
 
     def _on_tools_changed(self, server_name: str, tools: list[ToolInfo]) -> None:
         if server_name in self._states:

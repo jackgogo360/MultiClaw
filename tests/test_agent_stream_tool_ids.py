@@ -1,15 +1,19 @@
 import asyncio
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from pydantic import BaseModel
 
+from multiclaw.agent.base import BaseAgent
 from multiclaw.agent.multiclaw import MultiClawAgent
 from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.agent.tool_batch import ToolBatchExecutor
 from multiclaw.context import ContextBuildReport, ContextBuildResult
+from multiclaw.events import AgentState, AgentStateEvent, EventBus
 from multiclaw.llm import LLMResponse
+from multiclaw.tenancy import TenantContext
 from multiclaw.tools import (
     ToolBuilder,
     ToolExecutionResult,
@@ -17,6 +21,8 @@ from multiclaw.tools import (
     ToolRegistry,
     ToolStatus,
 )
+from multiclaw.workflow.models import RecoveryStrategy
+from multiclaw.workflow.models import RunLease, RunLeaseHandle
 
 
 class _DummySkillManager:
@@ -65,6 +71,10 @@ class _ReportOnlyContextBuilder:
 
 
 class _DummyMemory:
+    async def recent(self, _context, limit: int, entry_type: str | None = None):
+        del limit, entry_type
+        return []
+
     async def save(self, _entry):
         return None
 
@@ -135,6 +145,36 @@ class _DummyDsmlRetryRouter:
         yield {"type": "token", "content": "Final summary"}
 
 
+class _SequentialStreamRouter:
+    def __init__(self, stream_sequences) -> None:
+        self.stream_sequences = list(stream_sequences)
+        self.stream_calls: list[dict] = []
+
+    async def stream_completion(self, **kwargs):
+        self.stream_calls.append(kwargs)
+        events = self.stream_sequences.pop(0)
+        if isinstance(events, Exception):
+            raise events
+        for event in events:
+            yield event
+
+
+class _TokenThenBlockRouter:
+    def __init__(self) -> None:
+        self.block = asyncio.Event()
+
+    async def stream_completion(self, **_kwargs):
+        yield {"type": "token", "content": "partial"}
+        await self.block.wait()
+
+
+@dataclass
+class _PersistedAssistantOutput:
+    message_id: str
+    output_digest: str
+    model_cursor: str
+
+
 class _ScriptedParams(BaseModel):
     query: str | None = None
     label: str | None = None
@@ -153,11 +193,14 @@ class _ScriptedInvocation(ToolInvocation[_ScriptedParams]):
 class _ScriptedToolBuilder(ToolBuilder[_ScriptedParams]):
     description = "Scripted stream test tool"
     parameters_schema = _ScriptedParams
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def __init__(self, name: str, runner, *, read_only: bool) -> None:
         self.name = name
         self._runner = runner
         self.read_only = read_only
+        if not read_only:
+            self.recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
     def validate(self, params: dict) -> _ScriptedParams:
         return _ScriptedParams(**params)
@@ -173,10 +216,14 @@ class _BatchScheduler:
     async def can_run_concurrently(self, builder, raw_params: dict) -> bool:
         return builder.read_only
 
-    async def run(self, builder, raw_params: dict) -> ToolExecutionResult:
+    async def run(self, builder, raw_params: dict, **_kwargs) -> ToolExecutionResult:
         self.run_calls.append((builder.name, raw_params))
         params = builder.validate(raw_params)
         return await builder.build(params).execute()
+
+
+def _stream_context(session_id: str = "s1", run_id: str = "r1") -> TenantContext:
+    return TenantContext("tenant-a", "workspace-a").for_run(session_id, run_id)
 
 
 @pytest.mark.asyncio
@@ -193,7 +240,7 @@ async def test_handle_message_stream_preserves_tool_call_ids(monkeypatch):
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     tool_call = next(event for event in events if event["type"] == "tool_call")
@@ -201,6 +248,54 @@ async def test_handle_message_stream_preserves_tool_call_ids(monkeypatch):
 
     assert tool_call["call_id"] == "call_123"
     assert tool_result["call_id"] == "call_123"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_stops_at_awaiting_approval_boundary():
+    router = _QueuedStreamRouter(
+        stream_sequences=[
+            [_tool_calls_event("call-await", {"query": "hello"})],
+            [{"type": "token", "content": "must not run"}],
+        ]
+    )
+    agent = _build_custom_stream_agent(
+        router=router,
+        registry=ToolRegistry(),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=2,
+    )
+    agent._execute_tool_batch = AsyncMock(
+        return_value=[
+            SimpleNamespace(
+                call_id="call-await",
+                name="edit_file",
+                observation=SimpleNamespace(content="approval required"),
+                result=SimpleNamespace(
+                    status=ToolStatus.AWAITING_APPROVAL,
+                    data={"approval_id": "approval-1"},
+                ),
+            )
+        ]
+    )
+
+    events = []
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
+        events.append(event)
+
+    assert [event["type"] for event in events] == ["tool_call", "done"]
+    assert events[0]["call_id"] == "call-await"
+    assert events[-1] == {
+        "type": "done",
+        "content": "",
+        "data": {"state": "awaiting_user", "detail": "tool awaiting approval"},
+    }
+    assert len(router.stream_calls) == 1
+    agent._execute_tool_batch.assert_awaited_once()
+    agent.remember.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -227,14 +322,14 @@ async def test_handle_message_stream_uses_context_build_with_report_and_only_pro
 
     events = []
     with patch("multiclaw.agent.multiclaw.logger.info") as mock_info:
-        async for event in agent.handle_message_stream("hello", session_id="s1"):
+        async for event in agent.handle_message_stream("hello", context=_stream_context()):
             events.append(event)
 
     assert events[-1] == {"type": "done", "content": "streamed", "data": {}}
     agent.context_builder.build_with_report.assert_awaited_once()
     request = agent.context_builder.build_with_report.await_args.args[0]
     assert request.user_input == "hello"
-    assert request.session_id == "s1"
+    assert request.context.session_id == "s1"
     assert request.context_window_limit == 1000
     assert request.skill_prompts == []
     assert router.stream_calls[0]["messages"] == expected_messages
@@ -258,6 +353,75 @@ async def test_handle_message_stream_uses_context_build_with_report_and_only_pro
 
 
 @pytest.mark.asyncio
+async def test_handle_message_stream_uses_injected_workflow_continuation_for_assistant_output():
+    router = _QueuedStreamRouter(
+        stream_sequences=[[{"type": "token", "content": "streamed"}]]
+    )
+    agent = _build_custom_stream_agent(
+        router=router,
+        registry=ToolRegistry(),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=1,
+    )
+    run_context = _stream_context()
+    lease = RunLease(
+        context=run_context,
+        lease_owner="runtime-1",
+        fencing_token=1,
+        version=1,
+        lease_expires_at=12345,
+    )
+    lease_handle = RunLeaseHandle(lease)
+    persisted: dict[str, object] = {}
+
+    class FakeWorkflowContinuation:
+        async def persist_assistant_output(
+            self,
+            *,
+            context,
+            run_lease_handle,
+            content,
+            turn_index,
+        ):
+            persisted["context"] = context
+            persisted["run_lease_handle"] = run_lease_handle
+            persisted["content"] = content
+            persisted["turn_index"] = turn_index
+            return _PersistedAssistantOutput(
+                message_id="msg-1",
+                output_digest="a" * 64,
+                model_cursor="cursor-1",
+            )
+
+    events = []
+    async for event in agent.handle_message_stream(
+        "hello",
+        context=run_context,
+        run_lease_handle=lease_handle,
+        workflow_continuation=FakeWorkflowContinuation(),
+    ):
+        events.append(event)
+
+    assert next(event for event in events if event["type"] == "done") == {
+        "type": "done",
+        "content": "streamed",
+        "data": {},
+    }
+    assert persisted == {
+        "context": run_context,
+        "run_lease_handle": lease_handle,
+        "content": "streamed",
+        "turn_index": 2,
+    }
+    agent._save_chat_msg.assert_any_await(run_context, "user", "hello", 1)
+    assert agent._save_chat_msg.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_handle_message_stream_retries_when_final_summary_contains_dsml():
     router = _DummyDsmlRetryRouter()
     agent = _build_custom_stream_agent(
@@ -272,7 +436,7 @@ async def test_handle_message_stream_retries_when_final_summary_contains_dsml():
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     done = next(event for event in events if event["type"] == "done")
@@ -284,10 +448,8 @@ async def test_handle_message_stream_retries_when_final_summary_contains_dsml():
 
 
 @pytest.mark.asyncio
-async def test_handle_message_stream_parallel_read_only_batch_overlaps_when_enabled():
+async def test_handle_message_stream_batches_run_serially_but_keep_tool_call_ids():
     timeline: list[str] = []
-    first_started = asyncio.Event()
-    second_started = asyncio.Event()
     active = 0
     max_active = 0
 
@@ -298,13 +460,7 @@ async def test_handle_message_stream_parallel_read_only_batch_overlaps_when_enab
         active += 1
         max_active = max(max_active, active)
         try:
-            if label == "first":
-                first_started.set()
-                await asyncio.wait_for(second_started.wait(), timeout=0.1)
-                await asyncio.sleep(0.02)
-            else:
-                second_started.set()
-                await asyncio.sleep(0.0)
+            await asyncio.sleep(0.01)
             return ToolExecutionResult(
                 status=ToolStatus.SUCCESS,
                 content=f"done:{label}",
@@ -336,22 +492,21 @@ async def test_handle_message_stream_parallel_read_only_batch_overlaps_when_enab
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
         if event["type"] == "tool_call":
             timeline.append(f"ui_call:{event['call_id']}")
         if event["type"] == "tool_result":
             timeline.append(f"ui_result:{event['call_id']}")
 
-    assert first_started.is_set()
-    assert second_started.is_set()
-    assert max_active == 2
+    assert max_active == 1
     assert timeline[:2] == ["ui_call:call_1", "ui_call:call_2"]
+    assert timeline[2:] == ["exec:first", "exec:second", "ui_result:call_1", "ui_result:call_2"]
     assert [event["call_id"] for event in events if event["type"] == "tool_result"] == [
         "call_1",
         "call_2",
     ]
-    assert [call.args[0] for call in agent.remember.await_args_list] == [
+    assert [call.args[1] for call in agent.remember.await_args_list] == [
         "done:first",
         "done:second",
     ]
@@ -406,7 +561,7 @@ async def test_handle_message_stream_read_write_read_batch_preserves_serial_barr
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     assert max_active == 1
@@ -476,7 +631,7 @@ async def test_handle_message_stream_preserves_original_tool_call_ids_and_result
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     followup_messages = router.stream_calls[1]["messages"]
@@ -485,8 +640,8 @@ async def test_handle_message_stream_preserves_original_tool_call_ids_and_result
     )
     tool_messages = [message for message in followup_messages if message["role"] == "tool"]
 
-    assert max_active == 2
-    assert finished == ["second", "first"]
+    assert max_active == 1
+    assert finished == ["first", "second"]
     assert [event["call_id"] for event in events if event["type"] == "tool_result"] == [
         "call_beta",
         "call_alpha",
@@ -551,7 +706,7 @@ async def test_handle_message_stream_parallel_flag_disabled_keeps_read_only_batc
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     assert max_active == 1
@@ -587,7 +742,7 @@ async def test_handle_message_stream_reflects_without_emitting_repeated_tool_ui_
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     tool_calls = [event for event in events if event["type"] == "tool_call"]
@@ -635,7 +790,7 @@ async def test_handle_message_stream_forces_summary_when_reflection_generation_f
     )
 
     events = []
-    async for event in agent.handle_message_stream("hello", session_id="s1"):
+    async for event in agent.handle_message_stream("hello", context=_stream_context()):
         events.append(event)
 
     tool_calls = [event for event in events if event["type"] == "tool_call"]
@@ -649,6 +804,128 @@ async def test_handle_message_stream_forces_summary_when_reflection_generation_f
     assert done == {"type": "done", "content": "forced summary", "data": {}}
     assert router.completion_calls[0]["tools"] is None
     assert router.stream_calls[-1]["tools"] is None
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_resets_state_after_forced_summary_before_next_run():
+    router = _SequentialStreamRouter(
+        [
+            [
+                _tool_calls_event("call_1", {"query": "alpha"}),
+            ],
+            [{"type": "token", "content": "forced summary"}],
+            [{"type": "token", "content": "next run"}],
+        ]
+    )
+    agent, state_events = _build_stateful_stream_agent(
+        router=router,
+        registry=_single_tool_registry("web_search", ["search results"]),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=1,
+    )
+
+    first_events = []
+    async for event in agent.handle_message_stream("first", context=_stream_context("s1", "r1")):
+        first_events.append(event)
+
+    second_events = []
+    async for event in agent.handle_message_stream("second", context=_stream_context("s1", "r2")):
+        second_events.append(event)
+
+    assert next(event for event in first_events if event["type"] == "done") == {
+        "type": "done",
+        "content": "forced summary",
+        "data": {},
+    }
+    assert agent.state == AgentState.IDLE
+    assert [(event.from_state, event.to_state) for event in state_events[:3]] == [
+        (AgentState.IDLE, AgentState.THINKING),
+        (AgentState.THINKING, AgentState.ACTING),
+        (AgentState.ACTING, AgentState.IDLE),
+    ]
+    assert state_events[3].from_state == AgentState.IDLE
+    assert state_events[3].to_state == AgentState.THINKING
+    assert next(event for event in second_events if event["type"] == "done") == {
+        "type": "done",
+        "content": "next run",
+        "data": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_resets_state_after_timeout_before_next_run():
+    router = _SequentialStreamRouter(
+        [
+            asyncio.TimeoutError("boom"),
+            [{"type": "token", "content": "recovered"}],
+        ]
+    )
+    agent, state_events = _build_stateful_stream_agent(
+        router=router,
+        registry=ToolRegistry(),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=1,
+    )
+
+    first_events = []
+    async for event in agent.handle_message_stream("first", context=_stream_context("s1", "r1")):
+        first_events.append(event)
+
+    second_events = []
+    async for event in agent.handle_message_stream("second", context=_stream_context("s1", "r2")):
+        second_events.append(event)
+
+    assert next(event for event in first_events if event["type"] == "error") == {
+        "type": "error",
+        "content": "Request timed out: boom",
+    }
+    assert agent.state == AgentState.IDLE
+    assert state_events[0].from_state == AgentState.IDLE
+    assert state_events[0].to_state == AgentState.THINKING
+    assert state_events[1].from_state == AgentState.THINKING
+    assert state_events[1].to_state == AgentState.IDLE
+    assert state_events[2].from_state == AgentState.IDLE
+    assert state_events[2].to_state == AgentState.THINKING
+    assert next(event for event in second_events if event["type"] == "done") == {
+        "type": "done",
+        "content": "recovered",
+        "data": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_resets_state_after_generator_close():
+    router = _TokenThenBlockRouter()
+    agent, state_events = _build_stateful_stream_agent(
+        router=router,
+        registry=ToolRegistry(),
+        scheduler=_BatchScheduler(),
+        parallel_enabled=True,
+        resilience_enabled=False,
+        repeat_limit=3,
+        max_reflections=1,
+        max_tool_rounds=1,
+    )
+
+    stream = agent.handle_message_stream("hello", context=_stream_context("s1", "r1"))
+    first = await anext(stream)
+    assert first == {"type": "token", "content": "partial"}
+
+    await stream.aclose()
+
+    assert agent.state == AgentState.IDLE
+    assert [(event.from_state, event.to_state) for event in state_events] == [
+        (AgentState.IDLE, AgentState.THINKING),
+        (AgentState.THINKING, AgentState.IDLE),
+    ]
 
 
 def _build_stub_stream_agent(
@@ -727,6 +1004,9 @@ def _build_custom_stream_agent(
     agent.scheduler = scheduler
     agent.memory = _DummyMemory()
     agent.router = router
+    agent.state = AgentState.IDLE
+    agent.event_bus = EventBus()
+    agent.event_router = None
     agent.settings = SimpleNamespace(
         agent=SimpleNamespace(
             system_prompt="sys",
@@ -755,3 +1035,39 @@ def _build_custom_stream_agent(
         side_effect=AssertionError("legacy per-call act path should not run")
     )
     return agent
+
+
+def _build_stateful_stream_agent(
+    *,
+    router,
+    registry: ToolRegistry,
+    scheduler,
+    parallel_enabled: bool,
+    resilience_enabled: bool,
+    repeat_limit: int,
+    max_reflections: int,
+    max_tool_rounds: int,
+):
+    agent = _build_custom_stream_agent(
+        router=router,
+        registry=registry,
+        scheduler=scheduler,
+        parallel_enabled=parallel_enabled,
+        resilience_enabled=resilience_enabled,
+        repeat_limit=repeat_limit,
+        max_reflections=max_reflections,
+        max_tool_rounds=max_tool_rounds,
+    )
+    event_bus = EventBus()
+    state_events: list[AgentStateEvent] = []
+
+    async def collect(event):
+        if isinstance(event, AgentStateEvent):
+            state_events.append(event)
+
+    event_bus.subscribe("agent.state_change", collect)
+    agent.event_bus = event_bus
+    agent.event_router = None
+    agent.state = AgentState.IDLE
+    agent.transition = BaseAgent.transition.__get__(agent, MultiClawAgent)
+    return agent, state_events

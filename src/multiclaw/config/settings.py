@@ -9,14 +9,103 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _sqlite_url_from_path(path: str) -> str:
+    if path == ":memory:":
+        return "sqlite+aiosqlite:///:memory:"
+    return f"sqlite+aiosqlite:///{path}"
+
+
+def _sqlite_path_from_url(url: str) -> str:
+    prefix = "sqlite+aiosqlite:///"
+    if url.startswith(prefix):
+        return url[len(prefix) :]
+    return url
+
+
 class AppSettings(BaseModel):
     name: str = "MultiClaw"
     version: str = "0.1.0"
     debug: bool = False
+    allowed_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost",
+            "http://localhost:5173",
+            "http://127.0.0.1",
+            "http://127.0.0.1:5173",
+            "http://testserver",
+        ]
+    )
+
+
+class DeploymentSettings(BaseModel):
+    profile: Literal["standalone"] = "standalone"
 
 
 class DatabaseSettings(BaseModel):
-    path: str = "data/multiclaw.db"
+    driver: Literal["sqlite", "mysql"] = "sqlite"
+    url: str = "sqlite+aiosqlite:///data/multiclaw.db"
+    migration_mode: Literal["validate"] = "validate"
+    sqlite_busy_timeout_ms: int = Field(default=5000, ge=1, le=60000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_path(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        migrated = dict(data)
+        legacy_path = migrated.pop("path", None)
+        if legacy_path is not None and "url" not in migrated:
+            migrated["url"] = _sqlite_url_from_path(legacy_path)
+            migrated.setdefault("driver", "sqlite")
+        return migrated
+
+    @model_validator(mode="after")
+    def validate_driver_url(self) -> "DatabaseSettings":
+        expected = {
+            "sqlite": "sqlite+aiosqlite://",
+            "mysql": "mysql+aiomysql://",
+        }[self.driver]
+        if not self.url.startswith(expected):
+            raise ValueError("database.driver must match database.url")
+        return self
+
+    @property
+    def path(self) -> str:
+        if self.driver == "sqlite":
+            return _sqlite_path_from_url(self.url)
+        return self.url
+
+
+class WorkspaceSettings(BaseModel):
+    root: str = "data/workspaces"
+
+
+class RuntimeSettings(BaseModel):
+    max_resident_tenants: int = Field(default=32, ge=1, le=1024)
+    idle_ttl_seconds: int = Field(default=900, ge=30)
+    max_concurrent_runs_per_tenant: int = Field(default=2, ge=1, le=32)
+
+
+class WorkflowSettings(BaseModel):
+    heartbeat_ms: int = Field(default=5000, ge=1000)
+    lease_ttl_ms: int = Field(default=20000, ge=5000)
+    max_checkpoint_payload_bytes: int = Field(default=262144, ge=1024, le=1048576)
+
+    @model_validator(mode="after")
+    def validate_lease_ratio(self) -> "WorkflowSettings":
+        if self.lease_ttl_ms < self.heartbeat_ms * 3:
+            raise ValueError("workflow.lease_ttl_ms must be at least 3x heartbeat_ms")
+        return self
+
+
+class SecretSettings(BaseModel):
+    allow_platform_fallback: bool = False
+    keyring_file: str = ""
+
+
+class DeletionSettings(BaseModel):
+    retention_days: int = Field(default=7, ge=0, le=30, strict=True)
 
 
 class LLMProviderSettings(BaseModel):
@@ -139,7 +228,7 @@ class McpSettings(BaseModel):
 
 
 class AuthSettings(BaseModel):
-    jwt_secret: str = ""
+    jwt_signing_key_file: str = ""
 
 
 class EmailSettings(BaseModel):
@@ -167,7 +256,13 @@ class Settings(BaseSettings):
     )
 
     app: AppSettings = Field(default_factory=AppSettings)
+    deployment: DeploymentSettings = Field(default_factory=DeploymentSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
+    workspace: WorkspaceSettings = Field(default_factory=WorkspaceSettings)
+    runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
+    workflow: WorkflowSettings = Field(default_factory=WorkflowSettings)
+    secrets: SecretSettings = Field(default_factory=SecretSettings)
+    deletion: DeletionSettings = Field(default_factory=DeletionSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
@@ -198,8 +293,14 @@ class Settings(BaseSettings):
         import copy
         result = copy.deepcopy(data)
         prefix = "MULTICLAW_"
+        env_only_secret_keys = {
+            "MULTICLAW_SECRETS_KEYRING_B64",
+            "MULTICLAW_AUTH_JWT_SIGNING_KEY",
+        }
         for key, value in os.environ.items():
             if not key.startswith(prefix):
+                continue
+            if key in env_only_secret_keys:
                 continue
             path_parts = key[len(prefix):].lower().split("__")
             current = result
@@ -234,8 +335,20 @@ class Settings(BaseSettings):
         result: dict[str, Any] = {}
         if "app" in data:
             result["app"] = data["app"]
+        if "deployment" in data:
+            result["deployment"] = data["deployment"]
         if "database" in data:
             result["database"] = data["database"]
+        if "workspace" in data:
+            result["workspace"] = data["workspace"]
+        if "runtime" in data:
+            result["runtime"] = data["runtime"]
+        if "workflow" in data:
+            result["workflow"] = data["workflow"]
+        if "secrets" in data:
+            result["secrets"] = data["secrets"]
+        if "deletion" in data:
+            result["deletion"] = data["deletion"]
         if "llm" in data:
             llm_data = dict(data["llm"])
             result["llm"] = {

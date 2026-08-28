@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from multiclaw.tools._common import WorkspaceToolBuilder, _error, _success
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
+from multiclaw.workflow.models import RecoveryStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,7 @@ class WebSearchToolBuilder(WorkspaceToolBuilder):
     name = "web_search"
     description = "Search the web with engine fallback. Engines: duckduckgo, bing, baidu."
     parameters_schema = WebSearchParams
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
     read_only = True
 
     def __init__(self, workspace_root: str | Path | None = None, policy=None,

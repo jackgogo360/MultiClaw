@@ -263,6 +263,61 @@ def test_load_mcp_config_marks_auto_workspace_config_untrusted(
     assert loaded["demo"].config_trust == "workspace_untrusted"
 
 
+def test_load_mcp_config_searches_from_workspace_root_not_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "tenant-a" / "workspace-a"
+    workspace.mkdir(parents=True)
+    _write_mcp_config(workspace / ".mcp.json", {"demo": {"command": "/usr/bin/env"}})
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [tmp_path / "home" / ".mcp.json"],
+    )
+
+    loaded = load_mcp_config(search_parents=True, workspace_root=workspace.resolve())
+
+    assert isinstance(loaded["demo"], StdioServerConfig)
+    assert loaded["demo"].config_source == "auto_workspace"
+    assert loaded["demo"].config_trust == "workspace_untrusted"
+
+
+@pytest.mark.parametrize("workspace_has_config", [False, True])
+def test_load_mcp_config_ignores_process_cwd_default_config_when_workspace_root_is_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_has_config: bool,
+) -> None:
+    workspace = tmp_path / "tenant-a" / "workspace-a"
+    workspace.mkdir(parents=True)
+    if workspace_has_config:
+        _write_mcp_config(workspace / ".mcp.json", {"workspace": {"command": "/usr/bin/env"}})
+
+    attacker_cwd = tmp_path / "attacker"
+    attacker_cwd.mkdir()
+    _write_mcp_config(attacker_cwd / ".mcp.json", {"attacker": {"command": "/bin/echo"}})
+    monkeypatch.chdir(attacker_cwd)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [tmp_path / "home" / ".mcp.json", Path(".mcp.json")],
+    )
+
+    loaded = load_mcp_config(search_parents=True, workspace_root=workspace.resolve())
+
+    assert "attacker" not in loaded
+    if workspace_has_config:
+        assert isinstance(loaded["workspace"], StdioServerConfig)
+        assert loaded["workspace"].config_source == "auto_workspace"
+        assert loaded["workspace"].config_trust == "workspace_untrusted"
+    else:
+        assert loaded == {}
+
+
 def test_load_mcp_config_marks_explicit_outside_path_trusted(
     tmp_path: Path,
 ) -> None:
@@ -457,6 +512,98 @@ def test_load_mcp_tools_config_unions_distinct_server_names_with_own_filters(
     assert tool_filters == {
         "home_demo": {"include": ["home"], "exclude": ["home_ex"]},
         "workspace_demo": {"include": ["workspace"], "exclude": ["workspace_ex"]},
+    }
+
+
+def test_load_mcp_tools_config_ignores_process_cwd_when_workspace_root_is_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "tenant-a" / "workspace-a"
+    workspace.mkdir(parents=True)
+    attacker_cwd = tmp_path / "attacker"
+    attacker_cwd.mkdir()
+    _write_mcp_config(
+        attacker_cwd / ".mcp.json",
+        {
+            "attacker": {
+                "command": "/bin/echo",
+                "tools": {"include": ["attack"], "exclude": ["defend"]},
+            }
+        },
+    )
+    monkeypatch.chdir(attacker_cwd)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [tmp_path / "home" / ".mcp.json", Path(".mcp.json")],
+    )
+
+    tool_filters = load_mcp_tools_config(
+        search_parents=True,
+        workspace_root=workspace.resolve(),
+    )
+
+    assert tool_filters == {}
+
+
+def test_load_mcp_tools_config_loads_workspace_filters_from_explicit_workspace_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "tenant-a" / "workspace-a"
+    workspace.mkdir(parents=True)
+    _write_mcp_config(
+        workspace / ".mcp.json",
+        {
+            "workspace_demo": {
+                "command": "/usr/bin/env",
+                "tools": {"include": ["workspace"], "exclude": ["workspace_ex"]},
+            }
+        },
+    )
+    attacker_cwd = tmp_path / "attacker"
+    attacker_cwd.mkdir()
+    monkeypatch.chdir(attacker_cwd)
+    monkeypatch.setattr(
+        mcp_config_module,
+        "DEFAULT_CONFIG_PATHS",
+        [tmp_path / "home" / ".mcp.json", Path(".mcp.json")],
+    )
+
+    tool_filters = load_mcp_tools_config(
+        search_parents=True,
+        workspace_root=workspace.resolve(),
+    )
+
+    assert tool_filters == {
+        "workspace_demo": {"include": ["workspace"], "exclude": ["workspace_ex"]},
+    }
+
+
+def test_load_mcp_tools_config_explicit_path_keeps_operator_semantics_with_workspace_root(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "tenant-a" / "workspace-a"
+    workspace.mkdir(parents=True)
+    operator_config = tmp_path / "operator" / "mcp-tools.json"
+    _write_mcp_config(
+        operator_config,
+        {
+            "operator_demo": {
+                "command": "/usr/bin/env",
+                "tools": {"include": ["operator"], "exclude": ["operator_ex"]},
+            }
+        },
+    )
+
+    tool_filters = load_mcp_tools_config(
+        path=operator_config,
+        workspace_root=workspace.resolve(),
+    )
+
+    assert tool_filters == {
+        "operator_demo": {"include": ["operator"], "exclude": ["operator_ex"]},
     }
 
 

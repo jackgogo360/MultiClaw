@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { approveApi } from "@/lib/api";
+import { useEffect, useState } from "react";
+import { ApiError, approveApi, type ApprovalRecord } from "@/lib/api";
 
 export interface ApprovalToolUIProps {
   approvalId?: string;
@@ -10,6 +10,13 @@ export interface ApprovalToolUIProps {
   respondToApproval?: (response: { approved: boolean; reason?: string }) => void;
 }
 
+function formatError(error: unknown) {
+  if (error instanceof ApiError) {
+    return error.message;
+  }
+  return error instanceof Error ? error.message : "Failed to resolve approval.";
+}
+
 export function ApprovalToolUI({
   approvalId,
   toolName,
@@ -17,50 +24,106 @@ export function ApprovalToolUI({
   status,
   respondToApproval,
 }: ApprovalToolUIProps) {
-  const [resolution, setResolution] = useState<string | null>(null);
+  const [approval, setApproval] = useState<ApprovalRecord | null>(null);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isReloading, setIsReloading] = useState(false);
 
-  const handleApprove = async () => {
+  const loadApproval = async (): Promise<ApprovalRecord> => {
+    if (!approvalId) {
+      throw new Error("Approval request id is missing.");
+    }
+    return approveApi.getApproval(approvalId);
+  };
+
+  const handleReloadApproval = async () => {
     if (!approvalId) {
       setError("Approval request id is missing.");
       return;
     }
 
+    setIsReloading(true);
     try {
-      const result = await approveApi.submit(approvalId, true);
-      if (!result.ok) {
-        throw new Error("Backend did not accept the approval request.");
-      }
-      respondToApproval?.({ approved: true });
-      setResolution("approved");
+      const next = await loadApproval();
+      setApproval(next);
       setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to approve request.");
+    } catch (nextError) {
+      setError(formatError(nextError));
+    } finally {
+      setIsReloading(false);
     }
   };
 
-  const handleReject = async () => {
+  useEffect(() => {
+    if (!approvalId) {
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const next = await approveApi.getApproval(approvalId);
+        if (!cancelled) {
+          setApproval(next);
+          setError(null);
+        }
+      } catch (nextError) {
+        if (!cancelled) {
+          setError(formatError(nextError));
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [approvalId]);
+
+  const submitDecision = async (approved: boolean) => {
     if (!approvalId) {
       setError("Approval request id is missing.");
       return;
     }
 
+    setBusy(true);
+    setError(null);
+    let currentApproval = approval;
     try {
-      const result = await approveApi.submit(approvalId, false);
-      if (!result.ok) {
-        throw new Error("Backend did not accept the approval request.");
+      currentApproval ??= await loadApproval();
+      const result = await approveApi.submit(
+        approvalId,
+        approved,
+        currentApproval.version,
+      );
+      setApproval(result);
+      respondToApproval?.({ approved });
+    } catch (nextError) {
+      if (nextError instanceof ApiError && nextError.status === 409) {
+        try {
+          const refreshed = await loadApproval();
+          setApproval(refreshed);
+          setError("Approval state changed on the server. Refreshed latest status.");
+        } catch (refreshError) {
+          setError(formatError(refreshError));
+        }
+      } else if (nextError instanceof ApiError && nextError.status === 410) {
+        setApproval(
+          currentApproval ? { ...currentApproval, status: "expired" } : null,
+        );
+        setError("This approval expired before your decision could be recorded.");
+      } else {
+        setError(formatError(nextError));
       }
-      respondToApproval?.({ approved: false });
-      setResolution("rejected");
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to reject request.");
+    } finally {
+      setBusy(false);
     }
   };
 
   if (status.type !== "requires-action") {
-    return null; // Use default tool rendering for non-approval tools
+    return null;
   }
+
+  const resolved = approval?.status === "approved" || approval?.status === "rejected";
+  const expired = approval?.status === "expired";
 
   return (
     <div className="my-2 max-w-md rounded-lg border border-accent/20 bg-surface p-4 shadow-sm">
@@ -86,14 +149,26 @@ export function ApprovalToolUI({
           <span className="font-mono text-sm font-medium tracking-tight">
             {toolName}
           </span>
+          {approval ? (
+            <div className="mt-1 text-xs text-muted-foreground">
+              Status: {approval.status} · version {approval.version}
+            </div>
+          ) : null}
         </div>
+        <button
+          className="approval-refresh-button"
+          onClick={() => void handleReloadApproval()}
+          disabled={busy || isReloading || !approvalId}
+        >
+          {isReloading ? "Reloading..." : "Reload status"}
+        </button>
       </div>
 
       <details className="mb-3 rounded border border-border">
         <summary className="cursor-pointer select-none bg-elevated px-3 py-1.5 text-xs text-muted-foreground">
           Raw params
         </summary>
-        <pre className="max-h-[120px] overflow-y-auto bg-background p-3 font-mono text-xs text-muted-foreground whitespace-pre-wrap break-all">
+        <pre className="max-h-[120px] overflow-y-auto break-all whitespace-pre-wrap bg-background p-3 font-mono text-xs text-muted-foreground">
           {JSON.stringify(args, null, 2)}
         </pre>
       </details>
@@ -104,27 +179,35 @@ export function ApprovalToolUI({
         </div>
       ) : null}
 
-      {resolution ? (
+      {resolved || expired ? (
         <div
-          className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${
-            resolution === "approved"
-              ? "border border-success/25 bg-success/10 text-success"
-              : "border border-danger/25 bg-danger/10 text-danger"
-          }`}
+          className={
+            approval?.status === "approved"
+              ? "approval-state approval-state--approved"
+              : expired
+                ? "approval-state approval-state--expired"
+                : "approval-state approval-state--rejected"
+          }
         >
-          {resolution === "approved" ? "Approved" : "Rejected"}
+          {approval?.status === "approved"
+            ? "Approved"
+            : approval?.status === "rejected"
+              ? "Rejected"
+              : "Expired"}
         </div>
       ) : (
         <div className="flex gap-2">
           <button
-            className="flex-1 rounded-lg bg-accent py-2 text-sm font-medium text-background hover:brightness-110"
-            onClick={handleApprove}
+            className="flex-1 rounded-lg bg-accent py-2 text-sm font-medium text-background hover:brightness-110 disabled:opacity-50"
+            onClick={() => void submitDecision(true)}
+            disabled={busy}
           >
             Approve
           </button>
           <button
-            className="flex-1 rounded-lg border border-border bg-elevated py-2 text-sm font-medium text-muted-foreground hover:border-danger hover:bg-danger/10 hover:text-danger"
-            onClick={handleReject}
+            className="flex-1 rounded-lg border border-border bg-elevated py-2 text-sm font-medium text-muted-foreground hover:border-danger hover:bg-danger/10 hover:text-danger disabled:opacity-50"
+            onClick={() => void submitDecision(false)}
+            disabled={busy}
           >
             Reject
           </button>

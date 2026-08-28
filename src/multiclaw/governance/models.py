@@ -16,6 +16,7 @@ class AuditLog(BaseModel):
     tool_name: str
     status: str
     detail: str
+    event_type: str = "tool.event"
     user_id: str = ""
     tenant_id: str = ""
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

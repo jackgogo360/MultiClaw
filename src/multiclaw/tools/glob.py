@@ -4,6 +4,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation, ToolStatus
+from multiclaw.workflow.models import RecoveryStrategy
 from multiclaw.tools._common import (
     MAX_GLOB_RESULTS,
     PathPolicy,
@@ -94,6 +95,7 @@ class GlobToolBuilder(WorkspaceToolBuilder):
     description = "Find files by glob pattern within the workspace."
     parameters_schema = GlobParams
     read_only = True
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def validate(self, params: dict) -> GlobParams:
         return GlobParams(**params)

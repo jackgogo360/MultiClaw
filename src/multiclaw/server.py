@@ -1,22 +1,18 @@
 import asyncio
 import hashlib
 import inspect
-import json
 import logging
 import re
 import threading
 import tempfile
 from contextlib import asynccontextmanager
-from collections.abc import Iterable
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from time import perf_counter
-from typing import Any
+from time import perf_counter, time
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
 LOG_DIR = Path.home() / ".multiclaw" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -54,6 +50,8 @@ logging.basicConfig(
     handlers=[_file_handler],
 )
 logger = logging.getLogger("multiclaw")
+DELETION_POLL_INTERVAL_SECONDS = 1.0
+DELETION_BATCH_SIZE = 8
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -84,37 +82,27 @@ def _friendly_error(exc: Exception) -> str:
     return msg
 
 
-from multiclaw.agent import MultiClawAgent
+def _note_startup_cleanup_error(primary: BaseException, phase: str, error: BaseException) -> None:
+    primary.add_note(f"{phase} cleanup failed: {type(error).__name__}: {error}")
+
+
+def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException) -> None:
+    primary.add_note(f"{phase} failed: {type(error).__name__}: {error}")
+
+
 from multiclaw.config import Settings
-from multiclaw.events import Event, EventBus
+from multiclaw.events import EventBus
 from multiclaw.governance import (
-    ExecutionGuard,
-    InMemoryAuditLogger,
-    PermissionChecker,
     SandboxController,
-    SandboxProcessRunner,
     SandboxReadiness,
 )
-from multiclaw.governance.sandbox.manager import SandboxManager
-from multiclaw.llm import ModelRouter
-from multiclaw.memory import SqliteMemory
-from multiclaw.planner import Planner
-from multiclaw.session import SqliteSessionStore, SessionStatus
+from multiclaw.runtime import RuntimeFactory, RuntimePool
+from multiclaw.runtime.pool import RuntimeCapacityError, RuntimeUnavailableError
+from multiclaw.storage import Database
+from multiclaw.tenancy import WorkspaceResolver
 from multiclaw.tools import (
-    CoreToolScheduler,
     ToolRegistry,
 )
-from multiclaw.tools.code_exec import CodeExecToolBuilder
-from multiclaw.tools.edit_file import EditFileToolBuilder, UndoEditToolBuilder
-from multiclaw.tools.find_dir import FindDirToolBuilder
-from multiclaw.tools.glob import GlobToolBuilder
-from multiclaw.tools.grep import GrepToolBuilder
-from multiclaw.tools.list_dir import ListDirToolBuilder
-from multiclaw.tools.read_file import ReadFileToolBuilder
-from multiclaw.tools.shell import ShellToolBuilder
-from multiclaw.tools.web_fetch import WebFetchToolBuilder
-from multiclaw.tools.web_search import WebSearchToolBuilder
-from multiclaw.tools.write_file import WriteFileToolBuilder
 from multiclaw.mcp import (
     MCPClientManager,
     MCPToolBuilder,
@@ -130,20 +118,35 @@ from multiclaw.mcp.types import (
     WebSocketServerConfig,
 )
 
-from uuid import uuid4
-
-from multiclaw.auth.store import AuthStore
-from multiclaw.auth.middleware import AuthMiddleware, require_auth
+from multiclaw.auth.cleanup import AuthCleanupWorker
+from multiclaw.auth.middleware import AuthMiddleware
+from multiclaw.auth.models import build_auth_runtime
 from multiclaw.auth.router import router as auth_router
-from multiclaw.stream import DataStreamEncoder
+from multiclaw.api.account import router as account_router
+from multiclaw.api.approvals import router as approvals_router
+from multiclaw.api.chat import router as chat_router
+from multiclaw.api.health import router as health_router
+from multiclaw.api.secrets import router as secrets_router
+from multiclaw.api.sessions import router as sessions_router
+from multiclaw.observability import (
+    OperationalMetrics,
+    TraceEventSink,
+    increment_metric,
+    observability_scope,
+    observe_database_error,
+    record_trace_event,
+)
+from multiclaw.workflow.recovery import WorkflowRecoveryWorker
+from multiclaw.deletion.service import DeletionService
+from multiclaw.deletion.worker import DeletionWorker
+from multiclaw.secrets.keyring import DeploymentKeyring, SecretKeyringError
+from multiclaw.secrets.resolver import SecretResolver
+from multiclaw.secrets.validation import SecretCredentialTester
 
 
 # ---------------------------------------------------------------------------
 # Agent factory
 # ---------------------------------------------------------------------------
-
-agent: MultiClawAgent
-shared_bus: EventBus
 _PUBLIC_SECRET_PATTERN = re.compile(
     r"(?:ghp_[A-Za-z0-9_]{1,255}|sk-[A-Za-z0-9_]{1,255}|Bearer\s+\S+"
     r"|token=[^\s&,;\"']{1,255}|key=[^\s&,;\"']{1,255})",
@@ -278,7 +281,10 @@ def _register_mcp_tools(
         logger.info("No MCP servers configured (no .mcp.json found)")
         return
 
-    tools_configs = load_mcp_tools_config(config_path)
+    tools_configs = _load_mcp_tools_config_for_workspace(
+        config_path,
+        workspace_root=workspace_root,
+    )
     registry_lock = threading.RLock()
     refreshed_servers: set[str] = set()
 
@@ -409,6 +415,16 @@ def _load_mcp_config_for_workspace(
     return load_mcp_config(config_path)
 
 
+def _load_mcp_tools_config_for_workspace(
+    config_path: str | None,
+    *,
+    workspace_root: Path,
+) -> dict[str, dict[str, list[str]]]:
+    if "workspace_root" in inspect.signature(load_mcp_tools_config).parameters:
+        return load_mcp_tools_config(config_path, workspace_root=workspace_root)
+    return load_mcp_tools_config(config_path)
+
+
 def _is_workspace_untrusted_config(config: object) -> bool:
     return getattr(config, "config_trust", "trusted_operator") == "workspace_untrusted"
 
@@ -425,143 +441,65 @@ def _mcp_transport_capability_prefix(config: object) -> str:
     if isinstance(config, WebSocketServerConfig):
         return "mcp_websocket"
     return "mcp_unknown"
+def _resolve_config_path() -> Path | None:
+    candidates = (
+        Path(__file__).resolve().parent.parent.parent / "multiclaw.toml",
+        Path(__file__).resolve().parent.parent / "multiclaw.toml",
+        Path("multiclaw.toml"),
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
-def create_agent(
+def _resolve_workspace_root(settings: Settings, config_path: Path | None) -> Path:
+    base_root = config_path.resolve().parent if config_path is not None else Path.cwd().resolve()
+    configured = Path(settings.workspace.root)
+    workspace_root = configured if configured.is_absolute() else (base_root / configured)
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    return workspace_root.resolve()
+
+
+def create_runtime_factory(
     *,
-    sandbox_controller: SandboxController | None = None,
-) -> MultiClawAgent:
-    global shared_bus
-    shared_bus = EventBus()
-
-    config_path = Path(__file__).resolve().parent.parent.parent / "multiclaw.toml"
-    if not config_path.exists():
-        config_path = Path(__file__).resolve().parent.parent / "multiclaw.toml"
-    if not config_path.exists():
-        config_path = Path("multiclaw.toml")
-
-    settings = Settings(_config_file=str(config_path) if config_path.exists() else None)
-    workspace_root = config_path.resolve().parent if config_path.exists() else Path.cwd().resolve()
-
-    from multiclaw.skills import SkillManager
-
-    skill_manager = SkillManager(
-        project_root=workspace_root,
-        max_active=settings.skill.max_active if hasattr(settings, 'skill') else 5,
+    settings: Settings | None = None,
+    database: Database | None = None,
+    workspace_resolver: WorkspaceResolver | None = None,
+    sandbox_controller_factory=None,
+    mcp_manager_factory: type[MCPClientManager] = MCPClientManager,
+) -> RuntimeFactory:
+    config_path = _resolve_config_path()
+    resolved_settings = settings or Settings(
+        _config_file=str(config_path) if config_path is not None else None
     )
-    if settings.skill.enabled if hasattr(settings, 'skill') else True:
-        skill_manager.discover()
-
-    if sandbox_controller is None:
-        sandbox_controller = SandboxManager.create(
-            settings=settings.governance.sandbox,
-            debug=settings.app.debug,
-            workspace_root=workspace_root,
-            event_bus=shared_bus,
-            runner=SandboxProcessRunner(),
-        )
-    sandbox_controller.initialize()
-
-    registry = ToolRegistry()
-    read_builder = ReadFileToolBuilder(workspace_root)
-    edit_builder = EditFileToolBuilder(workspace_root)
-    registry.register(read_builder)
-    registry.register(WriteFileToolBuilder(workspace_root, read_builder))
-    registry.register(edit_builder)
-    registry.register(UndoEditToolBuilder(workspace_root, edit_builder))
-    registry.register(GlobToolBuilder(workspace_root))
-    registry.register(ListDirToolBuilder(workspace_root))
-    registry.register(GrepToolBuilder(workspace_root))
-    registry.register(FindDirToolBuilder(workspace_root))
-    if sandbox_controller.is_profile_ready(settings.governance.sandbox.profiles.shell):
-        registry.register(
-            ShellToolBuilder(
-                workspace_root,
-                sandbox_controller=sandbox_controller,
-                profile_name=settings.governance.sandbox.profiles.shell,
-            )
-        )
-    else:
-        _record_blocked_capability_safely(
-            sandbox_controller,
-            name="shell",
-            reason=f"sandbox profile {settings.governance.sandbox.profiles.shell!r} is not ready",
-            workspace_root=workspace_root,
-        )
-    if sandbox_controller.is_profile_ready(settings.governance.sandbox.profiles.code_exec):
-        registry.register(
-            CodeExecToolBuilder(
-                workspace_root,
-                sandbox_controller=sandbox_controller,
-                profile_name=settings.governance.sandbox.profiles.code_exec,
-            )
-        )
-    else:
-        _record_blocked_capability_safely(
-            sandbox_controller,
-            name="code_exec",
-            reason=f"sandbox profile {settings.governance.sandbox.profiles.code_exec!r} is not ready",
-            workspace_root=workspace_root,
-        )
-    registry.register(
-        WebFetchToolBuilder(
-            workspace_root,
-            allow_private_networks=settings.tools.web_fetch_allow_private_networks,
-        )
+    resolved_database = database or Database.create(resolved_settings.database)
+    resolved_workspace_resolver = workspace_resolver or WorkspaceResolver(
+        _resolve_workspace_root(resolved_settings, config_path)
     )
-    registry.register(WebSearchToolBuilder(workspace_root))
-
-    # Register MCP tools if enabled
-    mcp_manager = None
-    if settings.mcp.enabled:
-        mcp_manager = MCPClientManager(
-            sandbox_controller=sandbox_controller,
-            workspace_root=workspace_root,
+    secret_resolver = None
+    secret_keyring = None
+    try:
+        secret_keyring = DeploymentKeyring.load(resolved_settings.secrets)
+        secret_resolver = SecretResolver(
+            database=resolved_database,
+            settings=resolved_settings.secrets,
+            keyring=secret_keyring,
         )
-        _register_mcp_tools(
-            registry=registry,
-            mcp_manager=mcp_manager,
-            config_path=(
-                settings.mcp.config_path if settings.mcp.config_path else None
-            ),
-            sandbox_controller=sandbox_controller,
-            workspace_root=workspace_root,
-            mcp_profile_name=settings.governance.sandbox.profiles.mcp_stdio,
-        )
-
-    readiness = sandbox_controller.finalize_readiness()
-
-    scheduler = CoreToolScheduler(
-        permission_checker=PermissionChecker(
-            guarded_tools={
-                "write_file",
-                "edit_file",
-                "undo_edit",
-                "shell",
-                "code_exec",
-            }
+    except SecretKeyringError:
+        secret_resolver = None
+    return RuntimeFactory(
+        settings=resolved_settings,
+        database=resolved_database,
+        workspace_resolver=resolved_workspace_resolver,
+        secret_resolver=secret_resolver,
+        sandbox_controller_factory=sandbox_controller_factory,
+        mcp_manager_factory=mcp_manager_factory,
+        mcp_tool_registrar=_register_mcp_tools,
+        config_path=(
+            resolved_settings.mcp.config_path if resolved_settings.mcp.config_path else None
         ),
-        execution_guard=ExecutionGuard(),
-        audit_logger=InMemoryAuditLogger(),
-        event_bus=shared_bus,
     )
-
-    runtime_agent = MultiClawAgent(
-        settings=settings,
-        router=ModelRouter(settings),
-        registry=registry,
-        scheduler=scheduler,
-        memory=SqliteMemory(settings.database.path),
-        planner=Planner(),
-        event_bus=shared_bus,
-        skill_manager=skill_manager,
-    )
-    runtime_agent.session_store = SqliteSessionStore(settings.database.path)
-    runtime_agent.mcp_manager = mcp_manager
-    runtime_agent.sandbox_controller = sandbox_controller
-    runtime_agent.sandbox_readiness = readiness
-    runtime_agent.workspace_root = workspace_root
-    return runtime_agent
 
 
 # ---------------------------------------------------------------------------
@@ -569,438 +507,316 @@ def create_agent(
 # ---------------------------------------------------------------------------
 
 
+def _validate_allowed_origins(origins: set[str] | frozenset[str]) -> frozenset[str]:
+    if "*" in origins:
+        raise ValueError("wildcard origins cannot be used with credentialed auth cookies")
+    return frozenset(origins)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global agent
-    agent = create_agent()
-    auth_store = AuthStore(agent.settings.database.path)
-    await auth_store.initialize()
-    app.state.auth_store = auth_store
-    app.state.settings = agent.settings
-    app.state.sandbox_readiness = agent.sandbox_readiness
-    app.state.workspace_root = getattr(agent, "workspace_root", None)
-    sandbox_controller = getattr(agent, "sandbox_controller", None)
-    if sandbox_controller is not None:
-        for event in sandbox_controller.drain_startup_events():
-            await shared_bus.publish(event)
+    runtime_factory = None
+    runtime_pool = None
+    auth_runtime = None
+    deletion_service = None
+    deletion_worker = None
+    recovery_stop: asyncio.Event | None = None
+    recovery_task: asyncio.Task | None = None
+    deletion_stop: asyncio.Event | None = None
+    deletion_task: asyncio.Task | None = None
+    auth_cleanup_stop: asyncio.Event | None = None
+    auth_cleanup_task: asyncio.Task | None = None
+    try:
+        runtime_factory = create_runtime_factory()
+        runtime_pool = RuntimePool(
+            factory=runtime_factory,
+            max_resident_tenants=runtime_factory.settings.runtime.max_resident_tenants,
+            idle_ttl_ms=runtime_factory.settings.runtime.idle_ttl_seconds * 1000,
+        )
+        auth_runtime = build_auth_runtime(runtime_factory.settings)
+        allowed_origins = _validate_allowed_origins(auth_runtime.allowed_origins)
+        readiness, startup_events = runtime_factory.probe_startup()
+        app.state.auth = auth_runtime
+        app.state.allowed_origins = allowed_origins
+        app.state.database = runtime_factory.database
+        app.state.runtime_pool = runtime_pool
+        app.state.workspace_resolver = runtime_factory.workspace_resolver
+        app.state.settings = runtime_factory.settings
+        app.state.operational_metrics = OperationalMetrics()
+        app.state.trace_sink = TraceEventSink()
+        app.state.secret_resolver = getattr(runtime_factory, "secret_resolver", None)
+        app.state.secret_keyring = getattr(app.state.secret_resolver, "_keyring", None)
+        app.state.secret_credential_tester = (
+            SecretCredentialTester(
+                resolver=app.state.secret_resolver,
+                settings=runtime_factory.settings,
+            )
+            if app.state.secret_resolver is not None
+            else None
+        )
+        app.state.sandbox_readiness = readiness
+        app.state.workspace_root = runtime_factory.workspace_resolver.root
+        app.state.sandbox_startup_events = startup_events
+        app.state.auth_forced_code = None
+        deletion_service = DeletionService(
+            database=runtime_factory.database,
+            runtime_pool=runtime_pool,
+            settings=runtime_factory.settings,
+        )
+        deletion_worker = DeletionWorker(
+            database=runtime_factory.database,
+            runtime_pool=runtime_pool,
+            workspace_resolver=runtime_factory.workspace_resolver,
+            settings=runtime_factory.settings,
+        )
+        app.state.deletion_service = deletion_service
+        app.state.deletion_worker = deletion_worker
+        if hasattr(runtime_factory.database, "dialect") and hasattr(runtime_factory.database, "connect"):
+            async with runtime_factory.database.connect():
+                pass
+            recovery_stop = asyncio.Event()
+            deletion_stop = asyncio.Event()
+            auth_cleanup_stop = asyncio.Event()
+
+            async def recovery_loop() -> None:
+                async with observability_scope(
+                    metrics=app.state.operational_metrics,
+                    trace_sink=app.state.trace_sink,
+                ):
+                    worker = WorkflowRecoveryWorker(
+                        database=runtime_factory.database,
+                        settings=runtime_factory.settings,
+                        runtime_pool=runtime_pool,
+                    )
+                    workflow_settings = getattr(runtime_factory.settings, "workflow", None)
+                    heartbeat_ms = getattr(workflow_settings, "heartbeat_ms", 1_000)
+                    interval_seconds = max(
+                        1.0,
+                        heartbeat_ms / 1000,
+                    )
+                    while not recovery_stop.is_set():
+                        await worker.run_once()
+                        try:
+                            await asyncio.wait_for(recovery_stop.wait(), timeout=interval_seconds)
+                        except asyncio.TimeoutError:
+                            continue
+
+            recovery_task = asyncio.create_task(recovery_loop())
+            if getattr(readiness, "ready", True):
+                async def deletion_loop() -> None:
+                    async with observability_scope(
+                        metrics=app.state.operational_metrics,
+                        trace_sink=app.state.trace_sink,
+                    ):
+                        await deletion_worker.run_until_stopped(
+                            stop_event=deletion_stop,
+                            batch_size=DELETION_BATCH_SIZE,
+                            interval_seconds=DELETION_POLL_INTERVAL_SECONDS,
+                        )
+
+                deletion_task = asyncio.create_task(
+                    deletion_loop()
+                )
+
+            async def auth_cleanup_loop() -> None:
+                async with observability_scope(
+                    metrics=app.state.operational_metrics,
+                    trace_sink=app.state.trace_sink,
+                ):
+                    worker = AuthCleanupWorker(runtime_factory.database)
+                    while not auth_cleanup_stop.is_set():
+                        await worker.run_once()
+                        try:
+                            await asyncio.wait_for(auth_cleanup_stop.wait(), timeout=60.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+            auth_cleanup_task = asyncio.create_task(auth_cleanup_loop())
+    except BaseException as primary:
+        try:
+            if recovery_stop is not None:
+                recovery_stop.set()
+            if deletion_stop is not None:
+                deletion_stop.set()
+            if auth_cleanup_stop is not None:
+                auth_cleanup_stop.set()
+            if recovery_task is not None:
+                try:
+                    await recovery_task
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "workflow_recovery.await", error)
+            if deletion_task is not None:
+                try:
+                    await deletion_task
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "deletion_worker.await", error)
+            if auth_cleanup_task is not None:
+                try:
+                    await auth_cleanup_task
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "auth_cleanup.await", error)
+            if auth_runtime is not None:
+                try:
+                    await auth_runtime.close()
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "auth.close", error)
+            if runtime_pool is not None:
+                try:
+                    await runtime_pool.close()
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "runtime_pool.close", error)
+            if runtime_factory is not None:
+                try:
+                    await runtime_factory.database.dispose()
+                except BaseException as error:
+                    _note_startup_cleanup_error(primary, "database.dispose", error)
+        finally:
+            raise primary
     try:
         yield
     finally:
-        try:
-            if hasattr(agent, "mcp_manager") and agent.mcp_manager:
-                try:
-                    agent.mcp_manager.stop()
-                except Exception:
-                    logger.warning("MCP manager shutdown failed; details redacted")
-        finally:
-            if sandbox_controller is not None:
-                try:
-                    sandbox_controller.close()
-                except Exception:
-                    logger.warning(
-                        "Sandbox controller reported residual startup state during shutdown; details redacted"
-                    )
+        primary: BaseException | None = None
+
+        if recovery_stop is not None:
+            recovery_stop.set()
+        if deletion_stop is not None:
+            deletion_stop.set()
+        if auth_cleanup_stop is not None:
+            auth_cleanup_stop.set()
+        if recovery_task is not None:
+            try:
+                await recovery_task
+            except BaseException as error:
+                primary = error if primary is None else primary
+        if deletion_task is not None:
+            try:
+                await deletion_task
+            except BaseException as error:
+                primary = error if primary is None else primary
+        if auth_cleanup_task is not None:
+            try:
+                await auth_cleanup_task
+            except BaseException as error:
+                primary = error if primary is None else primary
+
+        if auth_runtime is not None:
+            try:
+                await auth_runtime.close()
+            except BaseException as error:
+                primary = error
+
+        if runtime_pool is not None:
+            try:
+                await runtime_pool.close()
+            except BaseException as error:
+                if primary is None:
+                    primary = error
+                else:
+                    _note_cleanup_error(primary, "runtime_pool.close", error)
+
+        if runtime_factory is not None:
+            try:
+                await runtime_factory.database.dispose()
+            except BaseException as error:
+                if primary is None:
+                    primary = error
+                else:
+                    _note_cleanup_error(primary, "database.dispose", error)
+
+        if primary is not None:
+            raise primary
 
 
 app = FastAPI(title="MultiClaw", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 app.include_router(auth_router)
 app.include_router(auth_router, prefix="/api")
+app.include_router(account_router)
+app.include_router(health_router)
+app.include_router(approvals_router)
+app.include_router(sessions_router)
+app.include_router(chat_router)
+app.include_router(secrets_router)
 
-api = APIRouter(prefix="/api")
+
+def _runtime_error_response(retry_after_seconds: int) -> JSONResponse:
+    return JSONResponse(
+        {"detail": "runtime temporarily unavailable"},
+        status_code=503,
+        headers={"Retry-After": str(retry_after_seconds)},
+    )
+
+
+@app.exception_handler(RuntimeCapacityError)
+async def handle_runtime_capacity_error(
+    request: Request,
+    exc: RuntimeCapacityError,
+) -> JSONResponse:
+    increment_metric(
+        "multiclaw_runtime_capacity_total",
+        labels={
+            "backend": getattr(request.app.state.database.dialect, "name", "unknown"),
+            "operation": "acquire",
+            "status": "error",
+            "error_class": "runtime_capacity",
+        },
+    )
+    record_trace_event(
+        "runtime_capacity",
+        attributes={"retry_after": exc.retry_after_seconds},
+    )
+    return _runtime_error_response(exc.retry_after_seconds)
+
+
+@app.exception_handler(RuntimeUnavailableError)
+async def handle_runtime_unavailable_error(
+    request: Request,
+    exc: RuntimeUnavailableError,
+) -> JSONResponse:
+    increment_metric(
+        "multiclaw_runtime_capacity_total",
+        labels={
+            "backend": getattr(request.app.state.database.dialect, "name", "unknown"),
+            "operation": "unavailable",
+            "status": "error",
+            "error_class": "runtime_unavailable",
+        },
+    )
+    return _runtime_error_response(exc.retry_after_seconds)
 
 
 @app.middleware("http")
 async def log_http_requests(request, call_next):
-    started = perf_counter()
-    try:
-        response = await call_next(request)
-    except Exception:
+    async with observability_scope(
+        metrics=getattr(request.app.state, "operational_metrics", None),
+        trace_sink=getattr(request.app.state, "trace_sink", None),
+    ):
+        started = perf_counter()
+        request.state.request_started_at_ms = int(time() * 1000)
+        try:
+            response = await call_next(request)
+        except Exception as error:
+            duration_ms = (perf_counter() - started) * 1000
+            database = getattr(request.app.state, "database", None)
+            backend = getattr(getattr(database, "dialect", None), "name", "unknown")
+            observe_database_error(error, backend=backend, operation=request.url.path)
+            logger.exception(
+                "HTTP %s %s -> 500 (%.1fms)",
+                request.method,
+                request.url.path,
+                duration_ms,
+            )
+            raise
+
         duration_ms = (perf_counter() - started) * 1000
-        logger.exception(
-            "HTTP %s %s -> 500 (%.1fms)",
+        logger.info(
+            "HTTP %s %s -> %d (%.1fms)",
             request.method,
             request.url.path,
+            response.status_code,
             duration_ms,
         )
-        raise
-
-    duration_ms = (perf_counter() - started) * 1000
-    logger.info(
-        "HTTP %s %s -> %d (%.1fms)",
-        request.method,
-        request.url.path,
-        response.status_code,
-        duration_ms,
-    )
-    return response
-
-
-class ChatRequest(BaseModel):
-    message: str | None = None
-    session_id: str | None = None
-    id: str | None = None
-    messages: list[dict[str, Any]] | None = None
-
-
-class SessionCreateRequest(BaseModel):
-    title: str = "New Chat"
-
-
-class SessionRenameRequest(BaseModel):
-    title: str
-
-
-class ApproveRequest(BaseModel):
-    request_id: str
-    approved: bool
-
-
-@app.get("/health/ready")
-async def health_ready(request: Request):
-    readiness = getattr(request.app.state, "sandbox_readiness", None)
-    if readiness is None:
-        payload = {
-            "ready": False,
-            "mode": "auto",
-            "backend_name": "unknown",
-            "probe": {
-                "backend_name": "unknown",
-                "available": False,
-                "capabilities": {},
-                "reason": "readiness unavailable",
-            },
-            "profiles": {},
-            "skipped_capabilities": {"sandbox_readiness": "readiness unavailable"},
-            "unsafe_fallback_active": False,
-        }
-        return JSONResponse(payload, status_code=503)
-
-    workspace_root = getattr(request.app.state, "workspace_root", None)
-    public_readiness = _sanitize_public_readiness(
-        readiness,
-        workspace_root=workspace_root.resolve() if isinstance(workspace_root, Path) else workspace_root,
-    )
-    payload = public_readiness.model_dump(mode="json")
-    return JSONResponse(payload, status_code=200 if readiness.ready else 503)
-
-
-@api.post("/approve")
-async def approve(req: ApproveRequest, user: dict = Depends(require_auth)):
-    ok = agent.scheduler.resolve_approval(req.request_id, req.approved)
-    return {"ok": ok}
-
-
-@api.get("/sessions")
-async def list_sessions(include_archived: bool = False, user: dict = Depends(require_auth)):
-    sessions = await agent.session_store.list_sessions(
-        include_archived=include_archived, user_id=user["id"]
-    )
-    return [session.model_dump(mode="json") for session in sessions]
-
-
-@api.post("/sessions")
-async def create_session(req: SessionCreateRequest, user: dict = Depends(require_auth)):
-    session = await agent.session_store.create(title=req.title, user_id=user["id"])
-    return session.model_dump(mode="json")
-
-
-@api.patch("/sessions/{session_id}")
-async def rename_session(session_id: str, req: SessionRenameRequest, user: dict = Depends(require_auth)):
-    session = await agent.session_store.get(session_id)
-    if session is None or session.user_id != user["id"]:
-        raise HTTPException(status_code=404, detail="session not found")
-    session = await agent.session_store.rename(session_id, req.title)
-    return session.model_dump(mode="json")
-
-
-@api.post("/sessions/{session_id}/archive")
-async def archive_session(session_id: str, user: dict = Depends(require_auth)):
-    session = await agent.session_store.get(session_id)
-    if session is None or session.user_id != user["id"]:
-        raise HTTPException(status_code=404, detail="session not found")
-    session = await agent.session_store.archive(session_id)
-    return session.model_dump(mode="json")
-
-
-@api.post("/sessions/{session_id}/restore")
-async def restore_session(session_id: str, user: dict = Depends(require_auth)):
-    session = await agent.session_store.get(session_id)
-    if session is None or session.user_id != user["id"]:
-        raise HTTPException(status_code=404, detail="session not found")
-    session = await agent.session_store.restore(session_id)
-    return session.model_dump(mode="json")
-
-
-@api.delete("/sessions/{session_id}")
-async def delete_session(session_id: str, user: dict = Depends(require_auth)):
-    session = await agent.session_store.get(session_id)
-    if session is None or session.user_id != user["id"]:
-        raise HTTPException(status_code=404, detail="session not found")
-    await agent.session_store.delete(session_id)
-    return {"ok": True}
-
-
-@api.get("/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str, limit: int = 50, user: dict = Depends(require_auth)):
-    session = await agent.session_store.get(session_id)
-    if session is None or session.user_id != user["id"]:
-        raise HTTPException(status_code=404, detail="session not found")
-    return await agent.session_store.get_messages(session_id, limit)
-
-
-@api.post("/chat")
-async def chat(req: ChatRequest, user: dict = Depends(require_auth)):
-    """SSE streaming — real token streaming from LLM with state events."""
-    message = _resolve_chat_message(req)
-    requested_session_id = req.session_id or req.id
-
-    # Resolve or create session
-    session = None
-    if requested_session_id:
-        session = await agent.session_store.get(requested_session_id)
-        if session is None or session.user_id != user["id"]:
-            session = None
-        elif session.status == SessionStatus.ARCHIVED:
-            raise HTTPException(status_code=409, detail="session is archived")
-    if session is None:
-        session = await agent.session_store.create(user_id=user["id"])
-
-    # Update session activity (title from first message)
-    session = await agent.session_store.touch_message(session.id, message)
-
-    async def event_stream():
-        logger.info("SSE stream started, message=%r, session=%r", message[:80], session.id)
-        enc = DataStreamEncoder()
-        text_part_id: str | None = None
-        reasoning_part_id: str | None = None
-        step_open = False
-        pending_tool_results = 0
-
-        def close_text_part() -> list[str]:
-            nonlocal text_part_id
-            if text_part_id is None:
-                return []
-            chunks = [enc.text_end(text_part_id)]
-            text_part_id = None
-            return chunks
-
-        def close_reasoning_part() -> list[str]:
-            nonlocal reasoning_part_id
-            if reasoning_part_id is None:
-                return []
-            chunks = [enc.reasoning_end(reasoning_part_id)]
-            reasoning_part_id = None
-            return chunks
-
-        def close_open_parts() -> list[str]:
-            return [*close_reasoning_part(), *close_text_part()]
-
-        def open_step() -> list[str]:
-            nonlocal step_open
-            if step_open:
-                return []
-            step_open = True
-            return [enc.start_step()]
-
-        def close_step() -> list[str]:
-            nonlocal step_open
-            if not step_open:
-                return []
-            step_open = False
-            return [enc.finish_step()]
-
-        yield enc.start()
-        yield enc.data_part(
-            "data-session",
-            session.model_dump(mode="json"),
-            transient=True,
-        )
-        for chunk in open_step():
-            yield chunk
-
-        token_queue: asyncio.Queue[dict] = asyncio.Queue()
-        event_queue: asyncio.Queue[Event] = asyncio.Queue()
-
-        async def collector(event: Event):
-            await event_queue.put(event)
-
-        sub_id = shared_bus.subscribe("*", collector)
-
-        async def run_stream():
-            try:
-                async for item in agent.handle_message_stream(message, session_id=session.id):
-                    await token_queue.put(item)
-            except Exception as exc:
-                logger.exception("stream error")
-                msg = _friendly_error(exc)
-                await token_queue.put({"type": "error", "content": msg})
-
-        stream_task = asyncio.create_task(run_stream())
-
-        try:
-            while True:
-                token_count = 0
-                while True:
-                    try:
-                        item = token_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-
-                    token_count += 1
-                    if item["type"] == "token":
-                        for chunk in open_step():
-                            yield chunk
-                        for chunk in close_reasoning_part():
-                            yield chunk
-                        if text_part_id is None:
-                            text_part_id = uuid4().hex
-                            yield enc.text_start(text_part_id)
-                        yield enc.text_delta(text_part_id, item["content"])
-                    elif item["type"] == "done":
-                        logger.info("stream done, tokens=%d, content_len=%d", token_count, len(item.get("content", "")))
-                        for chunk in close_open_parts():
-                            yield chunk
-                        for chunk in close_step():
-                            yield chunk
-                        yield enc.finish("stop")
-                        return
-                    elif item["type"] == "error":
-                        logger.error("stream error: %s", item["content"])
-                        for chunk in close_open_parts():
-                            yield chunk
-                        for chunk in close_step():
-                            yield chunk
-                        yield enc.error(item["content"])
-                        return
-                    elif item["type"] == "tool_call":
-                        for chunk in open_step():
-                            yield chunk
-                        for chunk in close_open_parts():
-                            yield chunk
-                        pending_tool_results += 1
-                        tool_call_id = item.get("call_id") or uuid4().hex
-                        yield enc.tool_input_available(
-                            tool_call_id,
-                            item["name"],
-                            item.get("arguments", {}),
-                        )
-                    elif item["type"] == "tool_result":
-                        for chunk in close_open_parts():
-                            yield chunk
-                        tool_call_id = item.get("call_id", "")
-                        if item.get("is_error", False):
-                            yield enc.tool_output_error(tool_call_id, item.get("content", ""))
-                        else:
-                            yield enc.tool_output_available(
-                                tool_call_id,
-                                {"content": item.get("content", "")},
-                            )
-                        if pending_tool_results > 0:
-                            pending_tool_results -= 1
-                        if pending_tool_results == 0:
-                            for chunk in close_step():
-                                yield chunk
-                    elif item["type"] == "reasoning":
-                        for chunk in open_step():
-                            yield chunk
-                        for chunk in close_text_part():
-                            yield chunk
-                        if reasoning_part_id is None:
-                            reasoning_part_id = uuid4().hex
-                            yield enc.reasoning_start(reasoning_part_id)
-                        yield enc.reasoning_delta(reasoning_part_id, item["content"])
-                    else:
-                        yield enc.data_part("data-state", {"item": item}, transient=True)
-
-                while not event_queue.empty():
-                    evt = event_queue.get_nowait()
-                    if evt.type == "tool.awaiting_approval":
-                        logger.info(
-                            "yield approval_required: request_id=%s tool=%s",
-                            evt.data.get("request_id"), evt.data.get("tool"),
-                        )
-                        for chunk in open_step():
-                            yield chunk
-                        for chunk in close_open_parts():
-                            yield chunk
-                        tool_call_id = evt.data.get("call_id") or uuid4().hex
-                        yield enc.tool_input_available(
-                            tool_call_id,
-                            evt.data.get("tool", ""),
-                            evt.data.get("params", {}),
-                        )
-                        yield enc.tool_approval_request(
-                            evt.data.get("request_id", ""),
-                            tool_call_id,
-                        )
-                    else:
-                        yield enc.data_part("data-state", {"state": evt.type}, transient=True)
-
-                if stream_task.done():
-                    exc = stream_task.exception()
-                    if exc:
-                        logger.exception("stream task crashed")
-                        for chunk in close_open_parts():
-                            yield chunk
-                        for chunk in close_step():
-                            yield chunk
-                        yield enc.error(str(exc))
-                    else:
-                        for chunk in close_open_parts():
-                            yield chunk
-                        for chunk in close_step():
-                            yield chunk
-                        yield enc.finish("stop")
-                    return
-
-                await asyncio.sleep(0.02)
-        finally:
-            stream_task.cancel()
-            shared_bus.unsubscribe(sub_id)
-            logger.info("SSE stream ended")
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"X-Vercel-AI-Data-Stream": "v1"},
-    )
-
-
-def _resolve_chat_message(req: ChatRequest) -> str:
-    if req.message:
-        return req.message
-
-    message = _extract_latest_user_message(req.messages or [])
-    if message:
-        return message
-
-    raise HTTPException(status_code=422, detail="No user message found in request")
-
-
-def _extract_latest_user_message(messages: list[dict[str, Any]]) -> str | None:
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            continue
-        text = _extract_message_text(message)
-        if text:
-            return text
-    return None
-
-
-def _extract_message_text(message: dict[str, Any]) -> str:
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, Iterable) and not isinstance(content, (str, bytes, dict)):
-        parts = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "text" and isinstance(part.get("text"), str):
-                parts.append(part["text"])
-        return "".join(parts)
-    return ""
+        return response
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +841,3 @@ app.mount("/assets", StaticFiles(directory=str(_STATIC_DIR / "assets")), name="a
 @app.get("/multiclaw.png")
 async def favicon():
     return FileResponse(_PNG_PATH, media_type="image/png")
-
-
-app.include_router(api)

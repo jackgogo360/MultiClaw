@@ -17,6 +17,7 @@ from multiclaw.tools._common import (
     _success,
 )
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation
+from multiclaw.workflow.models import RecoveryStrategy
 
 
 class ReadFileParams(BaseModel):
@@ -163,6 +164,7 @@ class ReadFileToolBuilder(WorkspaceToolBuilder):
     description = "Read a file from the workspace with 1-based line ranges."
     parameters_schema = ReadFileParams
     read_only = True
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def __init__(self, workspace_root: str | Path | None = None, policy: PathPolicy | None = None) -> None:
         super().__init__(workspace_root=workspace_root, policy=policy)

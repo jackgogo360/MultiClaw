@@ -14,6 +14,7 @@ from multiclaw.tools._common import (
     _success,
 )
 from multiclaw.tools.base import ToolBuilder, ToolExecutionResult, ToolInvocation, ToolStatus
+from multiclaw.workflow.models import RecoveryStrategy
 
 
 class EditFileParams(BaseModel):
@@ -205,6 +206,7 @@ class EditFileToolBuilder(WorkspaceToolBuilder):
     name = "edit_file"
     description = "Edit a file by replacing old_string with new_string."
     parameters_schema = EditFileParams
+    recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
     def __init__(
         self,
@@ -262,6 +264,7 @@ class UndoEditToolBuilder(ToolBuilder[UndoEditParams]):
     name = "undo_edit"
     description = "Undo the most recent edit_file change for a file."
     parameters_schema = UndoEditParams
+    recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
 
     def __init__(self, workspace_root: str | Path | None = None, edit_builder: EditFileToolBuilder | None = None) -> None:
         self.workspace_root = Path(workspace_root or Path.cwd()).resolve()

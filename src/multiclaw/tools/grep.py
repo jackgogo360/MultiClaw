@@ -6,6 +6,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from multiclaw.tools.base import ToolExecutionResult, ToolInvocation, ToolStatus
+from multiclaw.workflow.models import RecoveryStrategy
 from multiclaw.tools._common import (
     MAX_GREP_LINE_LENGTH,
     MAX_GREP_RESULTS,
@@ -195,6 +196,7 @@ class GrepToolBuilder(WorkspaceToolBuilder):
     description = "Search file contents in the workspace."
     parameters_schema = GrepParams
     read_only = True
+    recovery_strategy = RecoveryStrategy.READ_ONLY_REPLAY
 
     def validate(self, params: dict) -> GrepParams:
         return GrepParams(**params)

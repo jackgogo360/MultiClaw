@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from multiclaw.config.settings import Settings
 from multiclaw.llm.providers import ProviderAdapter, OpenAIAdapter, AnthropicAdapter
 from multiclaw.llm.router import ModelRouter, CapabilityTag
+from multiclaw.secrets.resolver import ResolvedCredentials, SecretBytes
 
 
 class TestProviderAdapters:
@@ -110,7 +111,6 @@ class TestModelRouter:
         adapter = router.get_adapter("gpt-4o-mini")
 
         assert isinstance(adapter, OpenAIAdapter)
-        assert adapter.api_key == "test-key"
 
     @pytest.mark.asyncio
     async def test_completion_makes_http_call_and_parses_response(self, router):
@@ -133,6 +133,108 @@ class TestModelRouter:
         assert result.content == "hi from openai"
         assert result.role == "assistant"
         mock_client.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_completion_uses_per_call_credentials_and_zeroizes(self, router):
+        mock_http_response = Mock()
+        mock_http_response.json.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "tenant secret ok"}}]
+        }
+        mock_http_response.raise_for_status = Mock()
+
+        captured: dict[str, dict] = {}
+
+        async def fake_post(url, *, headers, json):
+            captured["request"] = {"url": url, "headers": headers, "body": json}
+            return mock_http_response
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.side_effect = fake_post
+        credentials = ResolvedCredentials(
+            provider_name="openai",
+            source="user",
+            base_url="https://tenant.example/v1",
+            api_key=SecretBytes(b"tenant-secret-key"),
+        )
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+                credentials=credentials,
+            )
+
+        assert result.content == "tenant secret ok"
+        assert captured["request"]["url"] == "https://tenant.example/v1/chat/completions"
+        assert captured["request"]["headers"]["Authorization"] == "Bearer tenant-secret-key"
+        assert credentials.api_key.is_zeroized()
+        assert "tenant-secret-key" not in repr(router.__dict__)
+
+    @pytest.mark.asyncio
+    async def test_stream_completion_uses_per_call_credentials_and_zeroizes(self, router):
+        chunks = [
+            'data: {"choices":[{"delta":{"content":"hello"}}]}',
+            'data: {"choices":[{"delta":{"content":" world"}}]}',
+            "data: [DONE]",
+        ]
+        captured: dict[str, dict] = {}
+
+        class _StreamResponse:
+            status_code = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_lines(self):
+                for chunk in chunks:
+                    yield chunk
+
+            async def aread(self):
+                return b""
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, method, url, *, headers, json):
+                captured["request"] = {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "body": json,
+                }
+                return _StreamResponse()
+
+        credentials = ResolvedCredentials(
+            provider_name="openai",
+            source="user",
+            base_url="https://tenant.example/v1",
+            api_key=SecretBytes(b"tenant-stream-key"),
+        )
+
+        with patch("httpx.AsyncClient", return_value=_Client()):
+            events = [
+                event
+                async for event in router.stream_completion(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": "hello"}],
+                    credentials=credentials,
+                )
+            ]
+
+        assert [event["content"] for event in events if event["type"] == "token"] == ["hello", " world"]
+        assert captured["request"]["headers"]["Authorization"] == "Bearer tenant-stream-key"
+        assert credentials.api_key.is_zeroized()
 
 
 class TestCapabilityTag:

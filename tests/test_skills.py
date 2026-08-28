@@ -356,3 +356,20 @@ def test_manager_get_active_skill_prompts():
         name, body = prompts[0]
         assert name == "greet"
         assert 'skill name="greet"' in body
+
+
+def test_manager_close_clears_active_and_discovered_state_idempotently():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        skill_dir = tmp_path / ".multiclaw" / "skills"
+        _make_minimal_skill(skill_dir, "greet", keywords=["hello"])
+
+        manager = SkillManager(project_root=tmp)
+        manager.discover()
+        manager.invoke("greet", args="world")
+
+        manager.close()
+        manager.close()
+
+        assert manager.skills == {}
+        assert manager.active_skills == []
