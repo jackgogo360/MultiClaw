@@ -10,7 +10,7 @@ MultiClaw `0.1.0` 只支持单机 `standalone`：一个 FastAPI 进程连接一�
 
 - Python `>=3.12` 与由 `uv.lock` 安装的依赖。
 - 已构建的前端 `src/multiclaw/static/`。
-- 二选一：持久化 SQLite volume，或 MySQL Community 8（最低 `8.0.36`、InnoDB、`utf8mb4`）。
+- 二选一：持久化 SQLite volume，或 Oracle MySQL 主版本 8（最低 `8.0.36`、InnoDB、`utf8mb4`；支持 commercial 版本标识）。
 - 受控工作区根目录，服务用户拥有读/写/执行权限，其他非受信用户不能写入。
 - 稳定 JWT 签名密钥、版本化 Secret keyring、真实邮件 provider 凭据。
 - macOS Seatbelt 或 Linux nsjail 原生沙箱，并在真实宿主机完成对应测试。
@@ -63,7 +63,7 @@ export MULTICLAW_DATABASE__DRIVER=mysql
 export MULTICLAW_DATABASE__URL="<mysql-url-from-secret-store>"
 ```
 
-注入值必须使用 `mysql+aiomysql` scheme。服务连接会设置 session time zone `+00:00` 和 `READ COMMITTED`；readiness 还要求 MySQL Community major 8、版本不低于 `8.0.36`、所有表为 InnoDB、数据库/表为 `utf8mb4`。MariaDB 和 Percona 当前不在支持范围。
+注入值必须使用 `mysql+aiomysql` scheme。服务连接会设置 session time zone `+00:00` 和 `READ COMMITTED`；readiness 还要求 Oracle MySQL 主版本 8、版本不低于 `8.0.36`、所有表为 InnoDB、数据库/表为 `utf8mb4`。commercial 版本标识可接受，MariaDB 和 Percona 当前不在支持范围。
 
 ## 备份与恢复演练
 
@@ -149,4 +149,3 @@ curl --fail http://127.0.0.1:15800/api/health/ready
 - 丢弃仍被数据库引用的 keyring 旧版本。
 - 以 `host_unsafe_dev_only` 绕过生产沙箱失败。
 - 把 `./start.sh`、开发 Vite server 或 mock 邮件作为生产服务。
-

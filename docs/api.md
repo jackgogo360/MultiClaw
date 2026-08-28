@@ -1,6 +1,6 @@
 # API 概览
 
-本页记录 MultiClaw `0.1.0` 的公开 HTTP 路由、认证边界和流式语义。运行服务后，以 `/docs` 和 `/openapi.json` 中的当前 schema 为请求/响应字段事实源；这里不复制全部 Pydantic schema。
+本页记录 MultiClaw `0.1.0` 的公开 HTTP 路由、认证边界和流式语义。持有有效登录会话后，以运行时 `/docs` 和 `/openapi.json` 中的当前 schema 为请求/响应字段事实源；预登录阶段使用本页，这里不复制全部 Pydantic schema。
 
 ## 基础地址与版本状态
 
@@ -139,5 +139,4 @@ readiness 验证数据库连接/版本、Alembic revision、schema 完整性、�
 - scope 隐藏使用 `404`，不要通过错误差异推断其他租户资源。
 - runtime 暂不可用为 `503 {"detail":"runtime temporarily unavailable"}` 并带 `Retry-After`。
 
-完整、可机器读取的字段定义始终以运行时 `/openapi.json` 为准；兼容别名 `/api/approve` 不会出现在 schema 中。
-
+认证后，完整、可机器读取的字段定义始终以运行时 `/openapi.json` 为准；兼容别名 `/api/approve` 不会出现在 schema 中。

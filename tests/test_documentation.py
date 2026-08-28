@@ -135,3 +135,50 @@ def test_formal_docs_use_current_health_routes() -> None:
     assert "/api/health/ready" in joined
     assert "`/health/live`" not in joined
     assert "`/health/ready`" not in joined
+
+
+def test_runtime_openapi_endpoints_are_described_as_authenticated() -> None:
+    for relative_path in (
+        "README.md",
+        "docs/getting-started.md",
+        "docs/development.md",
+        "docs/api.md",
+    ):
+        lines = (ROOT / relative_path).read_text(encoding="utf-8").splitlines()
+        endpoint_lines = [
+            line
+            for line in lines
+            if "`/docs`" in line
+            or "15800/docs" in line
+            or "/openapi.json" in line
+        ]
+        assert endpoint_lines, relative_path
+        assert all(
+            any(term in line for term in ("认证", "登录", "有效会话"))
+            for line in endpoint_lines
+        ), relative_path
+
+
+def test_skill_environment_variables_use_the_singular_settings_field() -> None:
+    configuration = (ROOT / "docs/configuration.md").read_text(encoding="utf-8")
+    development = (ROOT / "docs/development.md").read_text(encoding="utf-8")
+    joined = f"{configuration}\n{development}"
+
+    for name in (
+        "MULTICLAW_SKILL__ENABLED",
+        "MULTICLAW_SKILL__MAX_ACTIVE",
+        "MULTICLAW_SKILL__EXTRA_DIRS",
+        "MULTICLAW_SKILL__USER_DIR",
+    ):
+        assert name in configuration
+    assert "MULTICLAW_SKILL__ENABLED" in development
+    assert "MULTICLAW_SKILLS__" not in joined
+
+
+def test_mysql_support_is_not_narrowed_to_community_edition() -> None:
+    markdown = [ROOT / name for name in REQUIRED_FILES if name.endswith(".md")]
+    joined = "\n".join(path.read_text(encoding="utf-8") for path in markdown)
+
+    assert "MySQL Community" not in joined
+    assert "Community major" not in joined
+    assert "Oracle MySQL" in joined

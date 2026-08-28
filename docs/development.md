@@ -42,7 +42,7 @@ uv run multiclaw db check
 uv run uvicorn multiclaw.server:app --host 127.0.0.1 --port 15800 --reload
 ```
 
-FastAPI 文档位于 `/docs`，OpenAPI schema 位于 `/openapi.json`。应用日志写入 `~/.multiclaw/logs/multiclaw.log`，按午夜轮转并保留 30 个归档；终端仍会显示 Uvicorn 日志。
+持有有效登录会话后，可访问 FastAPI 文档 `/docs` 和 OpenAPI schema `/openapi.json`；预登录时使用仓库内的 [API 概览](api.md)。应用日志写入 `~/.multiclaw/logs/multiclaw.log`，按午夜轮转并保留 30 个归档；终端仍会显示 Uvicorn 日志。
 
 应用不会在启动时自动迁移。切换数据库 URL 后重新执行 `db upgrade` 和 `db check`，否则 readiness 会以 `schema_revision` 拒绝放量。
 
@@ -92,7 +92,7 @@ export MULTICLAW_DATABASE__URL=sqlite+aiosqlite:///data/multiclaw-dev.db
 ### MCP 与 skills
 
 - `MULTICLAW_MCP__ENABLED=false` 可在排查时关闭 MCP；`mcp.config_path` 为空时加载仓库默认 `.mcp.json`/相关配置逻辑。
-- `MULTICLAW_SKILLS__ENABLED=false` 可关闭 skill discovery；额外目录通过 JSON 数组形式的 `MULTICLAW_SKILLS__EXTRA_DIRS` 传入。
+- `MULTICLAW_SKILL__ENABLED=false` 可关闭 skill discovery；额外目录通过 JSON 数组形式的 `MULTICLAW_SKILL__EXTRA_DIRS` 传入。
 - MCP 配置不会自动把所有 server 连接到所有租户。运行时工厂会按允许的配置和沙箱 readiness 构建租户能力，失败能力会进入 readiness/日志而不是静默扩大权限。
 
 ## 调试就绪性
@@ -126,4 +126,3 @@ SQLite/default测试应始终执行。MySQL 和原生沙箱用例需要外部条
 - 不修改冻结迁移 `alembic/versions/20260815_0001_multi_tenant_baseline.py`。后续 schema 变化必须新增迁移。
 - 不手工编辑 `src/multiclaw/static/` 的哈希资源。
 - 提交必须遵循 [CONTRIBUTING.md](../CONTRIBUTING.md#分支与提交) 中的 Lore trailer 要求。
-

@@ -1,8 +1,10 @@
 # MultiClaw 项目文档体系设计
 
-**日期：** 2026-08-28  
-**状态：** 已批准  
-**基线分支：** `feature/multi-tenant-implementation`  
+**日期：** 2026-08-28
+
+**状态：** 已批准
+
+**基线分支：** `feature/multi-tenant-implementation`
 **交付分支：** `docs/complete-project-documentation`
 
 ## 1. 背景

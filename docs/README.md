@@ -36,4 +36,3 @@
 - [项目文档体系设计](superpowers/specs/2026-08-28-complete-project-documentation-design.md)
 
 发现文档与代码不一致时，请按[贡献指南](../CONTRIBUTING.md#文档维护)修正文档，并运行 `uv run python scripts/check_docs.py`。
-
