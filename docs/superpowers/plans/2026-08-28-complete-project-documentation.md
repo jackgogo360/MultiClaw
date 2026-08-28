@@ -40,6 +40,7 @@
 - `docs/deployment.md`：单机发布、数据库、健康门禁、回滚和备份。
 - `docs/security-model.md`：信任边界、隔离、加密、MCP、沙箱和删除恢复。
 - `docs/troubleshooting.md`：症状、原因、检查和修复路径。
+- `scripts/__init__.py`：允许 pytest 导入仓库维护脚本。
 - `scripts/check_docs.py`：无网络、只读的 Markdown/内容检查器。
 - `tests/test_documentation.py`：检查器和正式文档契约测试。
 
@@ -62,7 +63,7 @@
 - Create: `tests/test_documentation.py`
 - Create: `scripts/check_docs.py`
 
-- [ ] **Step 1: Write the failing documentation contract tests**
+- [x] **Step 1: Write the failing documentation contract tests**
 
 Create `tests/test_documentation.py` with isolated checker behaviors that do not depend on the not-yet-created repository documents:
 
@@ -106,7 +107,7 @@ def test_check_content_rejects_unresolved_marker_and_old_health_route(tmp_path: 
     assert any("obsolete health route" in issue for issue in issues)
 ```
 
-- [ ] **Step 2: Run the contract and observe the missing-document failure**
+- [x] **Step 2: Run the contract and observe the missing-document failure**
 
 Run:
 
@@ -116,7 +117,7 @@ uv run pytest tests/test_documentation.py -q
 
 Expected: collection error `ModuleNotFoundError: No module named 'scripts.check_docs'`, proving the checker behavior does not exist yet.
 
-- [ ] **Step 3: Implement the standard-library checker**
+- [x] **Step 3: Implement the standard-library checker**
 
 Create `scripts/check_docs.py` with these concrete functions:
 
@@ -131,7 +132,7 @@ Create `scripts/check_docs.py` with these concrete functions:
 
 The script must define its own exact required-file tuple so it remains usable without importing pytest code. It must read UTF-8, stay inside the repository root, avoid network access and never write files.
 
-- [ ] **Step 4: Run focused checker tests**
+- [x] **Step 4: Run focused checker tests**
 
 Run:
 
@@ -141,7 +142,7 @@ uv run pytest tests/test_documentation.py -q
 
 Expected: all isolated checker tests pass. Running `uv run python scripts/check_docs.py` separately returns `1` with actionable missing-file messages until the planned documents are created; that repository-level red state is not wired into CI or committed as a failing pytest contract yet.
 
-- [ ] **Step 5: Commit the contract**
+- [x] **Step 5: Commit the contract**
 
 ```bash
 git add scripts/check_docs.py tests/test_documentation.py
