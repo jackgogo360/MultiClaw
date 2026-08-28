@@ -1,103 +1,112 @@
-# Multi-Tenant Operations
+# 多租户运维手册
 
-This document covers the current standalone deployment and operational contract for MultiClaw's multi-tenant release gate. It intentionally avoids DSNs, tokens, email addresses, and real filesystem paths.
+本文说明 MultiClaw 当前单机部署的数据库发布、密钥、健康门禁、清除器和轮换操作。部署拓扑见[部署指南](deployment.md)，字段见[配置参考](configuration.md)，边界见[安全模型](security-model.md)，具体故障见[故障排查](troubleshooting.md)。
 
-## Deployment Inputs
+## 部署输入
 
-- Configure exactly one `database.driver` and one `database.url`.
-- `database.driver` must match the `database.url` scheme:
-  - `sqlite` uses the SQLite async SQLAlchemy URL form
-  - `mysql` uses the MySQL async SQLAlchemy URL form
-- Supported backends are SQLite and MySQL. Do not configure both for one deployment and do not keep a second standby backend in the same process config.
+- 一个部署只配置一个 `database.driver` 和一个 `database.url`。
+- `sqlite` 必须使用 `sqlite+aiosqlite` URL；`mysql` 必须使用 `mysql+aiomysql` URL。
+- 不在同一进程中同时配置两个后端，不做双写，也不把另一数据库当作应用内热备。
+- 数据库凭据、JWT key、Secret keyring 和邮件 API key 由部署 secret 渠道提供，不写入变更记录、日志或仓库。
 
-## Database Release Procedure
+## 数据库发布流程
 
-Before starting or reintroducing API traffic for a deployment:
+在启动或重新引入 API 流量前：
 
-1. Run `multiclaw db upgrade`.
-2. Run `multiclaw db check`.
-3. Start the API only after both commands succeed.
+1. 对生产同等数据执行一致性备份并验证恢复。
+2. 设置目标部署的数据库环境。
+3. 运行 `uv run multiclaw db upgrade`。
+4. 运行 `uv run multiclaw db check`。
+5. 启动 API，验证 live、ready 和独立原生沙箱门禁。
+6. 只有全部必需门禁通过后才放量。
 
-The API does not run migrations automatically. `/api/health/ready` fails closed on schema drift; it is not a migration hook.
+API 不自动执行迁移。`/api/health/ready` 对 schema drift fail closed，但它不是迁移 hook。当前产品未对外发布，不计划历史租户回填或旧产品数据迁移；新的 schema 变更仍必须新增 Alembic revision，不能改写冻结基线。
 
-Before any future forward-only upgrade, take a backup of a production-like database and verify that restore works before changing live traffic.
+## JWT 签名密钥
 
-## JWT Signing Key
+必须恰好选择一个来源：
 
-- Configure the JWT signing key from exactly one source:
-  - environment variable `MULTICLAW_AUTH_JWT_SIGNING_KEY`, or
-  - config key `auth.jwt_signing_key_file`
-- Do not configure both sources and do not leave both unset.
-- The loaded key material must contain at least 32 bytes.
-- If you use `auth.jwt_signing_key_file`, keep the file non-world-readable, operator-managed, and outside any user-controlled workspace content.
+- `MULTICLAW_AUTH_JWT_SIGNING_KEY`；
+- `auth.jwt_signing_key_file`。
 
-## Secret Keyring
+key material 至少 32 字节。文件必须由运维方管理、拒绝符号链接、权限不包含 group/other 位，且位于租户不可控制的位置。更换 key 会使既有 session/recovery token 失效，并改变验证码摘要派生；轮换前应明确用户影响。
 
-- Configure the deployment keyring from exactly one source:
-  - environment variable `MULTICLAW_SECRETS_KEYRING_B64`, or
-  - config key `secrets.keyring_file`
-- Do not configure both sources and do not leave both unset.
-- The keyring must keep one active version and every older version that is still referenced by database rows.
-- Record the active key version and the retained old versions in your deployment change record. Do not store raw key payloads, tokens, or filesystem paths in that record.
-- If you use `secrets.keyring_file`, apply the same operator-managed and restrictive-permission handling as the JWT file source.
+## Secret keyring
 
-## Health Endpoints And Traffic Gates
+必须恰好选择一个来源：
 
-- `/api/health/live` only proves that the process is alive.
-- `/api/health/ready` is the traffic gate. It returns ready only when all current invariants hold, including:
-  - database connectivity
-  - supported backend version
-  - schema revision at the current Alembic head
-  - schema integrity and foreign-key checks
-  - workspace root permissions
-  - active default workspace integrity
-  - keyring load plus referenced-version validation
-- For MySQL, readiness also requires InnoDB tables, `utf8mb4`, a UTC-compatible session time zone, and `READ COMMITTED`.
-- If readiness fails, remove the instance from traffic and investigate. Do not use readiness failure as a reason to auto-run migrations in place.
+- `MULTICLAW_SECRETS_KEYRING_B64`；
+- `secrets.keyring_file`。
 
-## Purge Worker
+keyring 必须保留一个活动版本和数据库仍引用的全部旧版本。部署变更记录可以写 active version、保留版本集合和引用计数，但不能写 raw key、token 或真实文件路径。
 
-- In the current standalone deployment, the API lifespan starts the purge worker only when startup readiness is healthy.
-- The worker runs as a cancellable batch-polling loop. Account deletion with retention `0` still completes asynchronously through that worker path.
-- Monitor the low-cardinality counter `multiclaw_purge_retry_total`.
-- When a purge stalls or retries, inspect the tenant's deletion job state, especially `status`, `worker_id`, `lease_expires_at`, `heartbeat_at`, `attempt_count`, and `last_error`, and also confirm whether blocking activity is still present.
-- Do not manually cascade or delete tenant rows out of order. The scoped purge path enforces its own deletion order and fencing rules.
-- Backups, traces, and incident notes for purge operations must not include email addresses, filesystem paths, or secret material.
+keyring 文件采用与 JWT 文件相同的 operator-managed、owner-only 策略。数据库备份必须与对应 keyring 版本集合一起纳入恢复演练。
 
-## Key Rotation
+## 健康与流量门禁
 
-1. Add the new key version to the keyring.
-2. Mark that new version as active.
-3. Keep all older versions that are still referenced by database rows.
-4. Because there is currently no productized rotation runner or CLI, handle rotation only through an operator-authored, code-reviewed one-off script or internal maintenance service running in a controlled maintenance environment.
-5. In that maintenance path, explicitly construct the current rotation service and invoke `SecretRotationService.rotate_batch()` in batches.
-6. If a batch fails, stop the rotation attempt and keep all older key versions.
-7. Monitor the returned `rotated`, `skipped`, and `failed` counts for each batch.
-8. Remove an old key version only after the database no longer references it.
+- `/api/health/live` 只证明进程响应。
+- `/api/health/ready` 检查数据库连接/版本、Alembic head、schema/外键完整性、工作区权限、active 默认工作区关系，以及 keyring 加载和引用版本。
+- MySQL 还要求 Oracle MySQL 主版本 8、最低 `8.0.36`、InnoDB、`utf8mb4`、UTC-compatible session time zone 和 `READ COMMITTED`；commercial 版本标识可接受。
 
-## Backend-Specific Notes
+ready 失败时移出流量并调查，不要原地自动迁移或关闭门禁。
 
-- SQLite:
-  - place the database on durable storage
-  - use backup methods that preserve file consistency
-  - treat file copies taken during active writes as unsafe unless your platform snapshot method guarantees consistency
-- MySQL:
-  - run MySQL `8.0.36` or newer on major version `8`, including `8.4.x`
-  - use InnoDB
-  - keep the database and tables on `utf8mb4`
-  - keep sessions UTC-compatible
-  - keep transaction isolation at `READ COMMITTED`
+当前公开 ready 不包含 sandbox readiness。部署必须额外运行目标平台 native gate，并核对 startup probe/registration skipped。ready=200 不能替代沙箱证据。
 
-## V1 Non-Goals
+## 清除 worker
 
-The following are explicitly out of scope for v1:
+单机 lifespan 在数据库连接成功后启动 workflow recovery 和认证清理 worker；账号清除 worker 仅在启动 sandbox readiness 健康时启动。
 
-- legacy data migration
-- dual-write
-- workspace switcher
-- cluster deployment
-- KMS or Vault integration
-- superadmin flows
-- same-run parallel tools
+- worker 以可取消的 batch polling loop 运行；`retention_days=0` 仍通过异步 worker 清除。
+- 监控低基数 `multiclaw_purge_retry_total`。
+- 停滞时检查 deletion job 的 `status`、`worker_id`、`lease_expires_at`、`heartbeat_at`、`attempt_count` 和 `last_error`，同时检查阻塞活动、数据库和工作区权限。
+- 不手工乱序级联删除租户表。作用域清除路径维护删除顺序、lease 和 fencing。
+- purge 事件、备份和 incident notes 不包含邮箱、真实路径或 Secret。
 
-The product is not released yet, so do not plan or execute historical tenant backfill.
+如果 sandbox startup readiness 不健康，清除 worker 不会启动，即使公开 `/api/health/ready` 仍可能通过。必须对此设置单独部署告警。
+
+## Secret key 轮换
+
+当前没有产品化 rotation CLI。轮换只能在受控维护环境中，由 code-reviewed 一次性脚本或内部维护服务调用 [`SecretRotationService.rotate_batch()`](../src/multiclaw/secrets/rotation.py)：
+
+1. 把新 key version 加入 keyring。
+2. 将新版本设为 active，保留所有旧版本。
+3. 部署包含新旧版本的 keyring，并确认 readiness。
+4. 以受控批次执行 rotation，记录每批 `rotated`、`skipped`、`failed`。
+5. 任一 batch 失败时停止，保留旧版本，调查 CAS 冲突或 envelope 问题。
+6. 统计数据库 key version 引用并完成备份恢复验证。
+7. 只有旧版本引用为零时才从后续 keyring 删除。
+
+轮换脚本不得输出 plaintext、nonce/ciphertext 全量或 raw key。
+
+## SQLite 运维
+
+- 数据库文件放在持久化存储，服务用户独占写权限。
+- 文件型连接启用 WAL、foreign keys、busy timeout 和 `synchronous=NORMAL`。
+- 使用 SQLite backup API、停止写入后的拷贝或保证一致性的 volume snapshot。
+- 不把普通活动写入期间的文件复制视为可恢复备份。
+- 容量、锁等待或备份窗口超出单机 SQLite 能力时，评估在发布前选择 MySQL；当前不提供产品内在线迁移工具。
+
+## MySQL 运维
+
+- 使用 Oracle MySQL 主版本 8，最低 `8.0.36`；commercial 版本标识可接受，MariaDB/Percona 不在当前支持范围。
+- 所有表使用 InnoDB，database/table charset 使用 `utf8mb4`。
+- session time zone 保持 `+00:00`/UTC-compatible，transaction isolation 为 `READ COMMITTED`。
+- 连接用户只授予应用 schema 所需权限；迁移账户可以与运行账户分离。
+- 备份与 point-in-time recovery 由 MySQL 运维体系提供，并定期在隔离实例演练。
+
+## 事故处置原则
+
+- 先阻断新流量，再保留日志、指标、数据库与 keyring 版本证据。
+- 不在工单中复制用户内容、Secret、认证 header、数据库 URL 或真实工作区路径。
+- stale fence、scope rejection、approval conflict 和 purge retry 都应按作用域 ID/错误类调查，不用全局数据导出定位。
+- 需要人工脚本时先 code review、备份、dry-run/只读统计，并限定 tenant/job/batch 作用域。
+
+## 当前非目标
+
+- 历史产品数据迁移或租户回填；
+- SQLite/MySQL 双写与在线切换；
+- 工作区切换器；
+- 多副本集群；
+- KMS/Vault 集成；
+- superadmin 流程；
+- 同一 run 内的变更工具并行执行。
