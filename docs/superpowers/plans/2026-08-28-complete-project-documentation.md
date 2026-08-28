@@ -345,7 +345,7 @@ Cover at least:
 
 - `db check` failure or pre-Alembic SQLite file.
 - driver/URL mismatch.
-- readiness `503` for schema, foreign keys, keyring, workspace, MySQL or sandbox.
+- readiness `503` for schema, foreign keys, keyring, workspace or MySQL; separately cover unavailable sandbox capabilities and the fact that the public readiness payload does not currently include sandbox readiness.
 - missing JWT/keyring sources.
 - email code not delivered in mock/real providers.
 - CSRF `403`.
