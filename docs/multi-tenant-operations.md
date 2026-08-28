@@ -46,7 +46,7 @@ keyring 文件采用与 JWT 文件相同的 operator-managed、owner-only 策略
 
 - `/api/health/live` 只证明进程响应。
 - `/api/health/ready` 检查数据库连接/版本、Alembic head、schema/外键完整性、工作区权限、active 默认工作区关系，以及 keyring 加载和引用版本。
-- MySQL 还要求 Community major 8、最低 `8.0.36`、InnoDB、`utf8mb4`、UTC-compatible session time zone 和 `READ COMMITTED`。
+- MySQL 还要求 Oracle MySQL 主版本 8、最低 `8.0.36`、InnoDB、`utf8mb4`、UTC-compatible session time zone 和 `READ COMMITTED`；commercial 版本标识可接受。
 
 ready 失败时移出流量并调查，不要原地自动迁移或关闭门禁。
 
@@ -88,7 +88,7 @@ ready 失败时移出流量并调查，不要原地自动迁移或关闭门禁�
 
 ## MySQL 运维
 
-- 使用 MySQL Community major 8，最低 `8.0.36`；MariaDB/Percona 不在当前支持范围。
+- 使用 Oracle MySQL 主版本 8，最低 `8.0.36`；commercial 版本标识可接受，MariaDB/Percona 不在当前支持范围。
 - 所有表使用 InnoDB，database/table charset 使用 `utf8mb4`。
 - session time zone 保持 `+00:00`/UTC-compatible，transaction isolation 为 `READ COMMITTED`。
 - 连接用户只授予应用 schema 所需权限；迁移账户可以与运行账户分离。

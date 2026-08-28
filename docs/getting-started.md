@@ -97,7 +97,7 @@ curl --fail http://127.0.0.1:15800/api/health/ready
 
 存活检查只证明进程能响应。就绪检查还验证数据库连接与版本、Alembic revision、SQLite 外键和完整性、工作区权限以及 keyring 引用；失败时返回 `503` 和 `checks_failed`，不要通过绕过检查来放量。
 
-OpenAPI UI 位于 <http://127.0.0.1:15800/docs>，原始 schema 位于 <http://127.0.0.1:15800/openapi.json>。
+完成登录并持有有效会话后，OpenAPI UI 位于 <http://127.0.0.1:15800/docs>，原始 schema 位于 <http://127.0.0.1:15800/openapi.json>。预登录阶段请先阅读仓库内的 [API 概览](api.md)。
 
 ## 首次登录
 

@@ -114,4 +114,3 @@ shell、code_exec 和 stdio MCP 使用不同 profile；workspace/network/subproc
 - **密钥服务：** keyring 是部署文件/环境输入，没有 KMS/Vault 的审计、自动轮换或硬件边界。
 
 这些限制不得通过扩大 MCP grant、关闭 audit、启用 unsafe sandbox 或绕过 readiness 来“修复”。
-

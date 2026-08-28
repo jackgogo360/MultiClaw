@@ -56,7 +56,7 @@ uv run pytest -q
 
 本地 MySQL 需要：
 
-1. 独立测试数据库，字符集为 `utf8mb4`，服务版本为 MySQL Community 8 且不低于 `8.0.36`。
+1. 独立测试数据库，字符集为 `utf8mb4`，服务版本为 Oracle MySQL 主版本 8 且不低于 `8.0.36`；commercial 版本标识可接受，MariaDB/Percona 不在支持范围。
 2. 一个由本地 secret 管理或当前 shell 注入的 `mysql+aiomysql` URL；不要把用户名和密码写进文档、Git 或命令记录。
 3. 将该 URL 同时提供给 `MULTICLAW_TEST_MYSQL_URL`。若需要把整个应用配置到 MySQL，再同步设置 `MULTICLAW_DATABASE__DRIVER=mysql` 和 `MULTICLAW_DATABASE__URL`。
 
@@ -136,4 +136,3 @@ git status --short
 - 冻结迁移 hash 是否保持不变（涉及多租户基线时）。
 
 失败时继续修复并重跑相关门禁；不要用删除断言、扩大 skip 或关闭安全检查换取绿灯。
-

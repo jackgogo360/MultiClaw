@@ -15,7 +15,7 @@
 
 ```bash
 export MULTICLAW_APP__ALLOWED_ORIGINS='["https://console.example.com"]'
-export MULTICLAW_SKILLS__EXTRA_DIRS='["/opt/multiclaw/skills"]'
+export MULTICLAW_SKILL__EXTRA_DIRS='["/opt/multiclaw/skills"]'
 ```
 
 两个环境变量是特殊安全输入，不会复制到普通 Settings 字段：
@@ -161,14 +161,14 @@ JSON 合约：
 
 ## Skills：`skills`
 
-TOML 分组名和环境变量使用复数 `skills`；Settings 内部属性名为 `skill`。
+TOML 分组名使用复数 `skills`，但 Settings 字段名和环境变量路径使用单数 `skill`。这是当前加载契约，不能把两种形式互换。
 
 | TOML key | 环境变量 | 类型 / 默认值 / 约束 | 分类与说明 |
 |---|---|---|---|
-| `skills.enabled` | `MULTICLAW_SKILLS__ENABLED` | bool / `true` | 功能开关 |
-| `skills.max_active` | `MULTICLAW_SKILLS__MAX_ACTIVE` | int / `5` / 无额外模型边界 | 运行容量 |
-| `skills.extra_dirs` | `MULTICLAW_SKILLS__EXTRA_DIRS` | string[] / `[]` | 信任边界；目录内容可影响 Agent 行为 |
-| `skills.user_dir` | `MULTICLAW_SKILLS__USER_DIR` | string / 空 | 信任边界；用户 skill 根目录 |
+| `skills.enabled` | `MULTICLAW_SKILL__ENABLED` | bool / `true` | 功能开关 |
+| `skills.max_active` | `MULTICLAW_SKILL__MAX_ACTIVE` | int / `5` / 无额外模型边界 | 运行容量 |
+| `skills.extra_dirs` | `MULTICLAW_SKILL__EXTRA_DIRS` | string[] / `[]` | 信任边界；目录内容可影响 Agent 行为 |
+| `skills.user_dir` | `MULTICLAW_SKILL__USER_DIR` | string / 空 | 信任边界；用户 skill 根目录 |
 
 额外 skill 目录必须由可信运维方控制，不能指向租户可任意写入的共享位置。
 

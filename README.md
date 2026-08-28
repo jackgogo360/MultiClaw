@@ -21,7 +21,7 @@ MultiClaw 是一个面向单机部署的多租户 AI Agent 运行时，提供工
 |---|---|
 | Python | `>=3.12` |
 | Node.js | CI 使用 Node.js 22；前端开发建议保持一致 |
-| 数据库 | SQLite；MySQL Community 8，最低 `8.0.36` |
+| 数据库 | SQLite；Oracle MySQL 主版本 8，最低 `8.0.36`（支持 commercial 版本标识） |
 | macOS 沙箱 | Seatbelt（`sandbox-exec`） |
 | Linux 沙箱 | nsjail，需部署方安装并配置 |
 | 部署拓扑 | 单进程、单机 `standalone`；不支持多副本集群 |
@@ -83,7 +83,7 @@ npm run dev
 
 - Web 界面：<http://127.0.0.1:5173>
 - 后端：<http://127.0.0.1:15800>
-- OpenAPI UI：<http://127.0.0.1:15800/docs>
+- OpenAPI UI（需先完成登录）：<http://127.0.0.1:15800/docs>
 - 存活检查：<http://127.0.0.1:15800/api/health/live>
 - 就绪检查：<http://127.0.0.1:15800/api/health/ready>
 

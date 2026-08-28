@@ -156,4 +156,3 @@ SSE 断开不等于数据库 run 自动完成。workflow heartbeat、终态持�
 4. readiness 继续验证 schema、SQLite 外键/完整性，或 MySQL 版本、InnoDB、字符集、UTC 与隔离级别。
 
 SQLite 和 MySQL 使用同一 schema 合约，但锁和并发行为不同；CI 必须保留两个后端分支。发布、备份和回滚流程见[部署指南](deployment.md)。
-
