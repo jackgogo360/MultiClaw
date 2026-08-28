@@ -218,7 +218,7 @@ The quick start must state that `start.sh` is a convenience command that binds b
 - 部署运维：deployment, multi-tenant operations and troubleshooting.
 - 设计记录：approved multi-tenant architecture and documentation design only.
 
-`docs/getting-started.md` must include prerequisites, clone/install, secure temporary local secrets, SQLite initialization, two-terminal startup, optional `start.sh`, first login with mock email provider, health checks, shutdown and next links. Production warnings must be adjacent to unsafe development examples.
+`docs/getting-started.md` must include prerequisites, clone/install, secure temporary local secrets, SQLite initialization, two-terminal startup, optional `start.sh`, health checks, interactive login provider requirements, shutdown and next links. It must state that mock email mode only skips delivery and does not expose the verification code, so interactive login requires a configured Brevo or Resend provider. Production warnings must be adjacent to unsafe development examples.
 
 - [ ] **Step 3: Replace the Vite template README**
 
