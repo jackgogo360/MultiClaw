@@ -1,37 +1,45 @@
-# Native Sandbox Deployment Guide
+# 原生沙箱部署
 
-This guide covers production deployment and rollback for MultiClaw's native sandbox backends.
+本文说明 MultiClaw 在 macOS Seatbelt 与 Linux nsjail 上运行 shell、code execution 和本地 stdio MCP 的部署条件、最小权限、测试与残余风险。
 
-## Prerequisites
+## 安全目标
 
-### macOS
+生产使用 `governance.sandbox.mode=auto`。启动 probe 至少验证：
 
-- `/usr/bin/sandbox-exec` must exist and be executable.
-- `cryptography==50.0.0` does not publish an Intel macOS `x86_64` wheel.
-- Intel macOS source builds for `cryptography==50.0.0` require a Rust toolchain plus OpenSSL development headers and libraries.
-- Current validation on this machine succeeded only with a temporary Rust + OpenSSL setup; no system Rust installation is present.
-- Native verification must run on a supported macOS host, not inside another parent sandbox that interferes with Seatbelt policy execution.
-- The startup probe must prove:
-  - allowed execution works
-  - outside-workspace writes are denied
-  - network is denied by default
-  - `.env` reads are denied
-  - `.git` writes are denied
-  - `code_exec` child creation is denied
+- 被允许的命令可以执行；
+- 工作区外写入被拒绝；
+- 默认网络被拒绝；
+- `.env`/`.env.*` 读取被拒绝；
+- `.git` 写入被拒绝；
+- 不允许 subprocess 的 profile 无法创建 child。
 
-### Linux
+probe 或具体 profile 不健康时，本地执行能力应被跳过，不允许静默回退到宿主执行。
 
-- `nsjail` must be installed and executable.
-- Set `MULTICLAW_NSJAIL_PATH` to the exact deployed binary path for native verification.
-- The host kernel must support the namespaces and restrictions required by the configured nsjail profile.
-- The startup probe must prove the same deny-path matrix as macOS before readiness can become healthy.
-- The Linux native gate additionally proves from inside the jailed process view that no non-loopback interfaces and no default route are visible while parent-listener access is denied.
+## macOS 前置条件
 
-## Configuration
+- `/usr/bin/sandbox-exec` 存在且可执行。
+- 目标宿主可以执行 Seatbelt profile；外层 sandbox 不能干扰验证结果。
+- 运行依赖必须能在目标 macOS 架构安装；使用 lockfile 验证，而不是在文档固定某个历史依赖版本。
+- native gate 必须在真实目标或等价宿主运行。
 
-Use `auto` in production. Do not use `host_unsafe_dev_only` outside local debugging.
+Seatbelt profile 限制 filesystem、network 和 process 能力。它不是容器；宿主账户权限、工作区权限和最小 MCP grant 仍是边界的一部分。
+
+## Linux 前置条件
+
+- nsjail 已安装，目标 binary 是普通可执行文件。
+- `governance.sandbox.linux.nsjail_path` 指向部署 binary；默认 `/usr/bin/nsjail`。
+- kernel 与运行环境允许所需 user/mount/network/pid namespace 和限制能力。
+- native test 使用独立的 `MULTICLAW_NSJAIL_PATH` 指定被测 binary。
+- Linux gate 还应从 jail 内证明没有非 loopback interface/default route，并且不能访问父进程 listener。
+
+容器内运行 nsjail 可能需要额外 kernel/capability 配置；不能通过授予过宽 host privilege 代替威胁建模。
+
+## 生产配置
 
 ```toml
+[app]
+debug = false
+
 [governance.sandbox]
 mode = "auto"
 backend_probe_on_startup = true
@@ -52,21 +60,21 @@ nsjail_path = "/usr/bin/nsjail"
 nsjail_config_dir = ""
 ```
 
-## Stdio MCP Grants
+自定义 profile/config 目录属于可信部署代码，必须随 release review、只读挂载并避免租户写入。
 
-Grant extra stdio MCP access explicitly and minimally. Never embed literal credentials in config files.
+## stdio MCP 最小授权
 
-- High-privilege local MCP settings must come from a trusted operator-managed config outside the workspace.
-- Workspace `.mcp.json` files marked `workspace_untrusted` never auto-connect, even when they request only conservative defaults.
-- Move any MCP server that should connect at startup into an explicit operator-managed config outside the workspace, then point MultiClaw at that trusted config path.
-- Trusted operator-managed stdio configs may still use the conservative defaults below when no extra grants are needed:
-  - `sandbox_network = "disabled"`
-  - `sandbox_workspace = "ro"`
-  - `sandbox_allow_subprocesses = false`
-  - `sandbox_env_allowlist = []`
-  - `sandbox_read_only_paths = []`
-- Workspace configs cannot use `${...}` expansion anywhere, including remote MCP URLs, headers, or OAuth fields.
-- Secret env expansion is allowed only as an exact same-key reference with an exact allowlist entry, for example `API_TOKEN = "${API_TOKEN}"` together with `sandbox_env_allowlist = ["API_TOKEN"]`.
+workspace-untrusted MCP 配置永不自动连接，包括 stdio 和远程 transport。需要启用的 server 必须放入 operator-managed 配置并经过审阅。
+
+可信 stdio server 的保守默认值：
+
+- `sandbox_network = "disabled"`
+- `sandbox_workspace = "ro"`
+- `sandbox_allow_subprocesses = false`
+- `sandbox_env_allowlist = []`
+- `sandbox_read_only_paths = []`
+
+只有 server 确实需要时才逐项扩大。Secret environment 必须同时满足同名 allowlist 和精确 `${VAR}` 引用；不要把 literal credential 写入配置。
 
 ```toml
 [mcp.servers.example_stdio]
@@ -82,122 +90,112 @@ sandbox_read_only_paths = ["/opt/example-mcp"]
 env = { SERVICE_TOKEN = "${SERVICE_TOKEN}" }
 ```
 
-`sandbox_network="inherit"`, writable workspaces, subprocess grants, and extra runtime roots are explicit security exceptions. Review each one as production-sensitive.
+`network=inherit`、可写 workspace、subprocess 与额外 runtime/read-only roots 都是生产敏感例外。对每个 server 记录用途、数据流、owner 和撤销方式。
 
-## Readiness And Probe Semantics
+## Probe 与流量门禁
 
-- `/health/ready` returns `200` only when the selected backend is available, probe evidence passes, and required sandbox profiles are ready.
-- `/health/ready` returns `503` when native sandbox proof is incomplete or blocked.
-- Liveness can remain healthy while readiness is `503`; this is intentional so operators can inspect diagnostics without exposing unsafe execution.
-- In `auto`, failed probes block local stdio sandboxed capabilities instead of falling back to host execution.
+启动时 [`RuntimeFactory.probe_startup()`](../src/multiclaw/runtime/factory.py) 创建临时 controller、执行 probe、冻结 `SandboxReadiness` 并保存到应用状态。每个租户 runtime 还会创建自己的 controller，并按 readiness 过滤能力。
 
-## Runner Output And Cleanup Semantics
+当前 `/api/health/ready` **不包含** sandbox readiness；它只检查数据库、schema、workspace 与 keyring。因此部署流水线必须：
 
-- `stdout` and `stderr` are each capped at 128 KiB.
-- If either stream exceeds that cap, the runner terminates the full process group, sets `completion_state=output_limit_exceeded`, clears both captured streams, and returns no partial output.
-- The runner guarantees TERM then KILL against the original process group and cleans up ordinary descendants that remain in that group.
-- On macOS, the contract does not guarantee forced cleanup of malicious or abnormal children that break away from the original PGID via `setsid(2)`, `setpgid(2)`, or double-fork patterns.
-- The runner cleans up only the `proc.wait` waiter it created itself; it does not cancel waiters owned by the caller.
+1. 在目标平台运行本页 native gate。
+2. 检查启动 probe、profiles、skipped capabilities 和 registration audit。
+3. 确认生产没有 unsafe fallback。
+4. 再结合 `/api/health/ready` 决定放量。
 
-## Accepted Risk
+账号清除 worker 只在 startup sandbox readiness 健康时启动。sandbox 不健康而公开 ready 通过仍是不可接受的生产状态，应单独告警。
 
-Accepted on August 8, 2026:
+## 输出、超时与清理
 
-- This is a Medium lifecycle/availability/workspace-integrity risk, not a Seatbelt host-isolation escape. Breakaway descendants still inherit the launched Seatbelt profile.
-- The residual risk is continued resource consumption plus continued access to already-authorized workspace paths and any explicitly granted MCP network or environment access.
-- Exposure is highest for `shell_workspace` and stdio MCP servers using `sandbox_allow_subprocesses = true`.
-- `code_exec_python` and default stdio MCP configs are not exposed to this specific path because their policies deny process creation.
-- `host_unsafe_dev_only` raises impact further and remains prohibited in production.
+[`SandboxProcessRunner`](../src/multiclaw/governance/sandbox/runner.py) 对 stdout、stderr 各限制 128 KiB：
 
-Operational guidance:
+- 任一 stream 超限即终止原 process group；
+- `completion_state=output_limit_exceeded`，标明 stream；
+- 两路 captured output 都清空，不返回 partial output；
+- 普通 timeout 对原 process group 先 TERM 后 KILL；
+- runner 只清理由自己创建的 `proc.wait` waiter，不取消调用方拥有的 waiter。
 
-- Use subprocess-enabled local MCP servers only on trusted local macOS hosts.
-- Do not treat a timeout audit record as proof that every arbitrary breakaway child was stopped.
-- After timeouts on macOS subprocess-enabled workloads, monitor for residual processes and clean them up operationally if needed.
-- Do not enable `host_unsafe_dev_only` in production to work around native gate failures.
+输出限制同时是可用性和数据泄露控制。调用方不得把原始异常、environment 或完整工作区路径拼回公开错误。
 
-## Migration Notes
+## macOS breakaway child 风险
 
-Legacy modes map as follows:
+当前保证不覆盖通过 `setsid`、`setpgid` 或 double-fork 脱离原 PGID 的恶意/异常 child。它们仍继承启动时 Seatbelt profile，因此这不是已知的 Seatbelt host-isolation escape；残余风险是持续占用资源，以及继续访问 profile 已授权的路径、网络或 environment。
 
-- `process` is deprecated and migrates to `auto`.
-- `docker` is no longer supported and must be removed before deployment.
-- There is no production-safe equivalent of "off". If native isolation is unavailable, keep readiness blocked and fix the deployment.
+风险在以下场景更高：
 
-Migration checklist:
+- `shell_workspace`；
+- `sandbox_allow_subprocesses=true` 的 stdio MCP；
+- 同时授予 network/environment/workspace write；
+- unsafe 开发模式。
 
-1. Replace legacy `governance.sandbox_mode` usage with `[governance.sandbox]`.
-2. Confirm production config uses `mode = "auto"`.
-3. Verify local stdio MCP servers declare only the minimum workspace/network/env grants they need.
-4. Remove any operational assumption that host fallback is acceptable in production.
+运维要求：
 
-## Unsafe Development Mode
+- subprocess-enabled 本地 MCP 只运行可信实现；
+- timeout audit 不能作为所有任意 child 已清理的证明；
+- macOS timeout 后监控残留进程，并在严格限定 PID/owner/correlation 后清理；
+- 不以 unsafe 模式规避该风险。
 
-`host_unsafe_dev_only` is for local debugging only.
+## 不安全开发模式
 
-- It requires `app.debug = true`.
-- It is prohibited in production.
-- It records unsafe fallback usage at startup and launch time.
-- It must not be used to "work around" a failing native release gate.
+`host_unsafe_dev_only` 只用于隔离开发机调试：
 
-## Native Test Commands
+- 必须同时 `app.debug=true`；
+- 在宿主直接执行，本质上不提供生产沙箱保证；
+- startup/launch 应记录 unsafe fallback；
+- 禁止在生产、共享主机或承载真实租户数据的环境使用。
 
-Default non-native validation:
+不存在生产安全的 “off”。原生隔离不可用时，修复部署或停止提供相关能力。
+
+## 原生测试命令
+
+默认排除 native：
 
 ```bash
-uv run pytest -m "not native_sandbox"
+uv run pytest -m "not native_sandbox" -q
 ```
 
-Default collection of native modules should skip them cleanly unless they are explicitly opted in:
+确认两个模块在未 opt-in 时给出明确 skip：
 
 ```bash
-uv run pytest tests/integration/test_sandbox_macos.py tests/integration/test_sandbox_linux.py -rs
+uv run pytest tests/integration/test_sandbox_macos.py tests/integration/test_sandbox_linux.py -q -rs
 ```
 
-macOS native gate:
+macOS gate：
 
 ```bash
-MULTICLAW_RUN_NATIVE_SANDBOX_TESTS=1 uv run pytest tests/integration/test_sandbox_macos.py -q -x
+MULTICLAW_RUN_NATIVE_SANDBOX_TESTS=1 \
+  uv run pytest tests/integration/test_sandbox_macos.py -q -x
 ```
 
-Linux native gate:
+Linux gate：
 
 ```bash
-MULTICLAW_RUN_NATIVE_SANDBOX_TESTS=1 MULTICLAW_NSJAIL_PATH=/usr/bin/nsjail \
+MULTICLAW_RUN_NATIVE_SANDBOX_TESTS=1 \
+MULTICLAW_NSJAIL_PATH=/usr/bin/nsjail \
   uv run pytest tests/integration/test_sandbox_linux.py -q -x
 ```
 
-## Rollback
+opt-in 后缺少 backend 必须失败。保留命令、宿主 OS/架构、binary path/version、通过/失败与限制作为 release evidence；不要写固定历史 pass count。
 
-Rollback is deployment-based and commit-based:
+## 配置升级
 
-1. Redeploy the last known-good release artifact if readiness blocks production rollout.
-2. Revert or cherry-pick back to the last known-good commit if configuration or policy changes caused the regression.
-3. Re-run the non-native suite and the matching native gate before re-promoting the rollback.
+- 旧 `governance.sandbox_mode=process` 会发出 deprecated warning 并映射到 `auto`；新配置直接使用 `[governance.sandbox]`。
+- `docker` 不受当前 Settings 支持，应从部署配置移除。
+- 复核所有 operator-managed stdio server 的 workspace/network/env/subprocess grant。
+- 移除任何“native 失败时可回退宿主”的运维假设。
 
-Do not bypass rollback pressure by enabling `host_unsafe_dev_only` in production.
+## 回滚
 
-## Known Verification Status
+1. startup probe、native gate 或 capability audit 不符合预期时停止放量。
+2. 重新部署上一个已知良好 artifact/profile/config。
+3. 运行非 native suite、目标平台 native gate、公开 ready 和 capability audit。
+4. 全部通过后恢复流量。
 
-Status as of August 8, 2026:
+禁止通过启用 `host_unsafe_dev_only` 承受回滚压力。
 
-- Non-native JUnit verification recorded 571 passed, 0 failures, 0 errors, and 0 skipped, for 586 total tests with 15 native-gated cases excluded.
-- `python -m compileall` passed.
-- Runner coverage passed with 25 tests, and the asyncio debug subset passed with 3 tests. The accepted-risk breakaway characterization also passed separately with `PYTHONASYNCIODEBUG=1`.
-- Earlier focused runner follow-up specification and quality/security reviews completed with 0 Critical, 0 Important, and 0 Minor findings.
-- Lock-only dependency upgrades were verified exactly at `mcp==1.28.1`, `starlette==1.3.1`, `pydantic-settings==2.14.2`, `cryptography==50.0.0`, `h2==4.4.1`, and `hpack==4.2.0`.
-- `uv sync --locked --offline` and `uv lock --check` both passed.
-- Compatibility verification passed with 116 tests.
-- `pip-audit==2.10.1` reported no known vulnerabilities.
-- Static scanning found no `create_subprocess_shell`, no multiprocessing helper usage, no `auto` host fallback, and no production `off` mode.
-- Exact long-token scanning found no matches; a broader `re_` rule still reports 59 identifier or dummy Bearer false positives.
-- The redaction subset passed with 8 tests.
-- Remaining warnings are pre-existing `aiosqlite` closed-event-loop thread warnings plus one Starlette `httpx`/`TestClient` deprecation warning.
-- macOS breakaway-child behavior is a documented accepted Medium risk: runner timeout cleanup reliably clears the original process group, but the characterization test reproduces a `start_new_session`/`setsid` child surviving runner timeout. The diagnostic test harness—not the runner—detects that survivor and precisely `SIGKILL`s its PID during teardown. `setpgid` and double-fork breakaways remain outside the guaranteed contract but were not separately characterized.
-- A later final full-branch security/completeness review found and this branch remediated a High trust-boundary issue: `workspace_untrusted` MCP configs could still auto-connect through stdio or remote transports. Those configs now never auto-connect and must be moved to an operator-managed config outside the workspace. Final rereview found 0 remaining Critical, High, Medium, or Low issues and returned `APPROVE WITH RELEASE BLOCKERS`.
-- Current macOS evidence does not show a native kernel or service hook that closes this gap: deny-default plus `deny system-sched` did not block `setsid`, current kqueue headers mark `NOTE_TRACK`/`NOTE_CHILD` unsupported since 10.5, and `launchd bootout` testing did not terminate `setsid` children.
-- macOS nested gating still fails at readiness with `probe_reason='seatbelt capability check failed: allowed_execution'`.
-- The Linux native gate was not executed in this environment.
-- Release remains blocked until both real-host native gates pass with the reviewed MCP restrictions enabled.
+## 当前验证限制
 
-Release should stay blocked until both native platform gates pass in their real host environments.
+- 本次文档交付环境没有执行真实 Linux nsjail gate；目标 Linux 部署必须自行提供证据。
+- macOS breakaway child 清理仍是已记录的生命周期/可用性/工作区完整性风险，没有声称已修复。
+- 外层受限执行环境可能让 Seatbelt allowed-execution probe 失败；嵌套失败不能代替真实宿主验证，也不能被描述为真实宿主已通过。
+- 公开 readiness 不聚合 sandbox readiness；需保留独立门禁，直到生产代码明确改变该契约。
