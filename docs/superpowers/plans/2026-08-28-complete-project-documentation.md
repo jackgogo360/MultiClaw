@@ -158,7 +158,7 @@ git commit -m "Keep contributor documentation executable"
 - Create: `CODE_OF_CONDUCT.md`
 - Create: `CHANGELOG.md`
 
-- [ ] **Step 1: Add the approved legal and governance documents**
+- [x] **Step 1: Add the approved legal and governance documents**
 
 Use the unmodified Apache License 2.0 text in `LICENSE` with the standard January 2004 header and `http://www.apache.org/licenses/` reference.
 
@@ -169,7 +169,7 @@ Write the remaining files with these exact section contracts:
 - `CODE_OF_CONDUCT.md`: Contributor Covenant 2.1 Chinese text with scope, enforcement, four consequence levels, attribution URL and repository-maintainer contact through private security or repository channels.
 - `CHANGELOG.md`: Keep a Changelog introduction, semantic-versioning statement, an `[未发布]` section, and a `0.1.0` development-baseline entry dated 2026-08-28 covering multi-tenancy, durable workflow, Secret encryption, native sandbox and SQLite/MySQL support.
 
-- [ ] **Step 2: Verify governance content and secret hygiene**
+- [x] **Step 2: Verify governance content and secret hygiene**
 
 Run:
 
@@ -180,7 +180,7 @@ rg -n 'xkeysib-[A-Za-z0-9_-]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|Bearer [
 
 Expected: isolated checker tests pass; the secret scan returns no matches.
 
-- [ ] **Step 3: Commit governance documents**
+- [x] **Step 3: Commit governance documents**
 
 ```bash
 git add LICENSE CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md CHANGELOG.md
