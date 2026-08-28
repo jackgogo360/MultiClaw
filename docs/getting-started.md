@@ -123,4 +123,3 @@ OpenAPI UI 位于 <http://127.0.0.1:15800/docs>，原始 schema 位于 <http://1
 - [架构说明](architecture.md)：理解租户边界、运行时和可恢复工作流。
 - [测试指南](testing.md)：运行后端、前端、文档和平台专项门禁。
 - [贡献指南](../CONTRIBUTING.md)：准备分支、提交和 Pull Request。
-
