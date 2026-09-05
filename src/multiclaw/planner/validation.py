@@ -27,10 +27,9 @@ _BEARER_TOKEN_CHAR_PATTERN = r"[A-Za-z0-9._~+/=-]"
 _STANDALONE_BEARER_PATTERN = (
     rf"\bbearer\s+(?={_BEARER_TOKEN_CHAR_PATTERN}{{8,}}"
     rf"(?!{_BEARER_TOKEN_CHAR_PATTERN}))"
-    rf"(?={_BEARER_TOKEN_CHAR_PATTERN}*[0-9._~+/=-])"
     rf"{_BEARER_TOKEN_CHAR_PATTERN}+"
 )
-_TOKEN_PREFIX_PATTERN = r"\b(?:sk[-_]|ghp_|github_pat_)[A-Za-z0-9_-]+"
+_TOKEN_PREFIX_PATTERN = r"\b(?:sk[-_]|ghp[-_]|github_pat_)[A-Za-z0-9_-]+"
 
 _SECRET_KEY = re.compile(_SECRET_NAME_PATTERN, re.IGNORECASE)
 _SECRET_VALUE = re.compile(
