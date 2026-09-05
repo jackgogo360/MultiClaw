@@ -214,6 +214,25 @@ class PlanDraft(BaseModel):
     steps: list[PlanDraftStep] = Field(min_length=1, max_length=20)
 
 
+class CompletedStepContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    logical_step_key: str = Field(pattern=LOGICAL_STEP_KEY)
+    summary: str = Field(min_length=1, max_length=4_000)
+    result_digest: str = Field(min_length=1, max_length=128)
+
+
+class PlanRevisionContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str
+    parent_version: int
+    feedback: str | None
+    failed_step_key: str | None
+    failed_error: str | None
+    completed: list[CompletedStepContext] = Field(max_length=20)
+
+
 class ValidatedPlanStep(PlanDraftStep):
     model_config = ConfigDict(extra="forbid", frozen=True)
 

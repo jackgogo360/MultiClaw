@@ -1,4 +1,6 @@
+from multiclaw.planner.generator import PlanGenerationError, PlanGenerator
 from multiclaw.planner.models import (
+    CompletedStepContext,
     Plan,
     PlanDecisionAction,
     PlanDecisionIdempotencyError,
@@ -10,6 +12,7 @@ from multiclaw.planner.models import (
     PlanningMode,
     PlanningRoute,
     PlanNotFoundError,
+    PlanRevisionContext,
     PlanStatus,
     PlanStep,
     PlanStepCompletion,
@@ -21,6 +24,7 @@ from multiclaw.planner.models import (
     ValidatedPlanStep,
 )
 from multiclaw.planner.planner import Planner
+from multiclaw.planner.policy import PlanningPolicy, PlanningUnavailableError
 from multiclaw.planner.validation import (
     MAX_PLAN_CONTENT_BYTES,
     PlanValidationError,
@@ -33,6 +37,7 @@ from multiclaw.planner.validation import (
 
 __all__ = [
     "MAX_PLAN_CONTENT_BYTES",
+    "CompletedStepContext",
     "Plan",
     "PlanDecisionAction",
     "PlanDecisionIdempotencyError",
@@ -40,7 +45,10 @@ __all__ = [
     "PlanDecisionRequest",
     "PlanDraft",
     "PlanDraftStep",
+    "PlanGenerationError",
+    "PlanGenerator",
     "PlanNotFoundError",
+    "PlanRevisionContext",
     "PlanStatus",
     "PlanStep",
     "PlanStepCompletion",
@@ -52,7 +60,9 @@ __all__ = [
     "Planner",
     "PlanningDecision",
     "PlanningMode",
+    "PlanningPolicy",
     "PlanningRoute",
+    "PlanningUnavailableError",
     "ValidatedPlanDraft",
     "ValidatedPlanStep",
     "canonical_plan_bytes",
