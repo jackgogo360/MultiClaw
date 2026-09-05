@@ -7,7 +7,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 import pytest
@@ -168,7 +168,7 @@ def _plan_step_ready_data(
     context: TenantContext,
     plan_id: str,
     plan_digest: str,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     return {
         "run_id": str(context.run_id),
         "plan_id": plan_id,
