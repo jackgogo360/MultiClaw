@@ -13,17 +13,41 @@ from multiclaw.planner.models import (
 )
 
 MAX_PLAN_CONTENT_BYTES = 262_144
-_SECRET_KEY = re.compile(
-    r"(?i)(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
+_AUTHORIZATION_NAME = r"authorization"
+_SECRET_NAME_PATTERN = (
+    rf"(?:{_AUTHORIZATION_NAME}|api[_-]?key|access[_-]?token|"
+    r"refresh[_-]?token|password|secret)"
 )
+_AUTHORIZATION_ASSIGNMENT_PATTERN = (
+    rf"{_AUTHORIZATION_NAME}\s*[:=]\s*"
+    r"(?:[A-Za-z][A-Za-z0-9._+-]*\s+)?\S+"
+)
+_SECRET_ASSIGNMENT_PATTERN = rf"{_SECRET_NAME_PATTERN}\s*[:=]\s*\S+"
+_BEARER_TOKEN_CHAR_PATTERN = r"[A-Za-z0-9._~+/=-]"
+_STANDALONE_BEARER_PATTERN = (
+    rf"\bbearer\s+(?={_BEARER_TOKEN_CHAR_PATTERN}{{8,}}"
+    rf"(?!{_BEARER_TOKEN_CHAR_PATTERN}))"
+    rf"(?={_BEARER_TOKEN_CHAR_PATTERN}*[0-9._~+/=-])"
+    rf"{_BEARER_TOKEN_CHAR_PATTERN}+"
+)
+_TOKEN_PREFIX_PATTERN = r"\b(?:sk[-_]|ghp_|github_pat_)[A-Za-z0-9_-]+"
+
+_SECRET_KEY = re.compile(_SECRET_NAME_PATTERN, re.IGNORECASE)
 _SECRET_VALUE = re.compile(
-    r"(?i)(authorization\s*:\s*bearer\s+\S+|bearer\s+\S+|"
-    r"(?:api[_-]?key|password|secret)\s*[:=]\s*\S+|\b(?:sk|ghp)[_-][A-Za-z0-9_-]+)"
+    rf"(?:{_AUTHORIZATION_ASSIGNMENT_PATTERN}|{_SECRET_ASSIGNMENT_PATTERN}|"
+    rf"{_STANDALONE_BEARER_PATTERN}|{_TOKEN_PREFIX_PATTERN})",
+    re.IGNORECASE,
 )
 
 
 class PlanValidationError(ValueError):
     pass
+
+
+def _require_positive_int(value: object, *, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise PlanValidationError(f"{name} must be a positive integer")
+    return value
 
 
 def _reject_credentials(value: object) -> None:
@@ -55,6 +79,14 @@ def validate_plan_draft(
     max_attempts: int,
     max_content_bytes: int = MAX_PLAN_CONTENT_BYTES,
 ) -> ValidatedPlanDraft:
+    max_steps = _require_positive_int(max_steps, name="max_steps")
+    max_depth = _require_positive_int(max_depth, name="max_depth")
+    max_attempts = _require_positive_int(max_attempts, name="max_attempts")
+    max_content_bytes = _require_positive_int(
+        max_content_bytes,
+        name="max_content_bytes",
+    )
+
     if len(draft.steps) > min(max_steps, 20):
         raise PlanValidationError("Plan exceeds configured step limit")
 
@@ -103,12 +135,16 @@ def validate_plan_draft(
 
     validated = ValidatedPlanDraft(
         objective=draft.objective,
-        constraints=draft.constraints,
+        constraints=tuple(draft.constraints),
         generation_reason=draft.generation_reason,
-        steps=[
-            ValidatedPlanStep(**by_key[key].model_dump(), ordinal=index)
+        steps=tuple(
+            ValidatedPlanStep(
+                **by_key[key].model_dump(exclude={"depends_on"}),
+                depends_on=tuple(by_key[key].depends_on),
+                ordinal=index,
+            )
             for index, key in enumerate(ordered, start=1)
-        ],
+        ),
     )
     _reject_credentials(validated.model_dump(mode="json"))
 

@@ -1,3 +1,4 @@
+import json
 import re
 
 import pytest
@@ -349,6 +350,20 @@ def _validation_draft(steps: list[PlanDraftStep]) -> PlanDraft:
     )
 
 
+def _validated_plan() -> ValidatedPlanDraft:
+    return validate_plan_draft(
+        _validation_draft(
+            [
+                _validation_step("inspect"),
+                _validation_step("verify", depends_on=["inspect"]),
+            ]
+        ),
+        max_steps=20,
+        max_depth=10,
+        max_attempts=2,
+    )
+
+
 def test_validation_returns_stable_topological_order() -> None:
     draft = _validation_draft(
         [
@@ -485,6 +500,82 @@ def test_validation_rejects_step_attempts_above_configured_limit() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(False, id="false"),
+        pytest.param(True, id="true"),
+        pytest.param(1.0, id="float"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param("1", id="string"),
+        pytest.param(None, id="none"),
+    ],
+)
+@pytest.mark.parametrize(
+    "argument",
+    ["max_steps", "max_depth", "max_attempts", "max_content_bytes"],
+)
+def test_validation_rejects_invalid_limit_arguments(
+    argument: str,
+    value: object,
+) -> None:
+    limits: dict[str, object] = {
+        "max_steps": 20,
+        "max_depth": 10,
+        "max_attempts": 2,
+        "max_content_bytes": planner.MAX_PLAN_CONTENT_BYTES,
+    }
+    limits[argument] = value
+
+    with pytest.raises(
+        PlanValidationError,
+        match=rf"{argument} must be a positive integer",
+    ):
+        validate_plan_draft(
+            _validation_draft([_validation_step("inspect")]),
+            **limits,
+        )
+
+
+def test_nan_cannot_bypass_dependency_depth_hard_cap() -> None:
+    steps = [
+        _validation_step(
+            f"s{index}",
+            depends_on=[] if index == 0 else [f"s{index - 1}"],
+        )
+        for index in range(11)
+    ]
+
+    with pytest.raises(PlanValidationError, match="max_depth must be a positive integer"):
+        validate_plan_draft(
+            _validation_draft(steps),
+            max_steps=20,
+            max_depth=float("nan"),
+            max_attempts=2,
+        )
+
+
+def test_nan_content_limit_cannot_bypass_oversized_plan() -> None:
+    oversized = _validation_draft([_validation_step("inspect")]).model_copy(
+        update={"objective": "x" * (planner.MAX_PLAN_CONTENT_BYTES + 1)}
+    )
+
+    with pytest.raises(
+        PlanValidationError,
+        match="max_content_bytes must be a positive integer",
+    ):
+        validate_plan_draft(
+            oversized,
+            max_steps=20,
+            max_depth=10,
+            max_attempts=2,
+            max_content_bytes=float("nan"),
+        )
+
+
 def test_validation_rejects_raw_credentials_and_oversized_canonical_content() -> None:
     credential = "Authorization: " + "Bearer live-token"
     secret = _validation_draft(
@@ -508,6 +599,54 @@ def test_validation_rejects_raw_credentials_and_oversized_canonical_content() ->
             max_attempts=2,
             max_content_bytes=100,
         )
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "refresh_token=abc123",
+        "access-token: abc123",
+        "Authorization=Basic abc123",
+        "Authorization: Bearer live-token",
+        "Bearer live-token",
+        "github_pat_abc123xyz",
+        "api_key=abc123",
+        "password=abc123",
+        "sk-abc123xyz",
+        "sk_abc123xyz",
+        "ghp_abc123xyz",
+    ],
+)
+def test_validation_and_sanitizer_share_credential_patterns(
+    credential: str,
+) -> None:
+    draft = _validation_draft(
+        [_validation_step("inspect", title=f"Inspect {credential}")]
+    )
+
+    with pytest.raises(PlanValidationError, match="credential-shaped content"):
+        validate_plan_draft(
+            draft,
+            max_steps=20,
+            max_depth=10,
+            max_attempts=2,
+        )
+    assert sanitize_plan_text(credential) == "[REDACTED]"
+
+
+def test_benign_bearer_prose_validates_and_sanitizes_unchanged() -> None:
+    text = "Bearer of the release"
+    draft = _validation_draft([_validation_step("inspect", title=text)])
+
+    validated = validate_plan_draft(
+        draft,
+        max_steps=20,
+        max_depth=10,
+        max_attempts=2,
+    )
+
+    assert validated.steps[0].title == text
+    assert sanitize_plan_text(text) == text
 
 
 def test_credential_scanner_rejects_credential_shaped_mapping_key() -> None:
@@ -562,6 +701,59 @@ def test_step_definition_digest_excludes_dependencies_and_ordinal() -> None:
     changed = step.model_copy(update={"depends_on": ["a"], "ordinal": 20})
 
     assert step_definition_digest(changed) == step_definition_digest(step)
+
+
+def test_validated_plan_immutability_rejects_field_assignment() -> None:
+    validated = _validated_plan()
+
+    with pytest.raises(ValidationError, match="frozen"):
+        validated.objective = "Mutated objective"
+
+
+def test_validated_step_immutability_rejects_field_assignment() -> None:
+    validated = _validated_plan()
+
+    with pytest.raises(ValidationError, match="frozen"):
+        validated.steps[0].title = "Mutated title"
+
+
+def test_validated_constraints_immutability_preserves_digest() -> None:
+    validated = _validated_plan()
+    before = plan_content_digest(validated)
+
+    with pytest.raises(AttributeError):
+        validated.constraints.append("New constraint")
+
+    assert plan_content_digest(validated) == before
+
+
+def test_validated_steps_immutability_preserves_digest() -> None:
+    validated = _validated_plan()
+    before = plan_content_digest(validated)
+
+    with pytest.raises(AttributeError):
+        validated.steps.append(validated.steps[0])
+
+    assert plan_content_digest(validated) == before
+
+
+def test_validated_dependencies_immutability_rejects_missing_dependency() -> None:
+    validated = _validated_plan()
+    before = plan_content_digest(validated)
+
+    with pytest.raises(AttributeError):
+        validated.steps[1].depends_on.append("missing")
+
+    assert "missing" not in validated.steps[1].depends_on
+    assert plan_content_digest(validated) == before
+
+
+def test_validated_snapshot_serializes_nested_tuples_as_json_arrays() -> None:
+    payload = json.loads(canonical_plan_bytes(_validated_plan()))
+
+    assert isinstance(payload["constraints"], list)
+    assert isinstance(payload["steps"], list)
+    assert isinstance(payload["steps"][0]["depends_on"], list)
 
 
 @pytest.mark.parametrize("ordinal", [1, 20])

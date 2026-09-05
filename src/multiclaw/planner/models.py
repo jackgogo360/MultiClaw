@@ -78,16 +78,25 @@ class PlanDraft(BaseModel):
 
 
 class ValidatedPlanStep(PlanDraftStep):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    depends_on: tuple[str, ...] = Field(  # type: ignore[assignment]
+        default_factory=tuple,
+        max_length=20,
+    )
     ordinal: int = Field(ge=1, le=20)
 
 
 class ValidatedPlanDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     objective: str = Field(min_length=1, max_length=16_000)
-    constraints: list[ConstraintText] = Field(default_factory=list, max_length=20)
+    constraints: tuple[ConstraintText, ...] = Field(
+        default_factory=tuple,
+        max_length=20,
+    )
     generation_reason: str = Field(min_length=1, max_length=1_000)
-    steps: list[ValidatedPlanStep] = Field(min_length=1, max_length=20)
+    steps: tuple[ValidatedPlanStep, ...] = Field(min_length=1, max_length=20)
 
 
 class PlanStepCompletion(BaseModel):
