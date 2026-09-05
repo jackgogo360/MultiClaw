@@ -33,6 +33,16 @@ keyring_file = ""
 [deletion]
 retention_days = 7
 
+[planning]
+enabled = true
+default_mode = "never"
+classification_model = ""
+generation_model = ""
+max_steps = 20
+max_dependency_depth = 10
+max_revisions = 5
+max_step_attempts = 2
+
 [llm]
 default_provider = "deepseek"
 default_model = "deepseek-v4-pro"

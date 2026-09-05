@@ -1,13 +1,36 @@
 import os
 import pytest
 from pydantic import ValidationError
-from multiclaw.config.settings import Settings
+from multiclaw.config import Settings
+from multiclaw.planner import PlanningMode
 
 
 def write_config(tmp_path, text):
     config_file = tmp_path / "multiclaw.toml"
     config_file.write_text(text)
     return config_file
+
+
+def test_planning_defaults_and_hard_caps() -> None:
+    settings = Settings(_config_file="/nonexistent")
+
+    assert settings.planning.enabled is True
+    assert settings.planning.default_mode is PlanningMode.AUTO
+    assert settings.planning.classification_model == ""
+    assert settings.planning.generation_model == ""
+    assert settings.planning.max_steps == 20
+    assert settings.planning.max_dependency_depth == 10
+    assert settings.planning.max_revisions == 5
+    assert settings.planning.max_step_attempts == 2
+
+    for payload in (
+        {"max_steps": 21},
+        {"max_dependency_depth": 11},
+        {"max_revisions": 21},
+        {"max_step_attempts": 21},
+    ):
+        with pytest.raises(ValidationError):
+            Settings(_config_file="/nonexistent", planning=payload)
 
 
 class TestSettings:
