@@ -64,7 +64,7 @@ class _BaseUnitOfWork(Generic[SelfType]):
             if self._tx is not None and self._tx.is_active:
                 if primary is None:
                     try:
-                        await self._tx.commit()
+                        await self.commit()
                     except BaseException as error:
                         primary = error
                 else:
@@ -90,9 +90,21 @@ class _BaseUnitOfWork(Generic[SelfType]):
     def _bind_repositories(self) -> None:
         raise NotImplementedError
 
+    async def _validate_precommit(self) -> None:
+        return None
+
     async def commit(self) -> None:
         if self._tx is None or not self._tx.is_active:
             return
+        try:
+            await self._validate_precommit()
+        except BaseException as primary:
+            await self._cleanup_after_failure(
+                primary=primary,
+                rollback_phase="rollback",
+                close_phase=None,
+            )
+            raise
         await self._tx.commit()
 
     def _register_after_tx_cleanup(
@@ -214,6 +226,9 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
             self._workflow_settings.heartbeat_ms,
             self._workflow_settings.lease_ttl_ms,
         )
+
+    async def _validate_precommit(self) -> None:
+        self.plans.require_no_unfinished_revisions()
 
 
 class DeletionUnitOfWork(_BaseUnitOfWork["DeletionUnitOfWork"]):

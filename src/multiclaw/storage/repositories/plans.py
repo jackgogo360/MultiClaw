@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -59,11 +59,21 @@ def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException
 
 
 @dataclass(slots=True)
+class _PlanTransactionState:
+    pending_revisions: dict[tuple[str, str], PlanDecisionRecord] = field(
+        default_factory=dict
+    )
+
+
+@dataclass(slots=True)
 class PlanRepository:
     _conn: AsyncConnection
     _dialect: Dialect
     _context: TenantContext
     _settings: PlanningSettings
+    _transaction_state: _PlanTransactionState = field(
+        default_factory=_PlanTransactionState
+    )
 
     @property
     def connection(self) -> AsyncConnection:
@@ -82,7 +92,17 @@ class PlanRepository:
             or context.workspace_id != self._context.workspace_id
         ):
             raise ValueError("PlanRepository context must remain within the UoW scope")
-        return PlanRepository(self._conn, self._dialect, context, self._settings)
+        return PlanRepository(
+            self._conn,
+            self._dialect,
+            context,
+            self._settings,
+            self._transaction_state,
+        )
+
+    def require_no_unfinished_revisions(self) -> None:
+        if self._transaction_state.pending_revisions:
+            raise RuntimeError("Cannot commit with an unfinished plan revision")
 
     async def create(
         self,
@@ -219,6 +239,14 @@ class PlanRepository:
         decided_by: str,
     ) -> PlanDecisionMutationResult:
         self._require_session()
+        pending_revision = self._pending_revision_claim(request.plan_id)
+        if (
+            pending_revision is not None
+            and pending_revision.decision_id != request.decision_id
+        ):
+            raise PlanDecisionIdempotencyError(
+                "Plan already has an unfinished revision decision claim"
+            )
         existing = await self._get_decision(request.plan_id, request.decision_id)
         if existing is not None:
             return await self._decision_replay(request, decided_by, existing)
@@ -226,14 +254,26 @@ class PlanRepository:
             raise ValueError("revision decisions require begin_revision_decision")
 
         latest = await self._lock_plan(request.plan_id)
-        existing = await self._get_decision(
+        decision_claims = await self._get_decision_claims(
             request.plan_id,
-            request.decision_id,
+            request.expected_version,
             for_update=True,
+        )
+        existing = next(
+            (
+                decision
+                for decision in decision_claims
+                if decision.decision_id == request.decision_id
+            ),
+            None,
         )
         if existing is not None:
             return await self._decision_replay(request, decided_by, existing)
         self._require_current_decision_target(request, latest)
+        if decision_claims:
+            raise PlanDecisionIdempotencyError(
+                "Plan aggregate version already has a different decision claim"
+            )
 
         savepoint = await self._conn.begin_nested()
         try:
@@ -276,7 +316,8 @@ class PlanRepository:
                 await savepoint.commit()
                 return result
         except IntegrityError as primary:
-            await self._rollback_savepoint(savepoint, primary)
+            if not await self._rollback_savepoint(savepoint, primary):
+                raise
             if not self._is_decision_id_duplicate(primary):
                 raise
             existing = await self._get_decision(
@@ -309,20 +350,43 @@ class PlanRepository:
         if request.action is not PlanDecisionAction.REVISE:
             raise ValueError("begin_revision_decision requires a revise action")
 
-        existing = await self._get_decision(request.plan_id, request.decision_id)
-        if existing is not None:
-            self._require_identical_decision(request, decided_by, existing)
-            return existing
+        pending_revision = self._pending_revision_claim(request.plan_id)
+        if pending_revision is not None:
+            if pending_revision.decision_id != request.decision_id:
+                raise PlanDecisionIdempotencyError(
+                    "Plan already has a different revision decision claim"
+                )
+            self._require_identical_decision(request, decided_by, pending_revision)
+            return pending_revision
 
         latest = await self._lock_plan(request.plan_id)
-        existing = await self._get_decision(
+        decision_claims = await self._get_decision_claims(
             request.plan_id,
-            request.decision_id,
+            request.expected_version,
             for_update=True,
+        )
+        existing = next(
+            (
+                decision
+                for decision in decision_claims
+                if decision.decision_id == request.decision_id
+            ),
+            None,
         )
         if existing is not None:
             self._require_identical_decision(request, decided_by, existing)
+            if len(decision_claims) != 1:
+                raise PlanDecisionIdempotencyError(
+                    "Plan decision history has an ambiguous aggregate boundary"
+                )
+            if existing.resulting_plan_version is None:
+                self._require_current_decision_target(request, latest)
+                self._register_revision_claim(request.plan_id, existing)
             return existing
+        if decision_claims:
+            raise PlanDecisionIdempotencyError(
+                "Plan aggregate version already has a different decision claim"
+            )
         self._require_current_decision_target(request, latest)
 
         savepoint = await self._conn.begin_nested()
@@ -338,9 +402,11 @@ class PlanRepository:
             if decision is None:
                 raise RuntimeError("Plan decision missing after insert")
             await savepoint.commit()
+            self._register_revision_claim(request.plan_id, decision)
             return decision
         except IntegrityError as primary:
-            await self._rollback_savepoint(savepoint, primary)
+            if not await self._rollback_savepoint(savepoint, primary):
+                raise
             if not self._is_decision_id_duplicate(primary):
                 raise
             existing = await self._get_decision(
@@ -351,6 +417,8 @@ class PlanRepository:
             if existing is None:
                 raise
             self._require_identical_decision(request, decided_by, existing)
+            if existing.resulting_plan_version is None:
+                self._register_revision_claim(request.plan_id, existing)
             return existing
         except BaseException as primary:
             await self._rollback_savepoint(savepoint, primary)
@@ -374,28 +442,76 @@ class PlanRepository:
             raise PlanDecisionIdempotencyError(
                 "Plan decision is not a revision decision"
             )
+        pending_revision = self._pending_revision_claim(plan_id)
         if existing.resulting_plan_version is not None:
             if existing.resulting_plan_version != resulting_plan_version:
                 raise PlanDecisionIdempotencyError(
                     "Plan decision already has a different resulting version"
                 )
+            if pending_revision is not None:
+                raise PlanDecisionIdempotencyError(
+                    "Revision decision changed after this transaction claimed it"
+                )
             return existing
+        if pending_revision is None or pending_revision != existing:
+            raise PlanDecisionIdempotencyError(
+                "Revision decision is not claimed by this transaction"
+            )
 
-        latest = await self.get(plan_id)
-        if latest is None:
-            raise PlanNotFoundError("Plan not found")
+        valid_resulting_version = existing.plan_version + 1
+        plan_match = await self._conn.execute(
+            select(agent_plans.c.id)
+            .where(
+                self._plan_predicate(plan_id),
+                agent_plans.c.status == PlanStatus.AWAITING_APPROVAL.value,
+                agent_plans.c.current_version == valid_resulting_version,
+                agent_plans.c.version
+                == existing.expected_plan_cas_version + 1,
+            )
+            .with_for_update()
+        )
+        feedback_matches = (
+            agent_plan_versions.c.revision_feedback.is_(None)
+            if existing.feedback is None
+            else agent_plan_versions.c.revision_feedback == existing.feedback
+        )
+        version_match = await self._conn.execute(
+            select(agent_plan_versions.c.plan_version)
+            .where(
+                self._version_scope_predicate(plan_id),
+                agent_plan_versions.c.plan_version == valid_resulting_version,
+                agent_plan_versions.c.parent_version == existing.plan_version,
+                feedback_matches,
+            )
+            .with_for_update()
+        )
         if (
-            resulting_plan_version != existing.plan_version + 1
-            or latest.current_version != resulting_plan_version
+            resulting_plan_version != valid_resulting_version
+            or plan_match.scalar_one_or_none() is None
+            or version_match.scalar_one_or_none() is None
         ):
+            latest = await self.get(plan_id)
+            if latest is None:
+                raise PlanNotFoundError("Plan not found")
             raise PlanVersionConflictError(latest)
 
+        decision_feedback_matches = (
+            agent_plan_decisions.c.feedback.is_(None)
+            if existing.feedback is None
+            else agent_plan_decisions.c.feedback == existing.feedback
+        )
         updated = await self._conn.execute(
             update(agent_plan_decisions)
             .where(
                 self._decision_scope_predicate(plan_id),
                 agent_plan_decisions.c.decision_id == decision_id,
                 agent_plan_decisions.c.action == PlanDecisionAction.REVISE.value,
+                agent_plan_decisions.c.plan_version == existing.plan_version,
+                agent_plan_decisions.c.expected_plan_cas_version
+                == existing.expected_plan_cas_version,
+                agent_plan_decisions.c.decided_by == existing.decided_by,
+                agent_plan_decisions.c.created_at == existing.created_at,
+                decision_feedback_matches,
                 agent_plan_decisions.c.resulting_plan_version.is_(None),
             )
             .values(resulting_plan_version=resulting_plan_version)
@@ -408,11 +524,13 @@ class PlanRepository:
                 raise PlanDecisionIdempotencyError(
                     "Plan decision already has a different resulting version"
                 )
+            self._clear_revision_claim(plan_id, decision_id)
             return existing
 
         finished = await self._get_decision(plan_id, decision_id)
         if finished is None:
             raise RuntimeError("Plan decision missing after finalization")
+        self._clear_revision_claim(plan_id, decision_id)
         return finished
 
     async def get(self, plan_id: str) -> PlanSnapshot | None:
@@ -578,6 +696,23 @@ class PlanRepository:
         row = result.mappings().first()
         return None if row is None else self._hydrate_decision(row)
 
+    async def _get_decision_claims(
+        self,
+        plan_id: str,
+        expected_plan_cas_version: int,
+        *,
+        for_update: bool = False,
+    ) -> tuple[PlanDecisionRecord, ...]:
+        statement = select(agent_plan_decisions).where(
+            self._decision_scope_predicate(plan_id),
+            agent_plan_decisions.c.expected_plan_cas_version
+            == expected_plan_cas_version,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self._conn.execute(statement)
+        return tuple(self._hydrate_decision(row) for row in result.mappings())
+
     async def _decision_replay(
         self,
         request: PlanDecisionRequest,
@@ -623,6 +758,19 @@ class PlanRepository:
         snapshot: PlanSnapshot,
         decision: PlanDecisionRecord,
     ) -> PlanSnapshot:
+        decisions = tuple(
+            candidate
+            for candidate in snapshot.decisions
+            if candidate.expected_plan_cas_version
+            <= decision.expected_plan_cas_version
+        )
+        decision_boundaries = {
+            candidate.expected_plan_cas_version for candidate in decisions
+        }
+        if len(decision_boundaries) != len(decisions) or decision not in decisions:
+            raise PlanDecisionIdempotencyError(
+                "Plan decision history has an ambiguous aggregate boundary"
+            )
         if decision.action is PlanDecisionAction.REVISE:
             if decision.resulting_plan_version is None:
                 raise ValueError("revision decisions require begin_revision_decision")
@@ -652,12 +800,6 @@ class PlanRepository:
         if current is None:
             raise ValueError("Plan decision references missing version data")
 
-        decisions = tuple(
-            candidate
-            for candidate in snapshot.decisions
-            if candidate.expected_plan_cas_version
-            <= decision.expected_plan_cas_version
-        )
         approvals = tuple(
             candidate
             for candidate in decisions
@@ -668,11 +810,7 @@ class PlanRepository:
             if not approvals
             else max(
                 approvals,
-                key=lambda candidate: (
-                    candidate.expected_plan_cas_version,
-                    candidate.created_at,
-                    candidate.decision_id,
-                ),
+                key=lambda candidate: candidate.expected_plan_cas_version,
             ).plan_version
         )
 
@@ -968,6 +1106,36 @@ class PlanRepository:
             "workspace_id": self._context.workspace_id,
             "session_id": self._require_session(),
         }
+
+    def _revision_claim_key(self, plan_id: str) -> tuple[str, str]:
+        return self._require_session(), plan_id
+
+    def _register_revision_claim(
+        self,
+        plan_id: str,
+        decision: PlanDecisionRecord,
+    ) -> None:
+        key = self._revision_claim_key(plan_id)
+        existing = self._transaction_state.pending_revisions.get(key)
+        if existing is not None and existing != decision:
+            raise PlanDecisionIdempotencyError(
+                "Plan already has a different revision decision claim"
+            )
+        self._transaction_state.pending_revisions[key] = decision
+
+    def _pending_revision_claim(
+        self,
+        plan_id: str,
+    ) -> PlanDecisionRecord | None:
+        return self._transaction_state.pending_revisions.get(
+            self._revision_claim_key(plan_id)
+        )
+
+    def _clear_revision_claim(self, plan_id: str, decision_id: str) -> None:
+        key = self._revision_claim_key(plan_id)
+        claim = self._transaction_state.pending_revisions.get(key)
+        if claim is not None and claim.decision_id == decision_id:
+            del self._transaction_state.pending_revisions[key]
 
     def _plan_scope_predicate(self):
         return and_(

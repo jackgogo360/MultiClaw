@@ -297,6 +297,44 @@ class DecisionIntegrityFailureConnection:
         return await self.connection.execute(statement, *args, **kwargs)
 
 
+class FailingDecisionRollbackSavepoint:
+    is_active = True
+
+    def __init__(self, connection, rollback_error: BaseException) -> None:
+        self.connection = connection
+        self.rollback_error = rollback_error
+
+    async def commit(self) -> None:
+        self.is_active = False
+
+    async def rollback(self) -> None:
+        self.connection.rollback_failed = True
+        raise self.rollback_error
+
+
+class DuplicateDecisionRollbackFailureConnection:
+    def __init__(self, connection, primary_error: IntegrityError) -> None:
+        self.connection = connection
+        self.primary_error = primary_error
+        self.rollback_failed = False
+
+    async def begin_nested(self):
+        return FailingDecisionRollbackSavepoint(
+            self,
+            RuntimeError("injected rollback failure"),
+        )
+
+    async def execute(self, statement, *args, **kwargs):
+        if self.rollback_failed:
+            raise AssertionError("database queried after savepoint rollback failure")
+        if (
+            getattr(statement, "is_insert", False)
+            and statement.table is agent_plan_decisions
+        ):
+            raise self.primary_error
+        return await self.connection.execute(statement, *args, **kwargs)
+
+
 class CountingConnection:
     def __init__(self, connection) -> None:
         self.connection = connection
@@ -690,6 +728,64 @@ async def test_nonduplicate_decision_integrity_error_is_not_a_replay(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action",
+    (PlanDecisionAction.APPROVE, PlanDecisionAction.REVISE),
+)
+async def test_duplicate_decision_rollback_failure_rethrows_primary_without_query(
+    action,
+    plan_database,
+    seeded_plan,
+    monkeypatch,
+):
+    primary = IntegrityError(
+        "INSERT INTO agent_plan_decisions",
+        {},
+        RuntimeError("injected duplicate decision"),
+    )
+    request = PlanDecisionRequest(
+        decision_id=f"rollback-failure-{action.value}",
+        plan_id=seeded_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_plan.aggregate_version,
+        action=action,
+        feedback="Revise safely" if action is PlanDecisionAction.REVISE else None,
+    )
+    monkeypatch.setattr(
+        PlanRepository,
+        "_is_decision_id_duplicate",
+        lambda _self, _error: True,
+    )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        repository = PlanRepository(
+            DuplicateDecisionRollbackFailureConnection(  # type: ignore[arg-type]
+                uow.conn,
+                primary,
+            ),
+            plan_database.dialect,
+            seeded_plan.context,
+            PlanningSettings(),
+        )
+        with pytest.raises(IntegrityError) as raised:
+            if action is PlanDecisionAction.REVISE:
+                await repository.begin_revision_decision(
+                    request,
+                    decided_by=seeded_plan.tenant_id,
+                )
+            else:
+                await repository.record_decision(
+                    request,
+                    decided_by=seeded_plan.tenant_id,
+                )
+
+    assert raised.value is primary
+    assert getattr(primary, "__notes__", []) == [
+        "savepoint rollback cleanup failed: RuntimeError: injected rollback failure"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stale_decision_returns_latest_snapshot(plan_database, seeded_revised_plan):
     stale = PlanDecisionRequest(
         decision_id="stale",
@@ -938,6 +1034,207 @@ async def test_completed_revision_decision_replays_original_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_revision_claim_is_unique_per_expected_aggregate_version(
+    plan_database,
+    seeded_plan,
+    monkeypatch,
+):
+    monkeypatch.setattr(plan_database.dialect, "db_now_ms", lambda: 1)
+    target = PlanDecisionRequest(
+        decision_id="z-revision-target",
+        plan_id=seeded_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="The intended revision",
+    )
+    later = target.model_copy(
+        update={
+            "decision_id": "a-later-revision",
+            "feedback": "A conflicting revision",
+        }
+    )
+    approval = target.model_copy(
+        update={
+            "decision_id": "approve-during-revision",
+            "action": PlanDecisionAction.APPROVE,
+            "feedback": None,
+        }
+    )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        first_repository = uow.plans.for_context(seeded_plan.context)
+        target_record = await first_repository.begin_revision_decision(
+            target,
+            decided_by=seeded_plan.tenant_id,
+        )
+        repeated = await uow.plans.for_context(
+            seeded_plan.context
+        ).begin_revision_decision(
+            target,
+            decided_by=seeded_plan.tenant_id,
+        )
+        assert repeated == target_record
+
+        with pytest.raises(PlanDecisionIdempotencyError):
+            await uow.plans.for_context(
+                seeded_plan.context
+            ).begin_revision_decision(
+                target,
+                decided_by=str(uuid4()),
+            )
+        with pytest.raises(PlanDecisionIdempotencyError, match="decision claim"):
+            await uow.plans.for_context(
+                seeded_plan.context
+            ).begin_revision_decision(
+                later,
+                decided_by=seeded_plan.tenant_id,
+            )
+        with pytest.raises(PlanDecisionIdempotencyError, match="decision claim"):
+            await uow.plans.for_context(seeded_plan.context).record_decision(
+                approval,
+                decided_by=seeded_plan.tenant_id,
+            )
+
+        revised = await first_repository.append_version(
+            plan_id=seeded_plan.plan_id,
+            expected_version=target.expected_version,
+            draft=plan_draft("The intended revised version"),
+            parent_version=target.plan_version,
+            revision_feedback=target.feedback,
+            supersedes=seeded_plan.step_ids,
+        )
+        intervening_approval = PlanDecisionRequest(
+            decision_id="approve-after-revision-append",
+            plan_id=seeded_plan.plan_id,
+            plan_version=revised.current_version,
+            expected_version=revised.aggregate_version,
+            action=PlanDecisionAction.APPROVE,
+            feedback=None,
+        )
+        with pytest.raises(PlanDecisionIdempotencyError, match="decision claim"):
+            await first_repository.record_decision(
+                intervening_approval,
+                decided_by=seeded_plan.tenant_id,
+            )
+        finished = await uow.plans.for_context(
+            seeded_plan.context
+        ).finish_revision_decision(
+            plan_id=seeded_plan.plan_id,
+            decision_id=target.decision_id,
+            resulting_plan_version=revised.current_version,
+        )
+        repeated_finish = await first_repository.finish_revision_decision(
+            plan_id=seeded_plan.plan_id,
+            decision_id=target.decision_id,
+            resulting_plan_version=revised.current_version,
+        )
+
+    assert repeated_finish == finished
+    assert await count_decisions(plan_database, seeded_plan.plan_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_historical_replay_rejects_ambiguous_same_cas_decisions(
+    plan_database,
+    seeded_plan,
+    monkeypatch,
+):
+    monkeypatch.setattr(plan_database.dialect, "db_now_ms", lambda: 1)
+    request = approve_request(seeded_plan, "z-original-decision")
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        await uow.plans.for_context(seeded_plan.context).record_decision(
+            request,
+            decided_by=seeded_plan.tenant_id,
+        )
+    async with plan_database.write_transaction() as connection:
+        await connection.execute(
+            insert(agent_plan_decisions).values(
+                tenant_id=seeded_plan.context.tenant_id,
+                workspace_id=seeded_plan.context.workspace_id,
+                session_id=seeded_plan.context.session_id,
+                plan_id=seeded_plan.plan_id,
+                decision_id="a-ambiguous-decision",
+                plan_version=1,
+                expected_plan_cas_version=seeded_plan.aggregate_version,
+                action=PlanDecisionAction.REJECT.value,
+                feedback=None,
+                decided_by=seeded_plan.tenant_id,
+                resulting_plan_version=None,
+                created_at=1,
+            )
+        )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        with pytest.raises(PlanDecisionIdempotencyError, match="ambiguous"):
+            await uow.plans.for_context(seeded_plan.context).record_decision(
+                request,
+                decided_by=seeded_plan.tenant_id,
+            )
+
+
+@pytest.mark.asyncio
+async def test_historical_replay_rejects_ambiguous_prior_cas_decisions(
+    plan_database,
+    seeded_plan,
+):
+    first_request = approve_request(seeded_plan, "approved-before-ambiguous-history")
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        first = await uow.plans.for_context(seeded_plan.context).record_decision(
+            first_request,
+            decided_by=seeded_plan.tenant_id,
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        awaiting_approval = await uow.plans.for_context(
+            seeded_plan.context
+        ).append_version(
+            plan_id=seeded_plan.plan_id,
+            expected_version=first.snapshot.aggregate_version,
+            draft=plan_draft("Version after the first approval"),
+            parent_version=first.snapshot.current_version,
+            revision_feedback="Continue after version one",
+            supersedes=seeded_plan.step_ids,
+        )
+    replayed_request = PlanDecisionRequest(
+        decision_id="approved-after-ambiguous-history",
+        plan_id=seeded_plan.plan_id,
+        plan_version=awaiting_approval.current_version,
+        expected_version=awaiting_approval.aggregate_version,
+        action=PlanDecisionAction.APPROVE,
+        feedback=None,
+    )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        await uow.plans.for_context(seeded_plan.context).record_decision(
+            replayed_request,
+            decided_by=seeded_plan.tenant_id,
+        )
+    async with plan_database.write_transaction() as connection:
+        await connection.execute(
+            insert(agent_plan_decisions).values(
+                tenant_id=seeded_plan.context.tenant_id,
+                workspace_id=seeded_plan.context.workspace_id,
+                session_id=seeded_plan.context.session_id,
+                plan_id=seeded_plan.plan_id,
+                decision_id="ambiguous-prior-decision",
+                plan_version=1,
+                expected_plan_cas_version=seeded_plan.aggregate_version,
+                action=PlanDecisionAction.REJECT.value,
+                feedback=None,
+                decided_by=seeded_plan.tenant_id,
+                resulting_plan_version=None,
+                created_at=1,
+            )
+        )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        with pytest.raises(PlanDecisionIdempotencyError, match="ambiguous"):
+            await uow.plans.for_context(seeded_plan.context).record_decision(
+                replayed_request,
+                decided_by=seeded_plan.tenant_id,
+            )
+
+
+@pytest.mark.asyncio
 async def test_revision_cannot_finish_without_appending_the_next_version(
     plan_database,
     seeded_plan,
@@ -998,6 +1295,156 @@ async def test_revision_validation_failure_rolls_back_decision_intent(
                 revision_feedback=request.feedback,
                 supersedes=seeded_plan.step_ids,
             )
+
+    assert await count_decisions(plan_database, seeded_plan.plan_id) == 0
+    assert await count_plan_rows(
+        plan_database,
+        seeded_plan.context,
+        seeded_plan.plan_id,
+    ) == (1, 1, 2, 1)
+
+
+@pytest.mark.asyncio
+async def test_caught_revision_failure_cannot_commit_pending_intent(
+    plan_database,
+    seeded_plan,
+):
+    request = PlanDecisionRequest(
+        decision_id="revise-caught-invalid",
+        plan_id=seeded_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="This invalid append is caught by the caller",
+    )
+    invalid = plan_draft("Invalid caught revision")
+    invalid.steps[1].depends_on = ["missing"]
+
+    with pytest.raises(RuntimeError, match="unfinished plan revision"):
+        async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+            repository = uow.plans.for_context(seeded_plan.context)
+            await repository.begin_revision_decision(
+                request,
+                decided_by=seeded_plan.tenant_id,
+            )
+            with pytest.raises(PlanValidationError, match="missing dependency"):
+                await repository.append_version(
+                    plan_id=seeded_plan.plan_id,
+                    expected_version=seeded_plan.aggregate_version,
+                    draft=invalid,
+                    parent_version=1,
+                    revision_feedback=request.feedback,
+                    supersedes=seeded_plan.step_ids,
+                )
+
+    assert await count_decisions(plan_database, seeded_plan.plan_id) == 0
+    assert await count_plan_rows(
+        plan_database,
+        seeded_plan.context,
+        seeded_plan.plan_id,
+    ) == (1, 1, 2, 1)
+
+
+@pytest.mark.asyncio
+async def test_explicit_commit_rejects_pending_revision_intent(
+    plan_database,
+    seeded_plan,
+):
+    request = PlanDecisionRequest(
+        decision_id="revise-explicit-commit",
+        plan_id=seeded_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="Explicit commit must fail closed",
+    )
+
+    with pytest.raises(RuntimeError, match="unfinished plan revision"):
+        async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+            await uow.plans.for_context(seeded_plan.context).begin_revision_decision(
+                request,
+                decided_by=seeded_plan.tenant_id,
+            )
+            await uow.commit()
+
+    assert await count_decisions(plan_database, seeded_plan.plan_id) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_result",
+    ("intervening-approval", "wrong-parent", "wrong-feedback", "wrong-result"),
+)
+async def test_revision_finish_requires_exact_intent_result(
+    invalid_result,
+    plan_database,
+    seeded_plan,
+):
+    request = PlanDecisionRequest(
+        decision_id=f"revise-{invalid_result}",
+        plan_id=seeded_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="The exact revision feedback",
+    )
+
+    with pytest.raises(RuntimeError, match="unfinished plan revision"):
+        async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+            repository = uow.plans.for_context(seeded_plan.context)
+            await repository.begin_revision_decision(
+                request,
+                decided_by=seeded_plan.tenant_id,
+            )
+            revised = await repository.append_version(
+                plan_id=seeded_plan.plan_id,
+                expected_version=request.expected_version,
+                draft=plan_draft("Revision with a mismatched result"),
+                parent_version=request.plan_version,
+                revision_feedback=request.feedback,
+                supersedes=seeded_plan.step_ids,
+            )
+            assert uow.conn is not None
+            if invalid_result == "intervening-approval":
+                await uow.conn.execute(
+                    update(agent_plans)
+                    .where(agent_plans.c.id == seeded_plan.plan_id)
+                    .values(
+                        status=PlanStatus.APPROVED.value,
+                        approved_version=revised.current_version,
+                        version=revised.aggregate_version + 1,
+                    )
+                )
+            elif invalid_result == "wrong-parent":
+                await uow.conn.execute(
+                    update(agent_plan_versions)
+                    .where(
+                        agent_plan_versions.c.plan_id == seeded_plan.plan_id,
+                        agent_plan_versions.c.plan_version == revised.current_version,
+                    )
+                    .values(parent_version=None)
+                )
+            elif invalid_result == "wrong-feedback":
+                await uow.conn.execute(
+                    update(agent_plan_versions)
+                    .where(
+                        agent_plan_versions.c.plan_id == seeded_plan.plan_id,
+                        agent_plan_versions.c.plan_version == revised.current_version,
+                    )
+                    .values(revision_feedback="different feedback")
+                )
+
+            resulting_version = (
+                revised.current_version + 1
+                if invalid_result == "wrong-result"
+                else revised.current_version
+            )
+            with pytest.raises(PlanVersionConflictError):
+                await repository.finish_revision_decision(
+                    plan_id=seeded_plan.plan_id,
+                    decision_id=request.decision_id,
+                    resulting_plan_version=resulting_version,
+                )
 
     assert await count_decisions(plan_database, seeded_plan.plan_id) == 0
     assert await count_plan_rows(
