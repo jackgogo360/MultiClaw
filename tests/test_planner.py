@@ -656,6 +656,24 @@ def test_validation_and_sanitizer_share_credential_patterns(
         ("password=abc,def", ("abc", "def")),
         ("secret=alpha;beta", ("alpha", "beta")),
         ("Authorization: Bearer abc,def", ("abc", "def")),
+        (
+            r'password="correct \"horse\" battery staple"',
+            ("correct", "horse", "battery", "staple"),
+        ),
+        (
+            'password="correct horse battery staple',
+            ("correct", "horse", "battery", "staple"),
+        ),
+        ('secret="alpha\nbeta gamma"', ("alpha", "beta", "gamma")),
+        (
+            'api_key="line-one\r\nline-two material"',
+            ("line-one", "line-two", "material"),
+        ),
+        (
+            r"secret='alpha \'beta\' gamma'",
+            ("alpha", "beta", "gamma"),
+        ),
+        ("password=\"trailing secret\\", ("trailing", "secret")),
     ],
 )
 def test_assignment_sanitization_removes_complete_credential_value(
