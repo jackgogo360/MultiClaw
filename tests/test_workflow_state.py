@@ -40,17 +40,20 @@ from multiclaw.workflow.models import (
     ApprovalRecord,
     ApprovalStatus,
     CheckpointPhase,
+    CorruptCheckpointError,
     ExecutionStatus,
     InvalidTransitionError,
     PlanAwaitingApprovalPayload,
     PlanReplanRequiredPayload,
     PlanStepReadyPayload,
     RunLease,
+    RunStartedPayload,
     RunStatus,
     StaleFenceError,
     TenantRunQuotaError,
     VersionConflictError,
 )
+from multiclaw.workflow.recovery import validate_phase_payload
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -159,6 +162,42 @@ async def _append_plan_version(
             },
         )
     return revised.current.content_digest
+
+
+def _plan_step_ready_data(
+    context: TenantContext,
+    plan_id: str,
+    plan_digest: str,
+) -> dict[str, object]:
+    return {
+        "run_id": str(context.run_id),
+        "plan_id": plan_id,
+        "plan_version": 1,
+        "plan_digest": plan_digest,
+        "step_id": str(uuid4()),
+        "step_run_id": str(uuid4()),
+        "attempt": 1,
+        "execution_cursor": "dispatch_step",
+        "cursor": "dispatch_step",
+    }
+
+
+async def _start_plan_checkpoint_run(
+    database: Database,
+    *,
+    suffix: str,
+) -> tuple[TenantContext, WorkflowCoordinator, RunLease, str, str]:
+    context = await _create_run_context(database, suffix=suffix)
+    plan_id, plan_digest = await _create_plan_for_run(database, context)
+    coordinator = _coordinator(database)
+    lease = await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    return context, coordinator, lease, plan_id, plan_digest
 
 
 def _coordinator(database: Database, settings: Settings | None = None) -> WorkflowCoordinator:
@@ -996,6 +1035,79 @@ def test_plan_checkpoint_payloads_are_strict_and_cursor_bound():
         )
 
 
+@pytest.mark.parametrize(
+    ("phase", "payload"),
+    (
+        (
+            CheckpointPhase.PLAN_AWAITING_APPROVAL,
+            PlanAwaitingApprovalPayload(
+                run_id="00000000-0000-0000-0000-000000000001",
+                plan_id="00000000-0000-0000-0000-000000000002",
+                plan_version=1,
+                plan_digest="a" * 64,
+                decision_cursor="plan-decision",
+                cursor="plan-decision",
+            ),
+        ),
+        (
+            CheckpointPhase.PLAN_STEP_READY,
+            PlanStepReadyPayload(
+                run_id="00000000-0000-0000-0000-000000000001",
+                plan_id="00000000-0000-0000-0000-000000000002",
+                plan_version=1,
+                plan_digest="a" * 64,
+                step_id="00000000-0000-0000-0000-000000000003",
+                step_run_id="00000000-0000-0000-0000-000000000004",
+                attempt=1,
+                execution_cursor="dispatch_step",
+                cursor="dispatch_step",
+            ),
+        ),
+        (
+            CheckpointPhase.PLAN_REPLAN_REQUIRED,
+            PlanReplanRequiredPayload(
+                run_id="00000000-0000-0000-0000-000000000001",
+                plan_id="00000000-0000-0000-0000-000000000002",
+                plan_version=1,
+                plan_digest="a" * 64,
+                failed_step_run_id="00000000-0000-0000-0000-000000000004",
+                failure_digest="b" * 64,
+                revision_cursor="generate_revision",
+                cursor="generate_revision",
+            ),
+        ),
+    ),
+)
+def test_validate_phase_payload_revalidates_mutated_plan_instances(
+    phase: CheckpointPhase,
+    payload: PlanAwaitingApprovalPayload
+    | PlanStepReadyPayload
+    | PlanReplanRequiredPayload,
+):
+    payload.cursor = "tampered-cursor"
+
+    with pytest.raises(CorruptCheckpointError):
+        validate_phase_payload(phase, payload)
+
+
+def test_validate_phase_payload_rebuilds_valid_legacy_typed_payload():
+    payload = RunStartedPayload(
+        tenant_id="00000000-0000-0000-0000-000000000001",
+        workspace_id="00000000-0000-0000-0000-000000000002",
+        session_id="00000000-0000-0000-0000-000000000003",
+        run_id="00000000-0000-0000-0000-000000000004",
+        started_at_ms=1,
+        model_cursor="model-inference",
+        cursor="model-inference",
+    )
+
+    phase, rebuilt = validate_phase_payload(CheckpointPhase.RUN_STARTED, payload)
+
+    assert phase is CheckpointPhase.RUN_STARTED
+    assert rebuilt == payload
+    assert rebuilt is not payload
+
+
 def test_waiting_run_can_resume_or_cancel_but_not_complete_directly():
     assert LEGAL_RUN_TRANSITIONS[RunStatus.AWAITING_USER] == frozenset(
         {RunStatus.RESUMING, RunStatus.CANCELLED}
@@ -1165,6 +1277,90 @@ async def test_plan_step_checkpoint_rejects_stale_fence_without_writing(
 
     assert current.version > stale.version
     assert await _checkpoint_rows(workflow_database, context) == checkpoints_before
+
+
+@pytest.mark.parametrize(
+    "invalid_fields",
+    (
+        {"attempt": True},
+        {"plan_digest": "not-a-sha256-digest"},
+        {"next_step": "model_inference"},
+        {"cursor": "continue_step"},
+    ),
+    ids=("boolean-attempt", "bad-digest", "wrong-next-step", "cursor-mismatch"),
+)
+@pytest.mark.asyncio
+async def test_constructed_invalid_plan_step_checkpoint_is_rejected_without_writing(
+    workflow_database: Database,
+    invalid_fields: dict[str, object],
+):
+    context, coordinator, lease, plan_id, plan_digest = await _start_plan_checkpoint_run(
+        workflow_database,
+        suffix="-constructed-invalid-plan-step",
+    )
+    data = _plan_step_ready_data(context, plan_id, plan_digest)
+    data.update(invalid_fields)
+    payload = PlanStepReadyPayload.model_construct(**data)
+    checkpoints_before = await _checkpoint_rows(workflow_database, context)
+
+    with pytest.raises(CorruptCheckpointError):
+        await coordinator.checkpoint(
+            lease,
+            CheckpointPhase.PLAN_STEP_READY,
+            payload,
+        )
+
+    assert await _checkpoint_rows(workflow_database, context) == checkpoints_before
+
+
+@pytest.mark.asyncio
+async def test_mutated_plan_step_checkpoint_is_rejected_without_writing(
+    workflow_database: Database,
+):
+    context, coordinator, lease, plan_id, plan_digest = await _start_plan_checkpoint_run(
+        workflow_database,
+        suffix="-mutated-plan-step",
+    )
+    payload = PlanStepReadyPayload.model_validate(
+        _plan_step_ready_data(context, plan_id, plan_digest)
+    )
+    payload.cursor = "continue_step"
+    checkpoints_before = await _checkpoint_rows(workflow_database, context)
+
+    with pytest.raises(CorruptCheckpointError):
+        await coordinator.checkpoint(
+            lease,
+            CheckpointPhase.PLAN_STEP_READY,
+            payload,
+        )
+
+    assert await _checkpoint_rows(workflow_database, context) == checkpoints_before
+
+
+@pytest.mark.asyncio
+async def test_valid_typed_plan_step_checkpoint_is_persisted(
+    workflow_database: Database,
+):
+    context, coordinator, lease, plan_id, plan_digest = await _start_plan_checkpoint_run(
+        workflow_database,
+        suffix="-valid-plan-step",
+    )
+    payload = PlanStepReadyPayload.model_validate(
+        _plan_step_ready_data(context, plan_id, plan_digest)
+    )
+    checkpoints_before = await _checkpoint_rows(workflow_database, context)
+
+    checkpoint = await coordinator.checkpoint(
+        lease,
+        CheckpointPhase.PLAN_STEP_READY,
+        payload,
+    )
+    checkpoints_after = await _checkpoint_rows(workflow_database, context)
+
+    assert checkpoint.phase is CheckpointPhase.PLAN_STEP_READY
+    assert len(checkpoints_after) == len(checkpoints_before) + 1
+    assert checkpoints_after[-1]["phase"] == CheckpointPhase.PLAN_STEP_READY.value
+    assert checkpoints_after[-1]["payload"] == payload.model_dump(mode="json")
 
 
 @pytest.mark.asyncio

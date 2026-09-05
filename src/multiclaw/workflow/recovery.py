@@ -130,7 +130,12 @@ def validate_phase_payload(
     normalized_phase = parse_phase(phase)
     payload_model = PHASE_PAYLOADS[normalized_phase]
     try:
-        validated = payload if isinstance(payload, payload_model) else payload_model.model_validate(payload)
+        validation_input = (
+            payload.model_dump(mode="python")
+            if isinstance(payload, payload_model)
+            else payload
+        )
+        validated = payload_model.model_validate(validation_input)
     except ValidationError as error:
         raise CorruptCheckpointError("checkpoint payload does not match phase schema") from error
     return normalized_phase, validated

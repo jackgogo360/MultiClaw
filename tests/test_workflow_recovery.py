@@ -419,6 +419,83 @@ async def test_plan_checkpoint_phases_map_to_recovery_decisions(
     assert outcome.executions_started == 0
 
 
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "schema_version": 1,
+            "run_id": "00000000-0000-0000-0000-000000000004",
+            "plan_id": "00000000-0000-0000-0000-000000000005",
+            "plan_version": 1,
+            "plan_digest": "a" * 64,
+            "step_id": "00000000-0000-0000-0000-000000000006",
+            "step_run_id": "00000000-0000-0000-0000-000000000007",
+            "attempt": 1,
+            "execution_cursor": "dispatch_step",
+            "next_step": "plan_step_execution",
+            "cursor": "continue_step",
+        },
+        {
+            "schema_version": 1,
+            "run_id": "00000000-0000-0000-0000-000000000004",
+            "plan_id": "00000000-0000-0000-0000-000000000005",
+            "plan_version": 1,
+            "plan_digest": "a" * 64,
+            "failed_step_run_id": "00000000-0000-0000-0000-000000000007",
+            "failure_digest": "b" * 64,
+            "revision_cursor": "generate_revision",
+            "next_step": "plan_revision",
+            "cursor": "generate_revision",
+        },
+    ),
+    ids=("cursor-mismatch", "phase-mismatch"),
+)
+@pytest.mark.asyncio
+async def test_raw_plan_phase_or_cursor_mismatch_blocks_recovery_without_lease(
+    workflow_database: Database,
+    payload: dict[str, object],
+):
+    run_context = await _create_run_context(workflow_database, suffix="-bad-plan-payload")
+    await _coordinator(workflow_database).start_run(run_context, "runtime-1")
+    payload = {**payload, "run_id": run_context.run_id}
+    payload_json = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    async with workflow_database.write_transaction() as conn:
+        await conn.execute(
+            insert(execution_checkpoints).values(
+                checkpoint_id=str(uuid4()),
+                tenant_id=run_context.tenant_id,
+                workspace_id=run_context.workspace_id,
+                session_id=run_context.session_id,
+                run_id=run_context.run_id,
+                approval_id=None,
+                execution_id=None,
+                phase=CheckpointPhase.PLAN_STEP_READY.value,
+                checkpoint_seq=1,
+                payload_json=payload_json,
+                payload_hash=hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                schema_version=1,
+                created_at=workflow_database.dialect.db_now_ms(),
+            )
+        )
+    await _expire_run_lease_with_db_clock(workflow_database, run_context)
+
+    outcome = await RecoveryService(workflow_database).recover(
+        run_context,
+        "runtime-2",
+    )
+
+    assert outcome.status is RunStatus.BLOCKED_CORRUPT
+    assert outcome.action is None
+    assert outcome.lease is None
+    assert outcome.executions_started == 0
+
+
 def test_checkpoint_timestamp_fields_reject_string_coercion() -> None:
     with pytest.raises(CorruptCheckpointError):
         validate_phase_payload(
