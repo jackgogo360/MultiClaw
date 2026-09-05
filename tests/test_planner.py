@@ -636,6 +636,74 @@ def test_validation_and_sanitizer_share_credential_patterns(
     assert sanitize_plan_text(credential) == "[REDACTED]"
 
 
+@pytest.mark.parametrize(
+    ("credential", "secret_fragments"),
+    [
+        (
+            'password="correct horse battery staple"',
+            ("correct", "horse", "battery", "staple"),
+        ),
+        ("secret='alpha beta gamma'", ("alpha", "beta", "gamma")),
+        (
+            'api_key = "key material with spaces"',
+            ("material", "spaces"),
+        ),
+        (
+            'Authorization = "Bearer quoted-secret-xyz opaque-token-987"',
+            ("quoted-secret-xyz", "opaque-token-987"),
+        ),
+        ("Authorization=Basic abc123", ("Basic", "abc123")),
+    ],
+)
+def test_assignment_sanitization_removes_complete_credential_value(
+    credential: str,
+    secret_fragments: tuple[str, ...],
+) -> None:
+    raw_draft = _validation_draft(
+        [_validation_step("inspect", title=credential)]
+    )
+    with pytest.raises(PlanValidationError, match="credential-shaped content"):
+        validate_plan_draft(
+            raw_draft,
+            max_steps=20,
+            max_depth=10,
+            max_attempts=2,
+        )
+
+    sanitized = sanitize_plan_text(credential)
+    assert sanitized == "[REDACTED]"
+    assert all(fragment not in sanitized for fragment in secret_fragments)
+
+    validated = validate_plan_draft(
+        _validation_draft([_validation_step("inspect", title=sanitized)]),
+        max_steps=20,
+        max_depth=10,
+        max_attempts=2,
+    )
+    canonical = canonical_plan_bytes(validated).decode("utf-8")
+    assert validated.steps[0].title == sanitized
+    assert all(fragment not in canonical for fragment in secret_fragments)
+
+
+def test_benign_authorization_prose_sanitizes_unchanged() -> None:
+    text = "authorization: user consent"
+
+    assert sanitize_plan_text(text) == text
+
+
+def test_benign_authorization_prose_validates() -> None:
+    text = "authorization: user consent"
+
+    validated = validate_plan_draft(
+        _validation_draft([_validation_step("inspect", title=text)]),
+        max_steps=20,
+        max_depth=10,
+        max_attempts=2,
+    )
+
+    assert validated.steps[0].title == text
+
+
 def test_benign_bearer_prose_validates_and_sanitizes_unchanged() -> None:
     text = "Bearer of the release"
     draft = _validation_draft([_validation_step("inspect", title=text)])

@@ -14,15 +14,28 @@ from multiclaw.planner.models import (
 
 MAX_PLAN_CONTENT_BYTES = 262_144
 _AUTHORIZATION_NAME = r"authorization"
+_SECRET_ASSIGNMENT_NAME_PATTERN = (
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
+)
 _SECRET_NAME_PATTERN = (
-    rf"(?:{_AUTHORIZATION_NAME}|api[_-]?key|access[_-]?token|"
-    r"refresh[_-]?token|password|secret)"
+    rf"(?:{_AUTHORIZATION_NAME}|{_SECRET_ASSIGNMENT_NAME_PATTERN})"
+)
+_QUOTED_ASSIGNMENT_VALUE_PATTERN = r'''(?:"[^"\r\n]*"|'[^'\r\n]*')'''
+_UNQUOTED_ASSIGNMENT_VALUE_PATTERN = r"[^\s,;]+"
+_ASSIGNMENT_VALUE_PATTERN = (
+    rf"(?:{_QUOTED_ASSIGNMENT_VALUE_PATTERN}|{_UNQUOTED_ASSIGNMENT_VALUE_PATTERN})"
+)
+_AUTHORIZATION_SCHEME_PATTERN = r"(?:basic|bearer|digest|token|negotiate)"
+_AUTHORIZATION_VALUE_PATTERN = (
+    rf"(?:{_QUOTED_ASSIGNMENT_VALUE_PATTERN}|"
+    rf"{_AUTHORIZATION_SCHEME_PATTERN}\s+{_ASSIGNMENT_VALUE_PATTERN})"
 )
 _AUTHORIZATION_ASSIGNMENT_PATTERN = (
-    rf"{_AUTHORIZATION_NAME}\s*[:=]\s*"
-    r"(?:[A-Za-z][A-Za-z0-9._+-]*\s+)?\S+"
+    rf"{_AUTHORIZATION_NAME}\s*[:=]\s*{_AUTHORIZATION_VALUE_PATTERN}"
 )
-_SECRET_ASSIGNMENT_PATTERN = rf"{_SECRET_NAME_PATTERN}\s*[:=]\s*\S+"
+_SECRET_ASSIGNMENT_PATTERN = (
+    rf"{_SECRET_ASSIGNMENT_NAME_PATTERN}\s*[:=]\s*{_ASSIGNMENT_VALUE_PATTERN}"
+)
 _BEARER_TOKEN_CHAR_PATTERN = r"[A-Za-z0-9._~+/=-]"
 _STANDALONE_BEARER_PATTERN = (
     rf"\bbearer\s+(?={_BEARER_TOKEN_CHAR_PATTERN}{{8,}}"
