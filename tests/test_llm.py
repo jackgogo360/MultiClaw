@@ -1,10 +1,19 @@
-import pytest
+import json
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
+import pytest
+
+import multiclaw.llm.router as router_module
 from multiclaw.config.settings import Settings
-from multiclaw.llm.providers import ProviderAdapter, OpenAIAdapter, AnthropicAdapter
-from multiclaw.llm.router import ModelRouter, CapabilityTag
-from multiclaw.secrets.resolver import ResolvedCredentials, SecretBytes
+from multiclaw.llm import CompletionRouter, LLMProviderError, LLMResponseParseError
+from multiclaw.llm.providers import AnthropicAdapter, OpenAIAdapter
+from multiclaw.llm.router import CapabilityTag, ModelRouter
+from multiclaw.secrets.resolver import (
+    ResolvedCredentials,
+    SecretBytes,
+    SecretNotConfiguredError,
+)
 
 
 class TestProviderAdapters:
@@ -135,6 +144,164 @@ class TestModelRouter:
         mock_client.post.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_completion_bounds_malformed_tool_argument_json(self, router):
+        canary = "parse-response-canary"
+        mock_http_response = Mock()
+        mock_http_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_invalid",
+                                "function": {
+                                    "name": "submit_plan",
+                                    "arguments": json.dumps({"secret": canary})[:-1],
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        mock_http_response.raise_for_status = Mock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.return_value = mock_http_response
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(LLMResponseParseError) as exc_info,
+        ):
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert str(exc_info.value) == "invalid LLM response"
+        assert canary not in repr(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.parametrize("failure_kind", ["transport", "status"])
+    @pytest.mark.asyncio
+    async def test_completion_bounds_http_provider_failures(
+        self,
+        router,
+        failure_kind,
+        caplog,
+    ):
+        canary = f"{failure_kind}-provider-canary"
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        if failure_kind == "transport":
+            mock_client.post.side_effect = httpx.ConnectError(canary)
+        else:
+            request = httpx.Request("POST", "https://api.example/v1/chat")
+            mock_client.post.return_value = httpx.Response(
+                503,
+                request=request,
+                text=canary,
+            )
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(LLMProviderError) as exc_info,
+        ):
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert str(exc_info.value) == "LLM provider unavailable"
+        assert canary not in repr(exc_info.value)
+        assert canary not in caplog.text
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.asyncio
+    async def test_completion_bounds_known_credential_resolution_failure(
+        self,
+        test_config_path,
+    ):
+        canary = "credential-resolution-canary"
+
+        async def unavailable_credentials(_provider_name):
+            raise SecretNotConfiguredError(canary)
+
+        router = ModelRouter(
+            Settings(_config_file=str(test_config_path)),
+            credential_resolver=unavailable_credentials,
+        )
+
+        with pytest.raises(LLMProviderError) as exc_info:
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert str(exc_info.value) == "LLM provider unavailable"
+        assert canary not in repr(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.asyncio
+    async def test_completion_bounds_missing_adapter(self, router):
+        with (
+            patch.object(router, "get_adapter", return_value=None),
+            pytest.raises(LLMProviderError) as exc_info,
+        ):
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert str(exc_info.value) == "LLM provider unavailable"
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.parametrize("error_type", [AssertionError, AttributeError, TypeError])
+    @pytest.mark.asyncio
+    async def test_completion_propagates_adapter_programming_errors(
+        self,
+        router,
+        error_type,
+    ):
+        mock_http_response = Mock()
+        mock_http_response.json.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "unused"}}]
+        }
+        mock_http_response.raise_for_status = Mock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.return_value = mock_http_response
+        credentials = ResolvedCredentials(
+            provider_name="openai",
+            source="user",
+            base_url="https://tenant.example/v1",
+            api_key=SecretBytes(b"tenant-programming-error-key"),
+        )
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch.object(
+                OpenAIAdapter,
+                "parse_response",
+                side_effect=error_type("programmer invariant failed"),
+            ),
+            pytest.raises(error_type, match="programmer invariant failed"),
+        ):
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+                credentials=credentials,
+            )
+
+        assert credentials.api_key.is_zeroized()
+
+    @pytest.mark.asyncio
     async def test_completion_uses_per_call_credentials_and_zeroizes(self, router):
         mock_http_response = Mock()
         mock_http_response.json.return_value = {
@@ -243,3 +410,8 @@ class TestCapabilityTag:
         assert CapabilityTag.FUNCTION_CALLING == "function_calling"
         assert CapabilityTag.VISION == "vision"
         assert CapabilityTag.EXTENDED_THINKING == "extended_thinking"
+
+    def test_completion_contract_and_failure_taxonomy_are_exported(self):
+        assert CompletionRouter is router_module.CompletionRouter
+        assert LLMProviderError is router_module.LLMProviderError
+        assert LLMResponseParseError is router_module.LLMResponseParseError

@@ -1,22 +1,44 @@
-import asyncio
+from __future__ import annotations
+
+import inspect
 import json
 import logging
 from collections.abc import AsyncIterator
 from enum import Enum
-import inspect
+from typing import TYPE_CHECKING, Protocol, cast
 
 import httpx
+from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 
-from multiclaw.config.settings import Settings
 from multiclaw.llm.providers import (
-    LLMResponse,
-    ProviderAdapter,
-    OpenAIAdapter,
     AnthropicAdapter,
+    LLMResponse,
+    OpenAIAdapter,
+    ProviderAdapter,
 )
-from multiclaw.secrets.resolver import ResolvedCredentials, SecretBytes
+
+if TYPE_CHECKING:
+    from multiclaw.config.settings import Settings
+    from multiclaw.secrets.resolver import ResolvedCredentials
+
+
+class LLMProviderError(RuntimeError):
+    pass
+
+
+class LLMResponseParseError(RuntimeError):
+    pass
+
+
+class CompletionRouter(Protocol):
+    async def completion(
+        self,
+        model: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+    ) -> LLMResponse: ...
 
 
 class CapabilityTag(str, Enum):
@@ -85,7 +107,7 @@ class ModelRouter:
         config = self._provider_configs.get(provider)
         if not config:
             return None
-        adapter_cls = config["adapter_cls"]
+        adapter_cls = cast(type[ProviderAdapter], config["adapter_cls"])
         return adapter_cls(api_key="", base_url=str(config["base_url"]))
 
     # ------------------------------------------------------------------
@@ -99,24 +121,51 @@ class ModelRouter:
         tools: list[dict] | None = None,
         credentials: ResolvedCredentials | None = None,
     ) -> LLMResponse:
+        from multiclaw.secrets.resolver import (
+            SecretNotConfiguredError,
+            UserSecretInvalidError,
+        )
+
         provider = self._model_provider.get(model) or self._settings.llm.default_provider
         adapter = self.get_adapter(model)
         if adapter is None:
-            raise ValueError(f"No adapter found for model '{model}'")
-        resolved = await self._resolve_credentials(provider, credentials)
+            raise LLMProviderError("LLM provider unavailable")
+
+        credentials_unavailable = False
+        try:
+            resolved = await self._resolve_credentials(provider, credentials)
+        except (SecretNotConfiguredError, UserSecretInvalidError):
+            credentials_unavailable = True
+        if credentials_unavailable:
+            raise LLMProviderError("LLM provider unavailable")
+
         try:
             request = self._build_request(adapter, resolved, model, messages, tools or [])
             _log_request(request)
 
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(
-                    request["url"],
-                    headers=request["headers"],
-                    json=request["body"],
-                )
-            _log_response(response)
-            response.raise_for_status()
-            parsed = adapter.parse_response(response.json())
+            provider_unavailable = False
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    response = await client.post(
+                        request["url"],
+                        headers=request["headers"],
+                        json=request["body"],
+                    )
+                _log_response(response)
+                response.raise_for_status()
+            except httpx.HTTPError:
+                provider_unavailable = True
+            if provider_unavailable:
+                raise LLMProviderError("LLM provider unavailable")
+
+            response_invalid = False
+            try:
+                parsed = adapter.parse_response(response.json())
+            except (json.JSONDecodeError, KeyError, IndexError, ValidationError):
+                response_invalid = True
+            if response_invalid:
+                raise LLMResponseParseError("invalid LLM response")
+
             logger.info(
                 "LLM response: content=%s tool_calls=%s reasoning=%d",
                 _truncate(parsed.content, 300),
@@ -256,6 +305,8 @@ class ModelRouter:
         config = self._provider_configs.get(provider_name)
         if not config:
             raise ValueError(f"No provider config found for '{provider_name}'")
+        from multiclaw.secrets.resolver import ResolvedCredentials, SecretBytes
+
         return ResolvedCredentials(
             provider_name=provider_name,
             source="platform",
@@ -325,8 +376,13 @@ def _log_response(response) -> None:
     status = getattr(response, "status_code", 0)
     logger.info("LLM response <- status=%s", status)
     if isinstance(status, int) and status >= 400:
-        try:
-            body = response.text
-        except Exception:
-            body = "<unavailable>"
-        logger.error("LLM error <- body: %s", _truncate(str(body), 2000))
+        logger.error("LLM error response body omitted")
+
+
+__all__ = [
+    "CapabilityTag",
+    "CompletionRouter",
+    "LLMProviderError",
+    "LLMResponseParseError",
+    "ModelRouter",
+]

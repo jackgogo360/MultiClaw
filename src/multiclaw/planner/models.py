@@ -192,6 +192,11 @@ class PlanningDecision(BaseModel):
 
 
 LOGICAL_STEP_KEY = r"^[a-z0-9_-]{1,64}$"
+PLAN_ID = (
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+RESULT_DIGEST = r"^[0-9a-f]{64}$"
 ConstraintText = Annotated[str, Field(min_length=1, max_length=1_000)]
 EvidenceText = Annotated[str, Field(min_length=1, max_length=2_000)]
 
@@ -221,17 +226,18 @@ class CompletedStepContext(BaseModel):
 
     logical_step_key: str = Field(pattern=LOGICAL_STEP_KEY)
     summary: str = Field(min_length=1, max_length=4_000)
-    result_digest: str = Field(min_length=1, max_length=128)
+    result_digest: str = Field(pattern=RESULT_DIGEST)
 
 
 class PlanRevisionContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    plan_id: str
-    parent_version: int
-    feedback: str | None
-    failed_step_key: str | None
-    failed_error: str | None
+    plan_id: str = Field(min_length=36, max_length=36, pattern=PLAN_ID)
+    parent_version: int = Field(ge=1, strict=True)
+    feedback: str | None = Field(max_length=8_000)
+    failed_step_key: str | None = Field(pattern=LOGICAL_STEP_KEY)
+    # Failure detail follows the existing 4,000-character plan result bound.
+    failed_error: str | None = Field(max_length=4_000)
     completed: list[CompletedStepContext] = Field(max_length=20)
 
 

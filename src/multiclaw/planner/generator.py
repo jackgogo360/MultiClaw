@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any
 
 from pydantic import ValidationError
 
+from multiclaw.llm import (
+    CompletionRouter,
+    LLMProviderError,
+    LLMResponse,
+    LLMResponseParseError,
+)
 from multiclaw.planner.models import (
     PlanDraft,
     PlanRevisionContext,
@@ -36,20 +43,16 @@ SUBMIT_PLAN_SCHEMA = function_schema(
 
 
 async def _request_plan(
-    router: Any,
+    router: CompletionRouter,
     *,
     model: str,
     messages: list[dict[str, str]],
-) -> tuple[bool, Any]:
-    try:
-        response = await router.completion(
-            model=model,
-            messages=messages,
-            tools=[SUBMIT_PLAN_SCHEMA],
-        )
-    except Exception:  # noqa: BLE001 - normalize all provider failures
-        return False, None
-    return True, response
+) -> LLMResponse:
+    return await router.completion(
+        model=model,
+        messages=messages,
+        tools=[deepcopy(SUBMIT_PLAN_SCHEMA)],
+    )
 
 
 def _sanitize_prompt_value(value: object) -> object:
@@ -127,7 +130,7 @@ def _validate_response(
     max_steps: int,
     max_depth: int,
     max_attempts: int,
-) -> tuple[ValidatedPlanDraft | None, dict[str, str] | None, bool]:
+) -> tuple[ValidatedPlanDraft | None, dict[str, str] | None]:
     try:
         validated = PlanGenerator._validated_response(
             response,
@@ -137,16 +140,14 @@ def _validate_response(
             max_attempts=max_attempts,
         )
     except (ValidationError, PlanValidationError) as error:
-        return None, _repair_message(error), False
-    except Exception:  # noqa: BLE001 - do not expose parser internals
-        return None, None, True
-    return validated, None, False
+        return None, _repair_message(error)
+    return validated, None
 
 
 class PlanGenerator:
     def __init__(
         self,
-        router: Any,
+        router: CompletionRouter,
         *,
         default_model: str,
         generation_model: str,
@@ -164,26 +165,40 @@ class PlanGenerator:
         max_attempts: int = 2,
     ) -> ValidatedPlanDraft:
         safe_objective = sanitize_plan_text(objective)
+        if not safe_objective.strip() or len(safe_objective) > 16_000:
+            raise PlanGenerationError("invalid planning objective")
         messages = _initial_messages(safe_objective, revision)
 
         for attempt in range(2):
-            available, response = await _request_plan(
-                self._router,
-                model=self._generation_model or self._default_model,
-                messages=messages,
-            )
-            if not available:
+            provider_unavailable = False
+            response_invalid = False
+            try:
+                response = await _request_plan(
+                    self._router,
+                    model=self._generation_model or self._default_model,
+                    messages=messages,
+                )
+            except LLMProviderError:
+                provider_unavailable = True
+            except LLMResponseParseError:
+                response_invalid = True
+
+            if provider_unavailable:
                 raise PlanGenerationError("plan generation unavailable") from None
 
-            validated, repair, parser_failed = _validate_response(
-                response,
-                safe_objective=safe_objective,
-                max_steps=max_steps,
-                max_depth=max_depth,
-                max_attempts=max_attempts,
-            )
-            if parser_failed:
-                raise PlanGenerationError("plan generation unavailable") from None
+            validated: ValidatedPlanDraft | None
+            repair: dict[str, str] | None
+            if response_invalid:
+                validated = None
+                repair = _repair_message(_StructuredResponseError("response"))
+            else:
+                validated, repair = _validate_response(
+                    response,
+                    safe_objective=safe_objective,
+                    max_steps=max_steps,
+                    max_depth=max_depth,
+                    max_attempts=max_attempts,
+                )
             if validated is not None:
                 return validated
             if attempt == 0:

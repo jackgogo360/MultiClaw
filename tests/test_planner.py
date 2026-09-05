@@ -6,8 +6,14 @@ import pytest
 from pydantic import ValidationError
 
 from multiclaw import planner
-from multiclaw.llm import LLMResponse, ToolCall
+from multiclaw.llm import (
+    LLMProviderError,
+    LLMResponse,
+    LLMResponseParseError,
+    ToolCall,
+)
 from multiclaw.planner import (
+    CompletedStepContext,
     Plan,
     PlanDecisionAction,
     PlanDraft,
@@ -913,6 +919,29 @@ def plan_draft(objective: str = "Deliver the change") -> PlanDraft:
     )
 
 
+def completed_step_context_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "logical_step_key": "inspect",
+        "summary": "Inspection completed.",
+        "result_digest": "a" * 64,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def revision_context_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "plan_id": str(uuid4()),
+        "parent_version": 1,
+        "feedback": None,
+        "failed_step_key": None,
+        "failed_error": None,
+        "completed": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
 class StubRouter:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -995,12 +1024,19 @@ async def test_explicit_policy_modes_never_call_model() -> None:
     assert router.calls == []
 
 
+@pytest.mark.parametrize(
+    "router_error",
+    [
+        LLMProviderError("provider unavailable private-classifier-canary"),
+        LLMResponseParseError("invalid response private-classifier-canary"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_auto_classification_failure_falls_back_direct_without_leak() -> None:
+async def test_auto_classification_failure_falls_back_direct_without_leak(
+    router_error: Exception,
+) -> None:
     policy = PlanningPolicy(
-        router=StubRouter(
-            [RuntimeError("provider unavailable token=private-classifier-canary")]
-        ),
+        router=StubRouter([router_error]),
         default_model="default",
         classification_model="classifier",
     )
@@ -1066,6 +1102,81 @@ async def test_classifier_accepts_only_its_bounded_function_schema() -> None:
         planner.PlanningDecision.model_json_schema()
     )
     assert "read_file" not in str(router.calls[0]["tools"])
+
+
+@pytest.mark.asyncio
+async def test_classifier_redacts_request_and_model_reason_only() -> None:
+    request_canary = "Authorization: Bearer classifier-request-canary"
+    reason_canary = "Authorization: Bearer classifier-reason-canary"
+    filesystem_path = "/workspace/project/docs/planning.md"
+    router = StubRouter(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="route",
+                        name="classify_planning_request",
+                        arguments={
+                            "mode": "plan",
+                            "reason": (
+                                f"Inspect {filesystem_path}; {reason_canary}; "
+                                "preserve authorization prose."
+                            ),
+                        },
+                    )
+                ],
+            )
+        ]
+    )
+
+    decision = await PlanningPolicy(
+        router=router,
+        default_model="default",
+        classification_model="classifier",
+    ).decide(
+        f"Inspect {filesystem_path}; {request_canary}; preserve authorization prose.",
+        PlanningMode.AUTO,
+    )
+
+    messages = str(router.calls[0]["messages"])
+    assert "classifier-request-canary" not in messages
+    assert request_canary not in messages
+    assert "[REDACTED]" in messages
+    assert filesystem_path in messages
+    assert "preserve authorization prose" in messages
+    assert "classifier-reason-canary" not in decision.reason
+    assert reason_canary not in decision.reason
+    assert "[REDACTED]" in decision.reason
+    assert filesystem_path in decision.reason
+    assert "preserve authorization prose" in decision.reason
+
+
+@pytest.mark.parametrize("error_type", [AssertionError, AttributeError, TypeError])
+@pytest.mark.asyncio
+async def test_classifier_propagates_programming_errors(error_type) -> None:
+    policy = PlanningPolicy(
+        router=StubRouter([error_type("programmer invariant failed")]),
+        default_model="default",
+        classification_model="classifier",
+    )
+
+    with pytest.raises(error_type, match="programmer invariant failed"):
+        await policy.decide("request", PlanningMode.AUTO)
+
+
+@pytest.mark.asyncio
+async def test_classifier_malformed_returned_shape_falls_back_direct() -> None:
+    decision = await PlanningPolicy(
+        router=StubRouter([object()]),
+        default_model="default",
+        classification_model="classifier",
+    ).decide("request", PlanningMode.AUTO)
+
+    assert decision == planner.PlanningDecision(
+        mode=PlanningRoute.DIRECT,
+        reason="automatic classification unavailable",
+    )
 
 
 @pytest.mark.asyncio
@@ -1186,6 +1297,92 @@ async def test_generator_passes_only_submit_plan_schema_and_validates_payload() 
     assert "read_file" not in str(router.calls[0]["tools"])
 
 
+@pytest.mark.parametrize("objective", ["x", "x" * 16_000])
+@pytest.mark.asyncio
+async def test_generator_accepts_sanitized_objective_boundaries(objective: str) -> None:
+    router = StubRouter(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=plan_draft().model_dump(),
+                    )
+                ],
+            )
+        ]
+    )
+
+    generated = await PlanGenerator(
+        router,
+        default_model="default",
+        generation_model="planner",
+    ).generate(objective=objective)
+
+    assert generated.objective == objective
+    assert len(router.calls) == 1
+
+
+@pytest.mark.parametrize("objective", ["", "   \t\n", "x" * 16_001])
+@pytest.mark.asyncio
+async def test_generator_rejects_invalid_objective_before_completion(
+    objective: str,
+) -> None:
+    router = StubRouter([])
+
+    with pytest.raises(PlanGenerationError, match="^invalid planning objective$"):
+        await PlanGenerator(
+            router,
+            default_model="default",
+            generation_model="planner",
+        ).generate(objective=objective)
+
+    assert router.calls == []
+
+
+@pytest.mark.asyncio
+async def test_generator_accepts_credential_only_objective_after_redaction() -> None:
+    canary = "Authorization: Bearer objective-only-canary"
+    router = StubRouter(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="plan",
+                        name="submit_plan",
+                        arguments=plan_draft().model_dump(),
+                    )
+                ],
+            )
+        ]
+    )
+
+    generated = await PlanGenerator(
+        router,
+        default_model="default",
+        generation_model="planner",
+    ).generate(objective=canary)
+
+    assert generated.objective == "[REDACTED]"
+    assert "objective-only-canary" not in str(router.calls[0]["messages"])
+
+
+@pytest.mark.parametrize("error_type", [AssertionError, AttributeError, TypeError])
+@pytest.mark.asyncio
+async def test_generator_propagates_programming_errors(error_type) -> None:
+    router = StubRouter([error_type("programmer invariant failed")])
+
+    with pytest.raises(error_type, match="programmer invariant failed"):
+        await PlanGenerator(
+            router,
+            default_model="default",
+            generation_model="planner",
+        ).generate(objective="Deliver")
+
+
 @pytest.mark.asyncio
 async def test_generator_repairs_once_then_fails_closed_without_raw_output() -> None:
     canary = "Authorization: Bearer repair-output-canary"
@@ -1221,6 +1418,75 @@ async def test_generator_repairs_once_then_fails_closed_without_raw_output() -> 
     assert second_messages[-1]["role"] == "system"
     assert canary not in str(second_messages)
     assert "not structured" not in str(second_messages)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_generator_repairs_router_parse_failure_once() -> None:
+    canary = "router-parse-canary"
+    valid = LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(
+                id="valid",
+                name="submit_plan",
+                arguments=plan_draft().model_dump(),
+            )
+        ],
+    )
+    router = StubRouter([LLMResponseParseError(canary), valid])
+
+    generated = await PlanGenerator(
+        router,
+        default_model="default",
+        generation_model="planner",
+    ).generate(objective="Deliver")
+
+    assert generated.objective == "Deliver"
+    assert len(router.calls) == 2
+    repair = str(router.calls[1]["messages"][-1])
+    assert "Invalid structured response" in repair
+    assert canary not in repair
+
+
+@pytest.mark.asyncio
+async def test_generator_rejects_two_router_parse_failures_without_leak() -> None:
+    canary = "two-router-parse-canary"
+    router = StubRouter(
+        [LLMResponseParseError(canary), LLMResponseParseError(canary)]
+    )
+
+    with pytest.raises(PlanGenerationError) as exc_info:
+        await PlanGenerator(
+            router,
+            default_model="default",
+            generation_model="planner",
+        ).generate(objective="Deliver")
+
+    assert len(router.calls) == 2
+    assert str(exc_info.value) == "two invalid structured responses"
+    assert canary not in str(router.calls[1]["messages"])
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_generator_provider_failure_during_repair_is_unavailable() -> None:
+    invalid = LLMResponse(content="not structured", tool_calls=[])
+    router = StubRouter(
+        [invalid, LLMProviderError("repair-provider-canary")]
+    )
+
+    with pytest.raises(PlanGenerationError) as exc_info:
+        await PlanGenerator(
+            router,
+            default_model="default",
+            generation_model="planner",
+        ).generate(objective="Deliver")
+
+    assert len(router.calls) == 2
+    assert str(exc_info.value) == "plan generation unavailable"
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
 
@@ -1348,7 +1614,11 @@ async def test_generator_owns_objective_and_redacts_revision_context() -> None:
 @pytest.mark.asyncio
 async def test_generator_provider_failure_is_bounded_and_does_not_leak() -> None:
     router = StubRouter(
-        [RuntimeError("provider unavailable Authorization: Bearer provider-canary")]
+        [
+            LLMProviderError(
+                "provider unavailable Authorization: Bearer provider-canary"
+            )
+        ]
     )
 
     with pytest.raises(PlanGenerationError) as exc_info:
@@ -1372,13 +1642,142 @@ async def test_generator_provider_failure_is_bounded_and_does_not_leak() -> None
 def test_plan_revision_context_is_strict() -> None:
     with pytest.raises(ValidationError):
         PlanRevisionContext.model_validate(
-            {
-                "plan_id": str(uuid4()),
-                "parent_version": 1,
-                "feedback": None,
-                "failed_step_key": None,
-                "failed_error": None,
-                "completed": [],
-                "unexpected": True,
-            }
+            revision_context_payload(unexpected=True)
         )
+
+
+def test_plan_revision_context_accepts_bounded_values() -> None:
+    context = PlanRevisionContext.model_validate(
+        revision_context_payload(
+            feedback="f" * 8_000,
+            failed_step_key="z" * 64,
+            failed_error="e" * 4_000,
+            completed=[
+                completed_step_context_payload(
+                    logical_step_key=f"step-{index}",
+                    summary="s" * 4_000,
+                    result_digest="f" * 64,
+                )
+                for index in range(20)
+            ],
+        )
+    )
+
+    assert context.parent_version == 1
+    assert len(context.feedback or "") == 8_000
+    assert len(context.failed_error or "") == 4_000
+    assert len(context.completed) == 20
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("plan_id", ""),
+        ("plan_id", "x" * 36),
+        ("parent_version", 0),
+        ("parent_version", "1"),
+        ("parent_version", 1.0),
+        ("parent_version", True),
+        ("feedback", "x" * 1_000_000),
+        ("failed_step_key", "INVALID PATH"),
+        ("failed_error", "x" * 1_000_000),
+        (
+            "completed",
+            [completed_step_context_payload()] * 21,
+        ),
+    ],
+)
+def test_plan_revision_context_rejects_unbounded_or_invalid_values(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        PlanRevisionContext.model_validate(revision_context_payload(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("logical_step_key", ""),
+        ("logical_step_key", "INVALID PATH"),
+        ("summary", ""),
+        ("summary", "x" * 1_000_000),
+        ("result_digest", "a" * 63),
+        ("result_digest", "a" * 65),
+        ("result_digest", "A" * 64),
+        ("result_digest", "g" * 64),
+    ],
+)
+def test_completed_step_context_rejects_invalid_values(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        CompletedStepContext.model_validate(
+            completed_step_context_payload(**{field: value})
+        )
+
+
+@pytest.mark.asyncio
+async def test_planning_schemas_are_fresh_for_each_completion() -> None:
+    class MutatingRouter(StubRouter):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.required_fields = []
+
+        async def completion(self, **kwargs):
+            parameters = kwargs["tools"][0]["function"]["parameters"]
+            self.required_fields.append(tuple(parameters["required"]))
+            parameters.clear()
+            return await super().completion(**kwargs)
+
+    classification_response = LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(
+                id="route",
+                name="classify_planning_request",
+                arguments={"mode": "plan", "reason": "Dependent work."},
+            )
+        ],
+    )
+    classifier_router = MutatingRouter(
+        [classification_response, classification_response]
+    )
+    policy = PlanningPolicy(
+        classifier_router,
+        default_model="default",
+        classification_model="classifier",
+    )
+
+    await policy.decide("first", PlanningMode.AUTO)
+    await policy.decide("second", PlanningMode.AUTO)
+
+    plan_response = LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(
+                id="plan",
+                name="submit_plan",
+                arguments=plan_draft().model_dump(),
+            )
+        ],
+    )
+    generator_router = MutatingRouter([plan_response, plan_response])
+    generator = PlanGenerator(
+        generator_router,
+        default_model="default",
+        generation_model="planner",
+    )
+
+    await generator.generate("first")
+    await generator.generate("second")
+
+    assert classifier_router.required_fields == [
+        ("mode", "reason"),
+        ("mode", "reason"),
+    ]
+    assert generator_router.required_fields == [
+        ("objective", "generation_reason", "steps"),
+        ("objective", "generation_reason", "steps"),
+    ]

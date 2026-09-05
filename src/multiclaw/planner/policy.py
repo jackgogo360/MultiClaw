@@ -1,15 +1,21 @@
-from typing import Any
+from copy import deepcopy
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
+from multiclaw.llm import CompletionRouter, LLMProviderError, LLMResponseParseError
 from multiclaw.planner.models import (
     PlanningDecision,
     PlanningMode,
     PlanningRoute,
 )
+from multiclaw.planner.validation import sanitize_plan_text
 
 
 class PlanningUnavailableError(RuntimeError):
+    pass
+
+
+class _ClassificationResponseError(ValueError):
     pass
 
 
@@ -38,7 +44,7 @@ CLASSIFY_SCHEMA = function_schema(
 class PlanningPolicy:
     def __init__(
         self,
-        router: Any,
+        router: CompletionRouter,
         *,
         default_model: str,
         classification_model: str,
@@ -73,6 +79,7 @@ class PlanningPolicy:
             )
 
         try:
+            safe_request = sanitize_plan_text(request)
             response = await self._router.completion(
                 model=self._classification_model or self._default_model,
                 messages=[
@@ -84,17 +91,29 @@ class PlanningPolicy:
                             "classify_planning_request function call."
                         ),
                     },
-                    {"role": "user", "content": request},
+                    {"role": "user", "content": safe_request},
                 ],
-                tools=[CLASSIFY_SCHEMA],
+                tools=[deepcopy(CLASSIFY_SCHEMA)],
             )
-            if len(response.tool_calls) != 1:
-                raise ValueError("classification requires exactly one tool call")
-            call = response.tool_calls[0]
-            if call.name != "classify_planning_request":
-                raise ValueError("unexpected classification function")
-            return PlanningDecision.model_validate(call.arguments)
-        except Exception:  # noqa: BLE001 - classification must fail open
+            tool_calls = getattr(response, "tool_calls", None)
+            if not isinstance(tool_calls, list) or len(tool_calls) != 1:
+                raise _ClassificationResponseError
+            call = tool_calls[0]
+            if getattr(call, "name", None) != "classify_planning_request":
+                raise _ClassificationResponseError
+            decision = PlanningDecision.model_validate(
+                getattr(call, "arguments", None)
+            )
+            return PlanningDecision(
+                mode=decision.mode,
+                reason=sanitize_plan_text(decision.reason),
+            )
+        except (
+            LLMProviderError,
+            LLMResponseParseError,
+            _ClassificationResponseError,
+            ValidationError,
+        ):
             return PlanningDecision(
                 mode=PlanningRoute.DIRECT,
                 reason="automatic classification unavailable",
