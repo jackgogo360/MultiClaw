@@ -48,6 +48,7 @@ class RecoveryStrategy(str, Enum):
 
 class CheckpointPhase(StrEnum):
     RUN_STARTED = "run_started"
+    PLAN_AWAITING_APPROVAL = "plan_awaiting_approval"
     MODEL_OUTPUT_COMMITTED = "model_output_committed"
     AWAITING_APPROVAL = "awaiting_approval"
     EXECUTION_DISPATCHING = "execution_dispatching"
@@ -71,6 +72,11 @@ CURSOR_FIELD = Field(min_length=1, max_length=255)
 REF_FIELD = Field(min_length=1, max_length=255)
 OPTIONAL_REQUEST_ID_FIELD = Field(default=None, min_length=1, max_length=255)
 DIGEST_FIELD = Field(min_length=64, max_length=64)
+UUID_PATTERN = (
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+SHA256_PATTERN = r"^[0-9a-f]{64}$"
 OPTIONAL_IDEMPOTENCY_KEY_FIELD = Field(default=None, min_length=1, max_length=128)
 
 
@@ -94,6 +100,22 @@ class RunStartedPayload(CheckpointPayload):
     def validate_cursor(self) -> "RunStartedPayload":
         if self.cursor != self.model_cursor:
             raise ValueError("cursor must match model_cursor")
+        return self
+
+
+class PlanAwaitingApprovalPayload(CheckpointPayload):
+    run_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_version: StrictInt = Field(ge=1)
+    plan_digest: str = Field(min_length=64, max_length=64, pattern=SHA256_PATTERN)
+    decision_cursor: str = CURSOR_FIELD
+    next_step: Literal["plan_decision"] = "plan_decision"
+    cursor: str = CURSOR_FIELD
+
+    @model_validator(mode="after")
+    def validate_cursor(self) -> "PlanAwaitingApprovalPayload":
+        if self.cursor != self.decision_cursor:
+            raise ValueError("cursor must match decision_cursor")
         return self
 
 
@@ -184,6 +206,7 @@ class RunTerminalPayload(CheckpointPayload):
 
 PHASE_PAYLOADS: dict[CheckpointPhase, type[CheckpointPayload]] = {
     CheckpointPhase.RUN_STARTED: RunStartedPayload,
+    CheckpointPhase.PLAN_AWAITING_APPROVAL: PlanAwaitingApprovalPayload,
     CheckpointPhase.MODEL_OUTPUT_COMMITTED: ModelOutputPayload,
     CheckpointPhase.AWAITING_APPROVAL: AwaitingApprovalPayload,
     CheckpointPhase.EXECUTION_DISPATCHING: ExecutionDispatchingPayload,
@@ -223,7 +246,7 @@ LEGAL_RUN_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
             RunStatus.CANCELLED,
         }
     ),
-    RunStatus.AWAITING_USER: frozenset({RunStatus.RESUMING}),
+    RunStatus.AWAITING_USER: frozenset({RunStatus.RESUMING, RunStatus.CANCELLED}),
     RunStatus.RESUMING: frozenset(
         {
             RunStatus.RUNNING,
@@ -355,6 +378,10 @@ class RunLeaseHandle:
 class RunRecord:
     context: TenantContext
     status: RunStatus
+    plan_id: str | None
+    initial_plan_version: int | None
+    active_plan_version: int | None
+    cancel_requested_at: int | None
     runtime_instance_id: str | None
     lease_owner: str | None
     fencing_token: int

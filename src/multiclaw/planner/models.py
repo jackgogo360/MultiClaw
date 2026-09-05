@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -6,8 +8,9 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from multiclaw.events.types import ScopedEvent
 from multiclaw.tenancy.context import TenantContext
-from multiclaw.workflow.models import RunStatus
+from multiclaw.workflow.models import RunLease, RunRecord, RunStatus
 
 
 class PlanningMode(StrEnum):
@@ -219,6 +222,52 @@ class PlanDraft(BaseModel):
     constraints: list[ConstraintText] = Field(default_factory=list, max_length=20)
     generation_reason: str = Field(min_length=1, max_length=1_000)
     steps: list[PlanDraftStep] = Field(min_length=1, max_length=20)
+
+
+class PlanReference(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    tenant_id: str = Field(min_length=1, max_length=36)
+    workspace_id: str = Field(min_length=1, max_length=36)
+    plan_id: str = Field(min_length=36, max_length=36, pattern=PLAN_ID)
+    plan_version: int = Field(ge=1, strict=True)
+    run_id: str = Field(min_length=36, max_length=36)
+    aggregate_version: int = Field(ge=1, strict=True)
+    session_id: str = Field(min_length=1, max_length=36)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanMaterializationResult:
+    plan: PlanSnapshot
+    reference: PlanReference
+    reference_message_id: str
+    run: RunRecord
+    event: ScopedEvent
+
+
+@dataclass(frozen=True, slots=True)
+class PlanDecisionResult:
+    snapshot: PlanSnapshot
+    decision: PlanDecisionRecord
+    run: RunRecord
+    lease: RunLease | None
+    idempotent_replay: bool
+    events: tuple[ScopedEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializeInitialPlan:
+    context: TenantContext
+    runtime_instance_id: str
+    source_message_id: str
+    assistant_turn_index: int
+    trigger_mode: PlanTriggerMode
+    draft: PlanDraft
+
+
+class PlanRevisionLimitError(RuntimeError):
+    pass
 
 
 class CompletedStepContext(BaseModel):

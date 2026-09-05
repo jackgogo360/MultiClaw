@@ -79,6 +79,37 @@ class PlanRepository:
     def connection(self) -> AsyncConnection:
         return self._conn
 
+    @staticmethod
+    async def locate_context(
+        connection: AsyncConnection,
+        *,
+        tenant_id: str,
+        plan_id: str,
+    ) -> TenantContext:
+        result = await connection.execute(
+            select(
+                agent_plans.c.tenant_id,
+                agent_plans.c.workspace_id,
+                agent_plans.c.session_id,
+            )
+            .where(
+                agent_plans.c.tenant_id == tenant_id,
+                agent_plans.c.id == plan_id,
+            )
+            .limit(2)
+        )
+        rows = result.mappings().all()
+        if len(rows) != 1:
+            raise PlanNotFoundError("Plan not found")
+        row = rows[0]
+        if str(row["tenant_id"]) != tenant_id:
+            raise PlanNotFoundError("Plan not found")
+        return TenantContext(
+            tenant_id=tenant_id,
+            workspace_id=str(row["workspace_id"]),
+            session_id=str(row["session_id"]),
+        )
+
     def _require_session(self) -> str:
         if self._context.session_id is None:
             raise ValueError("PlanRepository requires session scope")
@@ -338,6 +369,18 @@ class PlanRepository:
         if conflict_snapshot is None:
             raise PlanNotFoundError("Plan not found")
         raise PlanVersionConflictError(conflict_snapshot)
+
+    async def replay_decision(
+        self,
+        request: PlanDecisionRequest,
+        *,
+        decided_by: str,
+    ) -> PlanDecisionMutationResult | None:
+        self._require_session()
+        existing = await self._get_decision(request.plan_id, request.decision_id)
+        if existing is None:
+            return None
+        return await self._decision_replay(request, decided_by, existing)
 
     async def begin_revision_decision(
         self,

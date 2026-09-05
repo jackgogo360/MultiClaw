@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -23,6 +24,7 @@ from multiclaw.workflow.models import (
     ExecutionStatus,
     InvalidTransitionError,
     LeaseConflictError,
+    PlanAwaitingApprovalPayload,
     RunLease,
     RunRecord,
     RunStatus,
@@ -69,9 +71,7 @@ class WorkflowCoordinator:
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             await repository._lock_tenant(context.tenant_id)
-            active_runs = await repository.count_active_runs(context.tenant_id)
-            if active_runs >= self._settings.runtime.max_concurrent_runs_per_tenant:
-                raise TenantRunQuotaError("tenant run quota exceeded")
+            await self._enforce_run_quota(repository, context.tenant_id)
             return await repository._create_run(
                 context,
                 runtime_instance_id=runtime_instance_id,
@@ -81,9 +81,7 @@ class WorkflowCoordinator:
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             await repository._lock_tenant(context.tenant_id)
-            active_runs = await repository.count_active_runs(context.tenant_id)
-            if active_runs >= self._settings.runtime.max_concurrent_runs_per_tenant:
-                raise TenantRunQuotaError("tenant run quota exceeded")
+            await self._enforce_run_quota(repository, context.tenant_id)
 
             lease = await repository._create_run(
                 context,
@@ -108,6 +106,43 @@ class WorkflowCoordinator:
             )
             return lease
 
+    async def start_plan_run_with_checkpoint(
+        self,
+        context: TenantContext,
+        runtime_instance_id: str,
+        *,
+        plan_id: str,
+        plan_version: int,
+        plan_digest: str,
+    ) -> RunLease:
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            await repository._lock_tenant(context.tenant_id)
+            await self._enforce_run_quota(repository, context.tenant_id)
+            lease = await repository._create_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                status=RunStatus.AWAITING_USER,
+                plan_id=plan_id,
+                initial_plan_version=plan_version,
+                active_plan_version=plan_version,
+            )
+            cursor = f"plan:{plan_id}:v{plan_version}:decision"
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.PLAN_AWAITING_APPROVAL,
+                PlanAwaitingApprovalPayload(
+                    run_id=context.run_id,
+                    plan_id=plan_id,
+                    plan_version=plan_version,
+                    plan_digest=plan_digest,
+                    decision_cursor=cursor,
+                    cursor=cursor,
+                ),
+                checkpoint_seq=1,
+            )
+            return lease
+
     async def acquire_run(self, context: TenantContext, runtime_instance_id: str) -> RunLease:
         async with self._write_connection() as conn:
             repository = self._repository(conn)
@@ -128,6 +163,105 @@ class WorkflowCoordinator:
             )
             if lease is None:
                 raise LeaseConflictError("awaiting_user run could not be resumed")
+            return lease
+
+    async def resume_waiting_plan_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+        plan_id: str,
+        plan_version: int,
+        expected_run_version: int,
+    ) -> RunLease:
+        async with self._write_connection() as conn:
+            lease = await self._repository(conn)._resume_waiting_plan_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                plan_id=plan_id,
+                plan_version=plan_version,
+                expected_run_version=expected_run_version,
+            )
+            if lease is None:
+                raise StaleFenceError("waiting Plan run fence is stale")
+            return lease
+
+    async def fence_waiting_plan_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+        plan_id: str,
+        plan_version: int,
+        expected_run_version: int,
+        plan_digest: str,
+    ) -> RunLease:
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            lease = await repository._fence_waiting_plan_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                plan_id=plan_id,
+                plan_version=plan_version,
+                plan_digest=plan_digest,
+                expected_run_version=expected_run_version,
+            )
+            if lease is None:
+                raise StaleFenceError("waiting Plan run fence is stale")
+            cursor = f"plan:{plan_id}:v{plan_version}:decision"
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.PLAN_AWAITING_APPROVAL,
+                PlanAwaitingApprovalPayload(
+                    run_id=context.run_id,
+                    plan_id=plan_id,
+                    plan_version=plan_version,
+                    plan_digest=plan_digest,
+                    decision_cursor=cursor,
+                    cursor=cursor,
+                ),
+                checkpoint_seq=await repository.get_next_checkpoint_seq(context),
+            )
+            return lease
+
+    async def cancel_waiting_plan_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+        plan_id: str,
+        plan_version: int,
+        expected_run_version: int,
+    ) -> RunLease:
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            lease = await repository._cancel_waiting_plan_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                plan_id=plan_id,
+                plan_version=plan_version,
+                expected_run_version=expected_run_version,
+            )
+            if lease is None:
+                raise StaleFenceError("waiting Plan run fence is stale")
+            record = await repository.get_run(context)
+            if record is None or record.finished_at is None:
+                raise RuntimeError("cancelled Plan run missing finished_at")
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.RUN_TERMINAL,
+                {
+                    "run_id": context.run_id,
+                    "terminal_status": RunStatus.CANCELLED.value,
+                    "finished_at_ms": record.finished_at,
+                    "final_digest": self._terminal_digest(
+                        context.run_id,
+                        RunStatus.CANCELLED,
+                        record.finished_at,
+                    ),
+                },
+                checkpoint_seq=await repository.get_next_checkpoint_seq(context),
+            )
             return lease
 
     async def heartbeat(self, lease: RunLease) -> RunLease:
@@ -402,6 +536,14 @@ class WorkflowCoordinator:
         async with self._write_connection() as conn:
             return await self._repository(conn).get_run(context)
 
+    async def get_plan_run(
+        self,
+        context: TenantContext,
+        plan_id: str,
+    ) -> RunRecord | None:
+        async with self._write_connection() as conn:
+            return await self._repository(conn).get_plan_run(context, plan_id)
+
     async def get_execution(self, context: TenantContext, execution_id: str) -> ExecutionRecord | None:
         async with self._write_connection() as conn:
             return await self._repository(conn).get_execution(context, execution_id)
@@ -496,8 +638,19 @@ class WorkflowCoordinator:
             self._settings.workflow.lease_ttl_ms,
         )
 
+    async def _enforce_run_quota(
+        self,
+        repository: WorkflowRepository,
+        tenant_id: str,
+    ) -> None:
+        active_runs = await repository.count_active_runs(tenant_id)
+        if active_runs >= self._settings.runtime.max_concurrent_runs_per_tenant:
+            raise TenantRunQuotaError("tenant run quota exceeded")
+
     def _scoped(self, conn) -> "WorkflowCoordinator":
-        return WorkflowCoordinator(self._database, settings=self._settings, connection=conn)
+        scoped = copy.copy(self)
+        scoped._connection = conn
+        return scoped
 
     @staticmethod
     def _validate_checkpoint_scope(

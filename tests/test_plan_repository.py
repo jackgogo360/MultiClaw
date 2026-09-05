@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from alembic import command
 from multiclaw.cli import alembic_config
-from multiclaw.config.settings import DatabaseSettings, PlanningSettings
+from multiclaw.config.settings import DatabaseSettings, PlanningSettings, Settings
 from multiclaw.memory import MemoryEntry
 from multiclaw.planner import (
     PlanDecisionAction,
@@ -20,6 +20,7 @@ from multiclaw.planner import (
     PlanDecisionRequest,
     PlanDraft,
     PlanDraftStep,
+    PlanNotFoundError,
     PlanStatus,
     PlanStepRunStatus,
     PlanSummary,
@@ -27,6 +28,8 @@ from multiclaw.planner import (
     PlanValidationError,
     PlanVersionConflictError,
 )
+from multiclaw.planner.service import MaterializeInitialPlan, PlanningService
+from multiclaw.planner.models import PlanRevisionLimitError
 from multiclaw.storage import Database
 from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.repositories.plans import PlanRepository
@@ -38,10 +41,14 @@ from multiclaw.storage.schema import (
     agent_plan_versions,
     agent_plans,
     agent_runs,
+    execution_checkpoints,
+    memory_entries,
 )
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
-from multiclaw.workflow import RunStatus
+from multiclaw.workflow import RunStatus, StaleFenceError
+from multiclaw.workflow.coordinator import WorkflowCoordinator
+from multiclaw.workflow.models import CheckpointPhase
 
 _ORIGINAL_TEST_MYSQL_URL = os.getenv("MULTICLAW_TEST_MYSQL_URL")
 
@@ -70,6 +77,42 @@ def plan_draft(objective: str = "Deliver the change") -> PlanDraft:
             ),
         ],
     )
+
+
+def planning_settings(*, max_revisions: int = 5) -> Settings:
+    return Settings(
+        _config_file="/nonexistent",
+        planning={"max_revisions": max_revisions},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SeededSourceMessage:
+    context: TenantContext
+    message_id: str
+
+    @property
+    def session_id(self) -> str:
+        assert self.context.session_id is not None
+        return self.context.session_id
+
+
+class FakePlanGenerator:
+    def __init__(self, next_draft: PlanDraft | None = None) -> None:
+        self.next_draft = next_draft or plan_draft()
+        self.calls: list[tuple[str, object | None]] = []
+        self.failure: BaseException | None = None
+        self.on_generate = None
+
+    async def generate(self, objective: str, revision=None, **_limits):
+        self.calls.append((objective, revision))
+        if self.failure is not None:
+            raise self.failure
+        if self.on_generate is not None:
+            callback = self.on_generate
+            self.on_generate = None
+            await callback()
+        return self.next_draft
 
 
 def agent_run_row(
@@ -232,6 +275,95 @@ async def plan_contexts(plan_database: Database) -> dict[str, TenantContext]:
         ),
         "secondary": await _seed_scope(plan_database, slug="plan-secondary"),
     }
+
+
+@pytest.fixture
+async def seeded_source_message(
+    plan_database: Database,
+    plan_contexts: dict[str, TenantContext],
+) -> SeededSourceMessage:
+    root = plan_contexts["primary"]
+    async with TenantUnitOfWork(plan_database, root) as uow:
+        session = await uow.sessions.create("Atomic plan")
+        context = root.for_session(session.id)
+        message = await MemoryRepository(
+            uow.conn,
+            context,
+            plan_database.dialect,
+        ).save(
+            MemoryEntry(
+                content="Deliver the change",
+                type="chat_message",
+                role="user",
+                turn_index=1,
+            )
+        )
+    return SeededSourceMessage(context=context, message_id=message.id)
+
+
+@dataclass(slots=True)
+class SeededWaitingPlan:
+    database: Database
+    context: TenantContext
+    plan_id: str
+    aggregate_version: int
+    generator: FakePlanGenerator
+    workflow: WorkflowCoordinator
+    service: PlanningService
+
+    @property
+    def tenant_id(self) -> str:
+        return self.context.tenant_id
+
+    async def load_plan(self):
+        async with TenantUnitOfWork(self.database, self.context) as uow:
+            snapshot = await uow.plans.for_context(self.context).get(self.plan_id)
+        assert snapshot is not None
+        return snapshot
+
+    async def load_run(self):
+        run = await self.workflow.get_run(self.context)
+        assert run is not None
+        return run
+
+
+@pytest.fixture
+async def seeded_waiting_plan(
+    plan_database: Database,
+    seeded_source_message: SeededSourceMessage,
+) -> SeededWaitingPlan:
+    settings = planning_settings()
+    generator = FakePlanGenerator()
+    workflow = WorkflowCoordinator(plan_database, settings=settings)
+    service = PlanningService(
+        plan_database,
+        settings=settings,
+        generator=generator,
+        workflow=workflow,
+    )
+    context = seeded_source_message.context.for_run(
+        seeded_source_message.session_id,
+        str(uuid4()),
+    )
+    materialized = await service.materialize_initial(
+        MaterializeInitialPlan(
+            context=context,
+            runtime_instance_id="runtime-1",
+            source_message_id=seeded_source_message.message_id,
+            assistant_turn_index=2,
+            trigger_mode=PlanTriggerMode.EXPLICIT,
+            draft=plan_draft(),
+        )
+    )
+    return SeededWaitingPlan(
+        database=plan_database,
+        context=context,
+        plan_id=materialized.plan.plan_id,
+        aggregate_version=materialized.plan.aggregate_version,
+        generator=generator,
+        workflow=workflow,
+        service=service,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,6 +657,526 @@ async def count_decisions(database: Database, plan_id: str) -> int:
             .where(agent_plan_decisions.c.plan_id == plan_id)
         )
         return int(result.scalar_one())
+
+
+async def count_all_rows(database: Database, table) -> int:
+    async with database.connect() as conn:
+        return int(
+            (await conn.execute(select(func.count()).select_from(table))).scalar_one()
+        )
+
+
+async def load_message(database: Database, message_id: str) -> MemoryEntry:
+    async with database.connect() as conn:
+        row = (
+            await conn.execute(
+                select(memory_entries).where(memory_entries.c.id == message_id)
+            )
+        ).mappings().one()
+    return MemoryEntry.from_row(row)
+
+
+def materialize_request(source: SeededSourceMessage) -> MaterializeInitialPlan:
+    return MaterializeInitialPlan(
+        context=source.context.for_run(source.session_id, str(uuid4())),
+        runtime_instance_id="runtime-1",
+        source_message_id=source.message_id,
+        assistant_turn_index=2,
+        trigger_mode=PlanTriggerMode.EXPLICIT,
+        draft=plan_draft(),
+    )
+
+
+def approve_waiting_request(
+    seeded: SeededWaitingPlan,
+    decision_id: str,
+) -> PlanDecisionRequest:
+    return PlanDecisionRequest(
+        decision_id=decision_id,
+        plan_id=seeded.plan_id,
+        plan_version=1,
+        expected_version=seeded.aggregate_version,
+        action=PlanDecisionAction.APPROVE,
+        feedback=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_materialization_is_one_transaction(
+    plan_database: Database,
+    seeded_source_message: SeededSourceMessage,
+):
+    service = PlanningService(plan_database, settings=planning_settings())
+    request = materialize_request(seeded_source_message)
+
+    materialized = await service.materialize_initial(request)
+    run = await WorkflowCoordinator(
+        plan_database,
+        settings=planning_settings(),
+    ).get_run(request.context)
+    checkpoint = await WorkflowCoordinator(
+        plan_database,
+        settings=planning_settings(),
+    ).get_latest_checkpoint(request.context)
+    message = await load_message(plan_database, materialized.reference_message_id)
+
+    assert run is not None
+    assert run.status is RunStatus.AWAITING_USER
+    assert (run.plan_id, run.initial_plan_version, run.active_plan_version) == (
+        materialized.plan.plan_id,
+        1,
+        1,
+    )
+    assert checkpoint is not None
+    assert checkpoint.phase == CheckpointPhase.PLAN_AWAITING_APPROVAL.value
+    assert message.content == ""
+    assert message.role == "assistant"
+    assert message.turn_index == 2
+    assert message.metadata["parts"] == [
+        {
+            "type": "data-plan-created",
+            "data": materialized.reference.model_dump(mode="json"),
+        }
+    ]
+    assert materialized.run == run
+    assert materialized.event.data == materialized.reference.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_materialization_failure_rolls_back_plan_run_checkpoint_and_reference(
+    plan_database: Database,
+    seeded_source_message: SeededSourceMessage,
+    monkeypatch,
+):
+    service = PlanningService(plan_database, settings=planning_settings())
+    message_count = await count_all_rows(plan_database, memory_entries)
+
+    async def raising_failure(*_args, **_kwargs):
+        raise RuntimeError("reference failure")
+
+    monkeypatch.setattr(service, "_persist_reference", raising_failure)
+
+    with pytest.raises(RuntimeError, match="reference failure"):
+        await service.materialize_initial(materialize_request(seeded_source_message))
+
+    assert await count_all_rows(plan_database, agent_plans) == 0
+    assert await count_all_rows(plan_database, agent_plan_versions) == 0
+    assert await count_all_rows(plan_database, agent_runs) == 0
+    assert await count_all_rows(plan_database, execution_checkpoints) == 0
+    assert await count_all_rows(plan_database, memory_entries) == message_count
+
+
+@pytest.mark.asyncio
+async def test_revision_keeps_active_version_and_old_rows_immutable(
+    seeded_waiting_plan: SeededWaitingPlan,
+):
+    before = await dump_plan_version_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+        1,
+    )
+    revised = plan_draft()
+    revised.steps[1].description = "Verify SQLite and MySQL."
+    seeded_waiting_plan.generator.next_draft = revised
+
+    result = await seeded_waiting_plan.service.decide(
+        PlanDecisionRequest(
+            decision_id="revise-1",
+            plan_id=seeded_waiting_plan.plan_id,
+            plan_version=1,
+            expected_version=seeded_waiting_plan.aggregate_version,
+            action=PlanDecisionAction.REVISE,
+            feedback="Verify both databases",
+        ),
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-2",
+    )
+    run = await seeded_waiting_plan.load_run()
+    after = await dump_plan_version_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+        1,
+    )
+
+    assert result.snapshot.current_version == 2
+    assert result.snapshot.status is PlanStatus.AWAITING_APPROVAL
+    assert result.decision.resulting_plan_version == 2
+    assert result.lease is None
+    assert run.active_plan_version == 1
+    assert run.status is RunStatus.AWAITING_USER
+    assert before == after
+
+
+@pytest.mark.asyncio
+async def test_revision_generation_failure_writes_no_decision_or_version(
+    seeded_waiting_plan: SeededWaitingPlan,
+):
+    seeded_waiting_plan.generator.failure = RuntimeError("generation failure")
+
+    with pytest.raises(RuntimeError, match="generation failure"):
+        await seeded_waiting_plan.service.decide(
+            PlanDecisionRequest(
+                decision_id="revise-generation-failure",
+                plan_id=seeded_waiting_plan.plan_id,
+                plan_version=1,
+                expected_version=seeded_waiting_plan.aggregate_version,
+                action=PlanDecisionAction.REVISE,
+                feedback="Revise safely",
+            ),
+            decided_by=seeded_waiting_plan.tenant_id,
+            runtime_instance_id="runtime-2",
+        )
+
+    plan = await seeded_waiting_plan.load_plan()
+    assert plan.current_version == 1
+    assert plan.decisions == ()
+    assert await count_decisions(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.plan_id,
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_revision_checkpoint_failure_rolls_back_decision_and_version(
+    seeded_waiting_plan: SeededWaitingPlan,
+    monkeypatch,
+):
+    async def raise_stale_fence(*_args, **_kwargs):
+        raise StaleFenceError("revision checkpoint failure")
+
+    monkeypatch.setattr(
+        seeded_waiting_plan.workflow,
+        "fence_waiting_plan_run",
+        raise_stale_fence,
+    )
+
+    with pytest.raises(StaleFenceError, match="revision checkpoint failure"):
+        await seeded_waiting_plan.service.decide(
+            PlanDecisionRequest(
+                decision_id="revise-checkpoint-failure",
+                plan_id=seeded_waiting_plan.plan_id,
+                plan_version=1,
+                expected_version=seeded_waiting_plan.aggregate_version,
+                action=PlanDecisionAction.REVISE,
+                feedback="Revise atomically",
+            ),
+            decided_by=seeded_waiting_plan.tenant_id,
+            runtime_instance_id="runtime-2",
+        )
+
+    plan = await seeded_waiting_plan.load_plan()
+    run = await seeded_waiting_plan.load_run()
+    assert plan.current_version == 1
+    assert plan.decisions == ()
+    assert run.status is RunStatus.AWAITING_USER
+    assert run.version == 1
+
+
+@pytest.mark.asyncio
+async def test_revision_quota_failure_persists_nothing(
+    seeded_waiting_plan: SeededWaitingPlan,
+):
+    service = PlanningService(
+        seeded_waiting_plan.database,
+        settings=planning_settings(max_revisions=0),
+        generator=seeded_waiting_plan.generator,
+        workflow=seeded_waiting_plan.workflow,
+    )
+
+    with pytest.raises(PlanRevisionLimitError):
+        await service.decide(
+            PlanDecisionRequest(
+                decision_id="revise-over-quota",
+                plan_id=seeded_waiting_plan.plan_id,
+                plan_version=1,
+                expected_version=seeded_waiting_plan.aggregate_version,
+                action=PlanDecisionAction.REVISE,
+                feedback="One revision too many",
+            ),
+            decided_by=seeded_waiting_plan.tenant_id,
+            runtime_instance_id="runtime-2",
+        )
+
+    plan = await seeded_waiting_plan.load_plan()
+    assert plan.current_version == 1
+    assert plan.decisions == ()
+
+
+@pytest.mark.asyncio
+async def test_completed_revision_replay_skips_generation_and_new_checkpoint(
+    seeded_waiting_plan: SeededWaitingPlan,
+):
+    request = PlanDecisionRequest(
+        decision_id="revise-replay",
+        plan_id=seeded_waiting_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_waiting_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="Revise safely",
+    )
+    first = await seeded_waiting_plan.service.decide(
+        request,
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-2",
+    )
+    checkpoints_before = await count_all_rows(
+        seeded_waiting_plan.database,
+        execution_checkpoints,
+    )
+    seeded_waiting_plan.generator.calls.clear()
+
+    replay = await seeded_waiting_plan.service.decide(
+        request,
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-3",
+    )
+
+    assert replay.idempotent_replay is True
+    assert replay.decision == first.decision
+    assert replay.snapshot == first.snapshot
+    assert replay.lease is None
+    assert replay.events == ()
+    assert seeded_waiting_plan.generator.calls == []
+    assert await count_all_rows(
+        seeded_waiting_plan.database,
+        execution_checkpoints,
+    ) == checkpoints_before
+
+
+@pytest.mark.asyncio
+async def test_revision_race_replays_winner_without_appending_again(
+    seeded_waiting_plan: SeededWaitingPlan,
+):
+    request = PlanDecisionRequest(
+        decision_id="revise-race-replay",
+        plan_id=seeded_waiting_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_waiting_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="Revise once",
+    )
+    winning_service = PlanningService(
+        seeded_waiting_plan.database,
+        settings=planning_settings(),
+        generator=FakePlanGenerator(),
+        workflow=seeded_waiting_plan.workflow,
+    )
+
+    async def commit_winner():
+        await winning_service.decide(
+            request,
+            decided_by=seeded_waiting_plan.tenant_id,
+            runtime_instance_id="runtime-winner",
+        )
+
+    seeded_waiting_plan.generator.on_generate = commit_winner
+
+    replay = await seeded_waiting_plan.service.decide(
+        request,
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-loser",
+    )
+    plan = await seeded_waiting_plan.load_plan()
+
+    assert replay.idempotent_replay is True
+    assert replay.lease is None
+    assert replay.events == ()
+    assert plan.current_version == 2
+    assert len(plan.versions) == 2
+    assert len(plan.decisions) == 1
+
+
+@pytest.mark.asyncio
+async def test_mismatched_revision_decision_id_is_rejected_before_generation(
+    seeded_waiting_plan: SeededWaitingPlan,
+):
+    request = PlanDecisionRequest(
+        decision_id="revise-mismatch",
+        plan_id=seeded_waiting_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_waiting_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="First feedback",
+    )
+    await seeded_waiting_plan.service.decide(
+        request,
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-2",
+    )
+    seeded_waiting_plan.generator.calls.clear()
+
+    with pytest.raises(PlanDecisionIdempotencyError):
+        await seeded_waiting_plan.service.decide(
+            request.model_copy(update={"feedback": "Different feedback"}),
+            decided_by=seeded_waiting_plan.tenant_id,
+            runtime_instance_id="runtime-3",
+        )
+
+    assert seeded_waiting_plan.generator.calls == []
+
+
+@pytest.mark.asyncio
+async def test_approve_and_resume_are_atomic(
+    seeded_waiting_plan: SeededWaitingPlan,
+    monkeypatch,
+):
+    async def raise_stale_fence(*_args, **_kwargs):
+        raise StaleFenceError("injected")
+
+    monkeypatch.setattr(
+        seeded_waiting_plan.workflow,
+        "resume_waiting_plan_run",
+        raise_stale_fence,
+    )
+
+    with pytest.raises(StaleFenceError, match="injected"):
+        await seeded_waiting_plan.service.decide(
+            approve_waiting_request(seeded_waiting_plan, "approve-rollback"),
+            decided_by=seeded_waiting_plan.tenant_id,
+            runtime_instance_id="runtime-2",
+        )
+
+    plan = await seeded_waiting_plan.load_plan()
+    run = await seeded_waiting_plan.load_run()
+    assert plan.status is PlanStatus.AWAITING_APPROVAL
+    assert plan.decisions == ()
+    assert run.status is RunStatus.AWAITING_USER
+
+
+@pytest.mark.asyncio
+async def test_approval_replay_never_constructs_a_second_lease(
+    seeded_waiting_plan: SeededWaitingPlan,
+):
+    request = approve_waiting_request(seeded_waiting_plan, "approve-replay")
+    first = await seeded_waiting_plan.service.decide(
+        request,
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-2",
+    )
+    run_after_first = await seeded_waiting_plan.load_run()
+    replay = await seeded_waiting_plan.service.decide(
+        request,
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-3",
+    )
+    run_after_replay = await seeded_waiting_plan.load_run()
+
+    assert first.lease is not None
+    assert replay.idempotent_replay is True
+    assert replay.lease is None
+    assert replay.events == ()
+    assert run_after_first.status is RunStatus.RESUMING
+    assert run_after_replay == run_after_first
+
+
+@pytest.mark.asyncio
+async def test_reject_and_cancel_commit_together(
+    seeded_waiting_plan: SeededWaitingPlan,
+):
+    result = await seeded_waiting_plan.service.decide(
+        PlanDecisionRequest(
+            decision_id="reject-1",
+            plan_id=seeded_waiting_plan.plan_id,
+            plan_version=1,
+            expected_version=seeded_waiting_plan.aggregate_version,
+            action=PlanDecisionAction.REJECT,
+            feedback=None,
+        ),
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-2",
+    )
+
+    assert result.snapshot.status is PlanStatus.REJECTED
+    assert result.run.status is RunStatus.CANCELLED
+    assert result.run.finished_at is not None
+    assert result.lease is None
+
+
+@pytest.mark.asyncio
+async def test_reject_rolls_back_when_run_cancel_fails(
+    seeded_waiting_plan: SeededWaitingPlan,
+    monkeypatch,
+):
+    async def raise_stale_fence(*_args, **_kwargs):
+        raise StaleFenceError("injected cancel")
+
+    monkeypatch.setattr(
+        seeded_waiting_plan.workflow,
+        "cancel_waiting_plan_run",
+        raise_stale_fence,
+    )
+
+    with pytest.raises(StaleFenceError, match="injected cancel"):
+        await seeded_waiting_plan.service.decide(
+            PlanDecisionRequest(
+                decision_id="reject-rollback",
+                plan_id=seeded_waiting_plan.plan_id,
+                plan_version=1,
+                expected_version=seeded_waiting_plan.aggregate_version,
+                action=PlanDecisionAction.REJECT,
+                feedback=None,
+            ),
+            decided_by=seeded_waiting_plan.tenant_id,
+            runtime_instance_id="runtime-2",
+        )
+
+    plan = await seeded_waiting_plan.load_plan()
+    run = await seeded_waiting_plan.load_run()
+    assert plan.status is PlanStatus.AWAITING_APPROVAL
+    assert plan.decisions == ()
+    assert run.status is RunStatus.AWAITING_USER
+
+
+@pytest.mark.asyncio
+async def test_revision_event_redacts_credentials(
+    seeded_waiting_plan: SeededWaitingPlan,
+):
+    result = await seeded_waiting_plan.service.decide(
+        PlanDecisionRequest(
+            decision_id="revise-redacted",
+            plan_id=seeded_waiting_plan.plan_id,
+            plan_version=1,
+            expected_version=seeded_waiting_plan.aggregate_version,
+            action=PlanDecisionAction.REVISE,
+            feedback="Use access_token=supersecretvalue in the fixture",
+        ),
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-2",
+    )
+
+    assert len(result.events) == 1
+    assert "supersecretvalue" not in str(result.events[0].model_dump(mode="json"))
+
+
+@pytest.mark.asyncio
+async def test_decision_context_locator_hides_foreign_and_unknown_plans(
+    seeded_waiting_plan: SeededWaitingPlan,
+    plan_contexts: dict[str, TenantContext],
+):
+    foreign_tenant_id = plan_contexts["secondary"].tenant_id
+    failures: list[tuple[type[BaseException], str]] = []
+
+    for plan_id in (seeded_waiting_plan.plan_id, str(uuid4())):
+        request = PlanDecisionRequest(
+            decision_id=f"foreign-{plan_id}",
+            plan_id=plan_id,
+            plan_version=1,
+            expected_version=1,
+            action=PlanDecisionAction.REVISE,
+            feedback="Do not disclose scope",
+        )
+        with pytest.raises(PlanNotFoundError) as exc_info:
+            await seeded_waiting_plan.service.decide(
+                request,
+                decided_by=foreign_tenant_id,
+                runtime_instance_id="runtime-foreign",
+            )
+        failures.append((type(exc_info.value), str(exc_info.value)))
+
+    assert failures[0] == failures[1]
+    assert seeded_waiting_plan.generator.calls == []
 
 
 async def insert_legacy_decision(
