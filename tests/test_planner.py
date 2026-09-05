@@ -1,12 +1,13 @@
 import pytest
 from pydantic import ValidationError
 
-import multiclaw.planner as planner
+from multiclaw import planner
 from multiclaw.planner import (
     Plan,
     PlanDecisionAction,
     PlanDraft,
     PlanDraftStep,
+    Planner,
     PlanningMode,
     PlanningRoute,
     PlanStatus,
@@ -14,7 +15,14 @@ from multiclaw.planner import (
     PlanStepCompletion,
     PlanStepRunStatus,
     PlanTriggerMode,
-    Planner,
+)
+from multiclaw.planner.validation import (
+    PlanValidationError,
+    canonical_plan_bytes,
+    plan_content_digest,
+    sanitize_plan_text,
+    step_definition_digest,
+    validate_plan_draft,
 )
 
 
@@ -294,3 +302,242 @@ def test_planner_package_exports():
     assert planner.PlanStatus is PlanStatus
     assert planner.PlanStep is PlanStep
     assert planner.Planner is Planner
+
+
+def _validation_step(
+    key: str,
+    *,
+    depends_on: list[str] | None = None,
+    title: str | None = None,
+    max_attempts: int = 2,
+) -> PlanDraftStep:
+    return PlanDraftStep(
+        logical_step_key=key,
+        title=title or key.title(),
+        description=f"Execute {key}.",
+        expected_outcome=f"{key} is verified.",
+        depends_on=depends_on or [],
+        max_attempts=max_attempts,
+    )
+
+
+def _validation_draft(steps: list[PlanDraftStep]) -> PlanDraft:
+    return PlanDraft(
+        objective="Deliver a tested change",
+        constraints=["Preserve behavior"],
+        generation_reason="Multiple dependent actions are required.",
+        steps=steps,
+    )
+
+
+def test_validation_returns_stable_topological_order() -> None:
+    draft = _validation_draft(
+        [
+            _validation_step("publish", depends_on=["test"]),
+            _validation_step("lint"),
+            _validation_step("test"),
+        ]
+    )
+
+    validated = validate_plan_draft(
+        draft,
+        max_steps=20,
+        max_depth=10,
+        max_attempts=2,
+    )
+
+    assert [step.logical_step_key for step in validated.steps] == [
+        "lint",
+        "test",
+        "publish",
+    ]
+    assert [step.ordinal for step in validated.steps] == [1, 2, 3]
+
+
+def test_validation_preserves_deterministic_order_for_disconnected_dag() -> None:
+    draft = _validation_draft(
+        [
+            _validation_step("package", depends_on=["build"]),
+            _validation_step("lint"),
+            _validation_step("build"),
+            _validation_step("report", depends_on=["lint"]),
+        ]
+    )
+
+    first = validate_plan_draft(
+        draft,
+        max_steps=20,
+        max_depth=10,
+        max_attempts=2,
+    )
+    second = validate_plan_draft(
+        draft.model_copy(deep=True),
+        max_steps=20,
+        max_depth=10,
+        max_attempts=2,
+    )
+
+    assert [step.logical_step_key for step in first.steps] == [
+        "lint",
+        "build",
+        "package",
+        "report",
+    ]
+    assert first == second
+
+
+@pytest.mark.parametrize(
+    ("steps", "message"),
+    [
+        ([_validation_step("a", depends_on=["missing"])], "missing dependency"),
+        ([_validation_step("a", depends_on=["a"])], "self dependency"),
+        (
+            [
+                _validation_step("a", depends_on=["b"]),
+                _validation_step("b", depends_on=["a"]),
+            ],
+            "cycle",
+        ),
+        (
+            [
+                _validation_step("a", depends_on=["b", "b"]),
+                _validation_step("b"),
+            ],
+            "duplicate dependency",
+        ),
+        ([_validation_step("a"), _validation_step("a")], "duplicate logical_step_key"),
+    ],
+)
+def test_validation_rejects_invalid_graphs(
+    steps: list[PlanDraftStep],
+    message: str,
+) -> None:
+    with pytest.raises(PlanValidationError, match=message):
+        validate_plan_draft(
+            _validation_draft(steps),
+            max_steps=20,
+            max_depth=10,
+            max_attempts=2,
+        )
+
+
+def test_validation_rejects_configured_step_limit() -> None:
+    with pytest.raises(PlanValidationError, match="configured step limit"):
+        validate_plan_draft(
+            _validation_draft([_validation_step("a"), _validation_step("b")]),
+            max_steps=1,
+            max_depth=10,
+            max_attempts=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("max_depth", "chain_length"),
+    [(2, 3), (20, 11)],
+)
+def test_validation_rejects_configured_and_hard_dependency_depth_limits(
+    max_depth: int,
+    chain_length: int,
+) -> None:
+    steps = [
+        _validation_step(
+            f"s{index}",
+            depends_on=[] if index == 0 else [f"s{index - 1}"],
+        )
+        for index in range(chain_length)
+    ]
+
+    with pytest.raises(PlanValidationError, match="dependency depth"):
+        validate_plan_draft(
+            _validation_draft(steps),
+            max_steps=20,
+            max_depth=max_depth,
+            max_attempts=2,
+        )
+
+
+def test_validation_rejects_step_attempts_above_configured_limit() -> None:
+    with pytest.raises(PlanValidationError, match="max_attempts"):
+        validate_plan_draft(
+            _validation_draft([_validation_step("retry", max_attempts=3)]),
+            max_steps=20,
+            max_depth=10,
+            max_attempts=2,
+        )
+
+
+def test_validation_rejects_raw_credentials_and_oversized_canonical_content() -> None:
+    credential = "Authorization: " + "Bearer live-token"
+    secret = _validation_draft(
+        [_validation_step("inspect", title=f"Use {credential}")]
+    )
+    with pytest.raises(PlanValidationError, match="credential-shaped"):
+        validate_plan_draft(
+            secret,
+            max_steps=20,
+            max_depth=10,
+            max_attempts=2,
+        )
+
+    oversized = _validation_draft([_validation_step(f"s{i}") for i in range(20)])
+    oversized.steps[0].description = "x" * 4_000
+    with pytest.raises(PlanValidationError, match="100 bytes"):
+        validate_plan_draft(
+            oversized,
+            max_steps=20,
+            max_depth=10,
+            max_attempts=2,
+            max_content_bytes=100,
+        )
+
+
+def test_sanitize_plan_text_redacts_credentials_only_when_requested() -> None:
+    assert sanitize_plan_text("Authorization: Bearer live-token") == "[REDACTED]"
+    assert sanitize_plan_text("Inspect the authorization flow") == (
+        "Inspect the authorization flow"
+    )
+
+
+def test_canonical_digests_ignore_mapping_order_but_include_definition_changes() -> None:
+    draft = _validation_draft(
+        [_validation_step("a"), _validation_step("b", depends_on=["a"])]
+    )
+    validated = validate_plan_draft(
+        draft,
+        max_steps=20,
+        max_depth=10,
+        max_attempts=2,
+    )
+
+    assert canonical_plan_bytes(validated) == canonical_plan_bytes(
+        validated.model_copy(deep=True)
+    )
+    assert len(plan_content_digest(validated)) == 64
+    before = step_definition_digest(validated.steps[0])
+    changed = validated.steps[0].model_copy(
+        update={"expected_outcome": "A different result."}
+    )
+    assert step_definition_digest(changed) != before
+
+
+def test_step_definition_digest_excludes_dependencies_and_ordinal() -> None:
+    validated = validate_plan_draft(
+        _validation_draft([_validation_step("a"), _validation_step("b")]),
+        max_steps=20,
+        max_depth=10,
+        max_attempts=2,
+    )
+    step = validated.steps[1]
+
+    changed = step.model_copy(update={"depends_on": ["a"], "ordinal": 20})
+
+    assert step_definition_digest(changed) == step_definition_digest(step)
+
+
+def test_planner_package_exports_validation_api() -> None:
+    assert planner.PlanValidationError is PlanValidationError
+    assert planner.canonical_plan_bytes is canonical_plan_bytes
+    assert planner.plan_content_digest is plan_content_digest
+    assert planner.sanitize_plan_text is sanitize_plan_text
+    assert planner.step_definition_digest is step_definition_digest
+    assert planner.validate_plan_draft is validate_plan_draft

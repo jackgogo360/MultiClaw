@@ -77,6 +77,19 @@ class PlanDraft(BaseModel):
     steps: list[PlanDraftStep] = Field(min_length=1, max_length=20)
 
 
+class ValidatedPlanStep(PlanDraftStep):
+    ordinal: int = Field(ge=1, le=20)
+
+
+class ValidatedPlanDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    objective: str = Field(min_length=1, max_length=16_000)
+    constraints: list[ConstraintText] = Field(default_factory=list, max_length=20)
+    generation_reason: str = Field(min_length=1, max_length=1_000)
+    steps: list[ValidatedPlanStep] = Field(min_length=1, max_length=20)
+
+
 class PlanStepCompletion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
