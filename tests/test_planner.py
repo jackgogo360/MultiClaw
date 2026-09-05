@@ -653,6 +653,9 @@ def test_validation_and_sanitizer_share_credential_patterns(
             ("quoted-secret-xyz", "opaque-token-987"),
         ),
         ("Authorization=Basic abc123", ("Basic", "abc123")),
+        ("password=abc,def", ("abc", "def")),
+        ("secret=alpha;beta", ("alpha", "beta")),
+        ("Authorization: Bearer abc,def", ("abc", "def")),
     ],
 )
 def test_assignment_sanitization_removes_complete_credential_value(
