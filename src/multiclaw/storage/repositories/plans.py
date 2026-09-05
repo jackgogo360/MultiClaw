@@ -254,23 +254,22 @@ class PlanRepository:
             raise ValueError("revision decisions require begin_revision_decision")
 
         latest = await self._lock_plan(request.plan_id)
-        decision_claims = await self._get_decision_claims(
+        existing = await self._get_decision(
             request.plan_id,
-            request.expected_version,
+            request.decision_id,
             for_update=True,
-        )
-        existing = next(
-            (
-                decision
-                for decision in decision_claims
-                if decision.decision_id == request.decision_id
-            ),
-            None,
         )
         if existing is not None:
             return await self._decision_replay(request, decided_by, existing)
         self._require_current_decision_target(request, latest)
-        if decision_claims:
+        decision_history = await self._require_unambiguous_decision_history(
+            request.plan_id,
+            request.expected_version,
+        )
+        if any(
+            decision.expected_plan_cas_version == request.expected_version
+            for decision in decision_history
+        ):
             raise PlanDecisionIdempotencyError(
                 "Plan aggregate version already has a different decision claim"
             )
@@ -359,35 +358,40 @@ class PlanRepository:
             self._require_identical_decision(request, decided_by, pending_revision)
             return pending_revision
 
+        existing = await self._get_decision(request.plan_id, request.decision_id)
+        if existing is not None:
+            self._require_identical_decision(request, decided_by, existing)
+            if existing.resulting_plan_version is not None:
+                return existing
+
         latest = await self._lock_plan(request.plan_id)
-        decision_claims = await self._get_decision_claims(
+        existing = await self._get_decision(
             request.plan_id,
-            request.expected_version,
+            request.decision_id,
             for_update=True,
-        )
-        existing = next(
-            (
-                decision
-                for decision in decision_claims
-                if decision.decision_id == request.decision_id
-            ),
-            None,
         )
         if existing is not None:
             self._require_identical_decision(request, decided_by, existing)
-            if len(decision_claims) != 1:
-                raise PlanDecisionIdempotencyError(
-                    "Plan decision history has an ambiguous aggregate boundary"
-                )
             if existing.resulting_plan_version is None:
                 self._require_current_decision_target(request, latest)
+                await self._require_unambiguous_decision_history(
+                    request.plan_id,
+                    request.expected_version,
+                )
                 self._register_revision_claim(request.plan_id, existing)
             return existing
-        if decision_claims:
+        self._require_current_decision_target(request, latest)
+        decision_history = await self._require_unambiguous_decision_history(
+            request.plan_id,
+            request.expected_version,
+        )
+        if any(
+            decision.expected_plan_cas_version == request.expected_version
+            for decision in decision_history
+        ):
             raise PlanDecisionIdempotencyError(
                 "Plan aggregate version already has a different decision claim"
             )
-        self._require_current_decision_target(request, latest)
 
         savepoint = await self._conn.begin_nested()
         try:
@@ -457,6 +461,10 @@ class PlanRepository:
             raise PlanDecisionIdempotencyError(
                 "Revision decision is not claimed by this transaction"
             )
+        await self._require_unambiguous_decision_history(
+            plan_id,
+            existing.expected_plan_cas_version,
+        )
 
         valid_resulting_version = existing.plan_version + 1
         plan_match = await self._conn.execute(
@@ -470,36 +478,30 @@ class PlanRepository:
             )
             .with_for_update()
         )
-        feedback_matches = (
-            agent_plan_versions.c.revision_feedback.is_(None)
-            if existing.feedback is None
-            else agent_plan_versions.c.revision_feedback == existing.feedback
-        )
-        version_match = await self._conn.execute(
-            select(agent_plan_versions.c.plan_version)
+        version_result = await self._conn.execute(
+            select(
+                agent_plan_versions.c.parent_version,
+                agent_plan_versions.c.revision_feedback,
+            )
             .where(
                 self._version_scope_predicate(plan_id),
                 agent_plan_versions.c.plan_version == valid_resulting_version,
-                agent_plan_versions.c.parent_version == existing.plan_version,
-                feedback_matches,
             )
             .with_for_update()
         )
+        version_row = version_result.mappings().first()
         if (
             resulting_plan_version != valid_resulting_version
             or plan_match.scalar_one_or_none() is None
-            or version_match.scalar_one_or_none() is None
+            or version_row is None
+            or version_row["parent_version"] != existing.plan_version
+            or version_row["revision_feedback"] != existing.feedback
         ):
             latest = await self.get(plan_id)
             if latest is None:
                 raise PlanNotFoundError("Plan not found")
             raise PlanVersionConflictError(latest)
 
-        decision_feedback_matches = (
-            agent_plan_decisions.c.feedback.is_(None)
-            if existing.feedback is None
-            else agent_plan_decisions.c.feedback == existing.feedback
-        )
         updated = await self._conn.execute(
             update(agent_plan_decisions)
             .where(
@@ -511,7 +513,6 @@ class PlanRepository:
                 == existing.expected_plan_cas_version,
                 agent_plan_decisions.c.decided_by == existing.decided_by,
                 agent_plan_decisions.c.created_at == existing.created_at,
-                decision_feedback_matches,
                 agent_plan_decisions.c.resulting_plan_version.is_(None),
             )
             .values(resulting_plan_version=resulting_plan_version)
@@ -696,22 +697,29 @@ class PlanRepository:
         row = result.mappings().first()
         return None if row is None else self._hydrate_decision(row)
 
-    async def _get_decision_claims(
+    async def _require_unambiguous_decision_history(
         self,
         plan_id: str,
-        expected_plan_cas_version: int,
-        *,
-        for_update: bool = False,
+        through_expected_plan_cas_version: int,
     ) -> tuple[PlanDecisionRecord, ...]:
-        statement = select(agent_plan_decisions).where(
-            self._decision_scope_predicate(plan_id),
-            agent_plan_decisions.c.expected_plan_cas_version
-            == expected_plan_cas_version,
+        result = await self._conn.execute(
+            select(agent_plan_decisions)
+            .where(
+                self._decision_scope_predicate(plan_id),
+                agent_plan_decisions.c.expected_plan_cas_version
+                <= through_expected_plan_cas_version,
+            )
+            .with_for_update()
         )
-        if for_update:
-            statement = statement.with_for_update()
-        result = await self._conn.execute(statement)
-        return tuple(self._hydrate_decision(row) for row in result.mappings())
+        decisions = tuple(self._hydrate_decision(row) for row in result.mappings())
+        boundaries = {
+            decision.expected_plan_cas_version for decision in decisions
+        }
+        if len(boundaries) != len(decisions):
+            raise PlanDecisionIdempotencyError(
+                "Plan decision history has an ambiguous aggregate boundary"
+            )
+        return decisions
 
     async def _decision_replay(
         self,

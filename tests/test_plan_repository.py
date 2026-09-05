@@ -1,4 +1,5 @@
 import asyncio
+import os
 from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 from uuid import uuid4
@@ -6,6 +7,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import delete, func, insert, select, text, update
+from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import IntegrityError
 
 from alembic import command
@@ -40,6 +42,8 @@ from multiclaw.storage.schema import (
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow import RunStatus
+
+_ORIGINAL_TEST_MYSQL_URL = os.getenv("MULTICLAW_TEST_MYSQL_URL")
 
 
 def plan_draft(objective: str = "Deliver the change") -> PlanDraft:
@@ -204,6 +208,19 @@ async def plan_database(tmp_path: Path):
 
 
 @pytest.fixture
+async def optional_mysql_plan_database():
+    if not _ORIGINAL_TEST_MYSQL_URL:
+        pytest.skip("MULTICLAW_TEST_MYSQL_URL is not configured")
+    database = Database.create(
+        DatabaseSettings(driver="mysql", url=_ORIGINAL_TEST_MYSQL_URL)
+    )
+    try:
+        yield database
+    finally:
+        await database.dispose()
+
+
+@pytest.fixture
 async def plan_contexts(plan_database: Database) -> dict[str, TenantContext]:
     primary = await _seed_scope(plan_database, slug="plan-primary")
     return {
@@ -342,6 +359,19 @@ class CountingConnection:
 
     async def execute(self, statement, *args, **kwargs):
         self.execute_calls += 1
+        return await self.connection.execute(statement, *args, **kwargs)
+
+
+class StatementRecordingConnection:
+    def __init__(self, connection) -> None:
+        self.connection = connection
+        self.statements: list[object] = []
+
+    async def begin_nested(self):
+        return await self.connection.begin_nested()
+
+    async def execute(self, statement, *args, **kwargs):
+        self.statements.append(statement)
         return await self.connection.execute(statement, *args, **kwargs)
 
 
@@ -495,6 +525,33 @@ async def count_decisions(database: Database, plan_id: str) -> int:
             .where(agent_plan_decisions.c.plan_id == plan_id)
         )
         return int(result.scalar_one())
+
+
+async def insert_legacy_decision(
+    database: Database,
+    seeded_plan: SeededPlan,
+    *,
+    decision_id: str,
+    plan_version: int,
+    expected_version: int,
+) -> None:
+    async with database.write_transaction() as connection:
+        await connection.execute(
+            insert(agent_plan_decisions).values(
+                tenant_id=seeded_plan.context.tenant_id,
+                workspace_id=seeded_plan.context.workspace_id,
+                session_id=seeded_plan.context.session_id,
+                plan_id=seeded_plan.plan_id,
+                decision_id=decision_id,
+                plan_version=plan_version,
+                expected_plan_cas_version=expected_version,
+                action=PlanDecisionAction.REJECT.value,
+                feedback=None,
+                decided_by=seeded_plan.tenant_id,
+                resulting_plan_version=None,
+                created_at=1,
+            )
+        )
 
 
 def approve_request(seeded_plan: SeededPlan, decision_id: str) -> PlanDecisionRequest:
@@ -804,6 +861,63 @@ async def test_stale_decision_returns_latest_snapshot(plan_database, seeded_revi
 
     assert raised.value.latest.current_version == 2
     assert await count_decisions(plan_database, seeded_revised_plan.plan_id) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action",
+    (
+        PlanDecisionAction.APPROVE,
+        PlanDecisionAction.REJECT,
+        PlanDecisionAction.REVISE,
+    ),
+)
+async def test_stale_different_decision_key_returns_durable_latest(
+    action,
+    plan_database,
+    seeded_plan,
+):
+    winner_request = approve_request(seeded_plan, "decision-winner")
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        winner = await uow.plans.for_context(seeded_plan.context).record_decision(
+            winner_request,
+            decided_by=seeded_plan.tenant_id,
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        durable_latest = await uow.plans.for_context(seeded_plan.context).get(
+            seeded_plan.plan_id
+        )
+    assert durable_latest == winner.snapshot
+
+    stale = PlanDecisionRequest(
+        decision_id=f"stale-{action.value}",
+        plan_id=seeded_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_plan.aggregate_version,
+        action=action,
+        feedback="Stale revision" if action is PlanDecisionAction.REVISE else None,
+    )
+    with pytest.raises(PlanVersionConflictError) as raised:
+        async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+            repository = uow.plans.for_context(seeded_plan.context)
+            if action is PlanDecisionAction.REVISE:
+                await repository.begin_revision_decision(
+                    stale,
+                    decided_by=seeded_plan.tenant_id,
+                )
+            else:
+                await repository.record_decision(
+                    stale,
+                    decided_by=seeded_plan.tenant_id,
+                )
+
+    assert raised.value.latest == durable_latest
+    assert await count_decisions(plan_database, seeded_plan.plan_id) == 1
+    assert await count_plan_rows(
+        plan_database,
+        seeded_plan.context,
+        seeded_plan.plan_id,
+    ) == (1, 1, 2, 1)
 
 
 @pytest.mark.asyncio
@@ -1235,6 +1349,190 @@ async def test_historical_replay_rejects_ambiguous_prior_cas_decisions(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ambiguous_boundary", ("target", "prior"))
+@pytest.mark.parametrize(
+    "action",
+    (
+        PlanDecisionAction.APPROVE,
+        PlanDecisionAction.REJECT,
+        PlanDecisionAction.REVISE,
+    ),
+)
+async def test_new_decision_claim_rejects_ambiguous_history(
+    ambiguous_boundary,
+    action,
+    plan_database,
+    seeded_plan,
+):
+    if ambiguous_boundary == "prior":
+        first_request = approve_request(seeded_plan, "first-history-decision")
+        async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+            first = await uow.plans.for_context(
+                seeded_plan.context
+            ).record_decision(
+                first_request,
+                decided_by=seeded_plan.tenant_id,
+            )
+        async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+            current = await uow.plans.for_context(
+                seeded_plan.context
+            ).append_version(
+                plan_id=seeded_plan.plan_id,
+                expected_version=first.snapshot.aggregate_version,
+                draft=plan_draft("Version after ambiguous history"),
+                parent_version=first.snapshot.current_version,
+                revision_feedback="Continue after version one",
+                supersedes=seeded_plan.step_ids,
+            )
+        await insert_legacy_decision(
+            plan_database,
+            seeded_plan,
+            decision_id="ambiguous-prior-history",
+            plan_version=1,
+            expected_version=seeded_plan.aggregate_version,
+        )
+    else:
+        await insert_legacy_decision(
+            plan_database,
+            seeded_plan,
+            decision_id="ambiguous-target-history-a",
+            plan_version=1,
+            expected_version=seeded_plan.aggregate_version,
+        )
+        await insert_legacy_decision(
+            plan_database,
+            seeded_plan,
+            decision_id="ambiguous-target-history-b",
+            plan_version=1,
+            expected_version=seeded_plan.aggregate_version,
+        )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        current = await uow.plans.for_context(seeded_plan.context).get(
+            seeded_plan.plan_id
+        )
+    assert current is not None
+
+    decision_count = await count_decisions(plan_database, seeded_plan.plan_id)
+    plan_counts = await count_plan_rows(
+        plan_database,
+        seeded_plan.context,
+        seeded_plan.plan_id,
+    )
+    request = PlanDecisionRequest(
+        decision_id=f"new-{ambiguous_boundary}-{action.value}",
+        plan_id=seeded_plan.plan_id,
+        plan_version=current.current_version,
+        expected_version=current.aggregate_version,
+        action=action,
+        feedback="Produce an exact revision" if action is PlanDecisionAction.REVISE else None,
+    )
+
+    with pytest.raises(PlanDecisionIdempotencyError, match="ambiguous"):
+        async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+            repository = uow.plans.for_context(seeded_plan.context)
+            if action is PlanDecisionAction.REVISE:
+                await repository.begin_revision_decision(
+                    request,
+                    decided_by=seeded_plan.tenant_id,
+                )
+                revised = await repository.append_version(
+                    plan_id=seeded_plan.plan_id,
+                    expected_version=request.expected_version,
+                    draft=plan_draft("Revision that must not persist"),
+                    parent_version=request.plan_version,
+                    revision_feedback=request.feedback,
+                    supersedes={
+                        step.logical_step_key: step.step_id
+                        for step in current.current.steps
+                    },
+                )
+                await repository.finish_revision_decision(
+                    plan_id=seeded_plan.plan_id,
+                    decision_id=request.decision_id,
+                    resulting_plan_version=revised.current_version,
+                )
+            else:
+                await repository.record_decision(
+                    request,
+                    decided_by=seeded_plan.tenant_id,
+                )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        after = await uow.plans.for_context(seeded_plan.context).get(
+            seeded_plan.plan_id
+        )
+    assert after == current
+    assert await count_decisions(plan_database, seeded_plan.plan_id) == decision_count
+    assert await count_plan_rows(
+        plan_database,
+        seeded_plan.context,
+        seeded_plan.plan_id,
+    ) == plan_counts
+
+
+@pytest.mark.asyncio
+async def test_revision_finish_keeps_claim_pending_when_history_becomes_ambiguous(
+    plan_database,
+    seeded_plan,
+):
+    request = PlanDecisionRequest(
+        decision_id="revision-before-ambiguous-history",
+        plan_id=seeded_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="Finish must revalidate history",
+    )
+
+    with pytest.raises(RuntimeError, match="unfinished plan revision"):
+        async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+            repository = uow.plans.for_context(seeded_plan.context)
+            await repository.begin_revision_decision(
+                request,
+                decided_by=seeded_plan.tenant_id,
+            )
+            revised = await repository.append_version(
+                plan_id=seeded_plan.plan_id,
+                expected_version=request.expected_version,
+                draft=plan_draft("Revision before ambiguous history"),
+                parent_version=request.plan_version,
+                revision_feedback=request.feedback,
+                supersedes=seeded_plan.step_ids,
+            )
+            assert uow.conn is not None
+            await uow.conn.execute(
+                insert(agent_plan_decisions).values(
+                    tenant_id=seeded_plan.context.tenant_id,
+                    workspace_id=seeded_plan.context.workspace_id,
+                    session_id=seeded_plan.context.session_id,
+                    plan_id=seeded_plan.plan_id,
+                    decision_id="late-ambiguous-history",
+                    plan_version=request.plan_version,
+                    expected_plan_cas_version=request.expected_version,
+                    action=PlanDecisionAction.REJECT.value,
+                    feedback=None,
+                    decided_by=seeded_plan.tenant_id,
+                    resulting_plan_version=None,
+                    created_at=1,
+                )
+            )
+            with pytest.raises(PlanDecisionIdempotencyError, match="ambiguous"):
+                await repository.finish_revision_decision(
+                    plan_id=seeded_plan.plan_id,
+                    decision_id=request.decision_id,
+                    resulting_plan_version=revised.current_version,
+                )
+
+    assert await count_decisions(plan_database, seeded_plan.plan_id) == 0
+    assert await count_plan_rows(
+        plan_database,
+        seeded_plan.context,
+        seeded_plan.plan_id,
+    ) == (1, 1, 2, 1)
+
+
+@pytest.mark.asyncio
 async def test_revision_cannot_finish_without_appending_the_next_version(
     plan_database,
     seeded_plan,
@@ -1452,6 +1750,227 @@ async def test_revision_finish_requires_exact_intent_result(
         seeded_plan.context,
         seeded_plan.plan_id,
     ) == (1, 1, 2, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("feedback_column", "expected_error"),
+    (
+        ("version", PlanVersionConflictError),
+        ("decision", PlanDecisionIdempotencyError),
+    ),
+)
+@pytest.mark.parametrize(
+    "stored_feedback",
+    ("caféExact", "CafeExact", "CaféExact "),
+)
+async def test_revision_finish_requires_python_exact_feedback(
+    feedback_column,
+    expected_error,
+    stored_feedback,
+    plan_database,
+    seeded_plan,
+):
+    request = PlanDecisionRequest(
+        decision_id=f"exact-feedback-{feedback_column}",
+        plan_id=seeded_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="CaféExact",
+    )
+
+    with pytest.raises(expected_error):
+        async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+            repository = uow.plans.for_context(seeded_plan.context)
+            await repository.begin_revision_decision(
+                request,
+                decided_by=seeded_plan.tenant_id,
+            )
+            revised = await repository.append_version(
+                plan_id=seeded_plan.plan_id,
+                expected_version=request.expected_version,
+                draft=plan_draft("Revision with inexact stored feedback"),
+                parent_version=request.plan_version,
+                revision_feedback=request.feedback,
+                supersedes=seeded_plan.step_ids,
+            )
+            assert uow.conn is not None
+            if feedback_column == "version":
+                await uow.conn.execute(
+                    update(agent_plan_versions)
+                    .where(
+                        agent_plan_versions.c.tenant_id
+                        == seeded_plan.context.tenant_id,
+                        agent_plan_versions.c.workspace_id
+                        == seeded_plan.context.workspace_id,
+                        agent_plan_versions.c.session_id
+                        == seeded_plan.context.session_id,
+                        agent_plan_versions.c.plan_id == seeded_plan.plan_id,
+                        agent_plan_versions.c.plan_version == revised.current_version,
+                    )
+                    .values(revision_feedback=stored_feedback)
+                )
+            else:
+                await uow.conn.execute(
+                    update(agent_plan_decisions)
+                    .where(
+                        agent_plan_decisions.c.tenant_id
+                        == seeded_plan.context.tenant_id,
+                        agent_plan_decisions.c.workspace_id
+                        == seeded_plan.context.workspace_id,
+                        agent_plan_decisions.c.session_id
+                        == seeded_plan.context.session_id,
+                        agent_plan_decisions.c.plan_id == seeded_plan.plan_id,
+                        agent_plan_decisions.c.decision_id == request.decision_id,
+                    )
+                    .values(feedback=stored_feedback)
+                )
+            await repository.finish_revision_decision(
+                plan_id=seeded_plan.plan_id,
+                decision_id=request.decision_id,
+                resulting_plan_version=revised.current_version,
+            )
+
+    assert await count_decisions(plan_database, seeded_plan.plan_id) == 0
+    assert await count_plan_rows(
+        plan_database,
+        seeded_plan.context,
+        seeded_plan.plan_id,
+    ) == (1, 1, 2, 1)
+
+
+@pytest.mark.asyncio
+async def test_revision_finish_mysql_sql_does_not_use_collated_feedback_equality(
+    plan_database,
+    seeded_plan,
+):
+    request = PlanDecisionRequest(
+        decision_id="mysql-exact-feedback-contract",
+        plan_id=seeded_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="CaféExact",
+    )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        recording = StatementRecordingConnection(uow.conn)
+        repository = PlanRepository(  # type: ignore[arg-type]
+            recording,
+            plan_database.dialect,
+            seeded_plan.context,
+            PlanningSettings(),
+        )
+        await repository.begin_revision_decision(
+            request,
+            decided_by=seeded_plan.tenant_id,
+        )
+        revised = await repository.append_version(
+            plan_id=seeded_plan.plan_id,
+            expected_version=request.expected_version,
+            draft=plan_draft("Compile exact feedback SQL"),
+            parent_version=request.plan_version,
+            revision_feedback=request.feedback,
+            supersedes=seeded_plan.step_ids,
+        )
+        await repository.finish_revision_decision(
+            plan_id=seeded_plan.plan_id,
+            decision_id=request.decision_id,
+            resulting_plan_version=revised.current_version,
+        )
+
+    compiled = tuple(
+        str(statement.compile(dialect=mysql.dialect()))
+        for statement in recording.statements
+        if hasattr(statement, "compile")
+    )
+    version_lock = next(
+        sql
+        for sql in compiled
+        if sql.startswith("SELECT agent_plan_versions") and "FOR UPDATE" in sql
+    )
+    decision_update = next(
+        sql for sql in compiled if sql.startswith("UPDATE agent_plan_decisions")
+    )
+    assert "agent_plan_versions.revision_feedback =" not in version_lock
+    assert "agent_plan_decisions.feedback =" not in decision_update
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_feedback",
+    ("caféExact", "CafeExact", "CaféExact "),
+)
+async def test_mysql_revision_finish_requires_python_exact_feedback(
+    stored_feedback,
+    optional_mysql_plan_database,
+):
+    database = optional_mysql_plan_database
+    root = await _seed_scope(database, slug=f"plan-mysql-{uuid4().hex[:8]}")
+    async with TenantUnitOfWork(database, root) as uow:
+        session = await uow.sessions.create("MySQL exact feedback")
+        context = root.for_session(session.id)
+        source = await MemoryRepository(uow.conn, context, database.dialect).save(
+            MemoryEntry(
+                content="Verify exact feedback",
+                type="chat_message",
+                role="user",
+                turn_index=1,
+            )
+        )
+        initial = await uow.plans.for_context(context).create(
+            plan_id=str(uuid4()),
+            source_message_id=source.id,
+            trigger_mode=PlanTriggerMode.EXPLICIT,
+            draft=plan_draft(),
+        )
+    request = PlanDecisionRequest(
+        decision_id="mysql-feedback-revision",
+        plan_id=initial.plan_id,
+        plan_version=initial.current_version,
+        expected_version=initial.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="CaféExact",
+    )
+
+    with pytest.raises(PlanVersionConflictError):
+        async with TenantUnitOfWork(database, context) as uow:
+            repository = uow.plans.for_context(context)
+            await repository.begin_revision_decision(
+                request,
+                decided_by=context.tenant_id,
+            )
+            revised = await repository.append_version(
+                plan_id=initial.plan_id,
+                expected_version=request.expected_version,
+                draft=plan_draft("MySQL exact feedback revision"),
+                parent_version=request.plan_version,
+                revision_feedback=request.feedback,
+                supersedes={
+                    step.logical_step_key: step.step_id
+                    for step in initial.current.steps
+                },
+            )
+            assert uow.conn is not None
+            await uow.conn.execute(
+                update(agent_plan_versions)
+                .where(
+                    agent_plan_versions.c.tenant_id == context.tenant_id,
+                    agent_plan_versions.c.workspace_id == context.workspace_id,
+                    agent_plan_versions.c.session_id == context.session_id,
+                    agent_plan_versions.c.plan_id == initial.plan_id,
+                    agent_plan_versions.c.plan_version == revised.current_version,
+                )
+                .values(revision_feedback=stored_feedback)
+            )
+            await repository.finish_revision_decision(
+                plan_id=initial.plan_id,
+                decision_id=request.decision_id,
+                resulting_plan_version=revised.current_version,
+            )
+
+    assert await count_decisions(database, initial.plan_id) == 0
 
 
 @pytest.mark.asyncio
