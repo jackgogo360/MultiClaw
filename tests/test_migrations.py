@@ -199,9 +199,13 @@ async def test_upgrade_preserves_legacy_direct_run_with_existing_reference(tmp_p
     assert violations == []
 
 
+@pytest.mark.parametrize("collision_table", ("agent_plans", "agent_plan_step_runs"))
 @pytest.mark.asyncio
-async def test_failed_sqlite_upgrade_restores_state_and_can_retry(tmp_path):
-    database_url = f"sqlite+aiosqlite:///{tmp_path / 'retry.db'}"
+async def test_failed_sqlite_upgrade_restores_state_and_can_retry(
+    tmp_path,
+    collision_table,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / f'retry-{collision_table}.db'}"
     config = alembic_config(database_url=database_url)
     await asyncio.to_thread(command.upgrade, config, "20260815_0001")
 
@@ -210,11 +214,13 @@ async def test_failed_sqlite_upgrade_restores_state_and_can_retry(tmp_path):
         await _seed_legacy_baseline(baseline)
         async with baseline.write_transaction() as conn:
             original_foreign_keys = await conn.scalar(text("PRAGMA foreign_keys"))
-            await conn.execute(text("CREATE TABLE agent_plans (collision INTEGER PRIMARY KEY)"))
+            await conn.execute(
+                text(f"CREATE TABLE {collision_table} (collision INTEGER PRIMARY KEY)")
+            )
     finally:
         await baseline.dispose()
 
-    with pytest.raises(OperationalError, match="agent_plans already exists"):
+    with pytest.raises(OperationalError, match=f"table {collision_table} already exists"):
         await asyncio.to_thread(command.upgrade, config, "head")
 
     failed = Database.create(DatabaseSettings(driver="sqlite", url=database_url))
@@ -225,21 +231,60 @@ async def test_failed_sqlite_upgrade_restores_state_and_can_retry(tmp_path):
             failed_tables = await conn.run_sync(
                 lambda sync_conn: set(inspect(sync_conn).get_table_names())
             )
+            failed_memory_uniques = await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_unique_constraints("memory_entries")
+            )
+            failed_agent_run_columns = await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_columns("agent_runs")
+            )
+            failed_plan_indexes = {
+                row[0]
+                for row in (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT name
+                            FROM sqlite_master
+                            WHERE type = 'index'
+                            AND name IN (
+                                'ix_agent_plans_scope_created_at',
+                                'ix_agent_plan_steps_scope_version_ordinal',
+                                'ix_agent_plan_decisions_scope_created_at'
+                            )
+                            """
+                        )
+                    )
+                ).all()
+            }
             failed_counts = {
                 table_name: await conn.scalar(text(f"SELECT count(*) FROM {table_name}"))
                 for table_name in ("memory_entries", "agent_runs", "approval_requests")
             }
+            failed_violations = (await conn.execute(text("PRAGMA foreign_key_check"))).all()
 
         assert failed_foreign_keys == original_foreign_keys
-        assert "_alembic_tmp_memory_entries" not in failed_tables
+        assert not any(table_name.startswith("_alembic_tmp_") for table_name in failed_tables)
         assert failed_counts == {
             "memory_entries": 1,
             "agent_runs": 1,
             "approval_requests": 1,
         }
+        assert not any(
+            unique["column_names"] == ["tenant_id", "workspace_id", "session_id", "id"]
+            for unique in failed_memory_uniques
+        )
+        assert {
+            "plan_id",
+            "initial_plan_version",
+            "active_plan_version",
+            "cancel_requested_at",
+        }.isdisjoint(column["name"] for column in failed_agent_run_columns)
+        assert (PLAN_TABLES - {collision_table}).isdisjoint(failed_tables)
+        assert failed_plan_indexes == set()
+        assert failed_violations == []
 
         async with failed.write_transaction() as conn:
-            await conn.execute(text("DROP TABLE agent_plans"))
+            await conn.execute(text(f"DROP TABLE {collision_table}"))
     finally:
         await failed.dispose()
 
@@ -260,17 +305,37 @@ async def test_failed_sqlite_upgrade_restores_state_and_can_retry(tmp_path):
                 table_name: await conn.scalar(text(f"SELECT count(*) FROM {table_name}"))
                 for table_name in ("memory_entries", "agent_runs", "approval_requests")
             }
+            final_diffs = await conn.run_sync(
+                lambda sync_conn: compare_metadata(
+                    MigrationContext.configure(
+                        sync_conn,
+                        opts={
+                            "target_metadata": metadata,
+                            "include_object": (
+                                lambda obj, name, type_, reflected, compare_to: not (
+                                    type_ == "table"
+                                    and reflected
+                                    and name == "alembic_version"
+                                )
+                            ),
+                        },
+                    ),
+                    metadata,
+                )
+            )
             violations = (await conn.execute(text("PRAGMA foreign_key_check"))).all()
     finally:
         await migrated.dispose()
 
     assert final_foreign_keys == original_foreign_keys
-    assert "_alembic_tmp_memory_entries" not in final_tables
+    assert not any(table_name.startswith("_alembic_tmp_") for table_name in final_tables)
     assert final_counts == failed_counts
+    assert PLAN_TABLES <= final_tables
     assert any(
         unique["column_names"] == ["tenant_id", "workspace_id", "session_id", "id"]
         for unique in final_memory_uniques
     )
+    assert final_diffs == []
     assert violations == []
 
 
