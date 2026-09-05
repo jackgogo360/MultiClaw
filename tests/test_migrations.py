@@ -339,6 +339,101 @@ async def test_failed_sqlite_upgrade_restores_state_and_can_retry(
     assert violations == []
 
 
+@pytest.mark.asyncio
+async def test_sqlite_upgrade_fails_closed_for_divergent_batch_temp_table(tmp_path):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'divergent-temp.db'}"
+    config = alembic_config(database_url=database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260815_0001")
+
+    baseline = Database.create(DatabaseSettings(driver="sqlite", url=database_url))
+    try:
+        await _seed_legacy_baseline(baseline)
+        async with baseline.write_transaction() as conn:
+            await conn.execute(
+                text(
+                    """
+                    CREATE TABLE _alembic_tmp_memory_entries
+                    AS SELECT * FROM memory_entries
+                    """
+                )
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO _alembic_tmp_memory_entries (
+                        id, tenant_id, workspace_id, session_id, content, type, role,
+                        turn_index, created_at, metadata_json
+                    ) VALUES
+                        (
+                            'temp-1', 'tenant', 'workspace', 'session', 'divergent one',
+                            'message', 'assistant', 2, 2, '{"temp": 1}'
+                        ),
+                        (
+                            'temp-2', 'tenant', 'workspace', 'session', 'divergent two',
+                            'message', 'assistant', 3, 3, '{"temp": 2}'
+                        )
+                    """
+                )
+            )
+            original_rows = (
+                await conn.execute(text("SELECT * FROM memory_entries ORDER BY id"))
+            ).all()
+            temporary_rows = (
+                await conn.execute(
+                    text("SELECT * FROM _alembic_tmp_memory_entries ORDER BY id")
+                )
+            ).all()
+    finally:
+        await baseline.dispose()
+
+    with pytest.raises(
+        OperationalError,
+        match="table _alembic_tmp_memory_entries already exists",
+    ):
+        await asyncio.to_thread(command.upgrade, config, "head")
+
+    failed = Database.create(DatabaseSettings(driver="sqlite", url=database_url))
+    try:
+        assert await _current_revision(failed) == "20260815_0001"
+        async with failed.connect() as conn:
+            failed_tables = await conn.run_sync(
+                lambda sync_conn: set(inspect(sync_conn).get_table_names())
+            )
+            failed_original_rows = (
+                await conn.execute(text("SELECT * FROM memory_entries ORDER BY id"))
+            ).all()
+            failed_temporary_rows = (
+                await conn.execute(
+                    text("SELECT * FROM _alembic_tmp_memory_entries ORDER BY id")
+                )
+            ).all()
+
+        assert {"memory_entries", "_alembic_tmp_memory_entries"} <= failed_tables
+        assert failed_original_rows == original_rows
+        assert failed_temporary_rows == temporary_rows
+
+        async with failed.write_transaction() as conn:
+            await conn.execute(text("DROP TABLE _alembic_tmp_memory_entries"))
+    finally:
+        await failed.dispose()
+
+    await asyncio.to_thread(command.upgrade, config, "head")
+
+    migrated = Database.create(DatabaseSettings(driver="sqlite", url=database_url))
+    try:
+        assert await _current_revision(migrated) == "20260905_0002"
+        async with migrated.connect() as conn:
+            final_rows = (
+                await conn.execute(text("SELECT * FROM memory_entries ORDER BY id"))
+            ).all()
+            violations = (await conn.execute(text("PRAGMA foreign_key_check"))).all()
+    finally:
+        await migrated.dispose()
+
+    assert final_rows == original_rows
+    assert violations == []
+
+
 def test_durable_plan_migration_rejects_downgrade(tmp_path):
     database_url = f"sqlite+aiosqlite:///{tmp_path / 'forward-only.db'}"
     config = alembic_config(database_url=database_url)
@@ -358,7 +453,10 @@ def test_mysql_offline_upgrade_renders_durable_plan_contract():
     command.upgrade(config, "head", sql=True)
 
     ddl = output.getvalue()
-    assert "decision_id VARCHAR(128)" in ddl
+    normalized_ddl = ddl.lower()
+    assert "decision_id varchar(128) collate utf8mb4_bin not null" in normalized_ddl
+    assert "check (char_length(decision_id) between 1 and 128)" in normalized_ddl
+    assert "check (length(decision_id)" not in normalized_ddl
     assert "result_ref VARCHAR(128)" in ddl
     assert "fk_agent_plan_step_runs_run_agent_runs" in ddl
     assert "fk_agent_plan_step_runs_result_memory_entries" not in ddl

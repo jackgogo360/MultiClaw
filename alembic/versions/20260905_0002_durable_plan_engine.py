@@ -33,51 +33,15 @@ def _payload_type():
     return sa.Text().with_variant(mysql.MEDIUMTEXT(), "mysql")
 
 
-def _set_sqlite_pragma(
-    name: Literal["foreign_keys", "defer_foreign_keys"],
-    *,
-    enabled: bool,
-) -> None:
+def _set_sqlite_defer_foreign_keys(*, enabled: bool) -> None:
     state = "ON" if enabled else "OFF"
-    op.get_bind().exec_driver_sql(f"PRAGMA {name}={state}")
+    op.get_bind().exec_driver_sql(f"PRAGMA defer_foreign_keys={state}")
 
 
-def _sqlite_pragma_enabled(
-    name: Literal["foreign_keys", "defer_foreign_keys"],
-) -> bool:
-    return bool(op.get_bind().exec_driver_sql(f"PRAGMA {name}").scalar_one())
-
-
-def _recover_sqlite_batch_table(table_name: str) -> None:
-    temporary_name = f"_alembic_tmp_{table_name}"
-    connection = op.get_bind()
-    table_names = set(sa.inspect(connection).get_table_names())
-    original_exists = table_name in table_names
-    temporary_exists = temporary_name in table_names
-
-    if not temporary_exists:
-        return
-    if not original_exists:
-        op.rename_table(temporary_name, table_name)
-        return
-
-    preparer = connection.dialect.identifier_preparer
-    original_count = connection.exec_driver_sql(
-        f"SELECT count(*) FROM {preparer.quote(table_name)}"
-    ).scalar_one()
-    temporary_count = connection.exec_driver_sql(
-        f"SELECT count(*) FROM {preparer.quote(temporary_name)}"
-    ).scalar_one()
-    if temporary_count > original_count:
-        op.drop_table(table_name)
-        op.rename_table(temporary_name, table_name)
-    else:
-        op.drop_table(temporary_name)
-
-
-def _recover_sqlite_batch_tables() -> None:
-    _recover_sqlite_batch_table("memory_entries")
-    _recover_sqlite_batch_table("agent_runs")
+def _sqlite_defer_foreign_keys_enabled() -> bool:
+    return bool(
+        op.get_bind().exec_driver_sql("PRAGMA defer_foreign_keys").scalar_one()
+    )
 
 
 def _add_memory_session_unique() -> None:
@@ -463,7 +427,14 @@ def _upgrade_schema() -> None:
         sa.Column("workspace_id", sa.CHAR(length=36), nullable=False),
         sa.Column("session_id", sa.CHAR(length=36), nullable=False),
         sa.Column("plan_id", sa.CHAR(length=36), nullable=False),
-        sa.Column("decision_id", sa.String(length=128), nullable=False),
+        sa.Column(
+            "decision_id",
+            sa.String(length=128).with_variant(
+                mysql.VARCHAR(length=128, collation="utf8mb4_bin"),
+                "mysql",
+            ),
+            nullable=False,
+        ),
         sa.Column("plan_version", sa.Integer(), nullable=False),
         sa.Column("expected_plan_cas_version", sa.BigInteger(), nullable=False),
         sa.Column("action", sa.String(length=16), nullable=False),
@@ -484,7 +455,7 @@ def _upgrade_schema() -> None:
             name=sa.schema.conv("ck_agent_plan_decisions_action_valid"),
         ),
         sa.CheckConstraint(
-            "length(decision_id) BETWEEN 1 AND 128",
+            sa.func.char_length(sa.column("decision_id")).between(1, 128),
             name=sa.schema.conv("ck_agent_plan_decisions_decision_id_length"),
         ),
         sa.ForeignKeyConstraint(
@@ -670,19 +641,16 @@ def upgrade() -> None:
         _upgrade_schema()
         return
 
-    original_foreign_keys = _sqlite_pragma_enabled("foreign_keys")
-    original_defer_foreign_keys = _sqlite_pragma_enabled("defer_foreign_keys")
+    original_defer_foreign_keys = _sqlite_defer_foreign_keys_enabled()
     # Pysqlite legacy transaction control does not begin a real transaction for DDL.
     # Start it explicitly so Alembic can roll back every batch-recreate step and stamp.
     op.get_bind().exec_driver_sql("BEGIN")
     # Keep enforcement enabled while deferring external FKs until rebuilt tables exist.
-    _set_sqlite_pragma("defer_foreign_keys", enabled=True)
+    _set_sqlite_defer_foreign_keys(enabled=True)
     try:
-        _recover_sqlite_batch_tables()
         _upgrade_schema()
     finally:
-        _set_sqlite_pragma("defer_foreign_keys", enabled=original_defer_foreign_keys)
-        _set_sqlite_pragma("foreign_keys", enabled=original_foreign_keys)
+        _set_sqlite_defer_foreign_keys(enabled=original_defer_foreign_keys)
 
 
 def downgrade() -> None:

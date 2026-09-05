@@ -117,6 +117,17 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
             step_run_foreign_keys = await conn.run_sync(
                 lambda sync_conn: inspect(sync_conn).get_foreign_keys("agent_plan_step_runs")
             )
+            decision_id_collation = await conn.scalar(
+                text(
+                    """
+                    SELECT collation_name
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE()
+                    AND table_name = 'agent_plan_decisions'
+                    AND column_name = 'decision_id'
+                    """
+                )
+            )
             engines = await conn.execute(
                 text(
                     """
@@ -211,6 +222,7 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
         assert reflected_column_types[("execution_checkpoints", "payload_json")] == "mediumtext"
         assert reflected_column_types[("user_secrets", "nonce")] in {"binary(12)", "varbinary(12)"}
         assert reflected_column_types[("agent_plan_decisions", "decision_id")] == "varchar(128)"
+        assert decision_id_collation == "utf8mb4_bin"
         assert reflected_column_types[("agent_plan_step_runs", "result_ref")] == "varchar(128)"
         assert not any(
             "result_ref" in foreign_key["constrained_columns"]
@@ -261,7 +273,11 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
             assert f"'{status}'" in reflected_checks["ck_agent_plans_status_valid"]
         for action in ("approve", "reject", "revise"):
             assert f"'{action}'" in reflected_checks["ck_agent_plan_decisions_action_valid"]
-        assert "128" in reflected_checks["ck_agent_plan_decisions_decision_id_length"]
+        decision_id_check = reflected_checks[
+            "ck_agent_plan_decisions_decision_id_length"
+        ].lower()
+        assert "char_length" in decision_id_check
+        assert "128" in decision_id_check
         for status in (
             "pending",
             "running",
@@ -471,6 +487,168 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
                         "payload_hash": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
                     },
                 )
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mysql_decision_id_unicode_and_binary_semantics(
+    isolated_mysql_database_url,
+):
+    await asyncio.to_thread(
+        command.upgrade,
+        alembic_config(database_url=isolated_mysql_database_url),
+        "head",
+    )
+    database = Database.create(
+        DatabaseSettings(driver="mysql", url=isolated_mysql_database_url)
+    )
+    scope = {
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "workspace_id": "00000000-0000-0000-0000-000000000101",
+        "session_id": "00000000-0000-0000-0000-000000000201",
+        "message_id": "00000000-0000-0000-0000-000000000301",
+        "plan_id": "00000000-0000-0000-0000-000000000401",
+    }
+    decision_insert = text(
+        """
+        INSERT INTO agent_plan_decisions (
+            tenant_id, workspace_id, session_id, plan_id, decision_id,
+            plan_version, expected_plan_cas_version, action, feedback,
+            decided_by, resulting_plan_version, created_at
+        ) VALUES (
+            :tenant_id, :workspace_id, :session_id, :plan_id, :decision_id,
+            1, 1, 'approve', NULL, :tenant_id, NULL, 2
+        )
+        """
+    )
+
+    try:
+        async with database.write_transaction() as conn:
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO users (
+                        id, email, auth_epoch, default_workspace_id, status,
+                        purge_after, created_at, updated_at, disabled_at,
+                        purge_requested_at
+                    ) VALUES (
+                        :tenant_id, 'decision-keys@example.com', 0, NULL, 'active',
+                        NULL, 1, 1, NULL, NULL
+                    )
+                    """
+                ),
+                scope,
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO workspaces (
+                        id, tenant_id, slug, name, status, created_at, updated_at
+                    ) VALUES (
+                        :workspace_id, :tenant_id, 'decision-keys',
+                        'Decision Keys', 'active', 1, 1
+                    )
+                    """
+                ),
+                scope,
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO chat_sessions (
+                        id, tenant_id, workspace_id, title, status, created_at,
+                        updated_at, last_message_at, metadata_json
+                    ) VALUES (
+                        :session_id, :tenant_id, :workspace_id, 'Decision Keys',
+                        'active', 1, 1, NULL, '{}'
+                    )
+                    """
+                ),
+                scope,
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO memory_entries (
+                        id, tenant_id, workspace_id, session_id, content, type,
+                        role, turn_index, created_at, metadata_json
+                    ) VALUES (
+                        :message_id, :tenant_id, :workspace_id, :session_id,
+                        'make a plan', 'message', 'user', 1, 1, '{}'
+                    )
+                    """
+                ),
+                scope,
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO agent_plans (
+                        id, tenant_id, workspace_id, session_id, source_message_id,
+                        trigger_mode, status, current_version, approved_version,
+                        version, created_at, updated_at
+                    ) VALUES (
+                        :plan_id, :tenant_id, :workspace_id, :session_id,
+                        :message_id, 'explicit', 'awaiting_approval', 1, NULL,
+                        1, 1, 1
+                    )
+                    """
+                ),
+                scope,
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO agent_plan_versions (
+                        tenant_id, workspace_id, session_id, plan_id, plan_version,
+                        objective, constraints_json, generation_reason,
+                        parent_version, revision_feedback, schema_version,
+                        content_digest, created_at
+                    ) VALUES (
+                        :tenant_id, :workspace_id, :session_id, :plan_id, 1,
+                        'Unicode keys', '{}', 'test', NULL, NULL, 1,
+                        :digest, 1
+                    )
+                    """
+                ),
+                {**scope, "digest": "a" * 64},
+            )
+            await conn.execute(
+                decision_insert,
+                [
+                    {**scope, "decision_id": "界" * 128},
+                    {**scope, "decision_id": "A"},
+                    {**scope, "decision_id": "a"},
+                ],
+            )
+
+        with pytest.raises(sa_exc.IntegrityError):
+            async with database.write_transaction() as conn:
+                await conn.execute(
+                    decision_insert,
+                    {**scope, "decision_id": "界" * 129},
+                )
+
+        async with database.connect() as conn:
+            stored_keys = (
+                await conn.execute(
+                    text(
+                        """
+                        SELECT decision_id
+                        FROM agent_plan_decisions
+                        WHERE tenant_id = :tenant_id
+                        AND workspace_id = :workspace_id
+                        AND session_id = :session_id
+                        AND plan_id = :plan_id
+                        ORDER BY BINARY decision_id
+                        """
+                    ),
+                    scope,
+                )
+            ).scalars().all()
+
+        assert stored_keys == ["A", "a", "界" * 128]
     finally:
         await database.dispose()
 

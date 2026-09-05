@@ -773,12 +773,32 @@ async def test_step_run_accepts_typed_memory_result_ref(database, seeded_scopes)
 async def test_migrated_sqlite_enforces_decision_id_length(database, seeded_scopes):
     primary, _foreign = seeded_scopes
     async with database.write_transaction() as conn:
-        await insert_plan_decision(conn, primary, decision_id="d")
-        await insert_plan_decision(conn, primary, decision_id="e" * 128)
+        await insert_plan_decision(conn, primary, decision_id="界" * 128)
+        await insert_plan_decision(conn, primary, decision_id="A")
+        await insert_plan_decision(conn, primary, decision_id="a")
         with pytest.raises(IntegrityError) as raised:
-            await insert_plan_decision(conn, primary, decision_id="f" * 129)
+            await insert_plan_decision(conn, primary, decision_id="界" * 129)
+
+    async with database.connect() as conn:
+        stored_keys = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT decision_id
+                    FROM agent_plan_decisions
+                    WHERE tenant_id = :tenant_id
+                    AND workspace_id = :workspace_id
+                    AND session_id = :session_id
+                    AND plan_id = :plan_id
+                    ORDER BY decision_id
+                    """
+                ),
+                primary,
+            )
+        ).scalars().all()
 
     assert "ck_agent_plan_decisions_decision_id_length" in str(raised.value.orig)
+    assert stored_keys == ["A", "a", "界" * 128]
 
 
 @pytest.mark.asyncio

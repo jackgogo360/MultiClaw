@@ -12,8 +12,10 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    column,
+    func,
 )
-from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.dialects.mysql import MEDIUMTEXT, VARCHAR
 from sqlalchemy.sql.naming import conv
 
 NAMING_CONVENTION = {
@@ -402,7 +404,14 @@ agent_plan_decisions = Table(
     Column("workspace_id", UUID_CHAR, primary_key=True),
     Column("session_id", UUID_CHAR, primary_key=True),
     Column("plan_id", UUID_CHAR, primary_key=True),
-    Column("decision_id", String(128), primary_key=True),
+    Column(
+        "decision_id",
+        String(128).with_variant(
+            VARCHAR(128, collation="utf8mb4_bin"),
+            "mysql",
+        ),
+        primary_key=True,
+    ),
     Column("plan_version", Integer, nullable=False),
     Column("expected_plan_cas_version", BIGINT, nullable=False),
     Column("action", String(16), nullable=False),
@@ -423,7 +432,7 @@ agent_plan_decisions = Table(
         name=conv("ck_agent_plan_decisions_action_valid"),
     ),
     CheckConstraint(
-        "length(decision_id) BETWEEN 1 AND 128",
+        func.char_length(column("decision_id")).between(1, 128),
         name=conv("ck_agent_plan_decisions_decision_id_length"),
     ),
     ForeignKeyConstraint(
