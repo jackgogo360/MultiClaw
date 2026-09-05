@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 import pytest
 from sqlalchemy import BigInteger, CheckConstraint, inspect, text
@@ -253,7 +253,7 @@ PAYLOAD_COLUMNS = {
 
 
 def _constraint_names(constraints: Iterable[CheckConstraint]) -> set[str]:
-    return {constraint.name for constraint in constraints if constraint.name}
+    return {str(constraint.name) for constraint in constraints if constraint.name}
 
 
 def _sqlite_url(tmp_path) -> str:
@@ -281,6 +281,7 @@ async def seeded_scopes(database):
         "plan_id": "00000000-0000-0000-0000-000000000401",
         "version_one_step_id": "00000000-0000-0000-0000-000000000501",
         "version_two_step_id": "00000000-0000-0000-0000-000000000502",
+        "run_id": "00000000-0000-0000-0000-000000000601",
     }
     foreign = {
         **primary,
@@ -374,6 +375,21 @@ async def seeded_scopes(database):
         await conn.execute(
             text(
                 """
+                INSERT INTO agent_runs (
+                    run_id, tenant_id, workspace_id, session_id, plan_id,
+                    initial_plan_version, active_plan_version, run_status,
+                    fencing_token, schema_version, version, created_at, updated_at
+                ) VALUES (
+                    :run_id, :tenant_id, :workspace_id, :session_id, :plan_id,
+                    1, 2, 'running', 0, 1, 1, 1, 1
+                )
+                """
+            ),
+            primary,
+        )
+        await conn.execute(
+            text(
+                """
                 INSERT INTO agent_plan_steps (
                     tenant_id, workspace_id, session_id, plan_id, plan_version,
                     step_id, logical_step_key, supersedes_step_id, ordinal, title,
@@ -436,6 +452,24 @@ async def insert_cross_version_dependency(
         ),
         primary,
     )
+
+
+async def assert_migrated_check_rejects(
+    conn: AsyncConnection,
+    *,
+    case: str,
+    statement: str,
+    parameters: Mapping[str, object],
+    constraint_name: str,
+) -> None:
+    savepoint = await conn.begin_nested()
+    try:
+        with pytest.raises(IntegrityError) as raised:
+            await conn.execute(text(statement), parameters)
+        assert constraint_name in str(raised.value.orig), case
+    finally:
+        if savepoint.is_active:
+            await savepoint.rollback()
 
 
 def test_core_metadata_matches_schema_contract():
@@ -559,6 +593,301 @@ async def test_plan_schema_rejects_cross_session_step_and_dependency(database, s
 
 
 @pytest.mark.asyncio
+async def test_migrated_sqlite_enforces_agent_plan_checks(database, seeded_scopes):
+    primary, _foreign = seeded_scopes
+    cases = (
+        (
+            "invalid trigger mode",
+            "UPDATE agent_plans SET trigger_mode = 'manual' WHERE id = :plan_id",
+            "ck_agent_plans_trigger_mode_valid",
+        ),
+        (
+            "invalid status",
+            "UPDATE agent_plans SET status = 'running' WHERE id = :plan_id",
+            "ck_agent_plans_status_valid",
+        ),
+        (
+            "non-positive current version",
+            "UPDATE agent_plans SET current_version = 0 WHERE id = :plan_id",
+            "ck_agent_plans_current_version_positive",
+        ),
+        (
+            "approved version beyond current",
+            "UPDATE agent_plans SET approved_version = 3 WHERE id = :plan_id",
+            "ck_agent_plans_approved_version_valid",
+        ),
+    )
+
+    async with database.write_transaction() as conn:
+        for case, statement, constraint_name in cases:
+            await assert_migrated_check_rejects(
+                conn,
+                case=case,
+                statement=statement,
+                parameters=primary,
+                constraint_name=constraint_name,
+            )
+
+
+@pytest.mark.asyncio
+async def test_migrated_sqlite_enforces_plan_version_checks(database, seeded_scopes):
+    primary, _foreign = seeded_scopes
+    digest = "c" * 64
+    cases = (
+        (
+            "non-positive plan version",
+            """
+            INSERT INTO agent_plan_versions (
+                tenant_id, workspace_id, session_id, plan_id, plan_version,
+                objective, constraints_json, generation_reason, parent_version,
+                revision_feedback, schema_version, content_digest, created_at
+            ) VALUES (
+                :tenant_id, :workspace_id, :session_id, :plan_id, 0,
+                'Invalid', '{}', 'test', NULL, NULL, 1, :digest, 3
+            )
+            """,
+            {**primary, "digest": digest},
+            "ck_agent_plan_versions_plan_version_positive",
+        ),
+        (
+            "non-positive schema version",
+            """
+            UPDATE agent_plan_versions SET schema_version = 0
+            WHERE tenant_id = :tenant_id AND workspace_id = :workspace_id
+              AND session_id = :session_id AND plan_id = :plan_id AND plan_version = 2
+            """,
+            primary,
+            "ck_agent_plan_versions_schema_version_positive",
+        ),
+        (
+            "parent is not earlier",
+            """
+            UPDATE agent_plan_versions SET parent_version = 2
+            WHERE tenant_id = :tenant_id AND workspace_id = :workspace_id
+              AND session_id = :session_id AND plan_id = :plan_id AND plan_version = 2
+            """,
+            primary,
+            "ck_agent_plan_versions_parent_version_valid",
+        ),
+        (
+            "invalid content digest length",
+            """
+            UPDATE agent_plan_versions SET content_digest = 'short'
+            WHERE tenant_id = :tenant_id AND workspace_id = :workspace_id
+              AND session_id = :session_id AND plan_id = :plan_id AND plan_version = 2
+            """,
+            primary,
+            "ck_agent_plan_versions_content_digest_valid",
+        ),
+    )
+
+    async with database.write_transaction() as conn:
+        for case, statement, parameters, constraint_name in cases:
+            await assert_migrated_check_rejects(
+                conn,
+                case=case,
+                statement=statement,
+                parameters=parameters,
+                constraint_name=constraint_name,
+            )
+
+
+@pytest.mark.asyncio
+async def test_migrated_sqlite_enforces_plan_step_checks(database, seeded_scopes):
+    primary, _foreign = seeded_scopes
+    cases = (
+        ("ordinal below range", "ordinal", 0, "ck_agent_plan_steps_ordinal_valid"),
+        ("ordinal above range", "ordinal", 21, "ck_agent_plan_steps_ordinal_valid"),
+        ("attempts below range", "max_attempts", 0, "ck_agent_plan_steps_max_attempts_valid"),
+        ("attempts above range", "max_attempts", 21, "ck_agent_plan_steps_max_attempts_valid"),
+        (
+            "invalid definition digest length",
+            "definition_digest",
+            "short",
+            "ck_agent_plan_steps_definition_digest_valid",
+        ),
+    )
+
+    async with database.write_transaction() as conn:
+        for case, column_name, value, constraint_name in cases:
+            await assert_migrated_check_rejects(
+                conn,
+                case=case,
+                statement=(
+                    f"UPDATE agent_plan_steps SET {column_name} = :invalid_value "
+                    "WHERE step_id = :version_two_step_id"
+                ),
+                parameters={**primary, "invalid_value": value},
+                constraint_name=constraint_name,
+            )
+
+
+@pytest.mark.asyncio
+async def test_migrated_sqlite_rejects_self_dependency(database, seeded_scopes):
+    primary, _foreign = seeded_scopes
+    async with database.write_transaction() as conn:
+        await assert_migrated_check_rejects(
+            conn,
+            case="step depends on itself",
+            statement="""
+                INSERT INTO agent_plan_step_dependencies (
+                    tenant_id, workspace_id, session_id, plan_id, plan_version,
+                    step_id, depends_on_step_id
+                ) VALUES (
+                    :tenant_id, :workspace_id, :session_id, :plan_id, 2,
+                    :version_two_step_id, :version_two_step_id
+                )
+            """,
+            parameters=primary,
+            constraint_name="ck_agent_plan_step_dependencies_distinct_steps",
+        )
+
+
+@pytest.mark.asyncio
+async def test_migrated_sqlite_enforces_plan_decision_checks(database, seeded_scopes):
+    primary, _foreign = seeded_scopes
+    statement = """
+        INSERT INTO agent_plan_decisions (
+            tenant_id, workspace_id, session_id, plan_id, decision_id,
+            plan_version, expected_plan_cas_version, action, feedback,
+            decided_by, resulting_plan_version, created_at
+        ) VALUES (
+            :tenant_id, :workspace_id, :session_id, :plan_id, :decision_id,
+            :plan_version, :expected_plan_cas_version, :action, NULL,
+            :tenant_id, NULL, 3
+        )
+    """
+    cases = (
+        (
+            "invalid action",
+            {"plan_version": 2, "expected_plan_cas_version": 1, "action": "archive"},
+            "ck_agent_plan_decisions_action_valid",
+        ),
+        (
+            "non-positive expected CAS version",
+            {"plan_version": 2, "expected_plan_cas_version": 0, "action": "approve"},
+            "ck_agent_plan_decisions_expected_cas_positive",
+        ),
+        (
+            "non-positive plan version",
+            {"plan_version": 0, "expected_plan_cas_version": 1, "action": "approve"},
+            "ck_agent_plan_decisions_plan_version_positive",
+        ),
+    )
+
+    async with database.write_transaction() as conn:
+        for index, (case, values, constraint_name) in enumerate(cases, start=1):
+            await assert_migrated_check_rejects(
+                conn,
+                case=case,
+                statement=statement,
+                parameters={
+                    **primary,
+                    **values,
+                    "decision_id": f"00000000-0000-0000-0000-{index:012d}",
+                },
+                constraint_name=constraint_name,
+            )
+
+
+@pytest.mark.asyncio
+async def test_migrated_sqlite_enforces_complete_run_plan_binding(database, seeded_scopes):
+    primary, _foreign = seeded_scopes
+    statement = """
+        INSERT INTO agent_runs (
+            run_id, tenant_id, workspace_id, session_id, plan_id,
+            initial_plan_version, active_plan_version, run_status,
+            fencing_token, schema_version, version, created_at, updated_at
+        ) VALUES (
+            :invalid_run_id, :tenant_id, :workspace_id, :session_id, :binding_plan_id,
+            :initial_plan_version, :active_plan_version, 'running', 0, 1, 1, 2, 2
+        )
+    """
+    partial_bindings = (
+        (primary["plan_id"], None, None),
+        (primary["plan_id"], 1, None),
+        (primary["plan_id"], None, 2),
+        (None, 1, 2),
+    )
+
+    async with database.write_transaction() as conn:
+        for index, (plan_id, initial_version, active_version) in enumerate(
+            partial_bindings,
+            start=1,
+        ):
+            await assert_migrated_check_rejects(
+                conn,
+                case=f"partial run binding {index}",
+                statement=statement,
+                parameters={
+                    **primary,
+                    "invalid_run_id": f"00000000-0000-0000-0001-{index:012d}",
+                    "binding_plan_id": plan_id,
+                    "initial_plan_version": initial_version,
+                    "active_plan_version": active_version,
+                },
+                constraint_name="ck_agent_runs_plan_binding_complete",
+            )
+
+
+@pytest.mark.asyncio
+async def test_migrated_sqlite_enforces_plan_step_run_checks(database, seeded_scopes):
+    primary, _foreign = seeded_scopes
+    statement = """
+        INSERT INTO agent_plan_step_runs (
+            tenant_id, workspace_id, session_id, plan_id, plan_version,
+            step_id, step_run_id, run_id, attempt, status, result_digest,
+            version, started_at, finished_at
+        ) VALUES (
+            :tenant_id, :workspace_id, :session_id, :plan_id, 2,
+            :version_two_step_id, :step_run_id, :run_id, :attempt, :status,
+            :result_digest, :row_version, 10, :finished_at
+        )
+    """
+    cases = (
+        (
+            "invalid status",
+            {"attempt": 1, "status": "waiting", "result_digest": None, "row_version": 1, "finished_at": None},
+            "ck_agent_plan_step_runs_status_valid",
+        ),
+        (
+            "non-positive attempt",
+            {"attempt": 0, "status": "pending", "result_digest": None, "row_version": 1, "finished_at": None},
+            "ck_agent_plan_step_runs_attempt_positive",
+        ),
+        (
+            "non-positive row version",
+            {"attempt": 1, "status": "pending", "result_digest": None, "row_version": 0, "finished_at": None},
+            "ck_agent_plan_step_runs_version_positive",
+        ),
+        (
+            "invalid result digest length",
+            {"attempt": 1, "status": "succeeded", "result_digest": "short", "row_version": 1, "finished_at": 10},
+            "ck_agent_plan_step_runs_result_digest_valid",
+        ),
+        (
+            "finish before start",
+            {"attempt": 1, "status": "succeeded", "result_digest": "d" * 64, "row_version": 1, "finished_at": 9},
+            "ck_agent_plan_step_runs_finished_at_valid",
+        ),
+    )
+
+    async with database.write_transaction() as conn:
+        for index, (case, values, constraint_name) in enumerate(cases, start=1):
+            await assert_migrated_check_rejects(
+                conn,
+                case=case,
+                statement=statement,
+                parameters={
+                    **primary,
+                    **values,
+                    "step_run_id": f"00000000-0000-0000-0002-{index:012d}",
+                },
+                constraint_name=constraint_name,
+            )
+
+
+@pytest.mark.asyncio
 async def test_plan_schema_allows_legacy_direct_run(database, seeded_scopes):
     primary, _foreign = seeded_scopes
     async with database.write_transaction() as conn:
@@ -569,7 +898,7 @@ async def test_plan_schema_allows_legacy_direct_run(database, seeded_scopes):
                     run_id, tenant_id, workspace_id, session_id, run_status,
                     fencing_token, schema_version, version, created_at, updated_at
                 ) VALUES (
-                    '00000000-0000-0000-0000-000000000601', :tenant_id,
+                    '00000000-0000-0000-0000-000000000602', :tenant_id,
                     :workspace_id, :session_id, 'running', 0, 1, 1, 1, 1
                 )
                 """
@@ -584,7 +913,7 @@ async def test_plan_schema_allows_legacy_direct_run(database, seeded_scopes):
                     """
                     SELECT plan_id, initial_plan_version, active_plan_version, cancel_requested_at
                     FROM agent_runs
-                    WHERE run_id = '00000000-0000-0000-0000-000000000601'
+                    WHERE run_id = '00000000-0000-0000-0000-000000000602'
                     """
                 )
             )
