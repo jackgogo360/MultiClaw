@@ -5,7 +5,7 @@ from typing import Generic, TypeVar
 
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncTransaction
 
-from multiclaw.config.settings import WorkflowSettings
+from multiclaw.config.settings import PlanningSettings, WorkflowSettings
 from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.auth import (
     AuthUserRepository,
@@ -19,6 +19,7 @@ from multiclaw.storage.repositories.deletions import (
     DeletionWorkflowRepository,
 )
 from multiclaw.storage.repositories.memory import MemoryRepository
+from multiclaw.storage.repositories.plans import PlanRepository
 from multiclaw.storage.repositories.secrets import SecretsRepository
 from multiclaw.storage.repositories.sessions import SessionRepository
 from multiclaw.storage.repositories.workflow import WorkflowRepository
@@ -177,6 +178,7 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
     workspaces: WorkspaceRepository
     sessions: SessionRepository
     memory: MemoryRepository
+    plans: PlanRepository
     secrets: SecretsRepository
     workflow: WorkflowRepository
 
@@ -185,10 +187,12 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
         database: Database,
         context: TenantContext,
         *,
+        planning_settings: PlanningSettings | None = None,
         workflow_settings: WorkflowSettings | None = None,
     ) -> None:
         super().__init__(database)
         self._context = context
+        self._planning_settings = planning_settings or PlanningSettings()
         self._workflow_settings = workflow_settings or WorkflowSettings()
 
     def _bind_repositories(self) -> None:
@@ -197,6 +201,12 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
         self.workspaces = WorkspaceRepository(self.conn, self._database.dialect, self._context)
         self.sessions = SessionRepository(self.conn, self._context, self._database.dialect)
         self.memory = MemoryRepository(self.conn, self._context, self._database.dialect)
+        self.plans = PlanRepository(
+            self.conn,
+            self._database.dialect,
+            self._context,
+            self._planning_settings,
+        )
         self.secrets = SecretsRepository(self.conn, self._database.dialect, self._context)
         self.workflow = WorkflowRepository(
             self.conn,

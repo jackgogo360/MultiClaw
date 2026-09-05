@@ -1,8 +1,12 @@
 import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from multiclaw.tenancy.context import TenantContext
 
 
 class PlanningMode(StrEnum):
@@ -45,6 +49,85 @@ class PlanStepRunStatus(StrEnum):
     FAILED_RETRYABLE = "failed_retryable"
     FAILED_TERMINAL = "failed_terminal"
     CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class PlanDecisionRecord:
+    decision_id: str
+    plan_version: int
+    expected_plan_cas_version: int
+    action: PlanDecisionAction
+    feedback: str | None
+    decided_by: str
+    resulting_plan_version: int | None
+    created_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlanStepRecord:
+    step_id: str
+    logical_step_key: str
+    supersedes_step_id: str | None
+    ordinal: int
+    title: str
+    description: str
+    expected_outcome: str
+    assigned_agent_profile_id: str | None
+    max_attempts: int
+    definition_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlanStepRunRecord:
+    step_run_id: str
+    run_id: str
+    plan_id: str
+    plan_version: int
+    step_id: str
+    attempt: int
+    status: PlanStepRunStatus
+    result_summary: str | None
+    result_ref: str | None
+    result_digest: str | None
+    error_code: str | None
+    error_detail_redacted: str | None
+    reused_from_step_run_id: str | None
+    version: int
+    started_at: int
+    finished_at: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlanVersionRecord:
+    plan_id: str
+    plan_version: int
+    objective: str
+    constraints: tuple[str, ...]
+    generation_reason: str
+    parent_version: int | None
+    revision_feedback: str | None
+    schema_version: int
+    content_digest: str
+    created_at: int
+    steps: tuple[PlanStepRecord, ...]
+    dependencies: Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class PlanSnapshot:
+    context: TenantContext
+    plan_id: str
+    source_message_id: str
+    trigger_mode: PlanTriggerMode
+    status: PlanStatus
+    current_version: int
+    approved_version: int | None
+    aggregate_version: int
+    created_at: int
+    updated_at: int
+    current: PlanVersionRecord
+    versions: tuple[PlanVersionRecord, ...]
+    decisions: tuple[PlanDecisionRecord, ...]
 
 
 class PlanningDecision(BaseModel):
