@@ -1068,6 +1068,38 @@ async def test_classifier_accepts_only_its_bounded_function_schema() -> None:
     assert "read_file" not in str(router.calls[0]["tools"])
 
 
+@pytest.mark.asyncio
+async def test_classifier_rejects_extra_fields_with_closed_schema() -> None:
+    response = LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(
+                id="route",
+                name="classify_planning_request",
+                arguments={
+                    "mode": "plan",
+                    "reason": "Multiple dependent changes.",
+                    "unexpected": "must not be accepted",
+                },
+            )
+        ],
+    )
+    router = StubRouter([response])
+
+    decision = await PlanningPolicy(
+        router=router,
+        default_model="default",
+        classification_model="classifier",
+    ).decide("request", PlanningMode.AUTO)
+
+    assert decision == planner.PlanningDecision(
+        mode=PlanningRoute.DIRECT,
+        reason="automatic classification unavailable",
+    )
+    parameters = router.calls[0]["tools"][0]["function"]["parameters"]
+    assert parameters["additionalProperties"] is False
+
+
 @pytest.mark.parametrize(
     "tool_calls",
     [

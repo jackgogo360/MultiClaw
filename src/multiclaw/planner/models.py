@@ -185,6 +185,8 @@ class PlanSummary:
 
 
 class PlanningDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     mode: PlanningRoute
     reason: str = Field(max_length=500)
 
