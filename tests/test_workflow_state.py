@@ -43,6 +43,8 @@ from multiclaw.workflow.models import (
     ExecutionStatus,
     InvalidTransitionError,
     PlanAwaitingApprovalPayload,
+    PlanReplanRequiredPayload,
+    PlanStepReadyPayload,
     RunLease,
     RunStatus,
     StaleFenceError,
@@ -902,8 +904,8 @@ async def test_tenant_context_rejects_active_user_without_default_workspace():
     assert exc_info.value.status_code == 403
 
 
-def test_plan_awaiting_approval_payload_is_strict_and_cursor_bound():
-    payload = PlanAwaitingApprovalPayload(
+def test_plan_checkpoint_payloads_are_strict_and_cursor_bound():
+    awaiting = PlanAwaitingApprovalPayload(
         run_id=str(uuid4()),
         plan_id=str(uuid4()),
         plan_version=1,
@@ -911,39 +913,86 @@ def test_plan_awaiting_approval_payload_is_strict_and_cursor_bound():
         decision_cursor="decision-1",
         cursor="decision-1",
     )
+    ready = PlanStepReadyPayload(
+        run_id=str(uuid4()),
+        plan_id=str(uuid4()),
+        plan_version=1,
+        plan_digest="a" * 64,
+        step_id=str(uuid4()),
+        step_run_id=str(uuid4()),
+        attempt=1,
+        execution_cursor="dispatch_step",
+        cursor="dispatch_step",
+    )
+    replan = PlanReplanRequiredPayload(
+        run_id=str(uuid4()),
+        plan_id=str(uuid4()),
+        plan_version=1,
+        plan_digest="a" * 64,
+        failed_step_run_id=str(uuid4()),
+        failure_digest="b" * 64,
+        revision_cursor="generate_revision",
+        cursor="generate_revision",
+    )
 
-    assert payload.next_step == "plan_decision"
+    assert awaiting.next_step == "plan_decision"
+    assert ready.next_step == "plan_step_execution"
+    assert replan.next_step == "plan_revision"
     assert (
         PHASE_PAYLOADS[CheckpointPhase.PLAN_AWAITING_APPROVAL]
         is PlanAwaitingApprovalPayload
     )
+    assert PHASE_PAYLOADS[CheckpointPhase.PLAN_STEP_READY] is PlanStepReadyPayload
+    assert (
+        PHASE_PAYLOADS[CheckpointPhase.PLAN_REPLAN_REQUIRED]
+        is PlanReplanRequiredPayload
+    )
+
+    for payload in (awaiting, ready, replan):
+        with pytest.raises(ValidationError):
+            type(payload).model_validate(
+                {**payload.model_dump(), "cursor": "different"}
+            )
+        with pytest.raises(ValidationError):
+            type(payload).model_validate(
+                {**payload.model_dump(), "unexpected": "field"}
+            )
+
     with pytest.raises(ValidationError):
         PlanAwaitingApprovalPayload.model_validate(
-            {**payload.model_dump(), "cursor": "different"}
+            {**awaiting.model_dump(), "plan_version": True}
         )
     with pytest.raises(ValidationError):
         PlanAwaitingApprovalPayload.model_validate(
-            {**payload.model_dump(), "plan_version": True}
+            {**awaiting.model_dump(), "plan_digest": "short"}
         )
     with pytest.raises(ValidationError):
         PlanAwaitingApprovalPayload.model_validate(
-            {**payload.model_dump(), "plan_digest": "short"}
+            {**awaiting.model_dump(), "plan_digest": "z" * 64}
         )
     with pytest.raises(ValidationError):
         PlanAwaitingApprovalPayload.model_validate(
-            {**payload.model_dump(), "plan_digest": "z" * 64}
+            {**awaiting.model_dump(), "run_id": "x" * 36}
         )
     with pytest.raises(ValidationError):
         PlanAwaitingApprovalPayload.model_validate(
-            {**payload.model_dump(), "run_id": "x" * 36}
+            {**awaiting.model_dump(), "plan_id": "x" * 36}
         )
     with pytest.raises(ValidationError):
-        PlanAwaitingApprovalPayload.model_validate(
-            {**payload.model_dump(), "plan_id": "x" * 36}
+        PlanStepReadyPayload.model_validate(
+            {**ready.model_dump(), "attempt": True}
         )
     with pytest.raises(ValidationError):
-        PlanAwaitingApprovalPayload.model_validate(
-            {**payload.model_dump(), "unexpected": "field"}
+        PlanStepReadyPayload.model_validate(
+            {**ready.model_dump(), "attempt": 21}
+        )
+    with pytest.raises(ValidationError):
+        PlanStepReadyPayload.model_validate(
+            {**ready.model_dump(), "execution_cursor": "generate_revision"}
+        )
+    with pytest.raises(ValidationError):
+        PlanReplanRequiredPayload.model_validate(
+            {**replan.model_dump(), "revision_cursor": "select_next"}
         )
 
 
@@ -1062,21 +1111,60 @@ async def test_approve_plan_resumes_with_new_fence_and_active_version(
     )
     before = await coordinator.get_run(context)
     assert before is not None
+    await _append_plan_version(workflow_database, context, plan_id)
 
     lease = await coordinator.resume_waiting_plan_run(
         context,
         runtime_instance_id="runtime-resume",
         plan_id=plan_id,
-        plan_version=1,
+        plan_version=2,
         expected_run_version=before.version,
     )
     after = await coordinator.get_run(context)
 
     assert after is not None
     assert after.status is RunStatus.RESUMING
-    assert after.active_plan_version == 1
+    assert after.active_plan_version == 2
     assert lease.fencing_token == before.fencing_token + 1
     assert lease.version == before.version + 1
+
+
+@pytest.mark.asyncio
+async def test_plan_step_checkpoint_rejects_stale_fence_without_writing(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-plan-stale-step")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    coordinator = _coordinator(workflow_database)
+    stale = await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    checkpoints_before = await _checkpoint_rows(workflow_database, context)
+    current = await coordinator.heartbeat(stale)
+
+    with pytest.raises(StaleFenceError):
+        await coordinator.checkpoint(
+            stale,
+            CheckpointPhase.PLAN_STEP_READY,
+            PlanStepReadyPayload(
+                run_id=str(context.run_id),
+                plan_id=plan_id,
+                plan_version=1,
+                plan_digest=plan_digest,
+                step_id=str(uuid4()),
+                step_run_id=str(uuid4()),
+                attempt=1,
+                execution_cursor="dispatch_step",
+                cursor="dispatch_step",
+            ),
+        )
+
+    assert current.version > stale.version
+    assert await _checkpoint_rows(workflow_database, context) == checkpoints_before
 
 
 @pytest.mark.asyncio

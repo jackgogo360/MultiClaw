@@ -49,6 +49,8 @@ class RecoveryStrategy(str, Enum):
 class CheckpointPhase(StrEnum):
     RUN_STARTED = "run_started"
     PLAN_AWAITING_APPROVAL = "plan_awaiting_approval"
+    PLAN_STEP_READY = "plan_step_ready"
+    PLAN_REPLAN_REQUIRED = "plan_replan_required"
     MODEL_OUTPUT_COMMITTED = "model_output_committed"
     AWAITING_APPROVAL = "awaiting_approval"
     EXECUTION_DISPATCHING = "execution_dispatching"
@@ -59,6 +61,9 @@ class CheckpointPhase(StrEnum):
 class RecoveryAction(StrEnum):
     RESUME_MODEL = "resume_model"
     AWAIT_USER = "await_user"
+    AWAIT_PLAN_DECISION = "await_plan_decision"
+    RESUME_PLAN_STEP = "resume_plan_step"
+    RESUME_PLAN_REVISION = "resume_plan_revision"
     REPLAY_READ_ONLY = "replay_read_only"
     RETRY_IDEMPOTENT = "retry_idempotent"
     MARK_MANUAL_UNCERTAIN = "mark_manual_uncertain"
@@ -116,6 +121,56 @@ class PlanAwaitingApprovalPayload(CheckpointPayload):
     def validate_cursor(self) -> PlanAwaitingApprovalPayload:
         if self.cursor != self.decision_cursor:
             raise ValueError("cursor must match decision_cursor")
+        return self
+
+
+class PlanStepReadyPayload(CheckpointPayload):
+    run_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_version: StrictInt = Field(ge=1)
+    plan_digest: str = Field(min_length=64, max_length=64, pattern=SHA256_PATTERN)
+    step_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    step_run_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    attempt: StrictInt = Field(ge=1, le=20)
+    execution_cursor: Literal[
+        "dispatch_step",
+        "continue_step",
+        "select_next",
+        "final_summary",
+    ]
+    next_step: Literal["plan_step_execution"] = "plan_step_execution"
+    cursor: str = CURSOR_FIELD
+
+    @model_validator(mode="after")
+    def validate_cursor(self) -> PlanStepReadyPayload:
+        if self.cursor != self.execution_cursor:
+            raise ValueError("cursor must match execution_cursor")
+        return self
+
+
+class PlanReplanRequiredPayload(CheckpointPayload):
+    run_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_version: StrictInt = Field(ge=1)
+    plan_digest: str = Field(min_length=64, max_length=64, pattern=SHA256_PATTERN)
+    failed_step_run_id: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=UUID_PATTERN,
+    )
+    failure_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=SHA256_PATTERN,
+    )
+    revision_cursor: Literal["generate_revision"] = "generate_revision"
+    next_step: Literal["plan_revision"] = "plan_revision"
+    cursor: str = CURSOR_FIELD
+
+    @model_validator(mode="after")
+    def validate_cursor(self) -> PlanReplanRequiredPayload:
+        if self.cursor != self.revision_cursor:
+            raise ValueError("cursor must match revision_cursor")
         return self
 
 
@@ -207,6 +262,8 @@ class RunTerminalPayload(CheckpointPayload):
 PHASE_PAYLOADS: dict[CheckpointPhase, type[CheckpointPayload]] = {
     CheckpointPhase.RUN_STARTED: RunStartedPayload,
     CheckpointPhase.PLAN_AWAITING_APPROVAL: PlanAwaitingApprovalPayload,
+    CheckpointPhase.PLAN_STEP_READY: PlanStepReadyPayload,
+    CheckpointPhase.PLAN_REPLAN_REQUIRED: PlanReplanRequiredPayload,
     CheckpointPhase.MODEL_OUTPUT_COMMITTED: ModelOutputPayload,
     CheckpointPhase.AWAITING_APPROVAL: AwaitingApprovalPayload,
     CheckpointPhase.EXECUTION_DISPATCHING: ExecutionDispatchingPayload,

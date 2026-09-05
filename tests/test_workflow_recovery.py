@@ -20,7 +20,14 @@ from multiclaw.storage.schema import execution_checkpoints
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
-from multiclaw.workflow.models import CheckpointPhase, CorruptCheckpointError, RunStatus, StaleFenceError
+from multiclaw.workflow.models import (
+    CheckpointPhase,
+    CheckpointRecord,
+    CorruptCheckpointError,
+    RecoveryAction,
+    RunStatus,
+    StaleFenceError,
+)
 from multiclaw.workflow.recovery import RecoveryService, validate_phase_payload
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -321,6 +328,95 @@ async def test_active_run_started_checkpoint_still_resumes_model(workflow_databa
     assert outcome.action.value == "resume_model"
     assert outcome.executions_started == 0
     assert outcome.lease is not None
+
+
+@pytest.mark.parametrize(
+    ("phase", "payload", "expected_action"),
+    (
+        (
+            "plan_awaiting_approval",
+            {
+                "run_id": "00000000-0000-0000-0000-000000000004",
+                "plan_id": "00000000-0000-0000-0000-000000000005",
+                "plan_version": 1,
+                "plan_digest": "a" * 64,
+                "decision_cursor": "decision-1",
+                "cursor": "decision-1",
+            },
+            "await_plan_decision",
+        ),
+        (
+            "plan_step_ready",
+            {
+                "run_id": "00000000-0000-0000-0000-000000000004",
+                "plan_id": "00000000-0000-0000-0000-000000000005",
+                "plan_version": 1,
+                "plan_digest": "a" * 64,
+                "step_id": "00000000-0000-0000-0000-000000000006",
+                "step_run_id": "00000000-0000-0000-0000-000000000007",
+                "attempt": 1,
+                "execution_cursor": "continue_step",
+                "cursor": "continue_step",
+            },
+            "resume_plan_step",
+        ),
+        (
+            "plan_replan_required",
+            {
+                "run_id": "00000000-0000-0000-0000-000000000004",
+                "plan_id": "00000000-0000-0000-0000-000000000005",
+                "plan_version": 1,
+                "plan_digest": "a" * 64,
+                "failed_step_run_id": "00000000-0000-0000-0000-000000000007",
+                "failure_digest": "b" * 64,
+                "revision_cursor": "generate_revision",
+                "cursor": "generate_revision",
+            },
+            "resume_plan_revision",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_plan_checkpoint_phases_map_to_recovery_decisions(
+    workflow_database: Database,
+    phase: str,
+    payload: dict[str, object],
+    expected_action: str,
+):
+    normalized_phase = CheckpointPhase(phase)
+    _, validated_payload = validate_phase_payload(normalized_phase, payload)
+    normalized_action = RecoveryAction(expected_action)
+    context = TenantContext(
+        tenant_id="00000000-0000-0000-0000-000000000001",
+        workspace_id="00000000-0000-0000-0000-000000000002",
+        session_id="00000000-0000-0000-0000-000000000003",
+        run_id="00000000-0000-0000-0000-000000000004",
+    )
+    checkpoint = CheckpointRecord(
+        checkpoint_id="00000000-0000-0000-0000-000000000008",
+        tenant_id=context.tenant_id,
+        workspace_id=context.workspace_id,
+        session_id=str(context.session_id),
+        run_id=str(context.run_id),
+        approval_id=None,
+        execution_id=None,
+        phase=normalized_phase,
+        checkpoint_seq=1,
+        payload_json="{}",
+        payload_hash="0" * 64,
+        schema_version=1,
+        created_at=1,
+    )
+
+    outcome = await RecoveryService(workflow_database)._classify(
+        context,
+        checkpoint,
+        normalized_phase,
+        validated_payload,
+    )
+
+    assert outcome.action is normalized_action
+    assert outcome.executions_started == 0
 
 
 def test_checkpoint_timestamp_fields_reject_string_coercion() -> None:

@@ -39,6 +39,9 @@ from multiclaw.workflow.models import (
     ModelOutputPayload,
     PHASE_PAYLOADS,
     LeaseConflictError,
+    PlanAwaitingApprovalPayload,
+    PlanReplanRequiredPayload,
+    PlanStepReadyPayload,
     RecoveryAction,
     RecoveryOutcome,
     RecoveryStrategy,
@@ -263,6 +266,18 @@ class RecoveryService:
         phase: CheckpointPhase,
         payload: CheckpointPayload,
     ) -> RecoveryOutcome:
+        if phase is CheckpointPhase.PLAN_AWAITING_APPROVAL:
+            assert isinstance(payload, PlanAwaitingApprovalPayload)
+            return RecoveryOutcome(action=RecoveryAction.AWAIT_PLAN_DECISION)
+
+        if phase is CheckpointPhase.PLAN_STEP_READY:
+            assert isinstance(payload, PlanStepReadyPayload)
+            return RecoveryOutcome(action=RecoveryAction.RESUME_PLAN_STEP)
+
+        if phase is CheckpointPhase.PLAN_REPLAN_REQUIRED:
+            assert isinstance(payload, PlanReplanRequiredPayload)
+            return RecoveryOutcome(action=RecoveryAction.RESUME_PLAN_REVISION)
+
         if phase in {
             CheckpointPhase.RUN_STARTED,
             CheckpointPhase.MODEL_OUTPUT_COMMITTED,
