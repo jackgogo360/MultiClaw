@@ -298,9 +298,10 @@ class PlanningService:
                 decision_id=request.decision_id,
                 resulting_plan_version=revised.current_version,
             )
-            revised = await repository.get(request.plan_id)
-            if revised is None:
+            persisted_revision = await repository.get(request.plan_id)
+            if persisted_revision is None:
                 raise PlanNotFoundError("Plan not found")
+            revised = persisted_revision
             run = await uow.workflow.get_plan_run(context, request.plan_id)
             if run is None:
                 raise PlanNotFoundError("Plan not found")

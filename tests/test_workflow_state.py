@@ -7,15 +7,16 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 import pytest
-from alembic import command
 from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import insert, select, text, update
 from starlette.requests import Request
 
+from alembic import command
 from multiclaw.api.dependencies import tenant_context
 from multiclaw.auth.models import UserRecord
 from multiclaw.cli import alembic_config
@@ -34,14 +35,13 @@ from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
+    LEGAL_RUN_TRANSITIONS,
+    PHASE_PAYLOADS,
     ApprovalRecord,
     ApprovalStatus,
     CheckpointPhase,
     ExecutionStatus,
     InvalidTransitionError,
-    LeaseConflictError,
-    LEGAL_RUN_TRANSITIONS,
-    PHASE_PAYLOADS,
     PlanAwaitingApprovalPayload,
     RunLease,
     RunStatus,
@@ -61,7 +61,9 @@ def _sqlite_url(tmp_path: Path) -> str:
 
 async def _upgrade_database(url: str) -> Database:
     await asyncio.to_thread(command.upgrade, alembic_config(database_url=url), "head")
-    driver = "mysql" if url.startswith("mysql+aiomysql://") else "sqlite"
+    driver: Literal["mysql", "sqlite"] = (
+        "mysql" if url.startswith("mysql+aiomysql://") else "sqlite"
+    )
     return Database.create(DatabaseSettings(driver=driver, url=url))
 
 
@@ -348,7 +350,7 @@ async def test_terminal_run_cannot_be_reacquired_after_lease_expiry(
     )
 
     lease = await _coordinator(workflow_database).start_run(run_context, "runtime-1")
-    finished = await _coordinator(workflow_database).finish_run(lease, terminal_status)
+    await _coordinator(workflow_database).finish_run(lease, terminal_status)
     before = await _coordinator(workflow_database).get_run(run_context)
     assert before is not None
 
@@ -1082,7 +1084,9 @@ async def test_revision_fences_waiting_run_without_activating_new_version(
     assert after.active_plan_version == 1
     assert lease.fencing_token == before.fencing_token + 1
     assert rows[-1]["phase"] == CheckpointPhase.PLAN_AWAITING_APPROVAL.value
-    assert rows[-1]["payload"]["plan_version"] == 2
+    payload = rows[-1]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["plan_version"] == 2
 
 
 @pytest.mark.asyncio
@@ -1116,7 +1120,9 @@ async def test_cancel_waiting_plan_writes_terminal_checkpoint(
     assert after.status is RunStatus.CANCELLED
     assert after.finished_at is not None
     assert rows[-1]["phase"] == CheckpointPhase.RUN_TERMINAL.value
-    assert rows[-1]["payload"]["terminal_status"] == RunStatus.CANCELLED.value
+    payload = rows[-1]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["terminal_status"] == RunStatus.CANCELLED.value
 
 
 def test_run_hydration_rejects_partial_plan_binding():

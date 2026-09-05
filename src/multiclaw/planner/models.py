@@ -145,7 +145,7 @@ class PlanDecisionRequest(BaseModel):
     feedback: str | None = Field(default=None, max_length=8_000)
 
     @model_validator(mode="after")
-    def validate_feedback(self) -> "PlanDecisionRequest":
+    def validate_feedback(self) -> PlanDecisionRequest:
         if self.action is PlanDecisionAction.REVISE:
             if self.feedback is None or not self.feedback.strip():
                 raise ValueError("revision feedback is required")

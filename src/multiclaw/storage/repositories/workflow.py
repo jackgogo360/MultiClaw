@@ -19,25 +19,23 @@ from multiclaw.storage.schema import (
 )
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import (
+    LEGAL_EXECUTION_TRANSITIONS,
+    LEGAL_RUN_TRANSITIONS,
+    TERMINAL_EXECUTION_STATUSES,
     ApprovalRecord,
     ApprovalStatus,
-    CheckpointPhase,
     CheckpointRecord,
     ExecutionRecord,
     ExecutionRecoveryRecord,
     ExecutionStatus,
     InvalidTransitionError,
-    LEGAL_EXECUTION_TRANSITIONS,
-    LEGAL_RUN_TRANSITIONS,
     RecoveryStrategy,
-    TERMINAL_EXECUTION_STATUSES,
     RunLease,
     RunRecord,
     RunStatus,
     VersionConflictError,
     WorkflowRuntimeCounters,
 )
-
 
 Dialect = SQLiteDialect | MySQLDialect
 ACTIVE_RUN_STATUSES = (RunStatus.RUNNING.value, RunStatus.AWAITING_USER.value, RunStatus.RESUMING.value)

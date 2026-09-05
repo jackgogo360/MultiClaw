@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 from contextlib import asynccontextmanager
+from typing import cast
 from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -16,19 +17,20 @@ from multiclaw.workflow.models import (
     AwaitingApprovalPayload,
     CheckpointPayload,
     CheckpointPhase,
+    CheckpointRecord,
     CheckpointWrite,
     ExecutionDispatchingPayload,
-    ExecutionResultObservedPayload,
     ExecutionRecord,
-    CheckpointRecord,
+    ExecutionResultObservedPayload,
     ExecutionStatus,
     InvalidTransitionError,
     LeaseConflictError,
     PlanAwaitingApprovalPayload,
+    RecoveryStrategy,
     RunLease,
     RunRecord,
+    RunStartedPayload,
     RunStatus,
-    RecoveryStrategy,
     StaleFenceError,
     TenantRunQuotaError,
     VersionConflictError,
@@ -115,6 +117,7 @@ class WorkflowCoordinator:
         plan_version: int,
         plan_digest: str,
     ) -> RunLease:
+        run_id = cast(str, context.run_id)
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             await repository._lock_tenant(context.tenant_id)
@@ -132,7 +135,7 @@ class WorkflowCoordinator:
                 lease,
                 CheckpointPhase.PLAN_AWAITING_APPROVAL,
                 PlanAwaitingApprovalPayload(
-                    run_id=context.run_id,
+                    run_id=run_id,
                     plan_id=plan_id,
                     plan_version=plan_version,
                     plan_digest=plan_digest,
@@ -196,6 +199,7 @@ class WorkflowCoordinator:
         expected_run_version: int,
         plan_digest: str,
     ) -> RunLease:
+        run_id = cast(str, context.run_id)
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             lease = await repository._fence_waiting_plan_run(
@@ -213,7 +217,7 @@ class WorkflowCoordinator:
                 lease,
                 CheckpointPhase.PLAN_AWAITING_APPROVAL,
                 PlanAwaitingApprovalPayload(
-                    run_id=context.run_id,
+                    run_id=run_id,
                     plan_id=plan_id,
                     plan_version=plan_version,
                     plan_digest=plan_digest,
@@ -233,6 +237,7 @@ class WorkflowCoordinator:
         plan_version: int,
         expected_run_version: int,
     ) -> RunLease:
+        run_id = cast(str, context.run_id)
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             lease = await repository._cancel_waiting_plan_run(
@@ -251,11 +256,11 @@ class WorkflowCoordinator:
                 lease,
                 CheckpointPhase.RUN_TERMINAL,
                 {
-                    "run_id": context.run_id,
+                    "run_id": run_id,
                     "terminal_status": RunStatus.CANCELLED.value,
                     "finished_at_ms": record.finished_at,
                     "final_digest": self._terminal_digest(
-                        context.run_id,
+                        run_id,
                         RunStatus.CANCELLED,
                         record.finished_at,
                     ),
@@ -309,6 +314,7 @@ class WorkflowCoordinator:
         }:
             raise InvalidTransitionError(f"{target.value} is not a terminal run status")
 
+        run_id = cast(str, lease.context.run_id)
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             if target is RunStatus.COMPLETED and await repository.has_nonterminal_execution(lease.context):
@@ -326,10 +332,10 @@ class WorkflowCoordinator:
                 transitioned,
                 CheckpointPhase.RUN_TERMINAL,
                 {
-                    "run_id": lease.context.run_id,
+                    "run_id": run_id,
                     "terminal_status": target.value,
                     "finished_at_ms": record.finished_at,
-                    "final_digest": self._terminal_digest(lease.context.run_id, target, record.finished_at),
+                    "final_digest": self._terminal_digest(run_id, target, record.finished_at),
                 },
                 checkpoint_seq=next_seq,
             )
@@ -492,7 +498,10 @@ class WorkflowCoordinator:
         execution_expected_status: ExecutionStatus | None = None,
         execution_expected_version: int | None = None,
     ) -> CheckpointWrite:
-        from multiclaw.workflow.recovery import encode_checkpoint_payload, validate_phase_payload
+        from multiclaw.workflow.recovery import (
+            encode_checkpoint_payload,
+            validate_phase_payload,
+        )
 
         normalized_phase, validated_payload = validate_phase_payload(phase, payload)
         resolved_approval_id, resolved_execution_id = self._validate_checkpoint_scope(
@@ -647,7 +656,7 @@ class WorkflowCoordinator:
         if active_runs >= self._settings.runtime.max_concurrent_runs_per_tenant:
             raise TenantRunQuotaError("tenant run quota exceeded")
 
-    def _scoped(self, conn) -> "WorkflowCoordinator":
+    def _scoped(self, conn) -> WorkflowCoordinator:
         scoped = copy.copy(self)
         scoped._connection = conn
         return scoped
@@ -663,11 +672,11 @@ class WorkflowCoordinator:
         execution_expected_status: ExecutionStatus | None,
         execution_expected_version: int | None,
     ) -> tuple[str | None, str | None]:
-        if payload.run_id != lease.context.run_id:
+        if cast(RunStartedPayload, payload).run_id != lease.context.run_id:
             raise InvalidTransitionError("checkpoint payload run_id does not match active run")
 
         if phase is CheckpointPhase.RUN_STARTED:
-            run_started = payload
+            run_started = cast(RunStartedPayload, payload)
             assert hasattr(run_started, "tenant_id")
             if run_started.tenant_id != lease.context.tenant_id:
                 raise InvalidTransitionError("checkpoint payload tenant_id does not match active run")
@@ -719,5 +728,5 @@ class WorkflowCoordinator:
 
     @staticmethod
     def _terminal_digest(run_id: str, target: RunStatus, finished_at_ms: int) -> str:
-        payload = f"{run_id}:{target.value}:{finished_at_ms}".encode("utf-8")
+        payload = f"{run_id}:{target.value}:{finished_at_ms}".encode()
         return hashlib.sha256(payload).hexdigest()

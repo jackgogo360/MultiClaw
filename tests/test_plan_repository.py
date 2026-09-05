@@ -2,6 +2,7 @@ import asyncio
 import os
 from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -28,11 +29,13 @@ from multiclaw.planner import (
     PlanValidationError,
     PlanVersionConflictError,
 )
-from multiclaw.planner.service import MaterializeInitialPlan, PlanningService
+from multiclaw.planner.generator import PlanGenerator
 from multiclaw.planner.models import PlanRevisionLimitError
+from multiclaw.planner.service import MaterializeInitialPlan, PlanningService
 from multiclaw.storage import Database
 from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.repositories.plans import PlanRepository
+from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.storage.schema import (
     agent_plan_decisions,
     agent_plan_step_dependencies,
@@ -46,7 +49,7 @@ from multiclaw.storage.schema import (
 )
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
-from multiclaw.workflow import RunStatus, StaleFenceError
+from multiclaw.workflow import RunStatus
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import CheckpointPhase
 
@@ -102,7 +105,7 @@ class FakePlanGenerator:
         self.next_draft = next_draft or plan_draft()
         self.calls: list[tuple[str, object | None]] = []
         self.failure: BaseException | None = None
-        self.on_generate = None
+        self.on_generate: Any = None
 
     async def generate(self, objective: str, revision=None, **_limits):
         self.calls.append((objective, revision))
@@ -286,6 +289,7 @@ async def seeded_source_message(
     async with TenantUnitOfWork(plan_database, root) as uow:
         session = await uow.sessions.create("Atomic plan")
         context = root.for_session(session.id)
+        assert uow.conn is not None
         message = await MemoryRepository(
             uow.conn,
             context,
@@ -338,7 +342,7 @@ async def seeded_waiting_plan(
     service = PlanningService(
         plan_database,
         settings=settings,
-        generator=generator,
+        generator=cast(PlanGenerator, generator),
         workflow=workflow,
     )
     context = seeded_source_message.context.for_run(
@@ -516,6 +520,7 @@ async def seeded_plan(
     async with TenantUnitOfWork(plan_database, root) as uow:
         session = await uow.sessions.create("Seeded plan")
         context = root.for_session(session.id)
+        assert uow.conn is not None
         source = await MemoryRepository(uow.conn, context, plan_database.dialect).save(
             MemoryEntry(content="Deliver the change", type="chat_message", role="user", turn_index=1)
         )
@@ -673,7 +678,7 @@ async def load_message(database: Database, message_id: str) -> MemoryEntry:
                 select(memory_entries).where(memory_entries.c.id == message_id)
             )
         ).mappings().one()
-    return MemoryEntry.from_row(row)
+    return MemoryEntry.from_row(dict(row))
 
 
 def materialize_request(source: SeededSourceMessage) -> MaterializeInitialPlan:
@@ -743,24 +748,132 @@ async def test_initial_materialization_is_one_transaction(
 
 
 @pytest.mark.asyncio
-async def test_materialization_failure_rolls_back_plan_run_checkpoint_and_reference(
+async def test_materialization_plan_create_failure_leaves_no_partial_rows(
     plan_database: Database,
     seeded_source_message: SeededSourceMessage,
     monkeypatch,
 ):
     service = PlanningService(plan_database, settings=planning_settings())
     message_count = await count_all_rows(plan_database, memory_entries)
+    original_create = PlanRepository.create
+    plan_write_reached = False
 
-    async def raising_failure(*_args, **_kwargs):
+    async def fail_after_plan_create(repository, *args, **kwargs):
+        nonlocal plan_write_reached
+        await original_create(repository, *args, **kwargs)
+        plan_write_reached = True
+        raise RuntimeError("plan create failure")
+
+    monkeypatch.setattr(PlanRepository, "create", fail_after_plan_create)
+
+    with pytest.raises(RuntimeError, match="plan create failure"):
+        await service.materialize_initial(materialize_request(seeded_source_message))
+
+    assert plan_write_reached is True
+    assert await count_all_rows(plan_database, agent_plans) == 0
+    assert await count_all_rows(plan_database, agent_plan_versions) == 0
+    assert await count_all_rows(plan_database, agent_plan_steps) == 0
+    assert await count_all_rows(plan_database, agent_plan_step_dependencies) == 0
+    assert await count_all_rows(plan_database, agent_runs) == 0
+    assert await count_all_rows(plan_database, execution_checkpoints) == 0
+    assert await count_all_rows(plan_database, memory_entries) == message_count
+
+
+@pytest.mark.asyncio
+async def test_materialization_run_creation_failure_rolls_back_plan_rows(
+    plan_database: Database,
+    seeded_source_message: SeededSourceMessage,
+    monkeypatch,
+):
+    service = PlanningService(plan_database, settings=planning_settings())
+    message_count = await count_all_rows(plan_database, memory_entries)
+    original_create_run = WorkflowRepository._create_run
+    run_write_reached = False
+
+    async def fail_after_run_create(repository, *args, **kwargs):
+        nonlocal run_write_reached
+        await original_create_run(repository, *args, **kwargs)
+        run_write_reached = True
+        raise RuntimeError("run creation failure")
+
+    monkeypatch.setattr(WorkflowRepository, "_create_run", fail_after_run_create)
+
+    with pytest.raises(RuntimeError, match="run creation failure"):
+        await service.materialize_initial(materialize_request(seeded_source_message))
+
+    assert run_write_reached is True
+    assert await count_all_rows(plan_database, agent_plans) == 0
+    assert await count_all_rows(plan_database, agent_plan_versions) == 0
+    assert await count_all_rows(plan_database, agent_plan_steps) == 0
+    assert await count_all_rows(plan_database, agent_plan_step_dependencies) == 0
+    assert await count_all_rows(plan_database, agent_runs) == 0
+    assert await count_all_rows(plan_database, execution_checkpoints) == 0
+    assert await count_all_rows(plan_database, memory_entries) == message_count
+
+
+@pytest.mark.asyncio
+async def test_materialization_checkpoint_insert_failure_rolls_back_plan_and_run(
+    plan_database: Database,
+    seeded_source_message: SeededSourceMessage,
+    monkeypatch,
+):
+    service = PlanningService(plan_database, settings=planning_settings())
+    message_count = await count_all_rows(plan_database, memory_entries)
+    original_insert_checkpoint = WorkflowRepository._insert_checkpoint
+    checkpoint_write_reached = False
+
+    async def fail_after_checkpoint_insert(repository, *args, **kwargs):
+        nonlocal checkpoint_write_reached
+        await original_insert_checkpoint(repository, *args, **kwargs)
+        checkpoint_write_reached = True
+        raise RuntimeError("approval checkpoint insertion failure")
+
+    monkeypatch.setattr(
+        WorkflowRepository,
+        "_insert_checkpoint",
+        fail_after_checkpoint_insert,
+    )
+
+    with pytest.raises(RuntimeError, match="approval checkpoint insertion failure"):
+        await service.materialize_initial(materialize_request(seeded_source_message))
+
+    assert checkpoint_write_reached is True
+    assert await count_all_rows(plan_database, agent_plans) == 0
+    assert await count_all_rows(plan_database, agent_plan_versions) == 0
+    assert await count_all_rows(plan_database, agent_plan_steps) == 0
+    assert await count_all_rows(plan_database, agent_plan_step_dependencies) == 0
+    assert await count_all_rows(plan_database, agent_runs) == 0
+    assert await count_all_rows(plan_database, execution_checkpoints) == 0
+    assert await count_all_rows(plan_database, memory_entries) == message_count
+
+
+@pytest.mark.asyncio
+async def test_materialization_reference_insert_failure_rolls_back_every_write(
+    plan_database: Database,
+    seeded_source_message: SeededSourceMessage,
+    monkeypatch,
+):
+    service = PlanningService(plan_database, settings=planning_settings())
+    message_count = await count_all_rows(plan_database, memory_entries)
+    original_persist_reference = service._persist_reference
+    reference_write_reached = False
+
+    async def fail_after_reference_insert(*args, **kwargs):
+        nonlocal reference_write_reached
+        await original_persist_reference(*args, **kwargs)
+        reference_write_reached = True
         raise RuntimeError("reference failure")
 
-    monkeypatch.setattr(service, "_persist_reference", raising_failure)
+    monkeypatch.setattr(service, "_persist_reference", fail_after_reference_insert)
 
     with pytest.raises(RuntimeError, match="reference failure"):
         await service.materialize_initial(materialize_request(seeded_source_message))
 
+    assert reference_write_reached is True
     assert await count_all_rows(plan_database, agent_plans) == 0
     assert await count_all_rows(plan_database, agent_plan_versions) == 0
+    assert await count_all_rows(plan_database, agent_plan_steps) == 0
+    assert await count_all_rows(plan_database, agent_plan_step_dependencies) == 0
     assert await count_all_rows(plan_database, agent_runs) == 0
     assert await count_all_rows(plan_database, execution_checkpoints) == 0
     assert await count_all_rows(plan_database, memory_entries) == message_count
@@ -843,16 +956,40 @@ async def test_revision_checkpoint_failure_rolls_back_decision_and_version(
     seeded_waiting_plan: SeededWaitingPlan,
     monkeypatch,
 ):
-    async def raise_stale_fence(*_args, **_kwargs):
-        raise StaleFenceError("revision checkpoint failure")
+    before_plan = await seeded_waiting_plan.load_plan()
+    before_run = await seeded_waiting_plan.load_run()
+    before_rows = await count_plan_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+    )
+    before_version = await dump_plan_version_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+        1,
+    )
+    before_checkpoints = await count_all_rows(
+        seeded_waiting_plan.database,
+        execution_checkpoints,
+    )
+    original_insert_checkpoint = WorkflowRepository._insert_checkpoint
+    checkpoint_write_reached = False
+
+    async def fail_after_checkpoint_insert(repository, *args, **kwargs):
+        nonlocal checkpoint_write_reached
+        await original_insert_checkpoint(repository, *args, **kwargs)
+        assert kwargs["phase"] == CheckpointPhase.PLAN_AWAITING_APPROVAL.value
+        checkpoint_write_reached = True
+        raise RuntimeError("revision checkpoint insertion failure")
 
     monkeypatch.setattr(
-        seeded_waiting_plan.workflow,
-        "fence_waiting_plan_run",
-        raise_stale_fence,
+        WorkflowRepository,
+        "_insert_checkpoint",
+        fail_after_checkpoint_insert,
     )
 
-    with pytest.raises(StaleFenceError, match="revision checkpoint failure"):
+    with pytest.raises(RuntimeError, match="revision checkpoint insertion failure"):
         await seeded_waiting_plan.service.decide(
             PlanDecisionRequest(
                 decision_id="revise-checkpoint-failure",
@@ -866,12 +1003,103 @@ async def test_revision_checkpoint_failure_rolls_back_decision_and_version(
             runtime_instance_id="runtime-2",
         )
 
-    plan = await seeded_waiting_plan.load_plan()
-    run = await seeded_waiting_plan.load_run()
-    assert plan.current_version == 1
-    assert plan.decisions == ()
-    assert run.status is RunStatus.AWAITING_USER
-    assert run.version == 1
+    assert checkpoint_write_reached is True
+    assert await seeded_waiting_plan.load_plan() == before_plan
+    assert await seeded_waiting_plan.load_run() == before_run
+    assert await count_plan_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+    ) == before_rows
+    assert await dump_plan_version_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+        1,
+    ) == before_version
+    assert await count_decisions(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.plan_id,
+    ) == 0
+    assert await count_all_rows(
+        seeded_waiting_plan.database,
+        execution_checkpoints,
+    ) == before_checkpoints
+
+
+@pytest.mark.asyncio
+async def test_revision_finish_failure_rolls_back_version_fence_and_checkpoint(
+    seeded_waiting_plan: SeededWaitingPlan,
+    monkeypatch,
+):
+    before_plan = await seeded_waiting_plan.load_plan()
+    before_run = await seeded_waiting_plan.load_run()
+    before_rows = await count_plan_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+    )
+    before_version = await dump_plan_version_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+        1,
+    )
+    before_checkpoints = await count_all_rows(
+        seeded_waiting_plan.database,
+        execution_checkpoints,
+    )
+    original_finish_revision = PlanRepository.finish_revision_decision
+    finish_write_reached = False
+
+    async def fail_after_finish_revision(repository, *args, **kwargs):
+        nonlocal finish_write_reached
+        await original_finish_revision(repository, *args, **kwargs)
+        finish_write_reached = True
+        raise RuntimeError("revision decision finalization failure")
+
+    monkeypatch.setattr(
+        PlanRepository,
+        "finish_revision_decision",
+        fail_after_finish_revision,
+    )
+
+    with pytest.raises(RuntimeError, match="revision decision finalization failure"):
+        await seeded_waiting_plan.service.decide(
+            PlanDecisionRequest(
+                decision_id="revise-finish-failure",
+                plan_id=seeded_waiting_plan.plan_id,
+                plan_version=1,
+                expected_version=seeded_waiting_plan.aggregate_version,
+                action=PlanDecisionAction.REVISE,
+                feedback="Finalize atomically",
+            ),
+            decided_by=seeded_waiting_plan.tenant_id,
+            runtime_instance_id="runtime-2",
+        )
+
+    assert finish_write_reached is True
+    assert await seeded_waiting_plan.load_plan() == before_plan
+    assert await seeded_waiting_plan.load_run() == before_run
+    assert await count_plan_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+    ) == before_rows
+    assert await dump_plan_version_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+        1,
+    ) == before_version
+    assert await count_decisions(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.plan_id,
+    ) == 0
+    assert await count_all_rows(
+        seeded_waiting_plan.database,
+        execution_checkpoints,
+    ) == before_checkpoints
 
 
 @pytest.mark.asyncio
@@ -881,7 +1109,7 @@ async def test_revision_quota_failure_persists_nothing(
     service = PlanningService(
         seeded_waiting_plan.database,
         settings=planning_settings(max_revisions=0),
-        generator=seeded_waiting_plan.generator,
+        generator=cast(PlanGenerator, seeded_waiting_plan.generator),
         workflow=seeded_waiting_plan.workflow,
     )
 
@@ -960,7 +1188,7 @@ async def test_revision_race_replays_winner_without_appending_again(
     winning_service = PlanningService(
         seeded_waiting_plan.database,
         settings=planning_settings(),
-        generator=FakePlanGenerator(),
+        generator=cast(PlanGenerator, FakePlanGenerator()),
         workflow=seeded_waiting_plan.workflow,
     )
 
@@ -1018,31 +1246,62 @@ async def test_mismatched_revision_decision_id_is_rejected_before_generation(
 
 
 @pytest.mark.asyncio
-async def test_approve_and_resume_are_atomic(
+async def test_plan_run_approval_rolls_back_after_run_cas_succeeds(
     seeded_waiting_plan: SeededWaitingPlan,
     monkeypatch,
 ):
-    async def raise_stale_fence(*_args, **_kwargs):
-        raise StaleFenceError("injected")
+    before_plan = await seeded_waiting_plan.load_plan()
+    before_run = await seeded_waiting_plan.load_run()
+    before_version = await dump_plan_version_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+        1,
+    )
+    before_checkpoints = await count_all_rows(
+        seeded_waiting_plan.database,
+        execution_checkpoints,
+    )
+    original_resume = WorkflowRepository._resume_waiting_plan_run
+    run_cas_reached = False
+
+    async def fail_after_run_cas(repository, *args, **kwargs):
+        nonlocal run_cas_reached
+        lease = await original_resume(repository, *args, **kwargs)
+        assert lease is not None
+        run_cas_reached = True
+        raise RuntimeError("approval post-CAS failure")
 
     monkeypatch.setattr(
-        seeded_waiting_plan.workflow,
-        "resume_waiting_plan_run",
-        raise_stale_fence,
+        WorkflowRepository,
+        "_resume_waiting_plan_run",
+        fail_after_run_cas,
     )
 
-    with pytest.raises(StaleFenceError, match="injected"):
+    with pytest.raises(RuntimeError, match="approval post-CAS failure"):
         await seeded_waiting_plan.service.decide(
             approve_waiting_request(seeded_waiting_plan, "approve-rollback"),
             decided_by=seeded_waiting_plan.tenant_id,
             runtime_instance_id="runtime-2",
         )
 
-    plan = await seeded_waiting_plan.load_plan()
-    run = await seeded_waiting_plan.load_run()
-    assert plan.status is PlanStatus.AWAITING_APPROVAL
-    assert plan.decisions == ()
-    assert run.status is RunStatus.AWAITING_USER
+    assert run_cas_reached is True
+    assert await seeded_waiting_plan.load_plan() == before_plan
+    assert await seeded_waiting_plan.load_run() == before_run
+    assert await dump_plan_version_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+        1,
+    ) == before_version
+    assert await count_decisions(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.plan_id,
+    ) == 0
+    assert await count_all_rows(
+        seeded_waiting_plan.database,
+        execution_checkpoints,
+    ) == before_checkpoints
 
 
 @pytest.mark.asyncio
@@ -1072,7 +1331,7 @@ async def test_approval_replay_never_constructs_a_second_lease(
 
 
 @pytest.mark.asyncio
-async def test_reject_and_cancel_commit_together(
+async def test_plan_run_reject_and_cancel_commit_together(
     seeded_waiting_plan: SeededWaitingPlan,
 ):
     result = await seeded_waiting_plan.service.decide(
@@ -1095,20 +1354,39 @@ async def test_reject_and_cancel_commit_together(
 
 
 @pytest.mark.asyncio
-async def test_reject_rolls_back_when_run_cancel_fails(
+async def test_plan_run_reject_checkpoint_failure_rolls_back_cancel_cas(
     seeded_waiting_plan: SeededWaitingPlan,
     monkeypatch,
 ):
-    async def raise_stale_fence(*_args, **_kwargs):
-        raise StaleFenceError("injected cancel")
+    before_plan = await seeded_waiting_plan.load_plan()
+    before_run = await seeded_waiting_plan.load_run()
+    before_version = await dump_plan_version_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+        1,
+    )
+    before_checkpoints = await count_all_rows(
+        seeded_waiting_plan.database,
+        execution_checkpoints,
+    )
+    original_insert_checkpoint = WorkflowRepository._insert_checkpoint
+    terminal_checkpoint_write_reached = False
+
+    async def fail_after_terminal_checkpoint(repository, *args, **kwargs):
+        nonlocal terminal_checkpoint_write_reached
+        await original_insert_checkpoint(repository, *args, **kwargs)
+        assert kwargs["phase"] == CheckpointPhase.RUN_TERMINAL.value
+        terminal_checkpoint_write_reached = True
+        raise RuntimeError("terminal checkpoint insertion failure")
 
     monkeypatch.setattr(
-        seeded_waiting_plan.workflow,
-        "cancel_waiting_plan_run",
-        raise_stale_fence,
+        WorkflowRepository,
+        "_insert_checkpoint",
+        fail_after_terminal_checkpoint,
     )
 
-    with pytest.raises(StaleFenceError, match="injected cancel"):
+    with pytest.raises(RuntimeError, match="terminal checkpoint insertion failure"):
         await seeded_waiting_plan.service.decide(
             PlanDecisionRequest(
                 decision_id="reject-rollback",
@@ -1122,11 +1400,23 @@ async def test_reject_rolls_back_when_run_cancel_fails(
             runtime_instance_id="runtime-2",
         )
 
-    plan = await seeded_waiting_plan.load_plan()
-    run = await seeded_waiting_plan.load_run()
-    assert plan.status is PlanStatus.AWAITING_APPROVAL
-    assert plan.decisions == ()
-    assert run.status is RunStatus.AWAITING_USER
+    assert terminal_checkpoint_write_reached is True
+    assert await seeded_waiting_plan.load_plan() == before_plan
+    assert await seeded_waiting_plan.load_run() == before_run
+    assert await dump_plan_version_rows(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.context,
+        seeded_waiting_plan.plan_id,
+        1,
+    ) == before_version
+    assert await count_decisions(
+        seeded_waiting_plan.database,
+        seeded_waiting_plan.plan_id,
+    ) == 0
+    assert await count_all_rows(
+        seeded_waiting_plan.database,
+        execution_checkpoints,
+    ) == before_checkpoints
 
 
 @pytest.mark.asyncio

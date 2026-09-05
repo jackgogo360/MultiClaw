@@ -97,7 +97,7 @@ class RunStartedPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_cursor(self) -> "RunStartedPayload":
+    def validate_cursor(self) -> RunStartedPayload:
         if self.cursor != self.model_cursor:
             raise ValueError("cursor must match model_cursor")
         return self
@@ -113,7 +113,7 @@ class PlanAwaitingApprovalPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_cursor(self) -> "PlanAwaitingApprovalPayload":
+    def validate_cursor(self) -> PlanAwaitingApprovalPayload:
         if self.cursor != self.decision_cursor:
             raise ValueError("cursor must match decision_cursor")
         return self
@@ -128,7 +128,7 @@ class ModelOutputPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_cursor(self) -> "ModelOutputPayload":
+    def validate_cursor(self) -> ModelOutputPayload:
         if self.cursor != self.model_cursor:
             raise ValueError("cursor must match model_cursor")
         return self
@@ -144,7 +144,7 @@ class AwaitingApprovalPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_cursor(self) -> "AwaitingApprovalPayload":
+    def validate_cursor(self) -> AwaitingApprovalPayload:
         if self.cursor != self.resume_cursor:
             raise ValueError("cursor must match resume_cursor")
         return self
@@ -163,7 +163,7 @@ class ExecutionDispatchingPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_dispatch(self) -> "ExecutionDispatchingPayload":
+    def validate_dispatch(self) -> ExecutionDispatchingPayload:
         if self.cursor != self.dispatch_cursor:
             raise ValueError("cursor must match dispatch_cursor")
         if self.recovery_strategy is RecoveryStrategy.IDEMPOTENT_RETRY and not self.idempotency_key:
@@ -183,7 +183,7 @@ class ExecutionResultObservedPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_cursor(self) -> "ExecutionResultObservedPayload":
+    def validate_cursor(self) -> ExecutionResultObservedPayload:
         if self.cursor != self.resume_cursor:
             raise ValueError("cursor must match resume_cursor")
         return self
@@ -198,7 +198,7 @@ class RunTerminalPayload(CheckpointPayload):
     cursor: None = None
 
     @model_validator(mode="after")
-    def validate_terminal_status(self) -> "RunTerminalPayload":
+    def validate_terminal_status(self) -> RunTerminalPayload:
         if self.terminal_status not in TERMINAL_RUN_STATUSES:
             raise ValueError("terminal_status must be terminal")
         return self
