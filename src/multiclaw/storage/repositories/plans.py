@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -101,7 +101,7 @@ class PlanRepository:
         )
         savepoint = await self._conn.begin_nested()
         try:
-            now = self._dialect.db_now_ms()
+            now = await self._db_now_ms()
             await self._conn.execute(
                 insert(agent_plans).values(
                     id=plan_id,
@@ -123,6 +123,7 @@ class PlanRepository:
                 parent_version=None,
                 revision_feedback=None,
                 supersedes={},
+                created_at=now,
             )
             created = await self.get(plan_id)
             if created is None:
@@ -175,6 +176,7 @@ class PlanRepository:
 
         savepoint = await self._conn.begin_nested()
         try:
+            now = await self._db_now_ms()
             await self._insert_version(
                 plan_id=plan_id,
                 plan_version=next_version,
@@ -182,6 +184,7 @@ class PlanRepository:
                 parent_version=parent_version,
                 revision_feedback=revision_feedback,
                 supersedes=supersedes,
+                created_at=now,
             )
             updated = await self._conn.execute(
                 update(agent_plans)
@@ -194,7 +197,7 @@ class PlanRepository:
                     status=PlanStatus.AWAITING_APPROVAL.value,
                     current_version=next_version,
                     version=expected_version + 1,
-                    updated_at=self._dialect.db_now_ms(),
+                    updated_at=now,
                 )
             )
             if int(updated.rowcount or 0) != 1:
@@ -216,12 +219,11 @@ class PlanRepository:
         decided_by: str,
     ) -> PlanDecisionMutationResult:
         self._require_session()
-        if request.action is PlanDecisionAction.REVISE:
-            raise ValueError("revision decisions require begin_revision_decision")
-
         existing = await self._get_decision(request.plan_id, request.decision_id)
         if existing is not None:
             return await self._decision_replay(request, decided_by, existing)
+        if request.action is PlanDecisionAction.REVISE:
+            raise ValueError("revision decisions require begin_revision_decision")
 
         latest = await self._lock_plan(request.plan_id)
         existing = await self._get_decision(
@@ -235,10 +237,12 @@ class PlanRepository:
 
         savepoint = await self._conn.begin_nested()
         try:
+            now = await self._db_now_ms()
             await self._insert_decision(
                 request,
                 decided_by=decided_by,
                 resulting_plan_version=None,
+                created_at=now,
             )
             updated = await self._conn.execute(
                 update(agent_plans)
@@ -260,22 +264,17 @@ class PlanRepository:
                         else agent_plans.c.approved_version
                     ),
                     version=agent_plans.c.version + 1,
-                    updated_at=self._dialect.db_now_ms(),
+                    updated_at=now,
                 )
             )
-            if int(updated.rowcount or 0) != 1:
-                conflict_snapshot = await self.get(request.plan_id)
-                if conflict_snapshot is None:
-                    raise PlanNotFoundError("Plan not found")
-                raise PlanVersionConflictError(conflict_snapshot)
-
-            result = await self._decision_result(
-                request.plan_id,
-                request.decision_id,
-                idempotent_replay=False,
-            )
-            await savepoint.commit()
-            return result
+            if int(updated.rowcount or 0) == 1:
+                result = await self._decision_result(
+                    request.plan_id,
+                    request.decision_id,
+                    idempotent_replay=False,
+                )
+                await savepoint.commit()
+                return result
         except IntegrityError as primary:
             await self._rollback_savepoint(savepoint, primary)
             if not self._is_decision_id_duplicate(primary):
@@ -291,6 +290,14 @@ class PlanRepository:
         except BaseException as primary:
             await self._rollback_savepoint(savepoint, primary)
             raise
+
+        cas_error = RuntimeError("Plan decision compare-and-swap failed")
+        if not await self._rollback_savepoint(savepoint, cas_error):
+            raise cas_error
+        conflict_snapshot = await self.get(request.plan_id)
+        if conflict_snapshot is None:
+            raise PlanNotFoundError("Plan not found")
+        raise PlanVersionConflictError(conflict_snapshot)
 
     async def begin_revision_decision(
         self,
@@ -320,10 +327,12 @@ class PlanRepository:
 
         savepoint = await self._conn.begin_nested()
         try:
+            now = await self._db_now_ms()
             await self._insert_decision(
                 request,
                 decided_by=decided_by,
                 resulting_plan_version=None,
+                created_at=now,
             )
             decision = await self._get_decision(request.plan_id, request.decision_id)
             if decision is None:
@@ -531,6 +540,7 @@ class PlanRepository:
         *,
         decided_by: str,
         resulting_plan_version: int | None,
+        created_at: int,
     ) -> None:
         await self._conn.execute(
             insert(agent_plan_decisions).values(
@@ -543,7 +553,7 @@ class PlanRepository:
                 feedback=request.feedback,
                 decided_by=decided_by,
                 resulting_plan_version=resulting_plan_version,
-                created_at=self._dialect.db_now_ms(),
+                created_at=created_at,
             )
         )
 
@@ -601,10 +611,85 @@ class PlanRepository:
         )
         if decision is None:
             raise RuntimeError("Plan decision missing from snapshot")
+        snapshot = self._snapshot_at_decision(snapshot, decision)
         return PlanDecisionMutationResult(
             snapshot=snapshot,
             decision=decision,
             idempotent_replay=idempotent_replay,
+        )
+
+    @staticmethod
+    def _snapshot_at_decision(
+        snapshot: PlanSnapshot,
+        decision: PlanDecisionRecord,
+    ) -> PlanSnapshot:
+        if decision.action is PlanDecisionAction.REVISE:
+            if decision.resulting_plan_version is None:
+                raise ValueError("revision decisions require begin_revision_decision")
+            current_version = decision.resulting_plan_version
+            status = PlanStatus.AWAITING_APPROVAL
+        else:
+            current_version = decision.plan_version
+            status = (
+                PlanStatus.APPROVED
+                if decision.action is PlanDecisionAction.APPROVE
+                else PlanStatus.REJECTED
+            )
+
+        versions = tuple(
+            version
+            for version in snapshot.versions
+            if version.plan_version <= current_version
+        )
+        current = next(
+            (
+                version
+                for version in versions
+                if version.plan_version == current_version
+            ),
+            None,
+        )
+        if current is None:
+            raise ValueError("Plan decision references missing version data")
+
+        decisions = tuple(
+            candidate
+            for candidate in snapshot.decisions
+            if candidate.expected_plan_cas_version
+            <= decision.expected_plan_cas_version
+        )
+        approvals = tuple(
+            candidate
+            for candidate in decisions
+            if candidate.action is PlanDecisionAction.APPROVE
+        )
+        approved_version = (
+            None
+            if not approvals
+            else max(
+                approvals,
+                key=lambda candidate: (
+                    candidate.expected_plan_cas_version,
+                    candidate.created_at,
+                    candidate.decision_id,
+                ),
+            ).plan_version
+        )
+
+        return replace(
+            snapshot,
+            status=status,
+            current_version=current_version,
+            approved_version=approved_version,
+            aggregate_version=decision.expected_plan_cas_version + 1,
+            updated_at=(
+                current.created_at
+                if decision.action is PlanDecisionAction.REVISE
+                else decision.created_at
+            ),
+            current=current,
+            versions=versions,
+            decisions=decisions,
         )
 
     @staticmethod
@@ -767,6 +852,7 @@ class PlanRepository:
         parent_version: int | None,
         revision_feedback: str | None,
         supersedes: Mapping[str, str],
+        created_at: int,
     ) -> None:
         self._require_session()
         scope = self._scope_values()
@@ -786,7 +872,7 @@ class PlanRepository:
                 revision_feedback=revision_feedback,
                 schema_version=1,
                 content_digest=plan_content_digest(validated),
-                created_at=self._dialect.db_now_ms(),
+                created_at=created_at,
             )
         )
 
@@ -862,13 +948,19 @@ class PlanRepository:
     async def _rollback_savepoint(
         savepoint: AsyncTransaction,
         primary: BaseException,
-    ) -> None:
+    ) -> bool:
         if not savepoint.is_active:
-            return
+            return True
         try:
             await savepoint.rollback()
         except BaseException as error:  # noqa: BLE001 - cleanup must not replace the primary
             _note_cleanup_error(primary, "savepoint rollback", error)
+            return False
+        return True
+
+    async def _db_now_ms(self) -> int:
+        result = await self._conn.execute(select(self._dialect.db_now_ms()))
+        return int(result.scalar_one())
 
     def _scope_values(self) -> dict[str, str]:
         return {

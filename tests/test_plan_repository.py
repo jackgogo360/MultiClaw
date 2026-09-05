@@ -477,17 +477,133 @@ async def test_same_decision_id_returns_original_result(plan_database, seeded_pl
         repo = uow.plans.for_context(seeded_plan.context)
         first = await repo.record_decision(request, decided_by=seeded_plan.tenant_id)
     async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        persisted_first = await uow.plans.for_context(seeded_plan.context).get(
+            seeded_plan.plan_id
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        latest_before_replay = await uow.plans.for_context(
+            seeded_plan.context
+        ).append_version(
+            plan_id=seeded_plan.plan_id,
+            expected_version=first.snapshot.aggregate_version,
+            draft=plan_draft("A later immutable version"),
+            parent_version=first.snapshot.current_version,
+            revision_feedback="This happened after the approval response",
+            supersedes=seeded_plan.step_ids,
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
         second = await uow.plans.for_context(seeded_plan.context).record_decision(
             request,
             decided_by=seeded_plan.tenant_id,
         )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        latest_after_replay = await uow.plans.for_context(seeded_plan.context).get(
+            seeded_plan.plan_id
+        )
 
     assert first.idempotent_replay is False
+    assert first.snapshot == persisted_first
     assert second.idempotent_replay is True
     assert second.snapshot == first.snapshot
     assert second.decision == first.decision
     assert second.snapshot.status is PlanStatus.APPROVED
+    assert latest_after_replay == latest_before_replay
     assert await count_decisions(plan_database, seeded_plan.plan_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_rejected_decision_replay_preserves_prior_approval(
+    plan_database,
+    seeded_plan,
+    monkeypatch,
+):
+    monkeypatch.setattr(plan_database.dialect, "db_now_ms", lambda: 1)
+    approval = approve_request(seeded_plan, "z-decision-approved-v1")
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        approved = await uow.plans.for_context(seeded_plan.context).record_decision(
+            approval,
+            decided_by=seeded_plan.tenant_id,
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        awaiting_rejection = await uow.plans.for_context(
+            seeded_plan.context
+        ).append_version(
+            plan_id=seeded_plan.plan_id,
+            expected_version=approved.snapshot.aggregate_version,
+            draft=plan_draft("A version that will be rejected"),
+            parent_version=approved.snapshot.current_version,
+            revision_feedback="Review a second version",
+            supersedes=seeded_plan.step_ids,
+        )
+
+    request = PlanDecisionRequest(
+        decision_id="y-decision-rejected-v2",
+        plan_id=seeded_plan.plan_id,
+        plan_version=awaiting_rejection.current_version,
+        expected_version=awaiting_rejection.aggregate_version,
+        action=PlanDecisionAction.REJECT,
+        feedback=None,
+    )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        first = await uow.plans.for_context(seeded_plan.context).record_decision(
+            request,
+            decided_by=seeded_plan.tenant_id,
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        persisted_first = await uow.plans.for_context(seeded_plan.context).get(
+            seeded_plan.plan_id
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        awaiting_later_approval = await uow.plans.for_context(
+            seeded_plan.context
+        ).append_version(
+            plan_id=seeded_plan.plan_id,
+            expected_version=first.snapshot.aggregate_version,
+            draft=plan_draft("A version after the rejection"),
+            parent_version=first.snapshot.current_version,
+            revision_feedback="Continue after rejection",
+            supersedes={
+                step.logical_step_key: step.step_id
+                for step in first.snapshot.current.steps
+            },
+        )
+    later_approval = PlanDecisionRequest(
+        decision_id="a-decision-approved-v3",
+        plan_id=seeded_plan.plan_id,
+        plan_version=awaiting_later_approval.current_version,
+        expected_version=awaiting_later_approval.aggregate_version,
+        action=PlanDecisionAction.APPROVE,
+        feedback=None,
+    )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        latest_before_replay = await uow.plans.for_context(
+            seeded_plan.context
+        ).record_decision(
+            later_approval,
+            decided_by=seeded_plan.tenant_id,
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        replay = await uow.plans.for_context(seeded_plan.context).record_decision(
+            request,
+            decided_by=seeded_plan.tenant_id,
+        )
+
+    assert replay.idempotent_replay is True
+    assert first.snapshot == persisted_first
+    assert replay.snapshot == first.snapshot
+    assert replay.snapshot.status is PlanStatus.REJECTED
+    assert replay.snapshot.current_version == 2
+    assert replay.snapshot.approved_version == 1
+    assert [version.plan_version for version in replay.snapshot.versions] == [1, 2]
+    assert {decision.decision_id for decision in replay.snapshot.decisions} == {
+        approval.decision_id,
+        request.decision_id,
+    }
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        latest_after_replay = await uow.plans.for_context(seeded_plan.context).get(
+            seeded_plan.plan_id
+        )
+    assert latest_after_replay == latest_before_replay.snapshot
 
 
 @pytest.mark.asyncio
@@ -526,7 +642,7 @@ async def test_reused_decision_id_with_different_input_is_rejected(
 @pytest.mark.asyncio
 async def test_decision_losing_late_cas_rolls_back_insert(plan_database, seeded_plan):
     request = approve_request(seeded_plan, "decision-late-cas")
-    with pytest.raises(PlanVersionConflictError):
+    with pytest.raises(PlanVersionConflictError) as raised:
         async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
             repository = PlanRepository(
                 LateCasFailureConnection(uow.conn),  # type: ignore[arg-type]
@@ -545,6 +661,8 @@ async def test_decision_losing_late_cas_rolls_back_insert(plan_database, seeded_
             seeded_plan.plan_id
         )
     assert snapshot is not None
+    assert raised.value.latest == snapshot
+    assert raised.value.latest.decisions == ()
     assert snapshot.status is PlanStatus.AWAITING_APPROVAL
     assert snapshot.aggregate_version == seeded_plan.aggregate_version
 
@@ -702,6 +820,121 @@ async def test_revision_records_result_and_preserves_parent_rows(plan_database, 
     )
     assert snapshot.current_version == 2
     assert decision.resulting_plan_version == 2
+
+
+@pytest.mark.asyncio
+async def test_completed_revision_decision_replays_original_snapshot(
+    plan_database,
+    seeded_plan,
+    monkeypatch,
+):
+    monkeypatch.setattr(plan_database.dialect, "db_now_ms", lambda: 1)
+    approval = approve_request(seeded_plan, "z-decision-approved-before-revision")
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        approved = await uow.plans.for_context(seeded_plan.context).record_decision(
+            approval,
+            decided_by=seeded_plan.tenant_id,
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        awaiting_revision = await uow.plans.for_context(
+            seeded_plan.context
+        ).append_version(
+            plan_id=seeded_plan.plan_id,
+            expected_version=approved.snapshot.aggregate_version,
+            draft=plan_draft("Version two needs revision"),
+            parent_version=approved.snapshot.current_version,
+            revision_feedback="Prepare version two",
+            supersedes=seeded_plan.step_ids,
+        )
+
+    request = PlanDecisionRequest(
+        decision_id="y-decision-revise-v2",
+        plan_id=seeded_plan.plan_id,
+        plan_version=awaiting_revision.current_version,
+        expected_version=awaiting_revision.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="Produce version three",
+    )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        repository = uow.plans.for_context(seeded_plan.context)
+        await repository.begin_revision_decision(
+            request,
+            decided_by=seeded_plan.tenant_id,
+        )
+        revised = await repository.append_version(
+            plan_id=seeded_plan.plan_id,
+            expected_version=request.expected_version,
+            draft=plan_draft("Revised version three"),
+            parent_version=request.plan_version,
+            revision_feedback=request.feedback,
+            supersedes={
+                step.logical_step_key: step.step_id
+                for step in awaiting_revision.current.steps
+            },
+        )
+        await repository.finish_revision_decision(
+            plan_id=seeded_plan.plan_id,
+            decision_id=request.decision_id,
+            resulting_plan_version=revised.current_version,
+        )
+        first = await repository.record_decision(
+            request,
+            decided_by=seeded_plan.tenant_id,
+        )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        persisted_first = await uow.plans.for_context(seeded_plan.context).get(
+            seeded_plan.plan_id
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        awaiting_later_approval = await uow.plans.for_context(
+            seeded_plan.context
+        ).append_version(
+            plan_id=seeded_plan.plan_id,
+            expected_version=first.snapshot.aggregate_version,
+            draft=plan_draft("Version four after the completed revision"),
+            parent_version=first.snapshot.current_version,
+            revision_feedback="Continue after version three",
+            supersedes={
+                step.logical_step_key: step.step_id
+                for step in first.snapshot.current.steps
+            },
+        )
+    later_approval = PlanDecisionRequest(
+        decision_id="a-decision-approved-v4",
+        plan_id=seeded_plan.plan_id,
+        plan_version=awaiting_later_approval.current_version,
+        expected_version=awaiting_later_approval.aggregate_version,
+        action=PlanDecisionAction.APPROVE,
+        feedback=None,
+    )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        latest_before_replay = await uow.plans.for_context(
+            seeded_plan.context
+        ).record_decision(
+            later_approval,
+            decided_by=seeded_plan.tenant_id,
+        )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        replay = await uow.plans.for_context(seeded_plan.context).record_decision(
+            request,
+            decided_by=seeded_plan.tenant_id,
+        )
+
+    assert replay.idempotent_replay is True
+    assert first.snapshot == persisted_first
+    assert replay.snapshot == first.snapshot
+    assert replay.snapshot.status is PlanStatus.AWAITING_APPROVAL
+    assert replay.snapshot.current_version == 3
+    assert replay.snapshot.approved_version == 1
+    assert replay.snapshot.aggregate_version == request.expected_version + 1
+    assert [version.plan_version for version in replay.snapshot.versions] == [1, 2, 3]
+    assert replay.decision.resulting_plan_version == 3
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        latest_after_replay = await uow.plans.for_context(seeded_plan.context).get(
+            seeded_plan.plan_id
+        )
+    assert latest_after_replay == latest_before_replay.snapshot
 
 
 @pytest.mark.asyncio
