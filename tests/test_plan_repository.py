@@ -24,6 +24,7 @@ from multiclaw.storage.schema import (
     agent_plan_step_runs,
     agent_plan_steps,
     agent_plan_versions,
+    agent_plans,
     agent_runs,
 )
 from multiclaw.storage.uow import TenantUnitOfWork
@@ -333,6 +334,42 @@ async def test_append_version_never_updates_old_rows(plan_database, seeded_plan)
     assert snapshot.current_version == 2
     assert snapshot.current.parent_version == 1
     assert snapshot.current.steps[1].supersedes_step_id == seeded_plan.step_ids["verify"]
+
+
+@pytest.mark.asyncio
+async def test_append_version_preserves_last_approved_version(plan_database, seeded_plan):
+    approved_aggregate_version = seeded_plan.aggregate_version + 1
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        await uow.conn.execute(
+            update(agent_plans)
+            .where(
+                agent_plans.c.tenant_id == seeded_plan.context.tenant_id,
+                agent_plans.c.workspace_id == seeded_plan.context.workspace_id,
+                agent_plans.c.session_id == seeded_plan.context.session_id,
+                agent_plans.c.id == seeded_plan.plan_id,
+            )
+            .values(
+                status=PlanStatus.APPROVED.value,
+                approved_version=1,
+                version=approved_aggregate_version,
+            )
+        )
+
+        snapshot = await uow.plans.for_context(seeded_plan.context).append_version(
+            plan_id=seeded_plan.plan_id,
+            expected_version=approved_aggregate_version,
+            draft=plan_draft("Revise the approved plan"),
+            parent_version=1,
+            revision_feedback="Add a revision",
+            supersedes={
+                "inspect": seeded_plan.step_ids["inspect"],
+                "verify": seeded_plan.step_ids["verify"],
+            },
+        )
+
+    assert snapshot.status is PlanStatus.AWAITING_APPROVAL
+    assert snapshot.current_version == 2
+    assert snapshot.approved_version == 1
 
 
 @pytest.mark.asyncio

@@ -171,7 +171,6 @@ class PlanRepository:
                 .values(
                     status=PlanStatus.AWAITING_APPROVAL.value,
                     current_version=next_version,
-                    approved_version=None,
                     version=expected_version + 1,
                     updated_at=self._dialect.db_now_ms(),
                 )
