@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -8,14 +9,19 @@ from uuid import uuid4
 
 from sqlalchemy import and_, func, insert, select, update
 from sqlalchemy.engine import RowMapping
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncTransaction
 
 from multiclaw.config.settings import PlanningSettings
 from multiclaw.planner.models import (
     PlanDecisionAction,
+    PlanDecisionIdempotencyError,
+    PlanDecisionMutationResult,
     PlanDecisionRecord,
+    PlanDecisionRequest,
     PlanDraft,
     PlanDraftStep,
+    PlanNotFoundError,
     PlanSnapshot,
     PlanStatus,
     PlanStepRecord,
@@ -23,6 +29,7 @@ from multiclaw.planner.models import (
     PlanStepRunStatus,
     PlanSummary,
     PlanTriggerMode,
+    PlanVersionConflictError,
     PlanVersionRecord,
     ValidatedPlanDraft,
 )
@@ -202,6 +209,203 @@ class PlanRepository:
             raise RuntimeError("Plan missing after revision")
         return revised
 
+    async def record_decision(
+        self,
+        request: PlanDecisionRequest,
+        *,
+        decided_by: str,
+    ) -> PlanDecisionMutationResult:
+        self._require_session()
+        if request.action is PlanDecisionAction.REVISE:
+            raise ValueError("revision decisions require begin_revision_decision")
+
+        existing = await self._get_decision(request.plan_id, request.decision_id)
+        if existing is not None:
+            return await self._decision_replay(request, decided_by, existing)
+
+        latest = await self._lock_plan(request.plan_id)
+        existing = await self._get_decision(
+            request.plan_id,
+            request.decision_id,
+            for_update=True,
+        )
+        if existing is not None:
+            return await self._decision_replay(request, decided_by, existing)
+        self._require_current_decision_target(request, latest)
+
+        savepoint = await self._conn.begin_nested()
+        try:
+            await self._insert_decision(
+                request,
+                decided_by=decided_by,
+                resulting_plan_version=None,
+            )
+            updated = await self._conn.execute(
+                update(agent_plans)
+                .where(
+                    self._plan_predicate(request.plan_id),
+                    agent_plans.c.status == PlanStatus.AWAITING_APPROVAL.value,
+                    agent_plans.c.current_version == request.plan_version,
+                    agent_plans.c.version == request.expected_version,
+                )
+                .values(
+                    status=(
+                        PlanStatus.APPROVED
+                        if request.action is PlanDecisionAction.APPROVE
+                        else PlanStatus.REJECTED
+                    ).value,
+                    approved_version=(
+                        request.plan_version
+                        if request.action is PlanDecisionAction.APPROVE
+                        else agent_plans.c.approved_version
+                    ),
+                    version=agent_plans.c.version + 1,
+                    updated_at=self._dialect.db_now_ms(),
+                )
+            )
+            if int(updated.rowcount or 0) != 1:
+                conflict_snapshot = await self.get(request.plan_id)
+                if conflict_snapshot is None:
+                    raise PlanNotFoundError("Plan not found")
+                raise PlanVersionConflictError(conflict_snapshot)
+
+            result = await self._decision_result(
+                request.plan_id,
+                request.decision_id,
+                idempotent_replay=False,
+            )
+            await savepoint.commit()
+            return result
+        except IntegrityError as primary:
+            await self._rollback_savepoint(savepoint, primary)
+            if not self._is_decision_id_duplicate(primary):
+                raise
+            existing = await self._get_decision(
+                request.plan_id,
+                request.decision_id,
+                for_update=True,
+            )
+            if existing is None:
+                raise
+            return await self._decision_replay(request, decided_by, existing)
+        except BaseException as primary:
+            await self._rollback_savepoint(savepoint, primary)
+            raise
+
+    async def begin_revision_decision(
+        self,
+        request: PlanDecisionRequest,
+        *,
+        decided_by: str,
+    ) -> PlanDecisionRecord:
+        self._require_session()
+        if request.action is not PlanDecisionAction.REVISE:
+            raise ValueError("begin_revision_decision requires a revise action")
+
+        existing = await self._get_decision(request.plan_id, request.decision_id)
+        if existing is not None:
+            self._require_identical_decision(request, decided_by, existing)
+            return existing
+
+        latest = await self._lock_plan(request.plan_id)
+        existing = await self._get_decision(
+            request.plan_id,
+            request.decision_id,
+            for_update=True,
+        )
+        if existing is not None:
+            self._require_identical_decision(request, decided_by, existing)
+            return existing
+        self._require_current_decision_target(request, latest)
+
+        savepoint = await self._conn.begin_nested()
+        try:
+            await self._insert_decision(
+                request,
+                decided_by=decided_by,
+                resulting_plan_version=None,
+            )
+            decision = await self._get_decision(request.plan_id, request.decision_id)
+            if decision is None:
+                raise RuntimeError("Plan decision missing after insert")
+            await savepoint.commit()
+            return decision
+        except IntegrityError as primary:
+            await self._rollback_savepoint(savepoint, primary)
+            if not self._is_decision_id_duplicate(primary):
+                raise
+            existing = await self._get_decision(
+                request.plan_id,
+                request.decision_id,
+                for_update=True,
+            )
+            if existing is None:
+                raise
+            self._require_identical_decision(request, decided_by, existing)
+            return existing
+        except BaseException as primary:
+            await self._rollback_savepoint(savepoint, primary)
+            raise
+
+    async def finish_revision_decision(
+        self,
+        *,
+        plan_id: str,
+        decision_id: str,
+        resulting_plan_version: int,
+    ) -> PlanDecisionRecord:
+        self._require_session()
+        if resulting_plan_version < 1:
+            raise ValueError("resulting_plan_version must be positive")
+
+        existing = await self._get_decision(plan_id, decision_id, for_update=True)
+        if existing is None:
+            raise PlanNotFoundError("Plan decision not found")
+        if existing.action is not PlanDecisionAction.REVISE:
+            raise PlanDecisionIdempotencyError(
+                "Plan decision is not a revision decision"
+            )
+        if existing.resulting_plan_version is not None:
+            if existing.resulting_plan_version != resulting_plan_version:
+                raise PlanDecisionIdempotencyError(
+                    "Plan decision already has a different resulting version"
+                )
+            return existing
+
+        latest = await self.get(plan_id)
+        if latest is None:
+            raise PlanNotFoundError("Plan not found")
+        if (
+            resulting_plan_version != existing.plan_version + 1
+            or latest.current_version != resulting_plan_version
+        ):
+            raise PlanVersionConflictError(latest)
+
+        updated = await self._conn.execute(
+            update(agent_plan_decisions)
+            .where(
+                self._decision_scope_predicate(plan_id),
+                agent_plan_decisions.c.decision_id == decision_id,
+                agent_plan_decisions.c.action == PlanDecisionAction.REVISE.value,
+                agent_plan_decisions.c.resulting_plan_version.is_(None),
+            )
+            .values(resulting_plan_version=resulting_plan_version)
+        )
+        if int(updated.rowcount or 0) != 1:
+            existing = await self._get_decision(plan_id, decision_id, for_update=True)
+            if existing is None:
+                raise PlanNotFoundError("Plan decision not found")
+            if existing.resulting_plan_version != resulting_plan_version:
+                raise PlanDecisionIdempotencyError(
+                    "Plan decision already has a different resulting version"
+                )
+            return existing
+
+        finished = await self._get_decision(plan_id, decision_id)
+        if finished is None:
+            raise RuntimeError("Plan decision missing after finalization")
+        return finished
+
     async def get(self, plan_id: str) -> PlanSnapshot | None:
         self._require_session()
         plan_result = await self._conn.execute(
@@ -295,6 +499,159 @@ class PlanRepository:
             versions=versions,
             decisions=tuple(self._hydrate_decision(row) for row in decision_rows),
         )
+
+    async def _lock_plan(self, plan_id: str) -> PlanSnapshot:
+        result = await self._conn.execute(
+            select(agent_plans.c.id)
+            .where(self._plan_predicate(plan_id))
+            .with_for_update()
+        )
+        if result.scalar_one_or_none() is None:
+            raise PlanNotFoundError("Plan not found")
+        latest = await self.get(plan_id)
+        if latest is None:
+            raise PlanNotFoundError("Plan not found")
+        return latest
+
+    @staticmethod
+    def _require_current_decision_target(
+        request: PlanDecisionRequest,
+        latest: PlanSnapshot,
+    ) -> None:
+        if (
+            latest.status is not PlanStatus.AWAITING_APPROVAL
+            or latest.current_version != request.plan_version
+            or latest.aggregate_version != request.expected_version
+        ):
+            raise PlanVersionConflictError(latest)
+
+    async def _insert_decision(
+        self,
+        request: PlanDecisionRequest,
+        *,
+        decided_by: str,
+        resulting_plan_version: int | None,
+    ) -> None:
+        await self._conn.execute(
+            insert(agent_plan_decisions).values(
+                **self._scope_values(),
+                plan_id=request.plan_id,
+                decision_id=request.decision_id,
+                plan_version=request.plan_version,
+                expected_plan_cas_version=request.expected_version,
+                action=request.action.value,
+                feedback=request.feedback,
+                decided_by=decided_by,
+                resulting_plan_version=resulting_plan_version,
+                created_at=self._dialect.db_now_ms(),
+            )
+        )
+
+    async def _get_decision(
+        self,
+        plan_id: str,
+        decision_id: str,
+        *,
+        for_update: bool = False,
+    ) -> PlanDecisionRecord | None:
+        statement = (
+            select(agent_plan_decisions)
+            .where(
+                self._decision_scope_predicate(plan_id),
+                agent_plan_decisions.c.decision_id == decision_id,
+            )
+            .limit(1)
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self._conn.execute(statement)
+        row = result.mappings().first()
+        return None if row is None else self._hydrate_decision(row)
+
+    async def _decision_replay(
+        self,
+        request: PlanDecisionRequest,
+        decided_by: str,
+        existing: PlanDecisionRecord,
+    ) -> PlanDecisionMutationResult:
+        self._require_identical_decision(request, decided_by, existing)
+        return await self._decision_result(
+            request.plan_id,
+            request.decision_id,
+            idempotent_replay=True,
+        )
+
+    async def _decision_result(
+        self,
+        plan_id: str,
+        decision_id: str,
+        *,
+        idempotent_replay: bool,
+    ) -> PlanDecisionMutationResult:
+        snapshot = await self.get(plan_id)
+        if snapshot is None:
+            raise PlanNotFoundError("Plan not found")
+        decision = next(
+            (
+                candidate
+                for candidate in snapshot.decisions
+                if candidate.decision_id == decision_id
+            ),
+            None,
+        )
+        if decision is None:
+            raise RuntimeError("Plan decision missing from snapshot")
+        return PlanDecisionMutationResult(
+            snapshot=snapshot,
+            decision=decision,
+            idempotent_replay=idempotent_replay,
+        )
+
+    @staticmethod
+    def _require_identical_decision(
+        request: PlanDecisionRequest,
+        decided_by: str,
+        existing: PlanDecisionRecord,
+    ) -> None:
+        if (
+            existing.plan_version != request.plan_version
+            or existing.expected_plan_cas_version != request.expected_version
+            or existing.action is not request.action
+            or existing.feedback != request.feedback
+            or existing.decided_by != decided_by
+        ):
+            raise PlanDecisionIdempotencyError(
+                "decision_id was already used with different input"
+            )
+
+    def _is_decision_id_duplicate(self, error: IntegrityError) -> bool:
+        original = error.orig
+        if self._dialect.name == "sqlite":
+            duplicate_codes = {
+                sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
+                sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+            }
+            if getattr(original, "sqlite_errorcode", None) not in duplicate_codes:
+                return False
+            message = str(original)
+            return all(
+                f"agent_plan_decisions.{column}" in message
+                for column in (
+                    "tenant_id",
+                    "workspace_id",
+                    "session_id",
+                    "plan_id",
+                    "decision_id",
+                )
+            )
+        arguments = getattr(original, "args", ())
+        if not arguments or arguments[0] != 1062:
+            return False
+        message = str(arguments[1] if len(arguments) > 1 else original).lower()
+        if "duplicate entry" not in message or "for key" not in message:
+            return False
+        key_name = message.rsplit("for key", 1)[1].strip().strip("'`")
+        return key_name in {"primary", "agent_plan_decisions.primary"}
 
     async def list_for_session(self) -> list[PlanSummary]:
         session_id = self._require_session()

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import RunStatus
@@ -129,6 +129,47 @@ class PlanSnapshot:
     current: PlanVersionRecord
     versions: tuple[PlanVersionRecord, ...]
     decisions: tuple[PlanDecisionRecord, ...]
+
+
+class PlanDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: str = Field(min_length=1, max_length=128)
+    plan_id: str = Field(min_length=36, max_length=36)
+    plan_version: int = Field(ge=1)
+    expected_version: int = Field(ge=1)
+    action: PlanDecisionAction
+    feedback: str | None = Field(default=None, max_length=8_000)
+
+    @model_validator(mode="after")
+    def validate_feedback(self) -> "PlanDecisionRequest":
+        if self.action is PlanDecisionAction.REVISE:
+            if self.feedback is None or not self.feedback.strip():
+                raise ValueError("revision feedback is required")
+        elif self.feedback is not None:
+            raise ValueError("feedback is valid only for revise")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class PlanDecisionMutationResult:
+    snapshot: PlanSnapshot
+    decision: PlanDecisionRecord
+    idempotent_replay: bool
+
+
+class PlanNotFoundError(RuntimeError):
+    pass
+
+
+class PlanDecisionIdempotencyError(RuntimeError):
+    pass
+
+
+class PlanVersionConflictError(RuntimeError):
+    def __init__(self, latest: PlanSnapshot):
+        super().__init__("Plan version conflict")
+        self.latest = latest
 
 
 @dataclass(frozen=True, slots=True)
