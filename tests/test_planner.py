@@ -1718,6 +1718,16 @@ def test_completed_step_context_rejects_invalid_values(
         )
 
 
+def test_planning_schema_templates_are_not_publicly_mutable() -> None:
+    from multiclaw.planner import generator as generator_module
+    from multiclaw.planner import policy as policy_module
+
+    assert not hasattr(policy_module, "CLASSIFY_SCHEMA")
+    assert "CLASSIFY_SCHEMA" not in policy_module.__all__
+    assert not hasattr(generator_module, "SUBMIT_PLAN_SCHEMA")
+    assert "SUBMIT_PLAN_SCHEMA" not in generator_module.__all__
+
+
 @pytest.mark.asyncio
 async def test_planning_schemas_are_fresh_for_each_completion() -> None:
     class MutatingRouter(StubRouter):

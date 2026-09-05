@@ -1,5 +1,3 @@
-from copy import deepcopy
-
 from pydantic import BaseModel, ValidationError
 
 from multiclaw.llm import CompletionRouter, LLMProviderError, LLMResponseParseError
@@ -34,11 +32,12 @@ def function_schema(
     }
 
 
-CLASSIFY_SCHEMA = function_schema(
-    "classify_planning_request",
-    "Choose whether this request needs a multi-step plan.",
-    PlanningDecision,
-)
+def _classify_schema() -> dict[str, object]:
+    return function_schema(
+        "classify_planning_request",
+        "Choose whether this request needs a multi-step plan.",
+        PlanningDecision,
+    )
 
 
 class PlanningPolicy:
@@ -93,7 +92,7 @@ class PlanningPolicy:
                     },
                     {"role": "user", "content": safe_request},
                 ],
-                tools=[deepcopy(CLASSIFY_SCHEMA)],
+                tools=[_classify_schema()],
             )
             tool_calls = getattr(response, "tool_calls", None)
             if not isinstance(tool_calls, list) or len(tool_calls) != 1:
@@ -121,7 +120,6 @@ class PlanningPolicy:
 
 
 __all__ = [
-    "CLASSIFY_SCHEMA",
     "PlanningPolicy",
     "PlanningUnavailableError",
     "function_schema",

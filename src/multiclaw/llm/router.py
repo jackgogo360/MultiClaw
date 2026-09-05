@@ -160,10 +160,21 @@ class ModelRouter:
 
             response_invalid = False
             try:
-                parsed = adapter.parse_response(response.json())
-            except (json.JSONDecodeError, KeyError, IndexError, ValidationError):
+                raw_response = response.json()
+                adapter.validate_response_payload(raw_response)
+            except (json.JSONDecodeError, ValidationError):
                 response_invalid = True
             if response_invalid:
+                raise LLMResponseParseError("invalid LLM response")
+
+            adapter_response_invalid = False
+            try:
+                parsed = adapter.parse_response(
+                    cast(dict[str, object], raw_response)
+                )
+            except (json.JSONDecodeError, ValidationError):
+                adapter_response_invalid = True
+            if adapter_response_invalid:
                 raise LLMResponseParseError("invalid LLM response")
 
             logger.info(

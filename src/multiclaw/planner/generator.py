@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from copy import deepcopy
 from typing import Any
 
 from pydantic import ValidationError
@@ -35,11 +34,12 @@ class _StructuredResponseError(PlanValidationError):
         self.location = location
 
 
-SUBMIT_PLAN_SCHEMA = function_schema(
-    "submit_plan",
-    "Submit a bounded dependency-aware plan for validation.",
-    PlanDraft,
-)
+def _submit_plan_schema() -> dict[str, object]:
+    return function_schema(
+        "submit_plan",
+        "Submit a bounded dependency-aware plan for validation.",
+        PlanDraft,
+    )
 
 
 async def _request_plan(
@@ -51,7 +51,7 @@ async def _request_plan(
     return await router.completion(
         model=model,
         messages=messages,
-        tools=[deepcopy(SUBMIT_PLAN_SCHEMA)],
+        tools=[_submit_plan_schema()],
     )
 
 
@@ -238,7 +238,6 @@ class PlanGenerator:
 
 
 __all__ = [
-    "SUBMIT_PLAN_SCHEMA",
     "PlanGenerationError",
     "PlanGenerator",
 ]
