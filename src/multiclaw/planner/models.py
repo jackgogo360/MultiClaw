@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -204,6 +206,39 @@ ConstraintText = Annotated[str, Field(min_length=1, max_length=1_000)]
 EvidenceText = Annotated[str, Field(min_length=1, max_length=2_000)]
 
 
+class PlanStepResultDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    plan_id: str = Field(min_length=36, max_length=36, pattern=PLAN_ID)
+    plan_version: int = Field(ge=1, strict=True)
+    run_id: str = Field(min_length=36, max_length=36, pattern=PLAN_ID)
+    step_id: str = Field(min_length=36, max_length=36, pattern=PLAN_ID)
+    step_run_id: str = Field(min_length=36, max_length=36, pattern=PLAN_ID)
+    attempt: int = Field(ge=1, le=20, strict=True)
+    status: Literal["succeeded", "failed"]
+    summary: str = Field(min_length=1, max_length=4_000)
+    evidence: list[EvidenceText] = Field(default_factory=list, max_length=20)
+    definition_digest: str = Field(pattern=RESULT_DIGEST)
+    dependency_result_digests: dict[
+        str,
+        Annotated[str, Field(pattern=RESULT_DIGEST)],
+    ] = Field(default_factory=dict, max_length=20)
+    tool_catalog_digest: str = Field(pattern=RESULT_DIGEST)
+    policy_digest: str = Field(pattern=RESULT_DIGEST)
+    skill_set_digest: str = Field(pattern=RESULT_DIGEST)
+
+    def digest(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
 class PlanDraftStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -267,6 +302,18 @@ class MaterializeInitialPlan:
 
 
 class PlanRevisionLimitError(RuntimeError):
+    pass
+
+
+class PlanExecutionBlocked(RuntimeError):
+    pass
+
+
+class PlanStepAlreadyRunningError(PlanExecutionBlocked):
+    pass
+
+
+class PlanAttemptLimitError(PlanExecutionBlocked):
     pass
 
 
