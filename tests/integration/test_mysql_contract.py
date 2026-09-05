@@ -1,15 +1,16 @@
 import asyncio
-from pathlib import Path
 import os
 import sys
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from alembic import command
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import exc as sa_exc, inspect, text
+from sqlalchemy import exc as sa_exc
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 
+from alembic import command
 from multiclaw.cli import alembic_config, check_revision_is_head
 from multiclaw.config.settings import DatabaseSettings
 from multiclaw.storage import Database
@@ -18,6 +19,15 @@ from multiclaw.tenancy import TenantContext
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from database_fixtures import _ORIGINAL_TEST_MYSQL_URL
+
+PLAN_TABLES = {
+    "agent_plans",
+    "agent_plan_versions",
+    "agent_plan_steps",
+    "agent_plan_step_dependencies",
+    "agent_plan_step_runs",
+    "agent_plan_decisions",
+}
 
 
 def _parse_mysql_version(version: str) -> tuple[int, int, int]:
@@ -98,6 +108,9 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
             checkpoint_foreign_keys = await conn.run_sync(
                 lambda sync_conn: inspect(sync_conn).get_foreign_keys("execution_checkpoints")
             )
+            agent_run_columns = await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_columns("agent_runs")
+            )
             engines = await conn.execute(
                 text(
                     """
@@ -117,6 +130,16 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
                         (table_name = 'tool_executions' AND column_name = 'input_payload_json')
                         OR (table_name = 'execution_checkpoints' AND column_name = 'payload_json')
                         OR (table_name = 'user_secrets' AND column_name = 'nonce')
+                        OR (table_name = 'agent_plan_versions' AND column_name IN (
+                            'objective', 'constraints_json', 'generation_reason', 'revision_feedback'
+                        ))
+                        OR (table_name = 'agent_plan_steps' AND column_name IN (
+                            'description', 'expected_outcome'
+                        ))
+                        OR (table_name = 'agent_plan_decisions' AND column_name = 'feedback')
+                        OR (table_name = 'agent_plan_step_runs' AND column_name IN (
+                            'result_summary', 'error_detail_redacted'
+                        ))
                     )
                     """
                 )
@@ -124,15 +147,18 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
             check_constraints = await conn.execute(
                 text(
                     """
-                    SELECT constraint_name
-                    FROM information_schema.table_constraints
-                    WHERE table_schema = DATABASE()
-                    AND constraint_type = 'CHECK'
+                    SELECT tc.constraint_name, cc.check_clause
+                    FROM information_schema.table_constraints AS tc
+                    JOIN information_schema.check_constraints AS cc
+                      ON cc.constraint_schema = tc.constraint_schema
+                     AND cc.constraint_name = tc.constraint_name
+                    WHERE tc.table_schema = DATABASE()
+                    AND tc.constraint_type = 'CHECK'
                     """
                 )
             )
 
-        assert revision == "20260815_0001"
+        assert revision == "20260905_0002"
         assert table_names - {"alembic_version"} == {
             "agent_runs",
             "approval_requests",
@@ -146,8 +172,15 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
             "users",
             "verification_codes",
             "workspaces",
-        }
+        } | PLAN_TABLES
         assert "alembic_version" in table_names
+        assert PLAN_TABLES <= table_names
+        assert {column["name"] for column in agent_run_columns} >= {
+            "plan_id",
+            "initial_plan_version",
+            "active_plan_version",
+            "cancel_requested_at",
+        }
         assert {row[1].lower() for row in engines.fetchall()} == {"innodb"}
         reflected_column_types = {
             (row[0], row[1]): row[2].lower()
@@ -156,6 +189,20 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
         assert reflected_column_types[("tool_executions", "input_payload_json")] == "mediumtext"
         assert reflected_column_types[("execution_checkpoints", "payload_json")] == "mediumtext"
         assert reflected_column_types[("user_secrets", "nonce")] in {"binary(12)", "varbinary(12)"}
+        assert {
+            reflected_column_types[(table_name, column_name)]
+            for table_name, column_name in {
+                ("agent_plan_versions", "objective"),
+                ("agent_plan_versions", "constraints_json"),
+                ("agent_plan_versions", "generation_reason"),
+                ("agent_plan_versions", "revision_feedback"),
+                ("agent_plan_steps", "description"),
+                ("agent_plan_steps", "expected_outcome"),
+                ("agent_plan_decisions", "feedback"),
+                ("agent_plan_step_runs", "result_summary"),
+                ("agent_plan_step_runs", "error_detail_redacted"),
+            }
+        } == {"mediumtext"}
         assert any(
             fk["constrained_columns"] == ["id", "default_workspace_id"]
             and fk["referred_table"] == "workspaces"
@@ -172,14 +219,29 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
             and fk["referred_table"] == "tool_executions"
             for fk in checkpoint_foreign_keys
         )
-        assert {
-            row[0] for row in check_constraints.fetchall()
-        } >= {
+        reflected_checks = dict(check_constraints.fetchall())
+        assert set(reflected_checks) >= {
             "ck_users_users_status_valid",
             "ck_tool_executions_tool_executions_status_valid",
             "ck_tool_executions_tool_executions_recovery_strategy_valid",
             "ck_user_secrets_user_secrets_algorithm_fixed",
+            "ck_agent_plans_status_valid",
+            "ck_agent_plan_decisions_action_valid",
+            "ck_agent_plan_step_runs_status_valid",
         }
+        for status in ("awaiting_approval", "approved", "rejected", "archived"):
+            assert f"'{status}'" in reflected_checks["ck_agent_plans_status_valid"]
+        for action in ("approve", "reject", "revise"):
+            assert f"'{action}'" in reflected_checks["ck_agent_plan_decisions_action_valid"]
+        for status in (
+            "pending",
+            "running",
+            "succeeded",
+            "failed_retryable",
+            "failed_terminal",
+            "cancelled",
+        ):
+            assert f"'{status}'" in reflected_checks["ck_agent_plan_step_runs_status_valid"]
 
         async with database.write_transaction() as conn:
             await conn.execute(
