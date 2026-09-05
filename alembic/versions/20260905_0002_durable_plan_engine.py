@@ -7,6 +7,8 @@ Create Date: 2026-09-05 00:02:00.000000
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql
 
@@ -18,7 +20,7 @@ branch_labels = None
 depends_on = None
 
 
-def _table_kwargs() -> dict[str, str]:
+def _table_kwargs() -> dict[str, Any]:
     if op.get_context().dialect.name == "mysql":
         return {
             "mysql_engine": "InnoDB",
@@ -32,38 +34,82 @@ def _payload_type():
 
 
 def _set_sqlite_foreign_keys(*, enabled: bool) -> None:
-    if op.get_context().dialect.name != "sqlite":
+    state = "ON" if enabled else "OFF"
+    op.get_bind().exec_driver_sql(f"PRAGMA foreign_keys={state}")
+
+
+def _sqlite_foreign_keys_enabled() -> bool:
+    return bool(op.get_bind().exec_driver_sql("PRAGMA foreign_keys").scalar_one())
+
+
+def _recover_sqlite_batch_table(table_name: str) -> None:
+    temporary_name = f"_alembic_tmp_{table_name}"
+    connection = op.get_bind()
+    table_names = set(sa.inspect(connection).get_table_names())
+    original_exists = table_name in table_names
+    temporary_exists = temporary_name in table_names
+
+    if not temporary_exists:
+        return
+    if not original_exists:
+        op.rename_table(temporary_name, table_name)
         return
 
-    state = "ON" if enabled else "OFF"
-    with op.get_context().autocommit_block():
-        op.get_bind().exec_driver_sql(f"PRAGMA foreign_keys={state}")
+    preparer = connection.dialect.identifier_preparer
+    original_count = connection.exec_driver_sql(
+        f"SELECT count(*) FROM {preparer.quote(table_name)}"
+    ).scalar_one()
+    temporary_count = connection.exec_driver_sql(
+        f"SELECT count(*) FROM {preparer.quote(temporary_name)}"
+    ).scalar_one()
+    if temporary_count > original_count:
+        op.drop_table(table_name)
+        op.rename_table(temporary_name, table_name)
+    else:
+        op.drop_table(temporary_name)
+
+
+def _recover_sqlite_batch_tables() -> None:
+    _recover_sqlite_batch_table("memory_entries")
+    _recover_sqlite_batch_table("agent_runs")
 
 
 def _add_memory_session_unique() -> None:
     constraint_name = "uq_memory_entries_tenant_id_workspace_id_session_id_id"
+    unique_columns = ["tenant_id", "workspace_id", "session_id", "id"]
+    if not op.get_context().as_sql:
+        existing_uniques = sa.inspect(op.get_bind()).get_unique_constraints("memory_entries")
+        if any(unique["column_names"] == unique_columns for unique in existing_uniques):
+            return
+
     if op.get_context().dialect.name == "sqlite":
         with op.batch_alter_table("memory_entries", recreate="always") as batch_op:
             batch_op.create_unique_constraint(
                 constraint_name,
-                ["tenant_id", "workspace_id", "session_id", "id"],
+                unique_columns,
             )
         return
 
     op.create_unique_constraint(
         constraint_name,
         "memory_entries",
-        ["tenant_id", "workspace_id", "session_id", "id"],
+        unique_columns,
     )
 
 
 def _add_agent_run_plan_binding() -> None:
-    recreate = "always" if op.get_context().dialect.name == "sqlite" else "auto"
+    recreate: Literal["always", "auto"] = (
+        "always" if op.get_context().dialect.name == "sqlite" else "auto"
+    )
     with op.batch_alter_table("agent_runs", recreate=recreate) as batch_op:
         batch_op.add_column(sa.Column("plan_id", sa.CHAR(length=36), nullable=True))
         batch_op.add_column(sa.Column("initial_plan_version", sa.Integer(), nullable=True))
         batch_op.add_column(sa.Column("active_plan_version", sa.Integer(), nullable=True))
         batch_op.add_column(sa.Column("cancel_requested_at", sa.BigInteger(), nullable=True))
+        batch_op.create_unique_constraint(
+            "uq_agent_runs_scope_plan_run",
+            ["tenant_id", "workspace_id", "session_id", "plan_id", "run_id"],
+        )
         batch_op.create_check_constraint(
             op.f("ck_agent_runs_plan_binding_complete"),
             (
@@ -121,16 +167,7 @@ def _create_indexes() -> None:
         ["tenant_id", "workspace_id", "session_id", "plan_id", "created_at"],
         unique=False,
     )
-    op.create_index(
-        "ix_agent_plan_step_runs_scope_run_step_attempt",
-        "agent_plan_step_runs",
-        ["tenant_id", "workspace_id", "session_id", "run_id", "step_id", "attempt"],
-        unique=False,
-    )
-
-
-def upgrade() -> None:
-    _set_sqlite_foreign_keys(enabled=False)
+def _upgrade_schema() -> None:
     _add_memory_session_unique()
 
     op.create_table(
@@ -420,7 +457,7 @@ def upgrade() -> None:
         sa.Column("workspace_id", sa.CHAR(length=36), nullable=False),
         sa.Column("session_id", sa.CHAR(length=36), nullable=False),
         sa.Column("plan_id", sa.CHAR(length=36), nullable=False),
-        sa.Column("decision_id", sa.CHAR(length=36), nullable=False),
+        sa.Column("decision_id", sa.String(length=128), nullable=False),
         sa.Column("plan_version", sa.Integer(), nullable=False),
         sa.Column("expected_plan_cas_version", sa.BigInteger(), nullable=False),
         sa.Column("action", sa.String(length=16), nullable=False),
@@ -439,6 +476,10 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "action IN ('approve', 'reject', 'revise')",
             name=sa.schema.conv("ck_agent_plan_decisions_action_valid"),
+        ),
+        sa.CheckConstraint(
+            "length(decision_id) BETWEEN 1 AND 128",
+            name=sa.schema.conv("ck_agent_plan_decisions_decision_id_length"),
         ),
         sa.ForeignKeyConstraint(
             ["tenant_id", "workspace_id", "session_id", "plan_id", "plan_version"],
@@ -498,7 +539,7 @@ def upgrade() -> None:
         sa.Column("attempt", sa.Integer(), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("result_summary", _payload_type(), nullable=True),
-        sa.Column("result_ref", sa.CHAR(length=36), nullable=True),
+        sa.Column("result_ref", sa.String(length=128), nullable=True),
         sa.Column("result_digest", sa.CHAR(length=64), nullable=True),
         sa.Column("error_code", sa.String(length=64), nullable=True),
         sa.Column("error_detail_redacted", _payload_type(), nullable=True),
@@ -551,26 +592,15 @@ def upgrade() -> None:
             onupdate="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
-            ["tenant_id", "workspace_id", "session_id", "run_id"],
+            ["tenant_id", "workspace_id", "session_id", "plan_id", "run_id"],
             [
                 "agent_runs.tenant_id",
                 "agent_runs.workspace_id",
                 "agent_runs.session_id",
+                "agent_runs.plan_id",
                 "agent_runs.run_id",
             ],
             name="fk_agent_plan_step_runs_run_agent_runs",
-            ondelete="RESTRICT",
-            onupdate="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(
-            ["tenant_id", "workspace_id", "session_id", "result_ref"],
-            [
-                "memory_entries.tenant_id",
-                "memory_entries.workspace_id",
-                "memory_entries.session_id",
-                "memory_entries.id",
-            ],
-            name="fk_agent_plan_step_runs_result_memory_entries",
             ondelete="RESTRICT",
             onupdate="RESTRICT",
         ),
@@ -627,7 +657,24 @@ def upgrade() -> None:
     )
 
     _create_indexes()
-    _set_sqlite_foreign_keys(enabled=True)
+
+
+def upgrade() -> None:
+    if op.get_context().dialect.name != "sqlite":
+        _upgrade_schema()
+        return
+
+    original_foreign_keys = _sqlite_foreign_keys_enabled()
+    with op.get_context().autocommit_block():
+        _set_sqlite_foreign_keys(enabled=False)
+        try:
+            _recover_sqlite_batch_tables()
+            _upgrade_schema()
+        except BaseException:
+            _recover_sqlite_batch_tables()
+            raise
+        finally:
+            _set_sqlite_foreign_keys(enabled=original_foreign_keys)
 
 
 def downgrade() -> None:

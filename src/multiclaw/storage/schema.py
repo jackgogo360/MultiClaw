@@ -402,7 +402,7 @@ agent_plan_decisions = Table(
     Column("workspace_id", UUID_CHAR, primary_key=True),
     Column("session_id", UUID_CHAR, primary_key=True),
     Column("plan_id", UUID_CHAR, primary_key=True),
-    Column("decision_id", UUID_CHAR, primary_key=True),
+    Column("decision_id", String(128), primary_key=True),
     Column("plan_version", Integer, nullable=False),
     Column("expected_plan_cas_version", BIGINT, nullable=False),
     Column("action", String(16), nullable=False),
@@ -421,6 +421,10 @@ agent_plan_decisions = Table(
     CheckConstraint(
         "action IN ('approve', 'reject', 'revise')",
         name=conv("ck_agent_plan_decisions_action_valid"),
+    ),
+    CheckConstraint(
+        "length(decision_id) BETWEEN 1 AND 128",
+        name=conv("ck_agent_plan_decisions_decision_id_length"),
     ),
     ForeignKeyConstraint(
         ["tenant_id", "workspace_id", "session_id", "plan_id", "plan_version"],
@@ -481,6 +485,14 @@ agent_runs = Table(
     Column("finished_at", BIGINT, nullable=True),
     UniqueConstraint("tenant_id", "run_id"),
     UniqueConstraint("tenant_id", "workspace_id", "session_id", "run_id"),
+    UniqueConstraint(
+        "tenant_id",
+        "workspace_id",
+        "session_id",
+        "plan_id",
+        "run_id",
+        name="uq_agent_runs_scope_plan_run",
+    ),
     CheckConstraint(
         (
             "run_status IN ("
@@ -559,7 +571,7 @@ agent_plan_step_runs = Table(
     Column("attempt", Integer, nullable=False),
     Column("status", String(32), nullable=False),
     Column("result_summary", PAYLOAD_TEXT, nullable=True),
-    Column("result_ref", UUID_CHAR, nullable=True),
+    Column("result_ref", String(128), nullable=True),
     Column("result_digest", CHAR(64), nullable=True),
     Column("error_code", String(64), nullable=True),
     Column("error_detail_redacted", PAYLOAD_TEXT, nullable=True),
@@ -630,26 +642,15 @@ agent_plan_step_runs = Table(
         onupdate="RESTRICT",
     ),
     ForeignKeyConstraint(
-        ["tenant_id", "workspace_id", "session_id", "run_id"],
+        ["tenant_id", "workspace_id", "session_id", "plan_id", "run_id"],
         [
             "agent_runs.tenant_id",
             "agent_runs.workspace_id",
             "agent_runs.session_id",
+            "agent_runs.plan_id",
             "agent_runs.run_id",
         ],
         name="fk_agent_plan_step_runs_run_agent_runs",
-        ondelete="RESTRICT",
-        onupdate="RESTRICT",
-    ),
-    ForeignKeyConstraint(
-        ["tenant_id", "workspace_id", "session_id", "result_ref"],
-        [
-            "memory_entries.tenant_id",
-            "memory_entries.workspace_id",
-            "memory_entries.session_id",
-            "memory_entries.id",
-        ],
-        name="fk_agent_plan_step_runs_result_memory_entries",
         ondelete="RESTRICT",
         onupdate="RESTRICT",
     ),
@@ -1008,15 +1009,6 @@ Index(
     agent_plan_decisions.c.created_at,
 )
 Index("ix_agent_runs_tenant_id_workspace_id_session_id", agent_runs.c.tenant_id, agent_runs.c.workspace_id, agent_runs.c.session_id)
-Index(
-    "ix_agent_plan_step_runs_scope_run_step_attempt",
-    agent_plan_step_runs.c.tenant_id,
-    agent_plan_step_runs.c.workspace_id,
-    agent_plan_step_runs.c.session_id,
-    agent_plan_step_runs.c.run_id,
-    agent_plan_step_runs.c.step_id,
-    agent_plan_step_runs.c.attempt,
-)
 Index(
     "ix_approval_requests_tenant_id_workspace_id_session_id_run_id",
     approval_requests.c.tenant_id,

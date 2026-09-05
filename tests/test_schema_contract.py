@@ -103,7 +103,7 @@ EXPECTED_STRING_LENGTHS = {
     ("agent_plan_decisions", "workspace_id"): 36,
     ("agent_plan_decisions", "session_id"): 36,
     ("agent_plan_decisions", "plan_id"): 36,
-    ("agent_plan_decisions", "decision_id"): 36,
+    ("agent_plan_decisions", "decision_id"): 128,
     ("agent_plan_decisions", "action"): 16,
     ("agent_plan_decisions", "decided_by"): 36,
     ("agent_runs", "tenant_id"): 36,
@@ -121,7 +121,7 @@ EXPECTED_STRING_LENGTHS = {
     ("agent_plan_step_runs", "step_run_id"): 36,
     ("agent_plan_step_runs", "run_id"): 36,
     ("agent_plan_step_runs", "status"): 32,
-    ("agent_plan_step_runs", "result_ref"): 36,
+    ("agent_plan_step_runs", "result_ref"): 128,
     ("agent_plan_step_runs", "result_digest"): 64,
     ("agent_plan_step_runs", "error_code"): 64,
     ("agent_plan_step_runs", "reused_from_step_run_id"): 36,
@@ -454,6 +454,121 @@ async def insert_cross_version_dependency(
     )
 
 
+async def insert_plan_step_run(
+    conn: AsyncConnection,
+    primary: Mapping[str, object],
+    *,
+    run_id: str,
+    step_run_id: str,
+    result_ref: str | None = None,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            INSERT INTO agent_plan_step_runs (
+                tenant_id, workspace_id, session_id, plan_id, plan_version,
+                step_id, step_run_id, run_id, attempt, status, result_ref,
+                version, started_at
+            ) VALUES (
+                :tenant_id, :workspace_id, :session_id, :plan_id, 2,
+                :version_two_step_id, :step_run_id, :run_id, 1, 'pending',
+                :result_ref, 1, 10
+            )
+            """
+        ),
+        {
+            **primary,
+            "run_id": run_id,
+            "step_run_id": step_run_id,
+            "result_ref": result_ref,
+        },
+    )
+
+
+async def seed_mismatched_plan_runs(
+    conn: AsyncConnection,
+    primary: Mapping[str, object],
+) -> tuple[str, str]:
+    legacy_run_id = "00000000-0000-0000-0000-000000000603"
+    foreign_plan_id = "00000000-0000-0000-0000-000000000402"
+    foreign_run_id = "00000000-0000-0000-0000-000000000604"
+    await conn.execute(
+        text(
+            """
+            INSERT INTO agent_plans (
+                id, tenant_id, workspace_id, session_id, source_message_id,
+                trigger_mode, status, current_version, approved_version,
+                version, created_at, updated_at
+            ) VALUES (
+                :foreign_plan_id, :tenant_id, :workspace_id, :session_id,
+                :source_message_id, 'explicit', 'approved', 1, 1, 1, 2, 2
+            )
+            """
+        ),
+        {**primary, "foreign_plan_id": foreign_plan_id},
+    )
+    await conn.execute(
+        text(
+            """
+            INSERT INTO agent_plan_versions (
+                tenant_id, workspace_id, session_id, plan_id, plan_version,
+                objective, constraints_json, generation_reason, parent_version,
+                revision_feedback, schema_version, content_digest, created_at
+            ) VALUES (
+                :tenant_id, :workspace_id, :session_id, :foreign_plan_id, 1,
+                'Foreign', '{}', 'test', NULL, NULL, 1, :digest, 2
+            )
+            """
+        ),
+        {**primary, "foreign_plan_id": foreign_plan_id, "digest": "e" * 64},
+    )
+    await conn.execute(
+        text(
+            """
+            INSERT INTO agent_runs (
+                run_id, tenant_id, workspace_id, session_id, plan_id,
+                initial_plan_version, active_plan_version, run_status,
+                fencing_token, schema_version, version, created_at, updated_at
+            ) VALUES
+                (:legacy_run_id, :tenant_id, :workspace_id, :session_id, NULL,
+                 NULL, NULL, 'running', 0, 1, 1, 2, 2),
+                (:foreign_run_id, :tenant_id, :workspace_id, :session_id,
+                 :foreign_plan_id, 1, 1, 'running', 0, 1, 1, 2, 2)
+            """
+        ),
+        {
+            **primary,
+            "legacy_run_id": legacy_run_id,
+            "foreign_plan_id": foreign_plan_id,
+            "foreign_run_id": foreign_run_id,
+        },
+    )
+    return legacy_run_id, foreign_run_id
+
+
+async def insert_plan_decision(
+    conn: AsyncConnection,
+    primary: Mapping[str, object],
+    *,
+    decision_id: str,
+) -> None:
+    await conn.execute(
+        text(
+            """
+            INSERT INTO agent_plan_decisions (
+                tenant_id, workspace_id, session_id, plan_id, decision_id,
+                plan_version, expected_plan_cas_version, action, feedback,
+                decided_by, resulting_plan_version, created_at
+            ) VALUES (
+                :tenant_id, :workspace_id, :session_id, :plan_id, :decision_id,
+                2, 1, 'approve', NULL, :tenant_id, NULL, 3
+            )
+            """
+        ),
+        {**primary, "decision_id": decision_id},
+    )
+
+
 async def assert_migrated_check_rejects(
     conn: AsyncConnection,
     *,
@@ -535,6 +650,22 @@ def test_core_metadata_matches_schema_contract():
     ) == 2
 
     assert any(
+        constraint.name == "uq_agent_runs_scope_plan_run"
+        and list(constraint.columns.keys())
+        == ["tenant_id", "workspace_id", "session_id", "plan_id", "run_id"]
+        for constraint in metadata.tables["agent_runs"].constraints
+    )
+    assert any(
+        fk.column_keys == ["tenant_id", "workspace_id", "session_id", "plan_id", "run_id"]
+        and fk.referred_table.name == "agent_runs"
+        for fk in metadata.tables["agent_plan_step_runs"].foreign_key_constraints
+    )
+    assert not any(
+        "result_ref" in fk.column_keys
+        for fk in metadata.tables["agent_plan_step_runs"].foreign_key_constraints
+    )
+
+    assert any(
         fk.column_keys == ["id", "default_workspace_id"]
         and [element.column.name for element in fk.elements] == ["tenant_id", "id"]
         for fk in metadata.tables["users"].foreign_key_constraints
@@ -558,6 +689,7 @@ def test_core_metadata_matches_schema_contract():
         "ck_agent_plan_decisions_plan_version_positive",
         "ck_agent_plan_decisions_expected_cas_positive",
         "ck_agent_plan_decisions_action_valid",
+        "ck_agent_plan_decisions_decision_id_length",
         "ck_agent_runs_agent_runs_run_status_valid",
         "ck_agent_runs_plan_binding_complete",
         "ck_agent_plan_step_runs_status_valid",
@@ -590,6 +722,63 @@ async def test_plan_schema_rejects_cross_session_step_and_dependency(database, s
             await insert_cross_session_plan_step(conn, primary, foreign)
         with pytest.raises(IntegrityError):
             await insert_cross_version_dependency(conn, primary)
+
+
+@pytest.mark.parametrize("run_kind", ("legacy", "different-plan"))
+@pytest.mark.asyncio
+async def test_step_run_rejects_run_not_bound_to_same_plan(
+    database,
+    seeded_scopes,
+    run_kind,
+):
+    primary, _foreign = seeded_scopes
+    async with database.write_transaction() as conn:
+        legacy_run_id, foreign_run_id = await seed_mismatched_plan_runs(conn, primary)
+        run_id = legacy_run_id if run_kind == "legacy" else foreign_run_id
+        with pytest.raises(IntegrityError):
+            await insert_plan_step_run(
+                conn,
+                primary,
+                run_id=run_id,
+                step_run_id=f"step-run-{run_kind}",
+            )
+
+
+@pytest.mark.asyncio
+async def test_step_run_accepts_run_bound_to_same_plan(database, seeded_scopes):
+    primary, _foreign = seeded_scopes
+    async with database.write_transaction() as conn:
+        await insert_plan_step_run(
+            conn,
+            primary,
+            run_id=str(primary["run_id"]),
+            step_run_id="step-run-same-plan",
+        )
+
+
+@pytest.mark.asyncio
+async def test_step_run_accepts_typed_memory_result_ref(database, seeded_scopes):
+    primary, _foreign = seeded_scopes
+    async with database.write_transaction() as conn:
+        await insert_plan_step_run(
+            conn,
+            primary,
+            run_id=str(primary["run_id"]),
+            step_run_id="step-run-typed-result",
+            result_ref=f"memory:{primary['source_message_id']}",
+        )
+
+
+@pytest.mark.asyncio
+async def test_migrated_sqlite_enforces_decision_id_length(database, seeded_scopes):
+    primary, _foreign = seeded_scopes
+    async with database.write_transaction() as conn:
+        await insert_plan_decision(conn, primary, decision_id="d")
+        await insert_plan_decision(conn, primary, decision_id="e" * 128)
+        with pytest.raises(IntegrityError) as raised:
+            await insert_plan_decision(conn, primary, decision_id="f" * 129)
+
+    assert "ck_agent_plan_decisions_decision_id_length" in str(raised.value.orig)
 
 
 @pytest.mark.asyncio

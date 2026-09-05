@@ -111,6 +111,12 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
             agent_run_columns = await conn.run_sync(
                 lambda sync_conn: inspect(sync_conn).get_columns("agent_runs")
             )
+            agent_run_uniques = await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_unique_constraints("agent_runs")
+            )
+            step_run_foreign_keys = await conn.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_foreign_keys("agent_plan_step_runs")
+            )
             engines = await conn.execute(
                 text(
                     """
@@ -137,8 +143,9 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
                             'description', 'expected_outcome'
                         ))
                         OR (table_name = 'agent_plan_decisions' AND column_name = 'feedback')
+                        OR (table_name = 'agent_plan_decisions' AND column_name = 'decision_id')
                         OR (table_name = 'agent_plan_step_runs' AND column_name IN (
-                            'result_summary', 'error_detail_redacted'
+                            'result_summary', 'result_ref', 'error_detail_redacted'
                         ))
                     )
                     """
@@ -181,6 +188,20 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
             "active_plan_version",
             "cancel_requested_at",
         }
+        assert any(
+            unique["name"] == "uq_agent_runs_scope_plan_run"
+            and unique["column_names"]
+            == ["tenant_id", "workspace_id", "session_id", "plan_id", "run_id"]
+            for unique in agent_run_uniques
+        )
+        assert any(
+            foreign_key["constrained_columns"]
+            == ["tenant_id", "workspace_id", "session_id", "plan_id", "run_id"]
+            and foreign_key["referred_table"] == "agent_runs"
+            and foreign_key["referred_columns"]
+            == ["tenant_id", "workspace_id", "session_id", "plan_id", "run_id"]
+            for foreign_key in step_run_foreign_keys
+        )
         assert {row[1].lower() for row in engines.fetchall()} == {"innodb"}
         reflected_column_types = {
             (row[0], row[1]): row[2].lower()
@@ -189,6 +210,12 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
         assert reflected_column_types[("tool_executions", "input_payload_json")] == "mediumtext"
         assert reflected_column_types[("execution_checkpoints", "payload_json")] == "mediumtext"
         assert reflected_column_types[("user_secrets", "nonce")] in {"binary(12)", "varbinary(12)"}
+        assert reflected_column_types[("agent_plan_decisions", "decision_id")] == "varchar(128)"
+        assert reflected_column_types[("agent_plan_step_runs", "result_ref")] == "varchar(128)"
+        assert not any(
+            "result_ref" in foreign_key["constrained_columns"]
+            for foreign_key in step_run_foreign_keys
+        )
         assert {
             reflected_column_types[(table_name, column_name)]
             for table_name, column_name in {
@@ -227,12 +254,14 @@ async def test_mysql_baseline_schema_contract(isolated_mysql_database_url):
             "ck_user_secrets_user_secrets_algorithm_fixed",
             "ck_agent_plans_status_valid",
             "ck_agent_plan_decisions_action_valid",
+            "ck_agent_plan_decisions_decision_id_length",
             "ck_agent_plan_step_runs_status_valid",
         }
         for status in ("awaiting_approval", "approved", "rejected", "archived"):
             assert f"'{status}'" in reflected_checks["ck_agent_plans_status_valid"]
         for action in ("approve", "reject", "revise"):
             assert f"'{action}'" in reflected_checks["ck_agent_plan_decisions_action_valid"]
+        assert "128" in reflected_checks["ck_agent_plan_decisions_decision_id_length"]
         for status in (
             "pending",
             "running",
