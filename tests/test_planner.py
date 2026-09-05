@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from pydantic import ValidationError
 
@@ -15,7 +17,10 @@ from multiclaw.planner import (
     PlanStepCompletion,
     PlanStepRunStatus,
     PlanTriggerMode,
+    ValidatedPlanDraft,
+    ValidatedPlanStep,
 )
+from multiclaw.planner import validation as planner_validation
 from multiclaw.planner.validation import (
     PlanValidationError,
     canonical_plan_bytes,
@@ -55,6 +60,20 @@ def plan_draft_payload(**overrides: object) -> dict[str, object]:
     }
     payload.update(overrides)
     return payload
+
+
+def validated_plan_draft_payload(
+    step_count: int = 1,
+    **overrides: object,
+) -> dict[str, object]:
+    steps = [
+        plan_draft_step_payload(
+            logical_step_key=f"step-{index}",
+            ordinal=index + 1,
+        )
+        for index in range(step_count)
+    ]
+    return plan_draft_payload(steps=steps, **overrides)
 
 
 def plan_step_completion_payload(**overrides: object) -> dict[str, object]:
@@ -491,6 +510,15 @@ def test_validation_rejects_raw_credentials_and_oversized_canonical_content() ->
         )
 
 
+def test_credential_scanner_rejects_credential_shaped_mapping_key() -> None:
+    # Validated plans are closed models, so exercise the recursive mapping boundary
+    # directly without widening the production API for a test-only entry point.
+    with pytest.raises(PlanValidationError, match="credential-shaped field"):
+        planner_validation._reject_credentials(
+            {"metadata": {"api_key": "ordinary-value"}}
+        )
+
+
 def test_sanitize_plan_text_redacts_credentials_only_when_requested() -> None:
     assert sanitize_plan_text("Authorization: Bearer live-token") == "[REDACTED]"
     assert sanitize_plan_text("Inspect the authorization flow") == (
@@ -512,7 +540,9 @@ def test_canonical_digests_ignore_mapping_order_but_include_definition_changes()
     assert canonical_plan_bytes(validated) == canonical_plan_bytes(
         validated.model_copy(deep=True)
     )
-    assert len(plan_content_digest(validated)) == 64
+    digest = plan_content_digest(validated)
+    assert len(digest) == 64
+    assert re.fullmatch(r"[0-9a-f]{64}", digest) is not None
     before = step_definition_digest(validated.steps[0])
     changed = validated.steps[0].model_copy(
         update={"expected_outcome": "A different result."}
@@ -534,6 +564,70 @@ def test_step_definition_digest_excludes_dependencies_and_ordinal() -> None:
     assert step_definition_digest(changed) == step_definition_digest(step)
 
 
+@pytest.mark.parametrize("ordinal", [1, 20])
+def test_validated_plan_step_accepts_ordinal_boundaries(ordinal: int) -> None:
+    step = ValidatedPlanStep.model_validate(
+        plan_draft_step_payload(ordinal=ordinal)
+    )
+
+    assert step.ordinal == ordinal
+
+
+@pytest.mark.parametrize("ordinal", [0, 21])
+def test_validated_plan_step_rejects_invalid_ordinals(ordinal: int) -> None:
+    with pytest.raises(ValidationError):
+        ValidatedPlanStep.model_validate(plan_draft_step_payload(ordinal=ordinal))
+
+
+def test_validated_plan_step_retains_draft_step_constraints() -> None:
+    with pytest.raises(ValidationError):
+        ValidatedPlanStep.model_validate(
+            plan_draft_step_payload(logical_step_key="UPPERCASE", ordinal=1)
+        )
+
+
+@pytest.mark.parametrize("step_count", [1, 20])
+def test_validated_plan_draft_accepts_step_container_boundaries(
+    step_count: int,
+) -> None:
+    draft = ValidatedPlanDraft.model_validate(
+        validated_plan_draft_payload(step_count)
+    )
+
+    assert len(draft.steps) == step_count
+
+
+@pytest.mark.parametrize("step_count", [0, 21])
+def test_validated_plan_draft_rejects_step_container_overflow(
+    step_count: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        ValidatedPlanDraft.model_validate(validated_plan_draft_payload(step_count))
+
+
+@pytest.mark.parametrize(
+    ("model_type", "payload"),
+    [
+        (
+            ValidatedPlanStep,
+            plan_draft_step_payload(ordinal=1, unexpected=True),
+        ),
+        (
+            ValidatedPlanDraft,
+            validated_plan_draft_payload(unexpected=True),
+        ),
+    ],
+)
+def test_validated_plan_models_reject_extra_fields(model_type, payload) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        model_type.model_validate(payload)
+
+    assert any(
+        error["type"] == "extra_forbidden" and error["loc"] == ("unexpected",)
+        for error in exc_info.value.errors()
+    )
+
+
 def test_planner_package_exports_validation_api() -> None:
     assert planner.PlanValidationError is PlanValidationError
     assert planner.canonical_plan_bytes is canonical_plan_bytes
@@ -541,3 +635,5 @@ def test_planner_package_exports_validation_api() -> None:
     assert planner.sanitize_plan_text is sanitize_plan_text
     assert planner.step_definition_digest is step_definition_digest
     assert planner.validate_plan_draft is validate_plan_draft
+    assert planner.ValidatedPlanDraft is ValidatedPlanDraft
+    assert planner.ValidatedPlanStep is ValidatedPlanStep
