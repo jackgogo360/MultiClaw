@@ -1,24 +1,27 @@
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from alembic import command
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import delete, func, insert, select, text, update
+from sqlalchemy.exc import IntegrityError
 
+from alembic import command
 from multiclaw.cli import alembic_config
-from multiclaw.config.settings import DatabaseSettings
+from multiclaw.config.settings import DatabaseSettings, PlanningSettings
 from multiclaw.memory import MemoryEntry
 from multiclaw.planner import (
     PlanDraft,
     PlanDraftStep,
     PlanStatus,
     PlanStepRunStatus,
+    PlanSummary,
     PlanTriggerMode,
 )
 from multiclaw.storage import Database
 from multiclaw.storage.repositories.memory import MemoryRepository
+from multiclaw.storage.repositories.plans import PlanRepository
 from multiclaw.storage.schema import (
     agent_plan_step_dependencies,
     agent_plan_step_runs,
@@ -29,6 +32,7 @@ from multiclaw.storage.schema import (
 )
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
+from multiclaw.workflow import RunStatus
 
 
 def plan_draft(objective: str = "Deliver the change") -> PlanDraft:
@@ -55,6 +59,53 @@ def plan_draft(objective: str = "Deliver the change") -> PlanDraft:
             ),
         ],
     )
+
+
+def agent_run_row(
+    context: TenantContext,
+    *,
+    plan_id: str,
+    run_id: str,
+    status: RunStatus,
+    created_at: int,
+) -> dict[str, object]:
+    return {
+        "run_id": run_id,
+        "tenant_id": context.tenant_id,
+        "workspace_id": context.workspace_id,
+        "session_id": context.session_id,
+        "plan_id": plan_id,
+        "initial_plan_version": 1,
+        "active_plan_version": 1,
+        "cancel_requested_at": None,
+        "run_status": status.value,
+        "runtime_instance_id": "runtime-a",
+        "lease_owner": "runtime-a",
+        "fencing_token": 1,
+        "lease_expires_at": 10_000,
+        "heartbeat_at": 1,
+        "schema_version": 1,
+        "version": 1,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "finished_at": None,
+    }
+
+
+def test_plan_summary_is_frozen():
+    summary = PlanSummary(
+        plan_id=str(uuid4()),
+        session_id=str(uuid4()),
+        status=PlanStatus.APPROVED,
+        current_version=2,
+        approved_version=1,
+        aggregate_version=3,
+        latest_run_id=str(uuid4()),
+        latest_run_status=RunStatus.RUNNING,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        summary.current_version = 3
 
 
 def _sqlite_url(tmp_path: Path) -> str:
@@ -168,6 +219,63 @@ class SeededPlan:
     foreign_contexts: tuple[TenantContext, ...]
 
 
+class FailingSavepoint:
+    is_active = True
+
+    def __init__(self, rollback_error: BaseException) -> None:
+        self.rollback_error = rollback_error
+
+    async def commit(self) -> None:
+        self.is_active = False
+
+    async def rollback(self) -> None:
+        raise self.rollback_error
+
+
+class FailingCreateConnection:
+    def __init__(self, primary_error: BaseException, savepoint: FailingSavepoint) -> None:
+        self.primary_error = primary_error
+        self.savepoint = savepoint
+
+    async def begin_nested(self) -> FailingSavepoint:
+        return self.savepoint
+
+    async def execute(self, *_args, **_kwargs):
+        raise self.primary_error
+
+
+class FixedNowDialect:
+    def db_now_ms(self) -> int:
+        return 1
+
+
+class ZeroRowcountResult:
+    rowcount = 0
+
+
+class LateCasFailureConnection:
+    def __init__(self, connection) -> None:
+        self.connection = connection
+
+    async def begin_nested(self):
+        return await self.connection.begin_nested()
+
+    async def execute(self, statement, *args, **kwargs):
+        if getattr(statement, "is_update", False) and statement.table is agent_plans:
+            return ZeroRowcountResult()
+        return await self.connection.execute(statement, *args, **kwargs)
+
+
+class CountingConnection:
+    def __init__(self, connection) -> None:
+        self.connection = connection
+        self.execute_calls = 0
+
+    async def execute(self, statement, *args, **kwargs):
+        self.execute_calls += 1
+        return await self.connection.execute(statement, *args, **kwargs)
+
+
 @pytest.fixture
 async def seeded_plan(
     plan_database: Database,
@@ -264,6 +372,34 @@ async def dump_plan_version_rows(
     return version_rows, step_rows, dependency_rows
 
 
+async def count_plan_rows(
+    database: Database,
+    context: TenantContext,
+    plan_id: str,
+) -> tuple[int, int, int, int]:
+    tables = (
+        agent_plans,
+        agent_plan_versions,
+        agent_plan_steps,
+        agent_plan_step_dependencies,
+    )
+    async with database.connect() as conn:
+        counts: list[int] = []
+        for table in tables:
+            result = await conn.execute(
+                select(func.count())
+                .select_from(table)
+                .where(
+                    table.c.tenant_id == context.tenant_id,
+                    table.c.workspace_id == context.workspace_id,
+                    table.c.session_id == context.session_id,
+                    (table.c.id if table is agent_plans else table.c.plan_id) == plan_id,
+                )
+            )
+            counts.append(int(result.scalar_one()))
+        return counts[0], counts[1], counts[2], counts[3]
+
+
 @pytest.mark.asyncio
 async def test_create_plan_materializes_one_immutable_version(plan_database, plan_contexts):
     context = plan_contexts["primary"]
@@ -293,11 +429,254 @@ async def test_create_plan_materializes_one_immutable_version(plan_database, pla
 
 
 @pytest.mark.asyncio
+async def test_create_plan_hydrates_multiple_dependencies_in_canonical_order(
+    plan_database,
+    plan_contexts,
+):
+    context = plan_contexts["primary"]
+    draft = plan_draft()
+    draft.steps.insert(
+        1,
+        PlanDraftStep(
+            logical_step_key="lint",
+            title="Lint",
+            description="Lint the implementation.",
+            expected_outcome="Static checks pass.",
+            depends_on=[],
+            max_attempts=2,
+        ),
+    )
+    draft.steps[2].depends_on = ["lint", "inspect"]
+
+    async with TenantUnitOfWork(plan_database, context) as uow:
+        session = await uow.sessions.create("Canonical dependencies")
+        scoped = context.for_session(session.id)
+        source = await MemoryRepository(uow.conn, scoped, plan_database.dialect).save(
+            MemoryEntry(
+                content="Deliver with linting",
+                type="chat_message",
+                role="user",
+                turn_index=1,
+            )
+        )
+        snapshot = await uow.plans.for_context(scoped).create(
+            plan_id=str(uuid4()),
+            source_message_id=source.id,
+            trigger_mode=PlanTriggerMode.EXPLICIT,
+            draft=draft,
+        )
+
+    step_ids = {
+        step.logical_step_key: step.step_id for step in snapshot.current.steps
+    }
+    assert snapshot.current.dependencies[step_ids["verify"]] == (
+        step_ids["inspect"],
+        step_ids["lint"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_hydrated_plan_dependencies_are_deeply_immutable(plan_database, seeded_plan):
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        snapshot = await uow.plans.for_context(seeded_plan.context).get(seeded_plan.plan_id)
+
+    assert snapshot is not None
+    assert snapshot.current is snapshot.versions[0]
+    dependent_step_id = snapshot.current.steps[1].step_id
+    with pytest.raises(TypeError):
+        snapshot.current.dependencies[dependent_step_id] = ()  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_create_plan_rolls_back_all_rows_when_step_materialization_fails(
+    plan_database,
+    plan_contexts,
+    monkeypatch,
+):
+    root = plan_contexts["primary"]
+    plan_id = str(uuid4())
+    duplicate_step_id = uuid4()
+    monkeypatch.setattr(
+        "multiclaw.storage.repositories.plans.uuid4",
+        lambda: duplicate_step_id,
+    )
+
+    async with TenantUnitOfWork(plan_database, root) as uow:
+        session = await uow.sessions.create("Atomic plan")
+        context = root.for_session(session.id)
+        source = await MemoryRepository(uow.conn, context, plan_database.dialect).save(
+            MemoryEntry(content="Deliver atomically", type="chat_message", role="user", turn_index=1)
+        )
+        with pytest.raises(IntegrityError):
+            await uow.plans.for_context(context).create(
+                plan_id=plan_id,
+                source_message_id=source.id,
+                trigger_mode=PlanTriggerMode.EXPLICIT,
+                draft=plan_draft(),
+            )
+
+    assert await count_plan_rows(plan_database, context, plan_id) == (0, 0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_create_plan_preserves_primary_error_when_savepoint_rollback_fails():
+    primary = RuntimeError("insert failed")
+    rollback_error = RuntimeError("rollback failed")
+    connection = FailingCreateConnection(primary, FailingSavepoint(rollback_error))
+    context = TenantContext(
+        tenant_id=str(uuid4()),
+        workspace_id=str(uuid4()),
+        session_id=str(uuid4()),
+    )
+    repository = PlanRepository(
+        connection,  # type: ignore[arg-type]
+        FixedNowDialect(),  # type: ignore[arg-type]
+        context,
+        PlanningSettings(),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await repository.create(
+            plan_id=str(uuid4()),
+            source_message_id=str(uuid4()),
+            trigger_mode=PlanTriggerMode.EXPLICIT,
+            draft=plan_draft(),
+        )
+
+    assert raised.value is primary
+    assert getattr(primary, "__notes__", []) == [
+        "savepoint rollback cleanup failed: RuntimeError: rollback failed"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_plan_lookup_hides_foreign_tenant_workspace_and_session(plan_database, seeded_plan):
     for foreign in seeded_plan.foreign_contexts:
         async with TenantUnitOfWork(plan_database, foreign) as uow:
             assert await uow.plans.for_context(foreign).get(seeded_plan.plan_id) is None
             assert await uow.plans.for_context(foreign).list_for_session() == []
+
+
+@pytest.mark.asyncio
+async def test_list_for_session_uses_one_query_without_hydrating_history(
+    plan_database,
+    seeded_plan,
+    monkeypatch,
+):
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        repository = uow.plans.for_context(seeded_plan.context)
+        snapshot = await repository.get(seeded_plan.plan_id)
+        assert snapshot is not None
+        for plan_version in range(2, 7):
+            snapshot = await repository.append_version(
+                plan_id=seeded_plan.plan_id,
+                expected_version=snapshot.aggregate_version,
+                draft=plan_draft(f"Historical revision {plan_version}"),
+                parent_version=snapshot.current_version,
+                revision_feedback=f"Revision {plan_version}",
+                supersedes={
+                    step.logical_step_key: step.step_id for step in snapshot.current.steps
+                },
+            )
+
+    def fail_if_hydrated(*_args, **_kwargs):
+        raise AssertionError("list_for_session must not hydrate PlanSnapshot history")
+
+    monkeypatch.setattr(PlanRepository, "_hydrate_version", fail_if_hydrated)
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        connection = CountingConnection(uow.conn)
+        repository = PlanRepository(
+            connection,  # type: ignore[arg-type]
+            plan_database.dialect,
+            seeded_plan.context,
+            PlanningSettings(),
+        )
+        summaries = await repository.list_for_session()
+
+    assert connection.execute_calls == 1
+    assert len(summaries) == 1
+    assert isinstance(summaries[0], PlanSummary)
+    assert summaries[0].current_version == 6
+    assert summaries[0].latest_run_id is None
+    assert summaries[0].latest_run_status is None
+
+
+@pytest.mark.asyncio
+async def test_list_for_session_selects_latest_run_deterministically(
+    plan_database,
+    seeded_plan,
+):
+    lower_run_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+    higher_run_id = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        await uow.conn.execute(
+            insert(agent_runs),
+            [
+                agent_run_row(
+                    seeded_plan.context,
+                    plan_id=seeded_plan.plan_id,
+                    run_id=lower_run_id,
+                    status=RunStatus.COMPLETED,
+                    created_at=20,
+                ),
+                agent_run_row(
+                    seeded_plan.context,
+                    plan_id=seeded_plan.plan_id,
+                    run_id=higher_run_id,
+                    status=RunStatus.RUNNING,
+                    created_at=20,
+                ),
+            ],
+        )
+
+        summaries = await uow.plans.for_context(seeded_plan.context).list_for_session()
+
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary.plan_id == seeded_plan.plan_id
+    assert summary.session_id == seeded_plan.context.session_id
+    assert summary.status is PlanStatus.AWAITING_APPROVAL
+    assert summary.current_version == 1
+    assert summary.approved_version is None
+    assert summary.aggregate_version == seeded_plan.aggregate_version
+    assert summary.latest_run_id == higher_run_id
+    assert summary.latest_run_status is RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_list_for_session_orders_equal_timestamps_by_plan_id_desc(
+    plan_database,
+    seeded_plan,
+):
+    extra_plan_ids = (
+        "11111111-1111-1111-1111-111111111111",
+        "99999999-9999-9999-9999-999999999999",
+    )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        repository = uow.plans.for_context(seeded_plan.context)
+        existing = await repository.get(seeded_plan.plan_id)
+        assert existing is not None
+        for plan_id in extra_plan_ids:
+            await repository.create(
+                plan_id=plan_id,
+                source_message_id=existing.source_message_id,
+                trigger_mode=PlanTriggerMode.EXPLICIT,
+                draft=plan_draft(f"Plan {plan_id}"),
+            )
+        await uow.conn.execute(
+            update(agent_plans)
+            .where(
+                agent_plans.c.tenant_id == seeded_plan.context.tenant_id,
+                agent_plans.c.workspace_id == seeded_plan.context.workspace_id,
+                agent_plans.c.session_id == seeded_plan.context.session_id,
+            )
+            .values(created_at=100)
+        )
+
+        summaries = await repository.list_for_session()
+
+    expected_ids = sorted((seeded_plan.plan_id, *extra_plan_ids), reverse=True)
+    assert [summary.plan_id for summary in summaries] == expected_ids
 
 
 @pytest.mark.asyncio
@@ -373,6 +752,113 @@ async def test_append_version_preserves_last_approved_version(plan_database, see
 
 
 @pytest.mark.asyncio
+async def test_append_version_rejects_stale_expected_version_without_writes(
+    plan_database,
+    seeded_plan,
+):
+    before = await count_plan_rows(
+        plan_database,
+        seeded_plan.context,
+        seeded_plan.plan_id,
+    )
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        with pytest.raises(ValueError, match="version conflict"):
+            await uow.plans.for_context(seeded_plan.context).append_version(
+                plan_id=seeded_plan.plan_id,
+                expected_version=seeded_plan.aggregate_version + 1,
+                draft=plan_draft("Stale revision"),
+                parent_version=1,
+                revision_feedback="This writer is stale",
+                supersedes={},
+            )
+
+    after = await count_plan_rows(
+        plan_database,
+        seeded_plan.context,
+        seeded_plan.plan_id,
+    )
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_append_version_rolls_back_new_rows_when_late_cas_loses(
+    plan_database,
+    seeded_plan,
+):
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        repository = PlanRepository(
+            LateCasFailureConnection(uow.conn),  # type: ignore[arg-type]
+            plan_database.dialect,
+            seeded_plan.context,
+            PlanningSettings(),
+        )
+        with pytest.raises(ValueError, match="version conflict"):
+            await repository.append_version(
+                plan_id=seeded_plan.plan_id,
+                expected_version=seeded_plan.aggregate_version,
+                draft=plan_draft("Losing revision"),
+                parent_version=1,
+                revision_feedback="Lose after child inserts",
+                supersedes={
+                    "inspect": seeded_plan.step_ids["inspect"],
+                    "verify": seeded_plan.step_ids["verify"],
+                },
+            )
+
+        snapshot = await uow.plans.for_context(seeded_plan.context).get(seeded_plan.plan_id)
+        assert snapshot is not None
+        assert snapshot.current_version == 1
+        assert [version.plan_version for version in snapshot.versions] == [1]
+
+    assert await count_plan_rows(
+        plan_database,
+        seeded_plan.context,
+        seeded_plan.plan_id,
+    ) == (1, 1, 2, 1)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sqlite_appends_have_one_winner_and_a_contiguous_chain(
+    plan_database,
+    seeded_plan,
+):
+    async def append_revision(label: str):
+        async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+            return await uow.plans.for_context(seeded_plan.context).append_version(
+                plan_id=seeded_plan.plan_id,
+                expected_version=seeded_plan.aggregate_version,
+                draft=plan_draft(f"Concurrent revision {label}"),
+                parent_version=1,
+                revision_feedback=f"Writer {label}",
+                supersedes={
+                    "inspect": seeded_plan.step_ids["inspect"],
+                    "verify": seeded_plan.step_ids["verify"],
+                },
+            )
+
+    outcomes = await asyncio.gather(
+        append_revision("a"),
+        append_revision("b"),
+        return_exceptions=True,
+    )
+
+    winners = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
+    losers = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    assert isinstance(losers[0], ValueError)
+    assert "version conflict" in str(losers[0])
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        snapshot = await uow.plans.for_context(seeded_plan.context).get(seeded_plan.plan_id)
+    assert snapshot is not None
+    assert snapshot.current_version == 2
+    assert snapshot.aggregate_version == seeded_plan.aggregate_version + 1
+    assert [version.plan_version for version in snapshot.versions] == [1, 2]
+    assert snapshot.versions[1].parent_version == 1
+
+
+@pytest.mark.asyncio
 async def test_root_plan_repository_rejects_direct_data_calls(plan_database, plan_contexts):
     async with TenantUnitOfWork(plan_database, plan_contexts["primary"]) as uow:
         with pytest.raises(ValueError, match="PlanRepository requires session scope"):
@@ -427,6 +913,73 @@ async def test_get_rejects_non_list_constraints_as_corrupt(plan_database, seeded
 
     async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
         with pytest.raises(ValueError, match="constraints_json"):
+            await uow.plans.for_context(seeded_plan.context).get(seeded_plan.plan_id)
+
+
+@pytest.mark.asyncio
+async def test_get_rejects_plan_with_missing_step_rows(plan_database, seeded_plan):
+    async with plan_database.write_transaction() as conn:
+        await conn.execute(
+            delete(agent_plan_step_dependencies).where(
+                agent_plan_step_dependencies.c.tenant_id == seeded_plan.context.tenant_id,
+                agent_plan_step_dependencies.c.workspace_id == seeded_plan.context.workspace_id,
+                agent_plan_step_dependencies.c.session_id == seeded_plan.context.session_id,
+                agent_plan_step_dependencies.c.plan_id == seeded_plan.plan_id,
+                agent_plan_step_dependencies.c.plan_version == 1,
+            )
+        )
+        await conn.execute(
+            delete(agent_plan_steps).where(
+                agent_plan_steps.c.tenant_id == seeded_plan.context.tenant_id,
+                agent_plan_steps.c.workspace_id == seeded_plan.context.workspace_id,
+                agent_plan_steps.c.session_id == seeded_plan.context.session_id,
+                agent_plan_steps.c.plan_id == seeded_plan.plan_id,
+                agent_plan_steps.c.plan_version == 1,
+                agent_plan_steps.c.step_id == seeded_plan.step_ids["verify"],
+            )
+        )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        with pytest.raises(ValueError, match="corrupt"):
+            await uow.plans.for_context(seeded_plan.context).get(seeded_plan.plan_id)
+
+
+@pytest.mark.asyncio
+async def test_get_rejects_plan_with_missing_dependency_rows(plan_database, seeded_plan):
+    async with plan_database.write_transaction() as conn:
+        await conn.execute(
+            delete(agent_plan_step_dependencies).where(
+                agent_plan_step_dependencies.c.tenant_id == seeded_plan.context.tenant_id,
+                agent_plan_step_dependencies.c.workspace_id == seeded_plan.context.workspace_id,
+                agent_plan_step_dependencies.c.session_id == seeded_plan.context.session_id,
+                agent_plan_step_dependencies.c.plan_id == seeded_plan.plan_id,
+                agent_plan_step_dependencies.c.plan_version == 1,
+            )
+        )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        with pytest.raises(ValueError, match="corrupt"):
+            await uow.plans.for_context(seeded_plan.context).get(seeded_plan.plan_id)
+
+
+@pytest.mark.asyncio
+async def test_get_rejects_plan_with_mismatched_step_digest(plan_database, seeded_plan):
+    async with plan_database.write_transaction() as conn:
+        await conn.execute(
+            update(agent_plan_steps)
+            .where(
+                agent_plan_steps.c.tenant_id == seeded_plan.context.tenant_id,
+                agent_plan_steps.c.workspace_id == seeded_plan.context.workspace_id,
+                agent_plan_steps.c.session_id == seeded_plan.context.session_id,
+                agent_plan_steps.c.plan_id == seeded_plan.plan_id,
+                agent_plan_steps.c.plan_version == 1,
+                agent_plan_steps.c.step_id == seeded_plan.step_ids["inspect"],
+            )
+            .values(definition_digest="f" * 64)
+        )
+
+    async with TenantUnitOfWork(plan_database, seeded_plan.context) as uow:
+        with pytest.raises(ValueError, match="definition_digest"):
             await uow.plans.for_context(seeded_plan.context).get(seeded_plan.plan_id)
 
 

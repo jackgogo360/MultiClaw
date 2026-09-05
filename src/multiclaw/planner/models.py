@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from multiclaw.tenancy.context import TenantContext
+from multiclaw.workflow.models import RunStatus
 
 
 class PlanningMode(StrEnum):
@@ -128,6 +129,18 @@ class PlanSnapshot:
     current: PlanVersionRecord
     versions: tuple[PlanVersionRecord, ...]
     decisions: tuple[PlanDecisionRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PlanSummary:
+    plan_id: str
+    session_id: str
+    status: PlanStatus
+    current_version: int
+    approved_version: int | None
+    aggregate_version: int
+    latest_run_id: str | None
+    latest_run_status: RunStatus | None
 
 
 class PlanningDecision(BaseModel):

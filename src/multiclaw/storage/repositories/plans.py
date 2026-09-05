@@ -3,21 +3,25 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from uuid import uuid4
 
-from sqlalchemy import and_, insert, select, update
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy import and_, func, insert, select, update
+from sqlalchemy.engine import RowMapping
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncTransaction
 
 from multiclaw.config.settings import PlanningSettings
 from multiclaw.planner.models import (
     PlanDecisionAction,
     PlanDecisionRecord,
     PlanDraft,
+    PlanDraftStep,
     PlanSnapshot,
     PlanStatus,
     PlanStepRecord,
     PlanStepRunRecord,
     PlanStepRunStatus,
+    PlanSummary,
     PlanTriggerMode,
     PlanVersionRecord,
     ValidatedPlanDraft,
@@ -35,11 +39,16 @@ from multiclaw.storage.schema import (
     agent_plan_steps,
     agent_plan_versions,
     agent_plans,
+    agent_runs,
 )
 from multiclaw.tenancy.context import TenantContext
-
+from multiclaw.workflow.models import RunStatus
 
 Dialect = SQLiteDialect | MySQLDialect
+
+
+def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException) -> None:
+    primary.add_note(f"{phase} cleanup failed: {type(error).__name__}: {error}")
 
 
 @dataclass(slots=True)
@@ -83,33 +92,39 @@ class PlanRepository:
             max_depth=self._settings.max_dependency_depth,
             max_attempts=self._settings.max_step_attempts,
         )
-        now = self._dialect.db_now_ms()
-        await self._conn.execute(
-            insert(agent_plans).values(
-                id=plan_id,
-                **self._scope_values(),
-                source_message_id=source_message_id,
-                trigger_mode=trigger_mode.value,
-                status=PlanStatus.AWAITING_APPROVAL.value,
-                current_version=1,
-                approved_version=None,
-                version=1,
-                created_at=now,
-                updated_at=now,
+        savepoint = await self._conn.begin_nested()
+        try:
+            now = self._dialect.db_now_ms()
+            await self._conn.execute(
+                insert(agent_plans).values(
+                    id=plan_id,
+                    **self._scope_values(),
+                    source_message_id=source_message_id,
+                    trigger_mode=trigger_mode.value,
+                    status=PlanStatus.AWAITING_APPROVAL.value,
+                    current_version=1,
+                    approved_version=None,
+                    version=1,
+                    created_at=now,
+                    updated_at=now,
+                )
             )
-        )
-        await self._insert_version(
-            plan_id=plan_id,
-            plan_version=1,
-            validated=validated,
-            parent_version=None,
-            revision_feedback=None,
-            supersedes={},
-        )
-        created = await self.get(plan_id)
-        if created is None:
-            raise RuntimeError("Plan missing after materialization")
-        return created
+            await self._insert_version(
+                plan_id=plan_id,
+                plan_version=1,
+                validated=validated,
+                parent_version=None,
+                revision_feedback=None,
+                supersedes={},
+            )
+            created = await self.get(plan_id)
+            if created is None:
+                raise RuntimeError("Plan missing after materialization")
+            await savepoint.commit()
+            return created
+        except BaseException as primary:
+            await self._rollback_savepoint(savepoint, primary)
+            raise
 
     async def append_version(
         self,
@@ -178,9 +193,8 @@ class PlanRepository:
             if int(updated.rowcount or 0) != 1:
                 raise ValueError("Plan version conflict")
             await savepoint.commit()
-        except BaseException:
-            if savepoint.is_active:
-                await savepoint.rollback()
+        except BaseException as primary:
+            await self._rollback_savepoint(savepoint, primary)
             raise
 
         revised = await self.get(plan_id)
@@ -282,19 +296,81 @@ class PlanRepository:
             decisions=tuple(self._hydrate_decision(row) for row in decision_rows),
         )
 
-    async def list_for_session(self) -> list[PlanSnapshot]:
-        self._require_session()
+    async def list_for_session(self) -> list[PlanSummary]:
+        session_id = self._require_session()
+        latest_runs = (
+            select(
+                agent_runs.c.tenant_id,
+                agent_runs.c.workspace_id,
+                agent_runs.c.session_id,
+                agent_runs.c.plan_id,
+                agent_runs.c.run_id,
+                agent_runs.c.run_status,
+                func.row_number()
+                .over(
+                    partition_by=(
+                        agent_runs.c.tenant_id,
+                        agent_runs.c.workspace_id,
+                        agent_runs.c.session_id,
+                        agent_runs.c.plan_id,
+                    ),
+                    order_by=(agent_runs.c.created_at.desc(), agent_runs.c.run_id.desc()),
+                )
+                .label("run_rank"),
+            )
+            .where(
+                agent_runs.c.tenant_id == self._context.tenant_id,
+                agent_runs.c.workspace_id == self._context.workspace_id,
+                agent_runs.c.session_id == session_id,
+                agent_runs.c.plan_id.is_not(None),
+            )
+            .subquery()
+        )
         result = await self._conn.execute(
-            select(agent_plans.c.id)
+            select(
+                agent_plans.c.id,
+                agent_plans.c.session_id,
+                agent_plans.c.status,
+                agent_plans.c.current_version,
+                agent_plans.c.approved_version,
+                agent_plans.c.version,
+                latest_runs.c.run_id.label("latest_run_id"),
+                latest_runs.c.run_status.label("latest_run_status"),
+            )
+            .outerjoin(
+                latest_runs,
+                and_(
+                    latest_runs.c.tenant_id == agent_plans.c.tenant_id,
+                    latest_runs.c.workspace_id == agent_plans.c.workspace_id,
+                    latest_runs.c.session_id == agent_plans.c.session_id,
+                    latest_runs.c.plan_id == agent_plans.c.id,
+                    latest_runs.c.run_rank == 1,
+                ),
+            )
             .where(self._plan_scope_predicate())
             .order_by(agent_plans.c.created_at.desc(), agent_plans.c.id.desc())
         )
-        snapshots: list[PlanSnapshot] = []
-        for plan_id in result.scalars().all():
-            snapshot = await self.get(str(plan_id))
-            if snapshot is not None:
-                snapshots.append(snapshot)
-        return snapshots
+        return [
+            PlanSummary(
+                plan_id=str(row["id"]),
+                session_id=str(row["session_id"]),
+                status=PlanStatus(str(row["status"])),
+                current_version=int(row["current_version"]),
+                approved_version=(
+                    None if row["approved_version"] is None else int(row["approved_version"])
+                ),
+                aggregate_version=int(row["version"]),
+                latest_run_id=(
+                    None if row["latest_run_id"] is None else str(row["latest_run_id"])
+                ),
+                latest_run_status=(
+                    None
+                    if row["latest_run_status"] is None
+                    else RunStatus(str(row["latest_run_status"]))
+                ),
+            )
+            for row in result.mappings()
+        ]
 
     async def latest_step_attempts(
         self,
@@ -425,6 +501,18 @@ class PlanRepository:
                 "Every supersedes_step_id must belong to an earlier version of the scoped Plan"
             )
 
+    @staticmethod
+    async def _rollback_savepoint(
+        savepoint: AsyncTransaction,
+        primary: BaseException,
+    ) -> None:
+        if not savepoint.is_active:
+            return
+        try:
+            await savepoint.rollback()
+        except BaseException as error:  # noqa: BLE001 - cleanup must not replace the primary
+            _note_cleanup_error(primary, "savepoint rollback", error)
+
     def _scope_values(self) -> dict[str, str]:
         return {
             "tenant_id": self._context.tenant_id,
@@ -475,7 +563,7 @@ class PlanRepository:
         )
 
     @staticmethod
-    def _hydrate_step(row: Mapping[str, object]) -> PlanStepRecord:
+    def _hydrate_step(row: RowMapping) -> PlanStepRecord:
         return PlanStepRecord(
             step_id=str(row["step_id"]),
             logical_step_key=str(row["logical_step_key"]),
@@ -495,9 +583,9 @@ class PlanRepository:
             definition_digest=str(row["definition_digest"]),
         )
 
-    @staticmethod
     def _hydrate_version(
-        row: Mapping[str, object],
+        self,
+        row: RowMapping,
         *,
         steps: tuple[PlanStepRecord, ...],
         dependencies: Mapping[str, tuple[str, ...]],
@@ -515,7 +603,7 @@ class PlanRepository:
             not isinstance(constraint, str) for constraint in constraints
         ):
             raise ValueError("Plan constraints_json must contain a list of strings")
-        return PlanVersionRecord(
+        version = PlanVersionRecord(
             plan_id=str(row["plan_id"]),
             plan_version=int(row["plan_version"]),
             objective=str(row["objective"]),
@@ -531,11 +619,75 @@ class PlanRepository:
             content_digest=str(row["content_digest"]),
             created_at=int(row["created_at"]),
             steps=steps,
-            dependencies=dict(dependencies),
+            dependencies=MappingProxyType(dict(dependencies)),
         )
+        self._validate_version_integrity(version)
+        return version
 
     @staticmethod
-    def _hydrate_decision(row: Mapping[str, object]) -> PlanDecisionRecord:
+    def _validate_version_integrity(version: PlanVersionRecord) -> None:
+        if version.schema_version != 1:
+            raise ValueError("Plan version schema is corrupt")
+        expected_ordinals = tuple(range(1, len(version.steps) + 1))
+        if tuple(step.ordinal for step in version.steps) != expected_ordinals:
+            raise ValueError("Plan step ordinals are corrupt")
+
+        steps_by_id = {step.step_id: step for step in version.steps}
+        if len(steps_by_id) != len(version.steps):
+            raise ValueError("Plan step identifiers are corrupt")
+        if any(step_id not in steps_by_id for step_id in version.dependencies):
+            raise ValueError("Plan dependency targets are corrupt")
+        if any(
+            dependency_id not in steps_by_id
+            for dependencies in version.dependencies.values()
+            for dependency_id in dependencies
+        ):
+            raise ValueError("Plan dependency sources are corrupt")
+
+        try:
+            draft = PlanDraft(
+                objective=version.objective,
+                constraints=list(version.constraints),
+                generation_reason=version.generation_reason,
+                steps=[
+                    PlanDraftStep(
+                        logical_step_key=step.logical_step_key,
+                        title=step.title,
+                        description=step.description,
+                        expected_outcome=step.expected_outcome,
+                        depends_on=[
+                            steps_by_id[dependency_id].logical_step_key
+                            for dependency_id in version.dependencies.get(step.step_id, ())
+                        ],
+                        max_attempts=step.max_attempts,
+                    )
+                    for step in version.steps
+                ],
+            )
+            validated = validate_plan_draft(
+                draft,
+                max_steps=20,
+                max_depth=10,
+                max_attempts=20,
+            )
+        except (KeyError, ValueError) as error:
+            raise ValueError("Plan version content is corrupt") from error
+
+        if tuple(
+            (step.logical_step_key, step.ordinal) for step in validated.steps
+        ) != tuple(
+            (step.logical_step_key, step.ordinal) for step in version.steps
+        ):
+            raise ValueError("Plan step ordering is corrupt")
+        validated_by_key = {step.logical_step_key: step for step in validated.steps}
+        for step in version.steps:
+            if step_definition_digest(validated_by_key[step.logical_step_key]) != step.definition_digest:
+                raise ValueError("Plan step definition_digest is corrupt")
+        if plan_content_digest(validated) != version.content_digest:
+            raise ValueError("Plan version content_digest is corrupt")
+
+    @staticmethod
+    def _hydrate_decision(row: RowMapping) -> PlanDecisionRecord:
         return PlanDecisionRecord(
             decision_id=str(row["decision_id"]),
             plan_version=int(row["plan_version"]),
@@ -552,7 +704,7 @@ class PlanRepository:
         )
 
     @staticmethod
-    def _hydrate_step_run(row: Mapping[str, object]) -> PlanStepRunRecord:
+    def _hydrate_step_run(row: RowMapping) -> PlanStepRunRecord:
         return PlanStepRunRecord(
             step_run_id=str(row["step_run_id"]),
             run_id=str(row["run_id"]),

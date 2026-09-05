@@ -148,6 +148,7 @@ def validate_plan_draft(
     if len(ordered) != len(keys):
         raise PlanValidationError("Plan dependency cycle")
 
+    canonical_order = {key: index for index, key in enumerate(ordered)}
     validated = ValidatedPlanDraft(
         objective=draft.objective,
         constraints=tuple(draft.constraints),
@@ -155,7 +156,12 @@ def validate_plan_draft(
         steps=tuple(
             ValidatedPlanStep(
                 **by_key[key].model_dump(exclude={"depends_on"}),
-                depends_on=tuple(by_key[key].depends_on),
+                depends_on=tuple(
+                    sorted(
+                        by_key[key].depends_on,
+                        key=canonical_order.__getitem__,
+                    )
+                ),
                 ordinal=index,
             )
             for index, key in enumerate(ordered, start=1)
