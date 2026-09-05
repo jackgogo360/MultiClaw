@@ -30,8 +30,9 @@ from multiclaw.planner import (
     PlanVersionConflictError,
 )
 from multiclaw.planner.generator import PlanGenerator
-from multiclaw.planner.models import PlanRevisionLimitError
+from multiclaw.planner.models import PlanRevisionContext, PlanRevisionLimitError
 from multiclaw.planner.service import MaterializeInitialPlan, PlanningService
+from multiclaw.planner.validation import sanitize_plan_text
 from multiclaw.storage import Database
 from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.repositories.plans import PlanRepository
@@ -1217,6 +1218,121 @@ async def test_revision_race_replays_winner_without_appending_again(
 
 
 @pytest.mark.asyncio
+async def test_revision_locked_claim_replays_winner_before_quota_or_append(
+    seeded_waiting_plan: SeededWaitingPlan,
+    monkeypatch,
+):
+    request = PlanDecisionRequest(
+        decision_id="revise-locked-winner",
+        plan_id=seeded_waiting_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_waiting_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback="Revise exactly once",
+    )
+    winning_service = PlanningService(
+        seeded_waiting_plan.database,
+        settings=planning_settings(),
+        generator=cast(PlanGenerator, FakePlanGenerator()),
+        workflow=seeded_waiting_plan.workflow,
+    )
+    losing_service = PlanningService(
+        seeded_waiting_plan.database,
+        settings=planning_settings(max_revisions=1),
+        generator=cast(PlanGenerator, seeded_waiting_plan.generator),
+        workflow=seeded_waiting_plan.workflow,
+    )
+    original_replay = PlanRepository.replay_decision
+    original_begin = PlanRepository.begin_revision_decision
+    original_append = PlanRepository.append_version
+    original_fence = WorkflowCoordinator.fence_waiting_plan_run
+    original_finish = PlanRepository.finish_revision_decision
+    winner_committed = False
+    stale_write_read_forced = False
+    locked_claim_observed_winner = False
+
+    async def stale_once_after_winner(repository, *args, **kwargs):
+        nonlocal stale_write_read_forced
+        replay = await original_replay(repository, *args, **kwargs)
+        if (
+            winner_committed
+            and replay is not None
+            and not stale_write_read_forced
+            and not locked_claim_observed_winner
+        ):
+            stale_write_read_forced = True
+            return None
+        return replay
+
+    async def observe_locked_claim(repository, *args, **kwargs):
+        nonlocal locked_claim_observed_winner
+        decision = await original_begin(repository, *args, **kwargs)
+        if winner_committed and decision.resulting_plan_version is not None:
+            locked_claim_observed_winner = True
+        return decision
+
+    async def forbid_append_after_winner(repository, *args, **kwargs):
+        if winner_committed:
+            raise AssertionError("losing revision appended after observing the winner")
+        return await original_append(repository, *args, **kwargs)
+
+    async def forbid_fence_after_winner(coordinator, *args, **kwargs):
+        if winner_committed:
+            raise AssertionError("losing revision fenced after observing the winner")
+        return await original_fence(coordinator, *args, **kwargs)
+
+    async def forbid_finish_after_winner(repository, *args, **kwargs):
+        if winner_committed:
+            raise AssertionError("losing revision finished after observing the winner")
+        return await original_finish(repository, *args, **kwargs)
+
+    monkeypatch.setattr(PlanRepository, "replay_decision", stale_once_after_winner)
+    monkeypatch.setattr(
+        PlanRepository,
+        "begin_revision_decision",
+        observe_locked_claim,
+    )
+    monkeypatch.setattr(PlanRepository, "append_version", forbid_append_after_winner)
+    monkeypatch.setattr(
+        WorkflowCoordinator,
+        "fence_waiting_plan_run",
+        forbid_fence_after_winner,
+    )
+    monkeypatch.setattr(
+        PlanRepository,
+        "finish_revision_decision",
+        forbid_finish_after_winner,
+    )
+
+    async def commit_winner():
+        nonlocal winner_committed
+        await winning_service.decide(
+            request,
+            decided_by=seeded_waiting_plan.tenant_id,
+            runtime_instance_id="runtime-winner",
+        )
+        winner_committed = True
+
+    seeded_waiting_plan.generator.on_generate = commit_winner
+
+    replay = await losing_service.decide(
+        request,
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-loser",
+    )
+    plan = await seeded_waiting_plan.load_plan()
+
+    assert locked_claim_observed_winner is True
+    assert replay.idempotent_replay is True
+    assert replay.snapshot.current_version == 2
+    assert replay.lease is None
+    assert replay.events == ()
+    assert len(seeded_waiting_plan.generator.calls) == 1
+    assert len(plan.versions) == 2
+    assert len(plan.decisions) == 1
+
+
+@pytest.mark.asyncio
 async def test_mismatched_revision_decision_id_is_rejected_before_generation(
     seeded_waiting_plan: SeededWaitingPlan,
 ):
@@ -1419,25 +1535,141 @@ async def test_plan_run_reject_checkpoint_failure_rolls_back_cancel_cas(
     ) == before_checkpoints
 
 
-@pytest.mark.asyncio
-async def test_revision_event_redacts_credentials(
-    seeded_waiting_plan: SeededWaitingPlan,
-):
-    result = await seeded_waiting_plan.service.decide(
-        PlanDecisionRequest(
-            decision_id="revise-redacted",
-            plan_id=seeded_waiting_plan.plan_id,
-            plan_version=1,
-            expected_version=seeded_waiting_plan.aggregate_version,
-            action=PlanDecisionAction.REVISE,
-            feedback="Use access_token=supersecretvalue in the fixture",
+@pytest.mark.parametrize(
+    ("feedback", "expected_feedback"),
+    (
+        ("Keep the validation wording unchanged", "Keep the validation wording unchanged"),
+        (
+            "Use access_token=supersecretvalue in the fixture",
+            "Use [REDACTED] in the fixture",
         ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_revision_feedback_is_safe_before_model_storage_and_return(
+    seeded_waiting_plan: SeededWaitingPlan,
+    feedback: str,
+    expected_feedback: str,
+):
+    request = PlanDecisionRequest(
+        decision_id="revise-safe-feedback",
+        plan_id=seeded_waiting_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_waiting_plan.aggregate_version,
+        action=PlanDecisionAction.REVISE,
+        feedback=feedback,
+    )
+
+    result = await seeded_waiting_plan.service.decide(
+        request,
         decided_by=seeded_waiting_plan.tenant_id,
         runtime_instance_id="runtime-2",
     )
+    revision_context = seeded_waiting_plan.generator.calls[0][1]
+    assert isinstance(revision_context, PlanRevisionContext)
+    async with seeded_waiting_plan.database.connect() as connection:
+        decision_feedback = (
+            await connection.execute(
+                select(agent_plan_decisions.c.feedback).where(
+                    agent_plan_decisions.c.plan_id == seeded_waiting_plan.plan_id,
+                    agent_plan_decisions.c.decision_id == request.decision_id,
+                )
+            )
+        ).scalar_one()
+        revision_feedback = (
+            await connection.execute(
+                select(agent_plan_versions.c.revision_feedback).where(
+                    agent_plan_versions.c.plan_id == seeded_waiting_plan.plan_id,
+                    agent_plan_versions.c.plan_version == 2,
+                )
+            )
+        ).scalar_one()
 
+    calls_before_replay = len(seeded_waiting_plan.generator.calls)
+    replay = await seeded_waiting_plan.service.decide(
+        request,
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-3",
+    )
+
+    assert expected_feedback == sanitize_plan_text(feedback)
+    assert revision_context.feedback == expected_feedback
+    assert decision_feedback == expected_feedback
+    assert revision_feedback == expected_feedback
+    assert result.decision.feedback == expected_feedback
+    assert result.snapshot.current.revision_feedback == expected_feedback
+    assert result.snapshot.decisions[-1].feedback == expected_feedback
     assert len(result.events) == 1
-    assert "supersecretvalue" not in str(result.events[0].model_dump(mode="json"))
+    assert result.events[0].data["decision"]["feedback"] == expected_feedback
+    assert replay.idempotent_replay is True
+    assert replay.decision.feedback == expected_feedback
+    assert replay.snapshot.decisions[-1].feedback == expected_feedback
+    assert len(seeded_waiting_plan.generator.calls) == calls_before_replay
+    assert "supersecretvalue" not in str(
+        {
+            "decision_row": decision_feedback,
+            "version_row": revision_feedback,
+            "revision_context": revision_context,
+            "result": result,
+            "replay": replay,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "action",
+    (PlanDecisionAction.APPROVE, PlanDecisionAction.REJECT),
+)
+@pytest.mark.asyncio
+async def test_plan_run_non_revision_feedback_is_sanitized_at_service_boundary(
+    seeded_waiting_plan: SeededWaitingPlan,
+    action: PlanDecisionAction,
+):
+    feedback = "Authorization: Bearer supersecretvalue"
+    expected_feedback = sanitize_plan_text(feedback)
+    request = PlanDecisionRequest.model_construct(
+        decision_id=f"{action.value}-safe-feedback",
+        plan_id=seeded_waiting_plan.plan_id,
+        plan_version=1,
+        expected_version=seeded_waiting_plan.aggregate_version,
+        action=action,
+        feedback=feedback,
+    )
+
+    result = await seeded_waiting_plan.service.decide(
+        request,
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-2",
+    )
+    async with seeded_waiting_plan.database.connect() as connection:
+        decision_feedback = (
+            await connection.execute(
+                select(agent_plan_decisions.c.feedback).where(
+                    agent_plan_decisions.c.plan_id == seeded_waiting_plan.plan_id,
+                    agent_plan_decisions.c.decision_id == request.decision_id,
+                )
+            )
+        ).scalar_one()
+    replay = await seeded_waiting_plan.service.decide(
+        request,
+        decided_by=seeded_waiting_plan.tenant_id,
+        runtime_instance_id="runtime-3",
+    )
+
+    assert decision_feedback == expected_feedback
+    assert result.decision.feedback == expected_feedback
+    assert result.snapshot.decisions[-1].feedback == expected_feedback
+    assert result.events[0].data["decision"]["feedback"] == expected_feedback
+    assert replay.idempotent_replay is True
+    assert replay.decision.feedback == expected_feedback
+    assert replay.events == ()
+    assert "supersecretvalue" not in str(
+        {
+            "decision_row": decision_feedback,
+            "result": result,
+            "replay": replay,
+        }
+    )
 
 
 @pytest.mark.asyncio

@@ -121,6 +121,13 @@ class WorkflowCoordinator:
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             await repository._lock_tenant(context.tenant_id)
+            if not await repository._plan_version_exists(
+                context,
+                plan_id,
+                plan_version,
+                content_digest=plan_digest,
+            ):
+                raise StaleFenceError("Plan version or digest is stale")
             await self._enforce_run_quota(repository, context.tenant_id)
             lease = await repository._create_run(
                 context,

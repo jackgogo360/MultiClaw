@@ -109,6 +109,7 @@ class PlanningService:
         decided_by: str,
         runtime_instance_id: str,
     ) -> PlanDecisionResult:
+        request = self._normalize_decision_request(request)
         context, snapshot, run, replay = await self._read_decision_state(
             request,
             decided_by=decided_by,
@@ -242,11 +243,17 @@ class PlanningService:
             workflow_settings=self._settings.workflow,
         ) as uow:
             repository = uow.plans.for_context(context)
-            replay = await repository.replay_decision(
+            claim = await repository.begin_revision_decision(
                 request,
                 decided_by=decided_by,
             )
-            if replay is not None:
+            if claim.resulting_plan_version is not None:
+                replay = await repository.replay_decision(
+                    request,
+                    decided_by=decided_by,
+                )
+                if replay is None:
+                    raise RuntimeError("completed revision decision could not be replayed")
                 run = await uow.workflow.get_plan_run(context, request.plan_id)
                 if run is None:
                     raise PlanNotFoundError("Plan not found")
@@ -263,10 +270,6 @@ class PlanningService:
                 raise PlanNotFoundError("Plan not found")
             if current.current_version - 1 >= self._settings.planning.max_revisions:
                 raise PlanRevisionLimitError("Plan revision limit exceeded")
-            await repository.begin_revision_decision(
-                request,
-                decided_by=decided_by,
-            )
             prior_steps = {
                 step.logical_step_key: step.step_id for step in current.current.steps
             }
@@ -403,6 +406,17 @@ class PlanningService:
             plan_version=snapshot.current_version,
             aggregate_version=snapshot.aggregate_version,
         )
+
+    @staticmethod
+    def _normalize_decision_request(
+        request: PlanDecisionRequest,
+    ) -> PlanDecisionRequest:
+        if request.feedback is None:
+            return request
+        safe_feedback = sanitize_plan_text(request.feedback)
+        if safe_feedback == request.feedback:
+            return request
+        return request.model_copy(update={"feedback": safe_feedback})
 
     @classmethod
     def _decision_event(

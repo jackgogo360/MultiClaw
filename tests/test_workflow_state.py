@@ -998,6 +998,35 @@ async def test_start_plan_run_binds_versions_and_approval_checkpoint(
     ]
 
 
+@pytest.mark.parametrize("mismatch", ("version", "digest"))
+@pytest.mark.asyncio
+async def test_plan_run_start_rejects_unknown_version_or_digest_without_rows(
+    workflow_database: Database,
+    mismatch: str,
+):
+    context = await _create_run_context(workflow_database, suffix=f"-plan-{mismatch}")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    plan_version = 2 if mismatch == "version" else 1
+    supplied_digest = (
+        ("0" * 64 if plan_digest != "0" * 64 else "1" * 64)
+        if mismatch == "digest"
+        else plan_digest
+    )
+    coordinator = _coordinator(workflow_database)
+
+    with pytest.raises(StaleFenceError, match="Plan version"):
+        await coordinator.start_plan_run_with_checkpoint(
+            context,
+            "runtime-plan",
+            plan_id=plan_id,
+            plan_version=plan_version,
+            plan_digest=supplied_digest,
+        )
+
+    assert await coordinator.get_run(context) is None
+    assert await _checkpoint_rows(workflow_database, context) == []
+
+
 @pytest.mark.asyncio
 async def test_direct_run_hydration_keeps_plan_binding_empty(
     workflow_database: Database,
