@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import json
 import re
 from dataclasses import dataclass
 
@@ -110,6 +112,43 @@ class MemoryRepository:
             limit=limit,
             visible_scope="session_only",
         )
+
+    async def has_final_summary(self, run_id: str) -> bool:
+        if self._context.session_id is None:
+            return False
+        like_escape = "^"
+        escaped_run_id = (
+            run_id.replace(like_escape, like_escape * 2)
+            .replace("%", f"{like_escape}%")
+            .replace("_", f"{like_escape}_")
+        )
+        result = await self._conn.execute(
+            select(memory_entries.c.metadata_json).where(
+                memory_entries.c.tenant_id == self._context.tenant_id,
+                memory_entries.c.workspace_id == self._context.workspace_id,
+                memory_entries.c.session_id == self._context.session_id,
+                memory_entries.c.type == "chat_message",
+                memory_entries.c.role == "assistant",
+                memory_entries.c.metadata_json.like(
+                    '%"kind":"plan_final_summary"%', escape=like_escape
+                ),
+                memory_entries.c.metadata_json.like(
+                    f'%"run_id":"{escaped_run_id}"%', escape=like_escape
+                ),
+            )
+        )
+        for metadata_json in result.scalars():
+            try:
+                metadata = json.loads(str(metadata_json))
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("kind") == "plan_final_summary"
+                and metadata.get("run_id") == run_id
+            ):
+                return True
+        return False
 
     async def context(
         self,

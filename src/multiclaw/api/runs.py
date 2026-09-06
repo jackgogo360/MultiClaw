@@ -12,6 +12,7 @@ from multiclaw.api.dependencies import tenant_context
 from multiclaw.api.plans import (
     _not_found,
     _scoped_uow,
+    _terminalize_cancelled_stream,
     _terminalize_stream_error,
     build_run_response,
 )
@@ -24,7 +25,7 @@ from multiclaw.runtime.pool import RuntimeUnavailableError
 from multiclaw.stream import DataStreamEncoder
 from multiclaw.tenancy import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
-from multiclaw.workflow.models import RunLeaseHandle, StaleFenceError
+from multiclaw.workflow.models import RunLeaseHandle, RunStatus, StaleFenceError
 
 router = APIRouter(prefix="/api")
 
@@ -102,6 +103,9 @@ async def retry_final_summary(
     try:
         runtime_lease = runtime.begin_run()
     except RuntimeError as error:
+        await WorkflowCoordinator(
+            request.app.state.database, settings=request.app.state.settings
+        ).transition_run(lease, RunStatus.AWAITING_USER)
         raise RuntimeUnavailableError(
             request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
         ) from error
@@ -121,6 +125,7 @@ async def retry_final_summary(
             )
             yield encoder.finish("stop")
         except asyncio.CancelledError:
+            await _terminalize_cancelled_stream(request, handle)
             raise
         except Exception:  # noqa: BLE001 - SSE must terminalize any internal failure.
             await _terminalize_stream_error(request, handle)

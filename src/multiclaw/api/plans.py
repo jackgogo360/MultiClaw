@@ -15,6 +15,7 @@ from multiclaw.api.dependencies import tenant_context
 from multiclaw.planner.models import (
     PlanDecisionAction,
     PlanDecisionBody,
+    PlanDecisionIdempotencyError,
     PlanDecisionRequest,
     PlanDecisionResponse,
     PlanNotFoundError,
@@ -92,14 +93,7 @@ def _attempt_response(attempt) -> PlanStepAttemptResponse:
 
 
 async def _summary_available(uow: TenantUnitOfWork, run_id: str) -> bool:
-    # Metadata, unlike streamed parts, is durable and scoped by the UoW context.
-    messages = await uow.memory.recent(limit=200, entry_type="chat_message")
-    return any(
-        message.role == "assistant"
-        and message.metadata.get("kind") == "plan_final_summary"
-        and message.metadata.get("run_id") == run_id
-        for message in messages
-    )
+    return await uow.memory.has_final_summary(run_id)
 
 
 async def build_run_response(
@@ -227,6 +221,20 @@ async def _terminalize_stream_error(
         )
 
 
+async def _terminalize_cancelled_stream(
+    request: Request,
+    handle: RunLeaseHandle,
+) -> None:
+    """Finish durable cleanup before propagating an SSE cancellation."""
+    cleanup_task = asyncio.create_task(_terminalize_stream_error(request, handle))
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            continue
+    await cleanup_task
+
+
 async def _scoped_uow(
     request: Request,
     context: TenantContext,
@@ -307,6 +315,21 @@ async def decide_plan(
         )
     except PlanNotFoundError as error:
         raise _not_found() from error
+    except PlanDecisionIdempotencyError:
+        async for uow, session_context in _scoped_uow(request, context, body.session_id):
+            latest = await build_plan_response(
+                uow,
+                await _load_scoped_plan(uow, session_context, plan_id),
+            )
+        return JSONResponse(
+            {
+                "detail": {
+                    "code": "plan_decision_conflict",
+                    "latest": latest.model_dump(mode="json"),
+                }
+            },
+            status_code=409,
+        )
     except PlanVersionConflictError as error:
         async for uow, _ in _scoped_uow(request, context, body.session_id):
             latest = await build_plan_response(uow, error.latest)
@@ -373,6 +396,8 @@ async def decide_plan(
                     )
             yield encoder.finish("stop")
         except asyncio.CancelledError:
+            if handle is not None:
+                await _terminalize_cancelled_stream(request, handle)
             raise
         except Exception:  # noqa: BLE001 - SSE must terminalize any internal failure.
             if handle is not None:
@@ -394,6 +419,8 @@ async def rerun_plan(
     context: TenantContext = Depends(tenant_context),  # noqa: B008
 ):
     session_context = context.for_session(body.session_id)
+    async for uow, checked_context in _scoped_uow(request, context, body.session_id):
+        await _load_scoped_plan(uow, checked_context, plan_id)
     runtime = await request.app.state.runtime_pool.acquire(session_context)
     run_context = session_context.for_run(body.session_id, str(uuid4()))
     try:
@@ -462,6 +489,7 @@ async def rerun_plan(
                 yield encoder.plan_step_status(attempt)
             yield encoder.finish("stop")
         except asyncio.CancelledError:
+            await _terminalize_cancelled_stream(request, handle)
             raise
         except Exception:  # noqa: BLE001 - SSE must terminalize any internal failure.
             await _terminalize_stream_error(request, handle)

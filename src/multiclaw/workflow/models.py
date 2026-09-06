@@ -310,6 +310,7 @@ LEGAL_RUN_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
     RunStatus.RESUMING: frozenset(
         {
             RunStatus.RUNNING,
+            RunStatus.AWAITING_USER,
             RunStatus.FAILED_TERMINAL,
             RunStatus.BLOCKED_INCOMPATIBLE,
             RunStatus.BLOCKED_CORRUPT,

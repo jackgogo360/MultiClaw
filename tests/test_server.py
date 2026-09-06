@@ -252,7 +252,7 @@ def test_plan_api_request_body_rejects_forged_decider(migrated_database):
     """Decision identity is derived from auth, never accepted from a client."""
     from multiclaw import server
 
-    with TestClient(server.app) as client:
+    with TestClient(server.app, raise_server_exceptions=False) as client:
         client.cookies = _make_auth_cookie(server.app, migrated_database)
         response = client.post(
             f"/api/plans/{uuid4()}/decision",
@@ -378,7 +378,7 @@ def test_plan_api_scopes_reads_and_streams_approved_execution(migrated_database,
         )
         return root, session.id, materialized.plan.plan_id, materialized.plan.aggregate_version
 
-    with TestClient(server.app) as client:
+    with TestClient(server.app, raise_server_exceptions=False) as client:
         owner_cookie = _make_auth_cookie(server.app, migrated_database, email="plans-owner@example.com")
         owner_id = jwt.decode(
             owner_cookie["token"], TEST_JWT_SIGNING_KEY, algorithms=["HS256"], audience="multiclaw-api"
@@ -399,6 +399,30 @@ def test_plan_api_scopes_reads_and_streams_approved_execution(migrated_database,
         assert listed.json()[0]["plan_id"] == plan_id
 
         original_acquire = server.app.state.runtime_pool.acquire
+        rerun_acquire_calls = 0
+
+        async def record_rerun_acquire(context):
+            nonlocal rerun_acquire_calls
+            rerun_acquire_calls += 1
+            return await original_acquire(context)
+
+        monkeypatch.setattr(
+            server.app.state.runtime_pool, "acquire", record_rerun_acquire
+        )
+        client.cookies = foreign_cookie
+        foreign_rerun = client.post(
+            f"/api/plans/{plan_id}/runs", json={"session_id": session_id}
+        )
+        client.cookies = owner_cookie
+        missing_rerun = client.post(
+            f"/api/plans/{uuid4()}/runs", json={"session_id": session_id}
+        )
+        assert foreign_rerun.status_code == missing_rerun.status_code == 404
+        assert foreign_rerun.json() == missing_rerun.json() == {
+            "detail": "resource not found"
+        }
+        assert rerun_acquire_calls == 0
+
         runner = FakeRunner()
 
         async def acquire_and_patch(context):
@@ -433,6 +457,82 @@ def test_plan_api_scopes_reads_and_streams_approved_execution(migrated_database,
         assert persisted.json()["status"] == "completed"
         assert persisted.json()["final_summary_available"] is True
 
+        async def add_newer_chat_messages() -> None:
+            async with TenantUnitOfWork(
+                migrated_database,
+                root.for_session(session_id),
+                planning_settings=server.app.state.settings.planning,
+                workflow_settings=server.app.state.settings.workflow,
+            ) as uow:
+                memory = MemoryRepository(
+                    uow.conn,
+                    root.for_session(session_id),
+                    migrated_database.dialect,
+                )
+                for turn_index in range(10_000, 10_201):
+                    await memory.save(
+                        MemoryEntry(
+                            content="newer chat message",
+                            type="chat_message",
+                            role="assistant",
+                            session_id=session_id,
+                            turn_index=turn_index,
+                        )
+                    )
+
+        asyncio.run(add_newer_chat_messages())
+        assert client.get(
+            f"/api/runs/{run_id}?session_id={session_id}"
+        ).json()["final_summary_available"] is True
+
+        extra_metadata_run_id = str(uuid4())
+
+        async def save_summary_with_extra_metadata() -> bool:
+            async with TenantUnitOfWork(
+                migrated_database,
+                root.for_session(session_id),
+                planning_settings=server.app.state.settings.planning,
+                workflow_settings=server.app.state.settings.workflow,
+            ) as uow:
+                memory = MemoryRepository(
+                    uow.conn,
+                    root.for_session(session_id),
+                    migrated_database.dialect,
+                )
+                await memory.save(
+                    MemoryEntry(
+                        content="A nested metadata lookalike.",
+                        type="chat_message",
+                        role="assistant",
+                        session_id=session_id,
+                        turn_index=19_999,
+                        metadata={
+                            "nested": {
+                                "kind": "plan_final_summary",
+                                "run_id": extra_metadata_run_id,
+                            },
+                        },
+                    )
+                )
+                await memory.save(
+                    MemoryEntry(
+                        content="A future-compatible final summary.",
+                        type="chat_message",
+                        role="assistant",
+                        session_id=session_id,
+                        turn_index=20_000,
+                        metadata={
+                            "kind": "plan_final_summary",
+                            "plan_id": plan_id,
+                            "run_id": extra_metadata_run_id,
+                            "summary_schema_version": 2,
+                        },
+                    )
+                )
+                return await memory.has_final_summary(extra_metadata_run_id)
+
+        assert asyncio.run(save_summary_with_extra_metadata()) is True
+
         stale = client.post(
             f"/api/plans/{plan_id}/decision",
             json={
@@ -446,6 +546,22 @@ def test_plan_api_scopes_reads_and_streams_approved_execution(migrated_database,
         assert stale.status_code == 409
         assert stale.json()["detail"]["code"] == "plan_version_conflict"
         assert stale.json()["detail"]["latest"]["current_version"] == 1
+
+        calls_before_conflicting_decision = runner.calls
+        conflicting_decision = client.post(
+            f"/api/plans/{plan_id}/decision",
+            json={
+                "session_id": session_id,
+                "decision_id": "approve-api-test",
+                "plan_version": 1,
+                "expected_version": aggregate_version + 1,
+                "action": "approve",
+            },
+        )
+        assert conflicting_decision.status_code == 409
+        assert conflicting_decision.json()["detail"]["code"] == "plan_decision_conflict"
+        assert conflicting_decision.json()["detail"]["latest"]["plan_id"] == plan_id
+        assert runner.calls == calls_before_conflicting_decision
 
         _, revise_session_id, revise_plan_id, revise_version = asyncio.run(seed_plan(owner_id))
 
@@ -726,6 +842,26 @@ def test_plan_api_scopes_reads_and_streams_approved_execution(migrated_database,
         assert stale_summary_retry.status_code == 409
         assert stale_summary_retry.json()["detail"] == "summary retry is unavailable"
 
+        original_begin_run = type(shared_runtime).begin_run
+
+        def reject_summary_retry_runtime(_runtime):
+            raise RuntimeError("runtime admission unavailable")
+
+        monkeypatch.setattr(
+            type(shared_runtime), "begin_run", reject_summary_retry_runtime
+        )
+        try:
+            unavailable_summary_retry = client.post(
+                f"/api/runs/{summary_run_id}/summary/retry",
+                json={"session_id": summary_session_id},
+            )
+        finally:
+            monkeypatch.setattr(type(shared_runtime), "begin_run", original_begin_run)
+        assert unavailable_summary_retry.status_code == 503
+        assert client.get(
+            f"/api/runs/{summary_run_id}?session_id={summary_session_id}"
+        ).json()["status"] == "awaiting_user"
+
         runner.router = FakeRouter()
         summary_retry = client.post(
             f"/api/runs/{summary_run_id}/summary/retry",
@@ -739,6 +875,250 @@ def test_plan_api_scopes_reads_and_streams_approved_execution(migrated_database,
         assert completed_get["status"] == "completed"
         assert len(completed_get["latest_attempts"]) == 1
         assert runner.calls == calls_before_summary + 1
+
+
+@pytest.mark.asyncio
+async def test_plan_execution_disconnect_terminalizes_durable_leases(
+    migrated_database,
+    monkeypatch,
+):
+    """Cancelling any Plan execution SSE stream must release its durable lease."""
+    from multiclaw import server
+    from multiclaw.api import plans as plans_api
+    from multiclaw.api import runs as runs_api
+    from multiclaw.memory import MemoryEntry
+    from multiclaw.planner.models import (
+        MaterializeInitialPlan,
+        PlanDecisionAction,
+        PlanDecisionBody,
+        PlanDraft,
+        PlanDraftStep,
+        PlanStepCompletion,
+        PlanTriggerMode,
+        SessionScopedRequest,
+    )
+    from multiclaw.planner.service import PlanningService
+    from multiclaw.storage.repositories.memory import MemoryRepository
+
+    class SuccessfulSummaryRouter:
+        async def completion(self, **_kwargs):
+            return SimpleNamespace(content="All durable Plan steps completed.")
+
+    class FailingSummaryRouter:
+        async def completion(self, **_kwargs):
+            raise RuntimeError("summary model unavailable")
+
+    class BlockingSummaryRouter:
+        def __init__(self, started: asyncio.Event) -> None:
+            self.started = started
+            self.release = asyncio.Event()
+
+        async def completion(self, **_kwargs):
+            self.started.set()
+            await self.release.wait()
+            return SimpleNamespace(content="unreachable")
+
+    class BlockingRunner:
+        def __init__(self) -> None:
+            self.settings = server.app.state.settings
+            self.router = SuccessfulSummaryRouter()
+            self.registry = SimpleNamespace(to_openai_schemas=list)
+            self.skill_manager = SimpleNamespace(active_skills=[])
+            self.step_started = asyncio.Event()
+            self.step_release = asyncio.Event()
+            self.block_steps = False
+
+        async def run_plan_step(self, _request, **_kwargs):
+            if self.block_steps:
+                self.step_started.set()
+                await self.step_release.wait()
+            return PlanStepCompletion(
+                status="succeeded",
+                summary="The scoped step succeeded.",
+                evidence=["persisted"],
+            )
+
+    async def seed_plan(user_id: str) -> tuple[TenantContext, str, str, int]:
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None and user.default_workspace_id is not None
+        root = TenantContext(user_id, user.default_workspace_id)
+        source_message_id = str(uuid4())
+        async with TenantUnitOfWork(
+            migrated_database,
+            root,
+            planning_settings=server.app.state.settings.planning,
+            workflow_settings=server.app.state.settings.workflow,
+        ) as uow:
+            session = await uow.sessions.create()
+            await MemoryRepository(
+                uow.conn, root.for_session(session.id), migrated_database.dialect
+            ).save(
+                MemoryEntry(
+                    id=source_message_id,
+                    content="Plan this request.",
+                    type="chat_message",
+                    role="user",
+                    session_id=session.id,
+                    turn_index=1,
+                )
+            )
+        materialized = await PlanningService(
+            migrated_database, settings=server.app.state.settings
+        ).materialize_initial(
+            MaterializeInitialPlan(
+                context=root.for_run(session.id, str(uuid4())),
+                runtime_instance_id="seed-runtime",
+                source_message_id=source_message_id,
+                assistant_turn_index=1,
+                trigger_mode=PlanTriggerMode.EXPLICIT,
+                draft=PlanDraft(
+                    objective="Validate stream cancellation cleanup.",
+                    constraints=[],
+                    generation_reason="test",
+                    steps=[
+                        PlanDraftStep(
+                            logical_step_key="verify",
+                            title="Verify",
+                            description="Run one durable scoped step.",
+                            expected_outcome="A persisted result.",
+                        )
+                    ],
+                ),
+            )
+        )
+        return root, session.id, materialized.plan.plan_id, materialized.plan.aggregate_version
+
+    async def cancel_after_execution_starts(response, started: asyncio.Event) -> str:
+        chunks: list[str] = []
+
+        async def consume() -> None:
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+
+        consume_task = asyncio.create_task(consume())
+        await asyncio.wait_for(started.wait(), timeout=3)
+        consume_task.cancel()
+        await asyncio.gather(consume_task, return_exceptions=True)
+        await response.body_iterator.aclose()
+        return _decode_sse_messages("".join(chunks))[0]["data"]["run_id"]
+
+    with TestClient(server.app):
+        user_id, _ = await _seed_user(migrated_database, "plan-disconnect@example.com")
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None and user.default_workspace_id is not None
+        root = TenantContext(user_id, user.default_workspace_id)
+        request = Request(
+            {
+                "type": "http",
+                "app": server.app,
+                "method": "POST",
+                "path": "/api/plans",
+                "headers": [],
+            }
+        )
+        runner = BlockingRunner()
+        original_acquire = server.app.state.runtime_pool.acquire
+        captured: dict[str, object] = {}
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            runtime.agent = runner
+            captured["runtime"] = runtime
+            captured.setdefault("active_runs_before_stream", runtime.active_run_count)
+            captured.setdefault(
+                "executing_runs_before_stream", runtime.active_executing_run_count
+            )
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+
+        _, session_id, plan_id, version = await seed_plan(user_id)
+        runner.block_steps = True
+        approval_response = await plans_api.decide_plan(
+            plan_id,
+            PlanDecisionBody(
+                session_id=session_id,
+                decision_id="cancel-approval-stream",
+                plan_version=1,
+                expected_version=version,
+                action=PlanDecisionAction.APPROVE,
+            ),
+            request,
+            root,
+        )
+        approval_run_id = await cancel_after_execution_starts(
+            approval_response, runner.step_started
+        )
+        approval_context = root.for_run(session_id, approval_run_id)
+        assert (
+            await _run_status(migrated_database, approval_context)
+            == RunStatus.FAILED_TERMINAL.value
+        )
+
+        runtime = captured["runtime"]
+        assert runtime.active_executing_run_count == captured["executing_runs_before_stream"]
+        assert runtime.active_run_count == captured["active_runs_before_stream"]
+
+        runner.step_started = asyncio.Event()
+        rerun_response = await plans_api.rerun_plan(
+            plan_id,
+            SessionScopedRequest(session_id=session_id),
+            request,
+            root,
+        )
+        rerun_run_id = await cancel_after_execution_starts(
+            rerun_response, runner.step_started
+        )
+        rerun_context = root.for_run(session_id, rerun_run_id)
+        assert (
+            await _run_status(migrated_database, rerun_context)
+            == RunStatus.FAILED_TERMINAL.value
+        )
+        assert runtime.active_executing_run_count == captured["executing_runs_before_stream"]
+        assert runtime.active_run_count == captured["active_runs_before_stream"]
+
+        _, summary_session_id, summary_plan_id, summary_version = await seed_plan(user_id)
+        runner.block_steps = False
+        runner.router = FailingSummaryRouter()
+        waiting_response = await plans_api.decide_plan(
+            summary_plan_id,
+            PlanDecisionBody(
+                session_id=summary_session_id,
+                decision_id="cancel-summary-stream-seed",
+                plan_version=1,
+                expected_version=summary_version,
+                action=PlanDecisionAction.APPROVE,
+            ),
+            request,
+            root,
+        )
+        waiting_parts = _decode_sse_messages(
+            "".join([chunk async for chunk in waiting_response.body_iterator])
+        )
+        summary_run_id = waiting_parts[0]["data"]["run_id"]
+        assert await _run_status(
+            migrated_database, root.for_run(summary_session_id, summary_run_id)
+        ) == RunStatus.AWAITING_USER.value
+
+        summary_started = asyncio.Event()
+        runner.router = BlockingSummaryRouter(summary_started)
+        retry_response = await runs_api.retry_final_summary(
+            summary_run_id,
+            SessionScopedRequest(session_id=summary_session_id),
+            request,
+            root,
+        )
+        retried_run_id = await cancel_after_execution_starts(
+            retry_response, summary_started
+        )
+        assert retried_run_id == summary_run_id
+        assert await _run_status(
+            migrated_database, root.for_run(summary_session_id, summary_run_id)
+        ) == RunStatus.FAILED_TERMINAL.value
+        assert runtime.active_executing_run_count == captured["executing_runs_before_stream"]
+        assert runtime.active_run_count == captured["active_runs_before_stream"]
 
 
 @pytest.fixture
