@@ -29,6 +29,7 @@ from multiclaw.planner.models import (
     SessionScopedRequest,
 )
 from multiclaw.planner.service import PlanningService
+from multiclaw.planner.validation import sanitize_plan_text
 from multiclaw.runtime.pool import RuntimeUnavailableError
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.stream import DataStreamEncoder
@@ -235,6 +236,58 @@ async def _terminalize_cancelled_stream(
     await cleanup_task
 
 
+async def _decision_conflict_response(
+    request: Request,
+    context: TenantContext,
+    session_id: str,
+    plan_id: str,
+) -> JSONResponse:
+    async for uow, session_context in _scoped_uow(request, context, session_id):
+        latest = await build_plan_response(
+            uow,
+            await _load_scoped_plan(uow, session_context, plan_id),
+        )
+        return JSONResponse(
+            {
+                "detail": {
+                    "code": "plan_decision_conflict",
+                    "latest": latest.model_dump(mode="json"),
+                }
+            },
+            status_code=409,
+        )
+    raise AssertionError("scoped UoW did not yield")
+
+
+def _decision_replay_response(
+    body: PlanDecisionBody,
+    replay,
+    run,
+) -> StreamingResponse:
+    async def stream() -> AsyncIterator[str]:
+        encoder = DataStreamEncoder()
+        yield encoder.run_metadata(body.session_id, str(run.context.run_id))
+        if replay.decision.action is PlanDecisionAction.REVISE:
+            yield encoder.plan_revised(
+                {
+                    "plan_id": replay.snapshot.plan_id,
+                    "current_version": replay.snapshot.current_version,
+                }
+            )
+        yield encoder.plan_decision(
+            {
+                "plan_id": replay.snapshot.plan_id,
+                "decision": PlanDecisionResponse(
+                    **asdict(replay.decision)
+                ).model_dump(mode="json"),
+                "idempotent_replay": True,
+            }
+        )
+        yield encoder.finish("stop")
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
 async def _scoped_uow(
     request: Request,
     context: TenantContext,
@@ -288,17 +341,6 @@ async def decide_plan(
     request: Request,
     context: TenantContext = Depends(tenant_context),  # noqa: B008
 ):
-    # Verify session and aggregate scope before acquiring a runtime or mutating.
-    async for uow, session_context in _scoped_uow(request, context, body.session_id):
-        await _load_scoped_plan(uow, session_context, plan_id)
-
-    runtime = await request.app.state.runtime_pool.acquire(session_context)
-    coordinator = getattr(runtime, "plan_execution", None)
-    if coordinator is None:
-        raise HTTPException(status_code=503, detail="runtime temporarily unavailable")
-    service: PlanningService | None = getattr(coordinator, "planning_service", None)
-    if service is None:
-        raise HTTPException(status_code=503, detail="runtime temporarily unavailable")
     decision_request = PlanDecisionRequest(
         decision_id=body.decision_id,
         plan_id=plan_id,
@@ -307,6 +349,36 @@ async def decide_plan(
         action=body.action,
         feedback=body.feedback,
     )
+    if decision_request.feedback is not None:
+        decision_request = decision_request.model_copy(
+            update={"feedback": sanitize_plan_text(decision_request.feedback)}
+        )
+    try:
+        async for uow, session_context in _scoped_uow(request, context, body.session_id):
+            await _load_scoped_plan(uow, session_context, plan_id)
+            replay = await uow.plans.for_context(session_context).replay_decision(
+                decision_request,
+                decided_by=context.tenant_id,
+            )
+            if replay is not None:
+                run = await uow.workflow.get_plan_run(session_context, plan_id)
+                if run is None:
+                    raise PlanNotFoundError("Plan not found")
+                return _decision_replay_response(body, replay, run)
+    except PlanNotFoundError as error:
+        raise _not_found() from error
+    except PlanDecisionIdempotencyError:
+        return await _decision_conflict_response(
+            request, context, body.session_id, plan_id
+        )
+
+    runtime = await request.app.state.runtime_pool.acquire(session_context)
+    coordinator = getattr(runtime, "plan_execution", None)
+    if coordinator is None:
+        raise HTTPException(status_code=503, detail="runtime temporarily unavailable")
+    service: PlanningService | None = getattr(coordinator, "planning_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="runtime temporarily unavailable")
     try:
         result = await service.decide(
             decision_request,
@@ -316,19 +388,8 @@ async def decide_plan(
     except PlanNotFoundError as error:
         raise _not_found() from error
     except PlanDecisionIdempotencyError:
-        async for uow, session_context in _scoped_uow(request, context, body.session_id):
-            latest = await build_plan_response(
-                uow,
-                await _load_scoped_plan(uow, session_context, plan_id),
-            )
-        return JSONResponse(
-            {
-                "detail": {
-                    "code": "plan_decision_conflict",
-                    "latest": latest.model_dump(mode="json"),
-                }
-            },
-            status_code=409,
+        return await _decision_conflict_response(
+            request, context, body.session_id, plan_id
         )
     except PlanVersionConflictError as error:
         async for uow, _ in _scoped_uow(request, context, body.session_id):

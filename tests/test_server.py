@@ -449,8 +449,45 @@ def test_plan_api_scopes_reads_and_streams_approved_execution(migrated_database,
         assert "data-plan-step-status" in {part["type"] for part in parts}
         assert runner.calls == 1
 
+        replay_acquire_calls = 0
+
+        async def reject_replay_runtime(_context):
+            nonlocal replay_acquire_calls
+            replay_acquire_calls += 1
+            raise RuntimeError("runtime must not be acquired for a decision replay")
+
+        monkeypatch.setattr(
+            server.app.state.runtime_pool, "acquire", reject_replay_runtime
+        )
+        try:
+            replayed = client.post(
+                f"/api/plans/{plan_id}/decision",
+                json={
+                    "session_id": session_id,
+                    "decision_id": "approve-api-test",
+                    "plan_version": 1,
+                    "expected_version": aggregate_version,
+                    "action": "approve",
+                },
+            )
+        finally:
+            monkeypatch.setattr(
+                server.app.state.runtime_pool, "acquire", acquire_and_patch
+            )
+        assert replayed.status_code == 200
+        replayed_parts = _decode_sse_messages(replayed.text)
+        assert [part["type"] for part in replayed_parts] == [
+            "data-run",
+            "data-plan-decision",
+            "finish",
+        ]
+        assert replayed_parts[1]["data"]["idempotent_replay"] is True
+        assert replay_acquire_calls == 0
+        assert runner.calls == 1
+
         authoritative = client.get(f"/api/plans/{plan_id}?session_id={session_id}")
         assert authoritative.status_code == 200
+        assert len(authoritative.json()["decisions"]) == 1
         run_id = authoritative.json()["runs"][0]["run_id"]
         persisted = client.get(f"/api/runs/{run_id}?session_id={session_id}")
         assert persisted.status_code == 200
