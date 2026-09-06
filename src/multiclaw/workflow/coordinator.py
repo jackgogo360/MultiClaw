@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import cast
 from uuid import uuid4
 
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from multiclaw.config import Settings
@@ -60,6 +61,49 @@ PHASE_ALLOWED_EXECUTION_STATUSES: dict[CheckpointPhase, frozenset[ExecutionStatu
 }
 
 
+class PostCommitEventQueue:
+    """Explicit post-commit event handoff for callers that own a transaction.
+
+    The transaction owner must call ``publish`` only after its transaction has
+    committed, or ``discard`` after rollback. Draining before publication makes
+    repeated post-commit handling idempotent.
+    """
+
+    def __init__(self) -> None:
+        self._events: list[ScopedEvent] = []
+        self._connection: AsyncConnection | None = None
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._events)
+
+    def defer(self, event: ScopedEvent) -> None:
+        self._events.append(event)
+
+    def bind(self, connection: AsyncConnection) -> None:
+        if self._connection is not None and self._connection is not connection:
+            raise ValueError("PostCommitEventQueue is already bound to another transaction")
+        if self._connection is connection:
+            return
+
+        self._connection = connection
+
+        def discard_on_rollback(_connection) -> None:
+            self.discard()
+
+        sqlalchemy_event.listen(connection.sync_connection, "rollback", discard_on_rollback)
+
+    def discard(self) -> None:
+        self._events.clear()
+
+    async def publish(self, event_router: EventRouter) -> None:
+        if self._connection is not None and self._connection.in_transaction():
+            raise RuntimeError("post-commit events cannot publish before the transaction is committed")
+        events, self._events = self._events, []
+        for event in events:
+            await event_router.publish(event)
+
+
 class WorkflowCoordinator:
     def __init__(
         self,
@@ -68,11 +112,15 @@ class WorkflowCoordinator:
         settings: Settings | None = None,
         connection: AsyncConnection | None = None,
         event_router: EventRouter | None = None,
+        post_commit_events: PostCommitEventQueue | None = None,
     ) -> None:
         self._database = database
         self._settings = settings or Settings(_config_file="/nonexistent")
         self._connection = connection
         self._event_router = event_router
+        self._post_commit_events = post_commit_events
+        if connection is not None and post_commit_events is not None:
+            post_commit_events.bind(connection)
 
     async def start_run(self, context: TenantContext, runtime_instance_id: str) -> RunLease:
         async with self._write_connection() as conn:
@@ -283,8 +331,16 @@ class WorkflowCoordinator:
 
     async def request_cancellation(self, context: TenantContext) -> RunRecord:
         """Persist a cancellation request, terminalizing waiting runs atomically."""
+        if (
+            self._connection is not None
+            and self._event_router is not None
+            and self._post_commit_events is None
+        ):
+            raise ValueError(
+                "externally owned cancellation transactions require a PostCommitEventQueue"
+            )
         run_id = cast(str, context.run_id)
-        publish_plan_id: str | None = None
+        post_commit_event: ScopedEvent | None = None
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             before = await repository.get_run(context)
@@ -321,34 +377,39 @@ class WorkflowCoordinator:
                 },
                 checkpoint_seq=await repository.get_next_checkpoint_seq(context),
             )
-            if before is not None and before.status is RunStatus.AWAITING_USER:
-                publish_plan_id = record.plan_id
-        if publish_plan_id is not None and self._event_router is not None and self._connection is None:
-            async with self._database.connect() as conn:
+            if (
+                before is not None
+                and before.status is RunStatus.AWAITING_USER
+                and record.plan_id is not None
+            ):
                 plan = await PlanRepository(
                     conn,
                     self._database.dialect,
                     context,
                     self._settings.planning,
-                ).get(publish_plan_id)
-            if plan is not None:
-                assert context.session_id is not None and context.run_id is not None
-                data = PlanReference(
-                    tenant_id=context.tenant_id,
-                    workspace_id=context.workspace_id,
-                    session_id=context.session_id,
-                    run_id=context.run_id,
-                    plan_id=plan.plan_id,
-                    plan_version=plan.current_version,
-                    aggregate_version=plan.aggregate_version,
-                ).model_dump(mode="json")
-                await self._event_router.publish(
-                    ScopedEvent.from_context(
+                ).get(record.plan_id)
+                if plan is not None:
+                    assert context.session_id is not None and context.run_id is not None
+                    data = PlanReference(
+                        tenant_id=context.tenant_id,
+                        workspace_id=context.workspace_id,
+                        session_id=context.session_id,
+                        run_id=context.run_id,
+                        plan_id=plan.plan_id,
+                        plan_version=plan.current_version,
+                        aggregate_version=plan.aggregate_version,
+                    ).model_dump(mode="json")
+                    post_commit_event = ScopedEvent.from_context(
                         context,
                         "plan.run_status",
                         {**data, "status": RunStatus.CANCELLED.value},
                     )
-                )
+        if post_commit_event is not None and self._event_router is not None:
+            if self._connection is None:
+                await self._event_router.publish(post_commit_event)
+            else:
+                assert self._post_commit_events is not None
+                self._post_commit_events.defer(post_commit_event)
         return record
 
     async def raise_if_cancel_requested(self, context: TenantContext) -> None:

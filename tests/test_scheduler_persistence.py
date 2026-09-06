@@ -288,6 +288,57 @@ async def test_cancel_after_non_idempotent_dispatch_persists_observed_result_onc
     )
 
 
+@pytest.mark.asyncio
+async def test_observed_result_rejects_foreign_prepared_lease_before_persistence(
+    workflow_database: Database,
+):
+    foreign_context = await _create_run_context(workflow_database, email_suffix="-foreign-lease")
+    target_context = await _create_run_context(
+        workflow_database,
+        email_suffix="-target-lease",
+        tenant_id=foreign_context.tenant_id,
+        workspace_id=foreign_context.workspace_id,
+    )
+    coordinator = _coordinator(workflow_database)
+    foreign_lease = await coordinator.start_run_with_checkpoint(foreign_context, "same-owner")
+    target_lease = await coordinator.start_run_with_checkpoint(target_context, "same-owner")
+    assert foreign_lease.lease_owner == target_lease.lease_owner
+    assert foreign_lease.fencing_token == target_lease.fencing_token
+
+    scheduler = _scheduler(workflow_database)
+    builder = PersistedToolBuilder(
+        name="foreign_prepared_result",
+        runner=lambda _params: None,
+        recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+    )
+    invocation = builder.build(PersistedParams(label="foreign"))
+    canonical_input = scheduler._canonicalize_input({"label": "foreign"})
+    prepared = await scheduler._prepare_execution(
+        builder=builder,
+        context=foreign_context,
+        call_id="foreign-prepared-result",
+        run_lease_handle=RunLeaseHandle(foreign_lease),
+        invocation=invocation,
+        canonical_input=canonical_input,
+        recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+        idempotency_key=None,
+    )
+
+    with pytest.raises(StaleFenceError, match="context"):
+        await scheduler._persist_execution_result(
+            prepared,
+            tool_name=builder.name,
+            context=target_context,
+            call_id="foreign-prepared-result",
+            result=ToolExecutionResult(status=ToolStatus.SUCCESS, content="must not persist"),
+        )
+
+    execution = await coordinator.get_execution(foreign_context, prepared.execution_id)
+    assert execution is not None
+    assert execution.status is ExecutionStatus.EXECUTING
+    assert await coordinator.get_execution(target_context, prepared.execution_id) is None
+
+
 class PersistedParams(BaseModel):
     label: str
     delay: float = 0.0

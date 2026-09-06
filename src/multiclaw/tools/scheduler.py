@@ -663,6 +663,8 @@ class CoreToolScheduler:
         lease: RunLease,
         context: TenantContext,
     ) -> RunLease:
+        if lease.context != context:
+            raise StaleFenceError("observed result lease context is stale")
         current = await workflow.get_run(context)
         if current is None:
             return lease

@@ -34,7 +34,7 @@ from multiclaw.storage.schema import (
 )
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
-from multiclaw.workflow.coordinator import WorkflowCoordinator
+from multiclaw.workflow.coordinator import PostCommitEventQueue, WorkflowCoordinator
 from multiclaw.workflow.models import (
     LEGAL_RUN_TRANSITIONS,
     PHASE_PAYLOADS,
@@ -1501,6 +1501,107 @@ async def test_waiting_plan_cancellation_emits_one_post_commit_status_event(
     assert events[0].event_type == "plan.run_status"
     assert events[0].data["status"] == "cancelled"
     assert events[0].data["plan_id"] == plan_id
+
+
+@pytest.mark.asyncio
+async def test_external_transaction_cancellation_defers_one_event_until_owner_commits(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-external-cancel-event")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    router = EventRouter()
+    events = []
+
+    async def capture(event):
+        events.append(event)
+
+    router.subscribe(EventScope.from_context(context), capture)
+    post_commit_events = PostCommitEventQueue()
+
+    async with workflow_database.write_transaction() as conn:
+        coordinator = WorkflowCoordinator(
+            workflow_database,
+            settings=Settings(_config_file="/nonexistent"),
+            connection=conn,
+            event_router=router,
+            post_commit_events=post_commit_events,
+        )
+        await coordinator.start_plan_run_with_checkpoint(
+            context,
+            "runtime-plan",
+            plan_id=plan_id,
+            plan_version=1,
+            plan_digest=plan_digest,
+        )
+        with pytest.raises(ValueError, match="PostCommitEventQueue"):
+            await WorkflowCoordinator(
+                workflow_database,
+                settings=Settings(_config_file="/nonexistent"),
+                connection=conn,
+                event_router=router,
+            ).request_cancellation(context)
+        await coordinator.request_cancellation(context)
+
+        assert events == []
+        assert post_commit_events.pending_count == 1
+        with pytest.raises(RuntimeError, match="committed"):
+            await post_commit_events.publish(router)
+
+    await post_commit_events.publish(router)
+    await post_commit_events.publish(router)
+
+    assert len(events) == 1
+    assert events[0].event_type == "plan.run_status"
+    assert events[0].data["status"] == RunStatus.CANCELLED.value
+
+    replay = _coordinator(workflow_database)
+    await replay.request_cancellation(context)
+    assert post_commit_events.pending_count == 0
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_external_transaction_cancellation_discards_deferred_event_after_rollback(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-external-cancel-rollback")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    await _coordinator(workflow_database).start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    router = EventRouter()
+    events = []
+
+    async def capture(event):
+        events.append(event)
+
+    router.subscribe(EventScope.from_context(context), capture)
+    post_commit_events = PostCommitEventQueue()
+
+    with pytest.raises(RuntimeError, match="force rollback"):
+        async with workflow_database.write_transaction() as conn:
+            coordinator = WorkflowCoordinator(
+                workflow_database,
+                settings=Settings(_config_file="/nonexistent"),
+                connection=conn,
+                event_router=router,
+                post_commit_events=post_commit_events,
+            )
+            await coordinator.request_cancellation(context)
+            assert post_commit_events.pending_count == 1
+            assert events == []
+            raise RuntimeError("force rollback")
+
+    await post_commit_events.publish(router)
+
+    run = await _coordinator(workflow_database).get_run(context)
+    assert run is not None and run.status is RunStatus.AWAITING_USER
+    assert post_commit_events.pending_count == 0
+    assert events == []
 
 
 @pytest.mark.asyncio
