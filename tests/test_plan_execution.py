@@ -2938,6 +2938,184 @@ async def test_terminal_execution_checkpoints_before_generator_and_waits_for_rev
 
 
 @pytest.mark.asyncio
+async def test_terminal_revision_context_uses_verified_completed_current_version(
+    execution_fixture,
+) -> None:
+    draft = _draft(("collect", "publish"), chain=True)
+    observed_phases: list[str] = []
+
+    async def observe_checkpoint() -> None:
+        observed_phases.extend(
+            str(item["phase"]) for item in await execution_fixture.checkpoints()
+        )
+
+    generator = ObservingFailureGenerator(draft, observe_checkpoint)
+    execution_fixture.service._generator = generator
+    coordinator = PlanExecutionCoordinator(
+        execution_fixture.database,
+        settings=execution_fixture.settings,
+        planning_service=execution_fixture.service,
+    )
+    await execution_fixture.materialize(draft)
+    await execution_fixture.approve()
+    current = await coordinator._load_active_plan(execution_fixture._context())
+    root_summary = "Collected Authorization: Bearer revision-context-token"
+    outcome = await coordinator.execute_to_boundary(
+        context=execution_fixture._context(),
+        run_lease_handle=RunLeaseHandle(execution_fixture.lease),
+        runner=ScriptedStepRunner(
+            [
+                PlanStepCompletion(
+                    status="succeeded",
+                    summary=root_summary,
+                    evidence=["Bearer raw-evidence-token"],
+                ),
+                PlanStepCompletion(
+                    status="failed",
+                    summary="publish failed",
+                    evidence=[],
+                ),
+            ]
+        ),
+    )
+
+    assert outcome.state == "awaiting_user"
+    assert CheckpointPhase.PLAN_REPLAN_REQUIRED.value in observed_phases
+    assert len(generator.calls) == 1
+    revision = generator.calls[0]
+    assert revision.parent_version == current.current_version
+    assert revision.failed_step_key == "publish"
+    assert revision.failed_error is not None and revision.failed_error.startswith(
+        "failure_digest:"
+    )
+    assert revision.current_plan is not None
+    current_context = revision.current_plan
+    assert (
+        current_context.plan_version,
+        current_context.content_digest,
+        current_context.objective,
+        current_context.constraints,
+        current_context.generation_reason,
+    ) == (
+        current.current.plan_version,
+        current.current.content_digest,
+        current.current.objective,
+        current.current.constraints,
+        current.current.generation_reason,
+    )
+    assert [step.logical_step_key for step in current_context.steps] == [
+        "collect",
+        "publish",
+    ]
+    expected_steps = {
+        step.logical_step_key: step for step in current.current.steps
+    }
+    for step_context in current_context.steps:
+        source = expected_steps[step_context.logical_step_key]
+        assert (
+            step_context.title,
+            step_context.description,
+            step_context.expected_outcome,
+            step_context.max_attempts,
+            step_context.definition_digest,
+            step_context.supersedes_step_id,
+        ) == (
+            source.title,
+            source.description,
+            source.expected_outcome,
+            source.max_attempts,
+            source.definition_digest,
+            source.supersedes_step_id,
+        )
+    assert [step.depends_on for step in current_context.steps] == [(), ("collect",)]
+    assert len(revision.completed) == 1
+    completed = revision.completed[0]
+    async with TenantUnitOfWork(
+        execution_fixture.database,
+        execution_fixture._context(),
+    ) as uow:
+        root_attempts = await uow.plans.step_attempts(
+            plan_id=current.plan_id,
+            plan_version=current.current_version,
+            run_id=str(execution_fixture._context().run_id),
+            step_id=current.current.steps[0].step_id,
+        )
+    assert len(root_attempts) == 1
+    root_document = await execution_fixture.load_result(root_attempts[0].result_ref)
+    assert (
+        completed.logical_step_key,
+        completed.summary,
+        completed.result_digest,
+    ) == (
+        "collect",
+        str(redact(root_summary)),
+        root_document.digest(),
+    )
+    revision_payload = json.dumps(revision.model_dump(mode="json"), sort_keys=True)
+    assert "revision-context-token" not in revision_payload
+    assert "raw-evidence-token" not in revision_payload
+    assert "evidence" not in revision_payload
+
+
+@pytest.mark.asyncio
+async def test_terminal_revision_generation_fails_closed_for_invalid_completed_result(
+    execution_fixture,
+) -> None:
+    draft = _draft(("collect", "publish"), chain=True)
+
+    async def observe_checkpoint() -> None:
+        return None
+
+    generator = ObservingFailureGenerator(draft, observe_checkpoint)
+    execution_fixture.service._generator = generator
+
+    class CorruptingRunner(ScriptedStepRunner):
+        async def run_plan_step(self, request, **kwargs):
+            if request.step.logical_step_key == "publish":
+                source = await execution_fixture.latest_attempt()
+                assert source.result_ref is not None
+                async with execution_fixture.database.write_transaction() as conn:
+                    await conn.execute(
+                        update(memory_entries)
+                        .where(memory_entries.c.id == source.result_ref.removeprefix("memory:"))
+                        .values(metadata_json='{"schema_version":2}')
+                    )
+            return await super().run_plan_step(request, **kwargs)
+
+    coordinator = PlanExecutionCoordinator(
+        execution_fixture.database,
+        settings=execution_fixture.settings,
+        planning_service=execution_fixture.service,
+    )
+    await execution_fixture.materialize(draft)
+    await execution_fixture.approve()
+    with pytest.raises(PlanExecutionBlocked, match="document is unavailable"):
+        await coordinator.execute_to_boundary(
+            context=execution_fixture._context(),
+            run_lease_handle=RunLeaseHandle(execution_fixture.lease),
+            runner=CorruptingRunner(
+                [
+                    PlanStepCompletion(
+                        status="succeeded",
+                        summary="collect complete",
+                        evidence=[],
+                    ),
+                    PlanStepCompletion(
+                        status="failed",
+                        summary="publish failed",
+                        evidence=[],
+                    ),
+                ]
+            ),
+        )
+
+    assert generator.calls == []
+    assert (await execution_fixture.latest_checkpoint())["phase"] == (
+        CheckpointPhase.PLAN_REPLAN_REQUIRED.value
+    )
+
+
+@pytest.mark.asyncio
 async def test_failed_revision_generation_terminates_without_extra_version(
     execution_fixture,
 ) -> None:

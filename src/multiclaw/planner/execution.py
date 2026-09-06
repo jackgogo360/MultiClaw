@@ -12,8 +12,10 @@ from multiclaw.config import Settings
 from multiclaw.planner.generator import PlanGenerationError
 from multiclaw.planner.models import (
     TERMINAL_PLAN_STEP_STATUSES,
+    CompletedStepContext,
     PlanExecutionBlocked,
     PlanExecutionOutcome,
+    PlanRevisionContext,
     PlanRevisionLimitError,
     PlanSnapshot,
     PlanStatus,
@@ -28,6 +30,7 @@ from multiclaw.planner.models import (
     PlanVersionRecord,
     is_plan_run_executable,
     is_plan_step_ready,
+    revision_current_plan_context,
 )
 from multiclaw.planner.service import FailureRevisionRequest, PlanningService
 from multiclaw.security.redaction import redact
@@ -634,7 +637,14 @@ class PlanExecutionCoordinator:
         generator = self._planning_service._generator
         if generator is None:
             return await self._fail_replan_terminal(run_lease_handle, plan)
-        revision = self._revision_context(plan, failed_step, failed, failure_digest)
+        revision = await self._revision_context(
+            context=context,
+            lease=lease,
+            plan=plan,
+            failed_step=failed_step,
+            failed=failed,
+            failure_digest=failure_digest,
+        )
         try:
             generated = await generator.generate(
                 plan.current.objective,
@@ -681,22 +691,78 @@ class PlanExecutionCoordinator:
             run=await self._load_run(lease.context),
         )
 
-    @staticmethod
-    def _revision_context(
+    async def _revision_context(
+        self,
+        *,
+        context: TenantContext,
+        lease: RunLease,
         plan: PlanSnapshot,
         failed_step: PlanStepRecord,
         failed: PlanStepRunRecord,
         failure_digest: str,
-    ):
-        from multiclaw.planner.models import PlanRevisionContext
-
+    ) -> PlanRevisionContext:
+        """Build revision input from one locked, strictly verified Plan version."""
+        async with TenantUnitOfWork(
+            self._database,
+            context,
+            planning_settings=self._settings.planning,
+            workflow_settings=self._settings.workflow,
+        ) as uow:
+            await uow.plans.lock_run_for_execution(lease)
+            current = await uow.plans.get(plan.plan_id)
+            if (
+                current is None
+                or current.current_version != plan.current_version
+                or current.aggregate_version != plan.aggregate_version
+            ):
+                raise PlanExecutionBlocked("Plan revision context changed")
+            current_steps = {
+                step.step_id: step for step in current.current.steps
+            }
+            current_failed_step = current_steps.get(failed.step_id)
+            if (
+                failed.plan_id != current.plan_id
+                or failed.plan_version != current.current_version
+                or failed.run_id != str(context.run_id)
+                or current_failed_step is None
+                or current_failed_step.step_id != failed_step.step_id
+                or failed.status is not PlanStepRunStatus.FAILED_TERMINAL
+            ):
+                raise PlanExecutionBlocked("Plan revision failure is inconsistent")
+            latest = await uow.plans.latest_step_attempts(
+                plan_id=current.plan_id,
+                plan_version=current.current_version,
+                run_id=str(context.run_id),
+                for_update=True,
+            )
+            verified_results = await self._load_succeeded_results(
+                context=context,
+                plan=current,
+                latest=latest,
+                memory=uow.memory,
+                plans=uow.plans,
+                for_update=True,
+            )
+            completed = [
+                CompletedStepContext(
+                    logical_step_key=step.logical_step_key,
+                    summary=str(redact(verified_results[step.step_id].summary)),
+                    result_digest=verified_results[step.step_id].digest(),
+                )
+                for step in sorted(
+                    current.current.steps,
+                    key=lambda step: (step.ordinal, step.step_id),
+                )
+                if step.step_id in verified_results
+            ]
         return PlanRevisionContext(
             plan_id=plan.plan_id,
             parent_version=plan.current_version,
             feedback=None,
             failed_step_key=failed_step.logical_step_key,
             failed_error=f"failure_digest:{failure_digest}",
-            completed=[],
+            completed=completed,
+            current_plan=revision_current_plan_context(current.current),
         )
 
     async def _step_attempt(

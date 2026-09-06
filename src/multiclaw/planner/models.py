@@ -383,6 +383,42 @@ class CompletedStepContext(BaseModel):
     result_digest: str = Field(pattern=RESULT_DIGEST)
 
 
+class ImmutablePlanStepContext(BaseModel):
+    """The bounded immutable definition a revision generator may reason about."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    logical_step_key: str = Field(pattern=LOGICAL_STEP_KEY)
+    title: str = Field(min_length=1, max_length=200)
+    description: str = Field(min_length=1, max_length=4_000)
+    expected_outcome: str = Field(min_length=1, max_length=2_000)
+    max_attempts: int = Field(ge=1, le=20, strict=True)
+    definition_digest: str = Field(pattern=RESULT_DIGEST)
+    supersedes_step_id: str | None = Field(
+        default=None,
+        min_length=36,
+        max_length=36,
+        pattern=PLAN_ID,
+    )
+    depends_on: tuple[Annotated[str, Field(pattern=LOGICAL_STEP_KEY)], ...] = Field(
+        default_factory=tuple,
+        max_length=20,
+    )
+
+
+class ImmutablePlanVersionContext(BaseModel):
+    """Structured current Plan state for revision generation, never an opaque blob."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    plan_version: int = Field(ge=1, strict=True)
+    content_digest: str = Field(pattern=RESULT_DIGEST)
+    objective: str = Field(min_length=1, max_length=16_000)
+    constraints: tuple[ConstraintText, ...] = Field(default_factory=tuple, max_length=20)
+    generation_reason: str = Field(min_length=1, max_length=1_000)
+    steps: tuple[ImmutablePlanStepContext, ...] = Field(min_length=1, max_length=20)
+
+
 class PlanRevisionContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -393,6 +429,47 @@ class PlanRevisionContext(BaseModel):
     # Failure detail follows the existing 4,000-character plan result bound.
     failed_error: str | None = Field(max_length=4_000)
     completed: list[CompletedStepContext] = Field(max_length=20)
+    current_plan: ImmutablePlanVersionContext | None = None
+
+
+def revision_current_plan_context(
+    version: PlanVersionRecord,
+) -> ImmutablePlanVersionContext:
+    """Map durable IDs to stable logical keys before exposing a revision context."""
+    steps = tuple(sorted(version.steps, key=lambda step: (step.ordinal, step.step_id)))
+    steps_by_id = {step.step_id: step for step in steps}
+    return ImmutablePlanVersionContext(
+        plan_version=version.plan_version,
+        content_digest=version.content_digest,
+        objective=version.objective,
+        constraints=version.constraints,
+        generation_reason=version.generation_reason,
+        steps=tuple(
+            ImmutablePlanStepContext(
+                logical_step_key=step.logical_step_key,
+                title=step.title,
+                description=step.description,
+                expected_outcome=step.expected_outcome,
+                max_attempts=step.max_attempts,
+                definition_digest=step.definition_digest,
+                supersedes_step_id=step.supersedes_step_id,
+                depends_on=tuple(
+                    dependency.logical_step_key
+                    for dependency in sorted(
+                        (
+                            steps_by_id[dependency_id]
+                            for dependency_id in version.dependencies.get(step.step_id, ())
+                        ),
+                        key=lambda dependency: (
+                            dependency.ordinal,
+                            dependency.step_id,
+                        ),
+                    )
+                ),
+            )
+            for step in steps
+        ),
+    )
 
 
 class ValidatedPlanStep(PlanDraftStep):

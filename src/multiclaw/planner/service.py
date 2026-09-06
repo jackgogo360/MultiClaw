@@ -24,6 +24,7 @@ from multiclaw.planner.models import (
     PlanSnapshot,
     PlanStepRunRecord,
     ValidatedPlanDraft,
+    revision_current_plan_context,
 )
 from multiclaw.planner.validation import sanitize_plan_text, validate_plan_draft
 from multiclaw.security.redaction import redact
@@ -326,6 +327,7 @@ class PlanningService:
             failed_step_key=None,
             failed_error=None,
             completed=[],
+            current_plan=revision_current_plan_context(snapshot.current),
         )
         generated = await self._generator.generate(
             snapshot.current.objective,
