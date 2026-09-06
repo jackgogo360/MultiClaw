@@ -505,11 +505,15 @@ class PlanExecutionCoordinator:
                     settings=self._settings,
                 ).transition_run(lease, RunStatus.RUNNING)
                 await run_lease_handle.replace(lease)
-            started = (
-                await self._resume_running_attempt(context=context, lease=lease)
-                if resume_running_attempt
-                else await self.start_next_attempt(context=context, lease=lease)
-            )
+            if resume_running_attempt:
+                started = await self._resume_running_attempt(context=context, lease=lease)
+            else:
+                await self.apply_compatible_reuse(
+                    context=context,
+                    lease=lease,
+                    runner=runner,
+                )
+                started = await self.start_next_attempt(context=context, lease=lease)
             if started is None:
                 if last_plan is None:
                     last_plan = await self._load_active_plan(context)

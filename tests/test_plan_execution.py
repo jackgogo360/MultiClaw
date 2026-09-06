@@ -3877,6 +3877,179 @@ async def test_apply_compatible_reuse_proves_a_dependency_chain(
     assert await execution_fixture.coordinator.select_next(context=context) is None
 
 
+@pytest.mark.asyncio
+async def test_execute_boundary_reuses_an_approved_compatible_revision(
+    execution_fixture,
+) -> None:
+    """A resumed approved revision reuses proven work before runner dispatch."""
+    revision_draft = _draft(("collect", "publish"), chain=True)
+    await execution_fixture.approve_chain(["collect", "publish"])
+    runner = ScriptedStepRunner([])
+    tool_digest = hashlib.sha256(b"[]").hexdigest()
+    policy_digest = hashlib.sha256(
+        json.dumps(
+            redact(execution_fixture.settings.governance.model_dump(mode="json")),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    skill_digest = hashlib.sha256(b"[]").hexdigest()
+    context = execution_fixture._context()
+    source_root = await execution_fixture.coordinator.start_next_attempt(
+        context=context,
+        lease=execution_fixture.lease,
+    )
+    assert source_root is not None
+    source_root_document = await execution_fixture.succeed(
+        source_root.step_run,
+        digest=tool_digest,
+        policy_digest=policy_digest,
+        skill_set_digest=skill_digest,
+    )
+    source_dependent = await execution_fixture.coordinator.start_next_attempt(
+        context=context,
+        lease=execution_fixture.lease,
+    )
+    assert source_dependent is not None
+    await execution_fixture.succeed(
+        source_dependent.step_run,
+        digest=tool_digest,
+        dependency_result_digests={"collect": source_root_document.digest()},
+        policy_digest=policy_digest,
+        skill_set_digest=skill_digest,
+    )
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        original = await uow.plans.get(execution_fixture.plan_id)
+        assert original is not None
+        source_root_attempt_before = await uow.plans.step_run_by_id(
+            run_id=str(context.run_id),
+            step_run_id=source_root.step_run.step_run_id,
+        )
+        source_dependent_attempt_before = await uow.plans.step_run_by_id(
+            run_id=str(context.run_id),
+            step_run_id=source_dependent.step_run.step_run_id,
+        )
+        assert source_root_attempt_before is not None
+        assert source_dependent_attempt_before is not None
+
+    source_root_document_before = await execution_fixture.load_result(
+        source_root_attempt_before.result_ref
+    )
+    source_dependent_document_before = await execution_fixture.load_result(
+        source_dependent_attempt_before.result_ref
+    )
+    running_lease = await execution_fixture.service.workflow.transition_run(
+        execution_fixture.lease,
+        RunStatus.RUNNING,
+    )
+    awaiting_revision_lease = await execution_fixture.service.workflow.transition_run(
+        running_lease,
+        RunStatus.AWAITING_USER,
+    )
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        await uow.conn.execute(
+            update(agent_plans)
+            .where(agent_plans.c.id == original.plan_id)
+            .values(status="awaiting_approval")
+        )
+    execution_fixture.service._generator = ObservingFailureGenerator(
+        revision_draft,
+        lambda: asyncio.sleep(0),
+    )
+    revised = await execution_fixture.service.decide(
+        PlanDecisionRequest(
+            decision_id=str(uuid4()),
+            plan_id=original.plan_id,
+            plan_version=original.current_version,
+            expected_version=original.aggregate_version,
+            action=PlanDecisionAction.REVISE,
+            feedback="Reuse the proven chain.",
+        ),
+        decided_by=context.tenant_id,
+        runtime_instance_id=awaiting_revision_lease.lease_owner,
+    )
+    approved = await execution_fixture.service.decide(
+        PlanDecisionRequest(
+            decision_id=str(uuid4()),
+            plan_id=revised.snapshot.plan_id,
+            plan_version=revised.snapshot.current_version,
+            expected_version=revised.snapshot.aggregate_version,
+            action=PlanDecisionAction.APPROVE,
+        ),
+        decided_by=context.tenant_id,
+        runtime_instance_id=awaiting_revision_lease.lease_owner,
+    )
+    assert approved.lease is not None
+    assert approved.run.status is RunStatus.RESUMING
+    assert approved.run.active_plan_version == approved.snapshot.current_version
+
+    lease_handle = RunLeaseHandle(approved.lease)
+    outcome = await execution_fixture.coordinator.execute_to_boundary(
+        context=context,
+        run_lease_handle=lease_handle,
+        runner=runner,
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.plan.current_version == 2
+    assert runner.calls == []
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        current = await uow.plans.get(original.plan_id)
+        assert current is not None
+        target_steps = {step.logical_step_key: step for step in current.current.steps}
+        target_root_attempts = await uow.plans.step_attempts(
+            plan_id=current.plan_id,
+            plan_version=current.current_version,
+            run_id=str(context.run_id),
+            step_id=target_steps["collect"].step_id,
+        )
+        target_dependent_attempts = await uow.plans.step_attempts(
+            plan_id=current.plan_id,
+            plan_version=current.current_version,
+            run_id=str(context.run_id),
+            step_id=target_steps["publish"].step_id,
+        )
+        source_root_attempt_after = await uow.plans.step_run_by_id(
+            run_id=str(context.run_id),
+            step_run_id=source_root_attempt_before.step_run_id,
+        )
+        source_dependent_attempt_after = await uow.plans.step_run_by_id(
+            run_id=str(context.run_id),
+            step_run_id=source_dependent_attempt_before.step_run_id,
+        )
+        assert source_root_attempt_after is not None
+        assert source_dependent_attempt_after is not None
+
+    assert len(target_root_attempts) == len(target_dependent_attempts) == 1
+    for reused, source_attempt in (
+        (target_root_attempts[0], source_root_attempt_before),
+        (target_dependent_attempts[0], source_dependent_attempt_before),
+    ):
+        assert reused.status is PlanStepRunStatus.SUCCEEDED
+        assert reused.reused_from_step_run_id == source_attempt.step_run_id
+        assert (
+            reused.result_ref,
+            reused.result_digest,
+            reused.result_summary,
+        ) == (
+            source_attempt.result_ref,
+            source_attempt.result_digest,
+            source_attempt.result_summary,
+        )
+    assert source_root_attempt_after == source_root_attempt_before
+    assert source_dependent_attempt_after == source_dependent_attempt_before
+    assert await execution_fixture.load_result(source_root_attempt_after.result_ref) == (
+        source_root_document_before
+    )
+    assert await execution_fixture.load_result(source_dependent_attempt_after.result_ref) == (
+        source_dependent_document_before
+    )
+    assert await execution_fixture.coordinator.select_next(
+        context=context,
+        lease=await lease_handle.current(),
+    ) is None
+
+
 @pytest.mark.parametrize(
     ("change", "expected_key"),
     [
