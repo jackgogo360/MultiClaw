@@ -2930,6 +2930,114 @@ async def test_apply_compatible_reuse_creates_explicit_reused_attempt(
 
 
 @pytest.mark.asyncio
+async def test_apply_compatible_reuse_concurrently_creates_one_durable_fact(
+    execution_fixture,
+) -> None:
+    """File-backed SQLite coordinators converge on one immutable reuse fact."""
+    assert execution_fixture.database.engine.url.database != ":memory:"
+
+    draft = _draft(("collect",), max_attempts=2)
+    await execution_fixture.approve_chain(["collect"])
+    runner = ScriptedStepRunner([])
+    tool_digest = hashlib.sha256(b"[]").hexdigest()
+    policy_digest = hashlib.sha256(
+        json.dumps(
+            redact(execution_fixture.settings.governance.model_dump(mode="json")),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    skill_digest = hashlib.sha256(b"[]").hexdigest()
+    context = execution_fixture._context()
+    source_started = await execution_fixture.coordinator.start_next_attempt(
+        context=context,
+        lease=execution_fixture.lease,
+    )
+    assert source_started is not None
+    source_document_before = await execution_fixture.succeed(
+        source_started.step_run,
+        digest=tool_digest,
+        policy_digest=policy_digest,
+        skill_set_digest=skill_digest,
+    )
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        original = await uow.plans.get(execution_fixture.plan_id)
+        assert original is not None
+        source_attempt_before = await uow.plans.step_run_by_id(
+            run_id=str(context.run_id),
+            step_run_id=source_started.step_run.step_run_id,
+        )
+        assert source_attempt_before is not None
+        revised = await uow.plans.append_version(
+            plan_id=original.plan_id,
+            expected_version=original.aggregate_version,
+            draft=draft,
+            parent_version=original.current_version,
+            revision_feedback="concurrent compatible reuse",
+            supersedes={"collect": original.current.steps[0].step_id},
+        )
+        await uow.conn.execute(
+            update(agent_plans)
+            .where(agent_plans.c.id == revised.plan_id)
+            .values(status="approved", approved_version=revised.current_version)
+        )
+        await uow.conn.execute(
+            update(agent_runs)
+            .where(agent_runs.c.run_id == context.run_id)
+            .values(active_plan_version=revised.current_version)
+        )
+
+    coordinator_a = execution_fixture.coordinator
+    coordinator_b = execution_fixture.new_coordinator()
+    results = await asyncio.gather(
+        coordinator_a.apply_compatible_reuse(
+            context=context,
+            lease=execution_fixture.lease,
+            runner=runner,
+        ),
+        coordinator_b.apply_compatible_reuse(
+            context=context,
+            lease=execution_fixture.lease,
+            runner=runner,
+        ),
+    )
+
+    assert sorted(len(result) for result in results) == [0, 1]
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        current = await uow.plans.get(execution_fixture.plan_id)
+        assert current is not None
+        target_attempts = await uow.plans.step_attempts(
+            plan_id=current.plan_id,
+            plan_version=current.current_version,
+            run_id=str(context.run_id),
+            step_id=current.current.steps[0].step_id,
+        )
+        source_attempt_after = await uow.plans.step_run_by_id(
+            run_id=str(context.run_id),
+            step_run_id=source_attempt_before.step_run_id,
+        )
+        assert source_attempt_after is not None
+
+    assert len(target_attempts) == 1
+    reused = target_attempts[0]
+    assert reused.status is PlanStepRunStatus.SUCCEEDED
+    assert reused.reused_from_step_run_id == source_attempt_before.step_run_id
+    assert (
+        reused.result_ref,
+        reused.result_digest,
+        reused.result_summary,
+    ) == (
+        source_attempt_before.result_ref,
+        source_attempt_before.result_digest,
+        source_attempt_before.result_summary,
+    )
+    assert source_attempt_after == source_attempt_before
+    assert await execution_fixture.load_result(source_attempt_after.result_ref) == (
+        source_document_before
+    )
+
+
+@pytest.mark.asyncio
 async def test_apply_compatible_reuse_proves_a_dependency_chain(
     execution_fixture,
 ) -> None:
