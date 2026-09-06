@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 from multiclaw.config import Settings
+from multiclaw.planner.generator import PlanGenerationError
 from multiclaw.planner.models import (
     TERMINAL_PLAN_STEP_STATUSES,
     PlanExecutionBlocked,
@@ -28,7 +29,6 @@ from multiclaw.planner.models import (
     is_plan_run_executable,
     is_plan_step_ready,
 )
-from multiclaw.planner.generator import PlanGenerationError
 from multiclaw.planner.service import FailureRevisionRequest, PlanningService
 from multiclaw.security.redaction import redact
 from multiclaw.storage.engine import Database

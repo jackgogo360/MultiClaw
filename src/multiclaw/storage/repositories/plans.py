@@ -1485,9 +1485,6 @@ class PlanRepository:
         except BaseException as primary:
             await self._rollback_savepoint(savepoint, primary)
             raise
-        except BaseException as primary:
-            await self._rollback_savepoint(savepoint, primary)
-            raise
 
     async def finish_step_attempt(
         self,
