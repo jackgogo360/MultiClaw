@@ -2985,6 +2985,58 @@ async def test_apply_compatible_reuse_proves_a_dependency_chain(
     assert await execution_fixture.coordinator.select_next(context=context) is None
 
 
+@pytest.mark.parametrize(
+    ("change", "expected_key"),
+    [
+        ("definition", "collect"),
+        ("dependency_definition", "publish"),
+        ("dependency_result", "publish"),
+        ("policy", "collect"),
+        ("missing_proof", "collect"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_incomplete_reuse_proof_forces_the_changed_or_unproven_step(
+    execution_fixture, change, expected_key
+) -> None:
+    """Every missing compatibility proof leaves a normal, non-reused attempt."""
+    await execution_fixture.approve_chain(["collect", "publish"])
+    runner = ScriptedStepRunner([])
+    digest = hashlib.sha256(b"[]").hexdigest()
+    policy = hashlib.sha256(json.dumps(redact(execution_fixture.settings.governance.model_dump(mode="json")), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    root = await execution_fixture.coordinator.start_next_attempt(context=execution_fixture._context(), lease=execution_fixture.lease)
+    assert root is not None
+    root_doc = await execution_fixture.succeed(root.step_run, digest=digest, policy_digest=("f" * 64 if change == "policy" else policy), skill_set_digest=digest)
+    dependent = await execution_fixture.coordinator.start_next_attempt(context=execution_fixture._context(), lease=execution_fixture.lease)
+    assert dependent is not None
+    await execution_fixture.succeed(
+        dependent.step_run,
+        digest=digest,
+        dependency_result_digests={"collect": ("e" * 64 if change == "dependency_result" else root_doc.digest())},
+        policy_digest=policy,
+        skill_set_digest=digest,
+    )
+    context = execution_fixture._context()
+    revision = _draft(("collect", "publish"), chain=True)
+    if change == "definition":
+        revision = _draft(("collect", "publish"), chain=True, max_attempts=1)
+    if change == "dependency_definition":
+        revision.steps[1] = revision.steps[1].model_copy(update={"max_attempts": 1})
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        original = await uow.plans.get(execution_fixture.plan_id)
+        assert original is not None
+        revised = await uow.plans.append_version(plan_id=original.plan_id, expected_version=original.aggregate_version, draft=revision, parent_version=1, revision_feedback=change, supersedes={step.logical_step_key: step.step_id for step in original.current.steps})
+        await uow.conn.execute(update(agent_plans).where(agent_plans.c.id == revised.plan_id).values(status="approved", approved_version=2))
+        await uow.conn.execute(update(agent_runs).where(agent_runs.c.run_id == context.run_id).values(active_plan_version=2))
+        if change == "missing_proof":
+            await uow.conn.execute(update(agent_plan_step_runs).where(agent_plan_step_runs.c.step_run_id == root.step_run.step_run_id).values(result_ref=None))
+    await execution_fixture.coordinator.apply_compatible_reuse(context=context, lease=execution_fixture.lease, runner=runner)
+    started = await execution_fixture.coordinator.start_next_attempt(context=context, lease=execution_fixture.lease)
+    assert started is not None
+    assert started.step.logical_step_key == expected_key
+    assert started.step_run.reused_from_step_run_id is None
+
+
 @pytest.mark.asyncio
 async def test_attempt_and_plan_step_ready_checkpoint_commit_together(execution_fixture):
     await execution_fixture.approve()
