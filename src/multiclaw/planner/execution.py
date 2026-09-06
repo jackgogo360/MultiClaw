@@ -127,6 +127,7 @@ def can_reuse_result(
         return False
     if (
         source_run.run_id != current_run_id
+        or source_run.step_id != source_step.step_id
         or source_run.status is not PlanStepRunStatus.SUCCEEDED
         or source_run.reused_from_step_run_id is not None
         or new_step.supersedes_step_id != source_step.step_id
@@ -165,6 +166,7 @@ def can_reuse_result(
             proof.new_step.supersedes_step_id != proof.source_step.step_id
             or proof.new_step.definition_digest != proof.source_step.definition_digest
             or proof.source_run.run_id != current_run_id
+            or proof.source_run.step_id != proof.source_step.step_id
             or proof.source_run.status is not PlanStepRunStatus.SUCCEEDED
             or proof.source_run.reused_from_step_run_id is not None
             or proof.source_result.plan_id != proof.source_run.plan_id
@@ -181,6 +183,7 @@ def can_reuse_result(
             or proof.source_result.digest() != expected
             or proof.reused_run.plan_id != proof.source_run.plan_id
             or proof.reused_run.run_id != current_run_id
+            or proof.reused_run.step_id != proof.new_step.step_id
             or proof.reused_run.reused_from_step_run_id != proof.source_run.step_run_id
             or proof.reused_run.status is not PlanStepRunStatus.SUCCEEDED
             or proof.reused_run.result_ref != proof.source_run.result_ref

@@ -2609,6 +2609,112 @@ def _complete_reuse_proof() -> dict[str, object]:
     }
 
 
+def _complete_reuse_proof_with_dependency() -> tuple[
+    dict[str, object], DependencyReuseProof
+]:
+    inputs = _complete_reuse_proof()
+    source_step = inputs["source_step"]
+    source_run = inputs["source_run"]
+    source_document = inputs["source_result"]
+    assert isinstance(source_step, PlanStepRecord)
+    assert isinstance(source_run, PlanStepRunRecord)
+    assert isinstance(source_document, PlanStepResultDocument)
+    dependency_source_step = replace(
+        source_step,
+        step_id=str(uuid4()),
+        logical_step_key="prepare",
+    )
+    dependency_new_step = replace(
+        dependency_source_step,
+        step_id=str(uuid4()),
+        supersedes_step_id=dependency_source_step.step_id,
+    )
+    dependency_source_run = replace(
+        source_run,
+        step_run_id=str(uuid4()),
+        step_id=dependency_source_step.step_id,
+        result_summary="prepare complete",
+        result_ref=f"memory:{uuid4()}",
+    )
+    dependency_document = source_document.model_copy(
+        update={
+            "step_id": dependency_source_step.step_id,
+            "step_run_id": dependency_source_run.step_run_id,
+            "summary": dependency_source_run.result_summary,
+        }
+    )
+    dependency_source_run = replace(
+        dependency_source_run,
+        result_digest=dependency_document.digest(),
+    )
+    dependency_proof = DependencyReuseProof(
+        new_step=dependency_new_step,
+        reused_run=replace(
+            dependency_source_run,
+            step_run_id=str(uuid4()),
+            plan_version=2,
+            step_id=dependency_new_step.step_id,
+            reused_from_step_run_id=dependency_source_run.step_run_id,
+        ),
+        source_step=dependency_source_step,
+        source_run=dependency_source_run,
+        source_result=dependency_document,
+    )
+    source_document = source_document.model_copy(
+        update={
+            "dependency_result_digests": {
+                dependency_new_step.logical_step_key: dependency_document.digest()
+            }
+        }
+    )
+    inputs["source_result"] = source_document
+    inputs["source_run"] = replace(source_run, result_digest=source_document.digest())
+    inputs["new_dependency_ids"] = frozenset({dependency_new_step.step_id})
+    inputs["dependency_proofs"] = {
+        dependency_new_step.logical_step_key: dependency_proof
+    }
+    return inputs, dependency_proof
+
+
+def test_reuse_rejects_source_run_step_identity_mismatch() -> None:
+    inputs = _complete_reuse_proof()
+    assert can_reuse_result(**inputs)
+    source_run = inputs["source_run"]
+    assert isinstance(source_run, PlanStepRunRecord)
+
+    inputs["source_run"] = replace(source_run, step_id=str(uuid4()))
+
+    assert not can_reuse_result(**inputs)
+
+
+def test_reuse_rejects_dependency_source_run_step_identity_mismatch() -> None:
+    inputs, dependency_proof = _complete_reuse_proof_with_dependency()
+    assert can_reuse_result(**inputs)
+
+    inputs["dependency_proofs"] = {
+        dependency_proof.new_step.logical_step_key: replace(
+            dependency_proof,
+            source_run=replace(dependency_proof.source_run, step_id=str(uuid4())),
+        )
+    }
+
+    assert not can_reuse_result(**inputs)
+
+
+def test_reuse_rejects_dependency_reused_run_step_identity_mismatch() -> None:
+    inputs, dependency_proof = _complete_reuse_proof_with_dependency()
+    assert can_reuse_result(**inputs)
+
+    inputs["dependency_proofs"] = {
+        dependency_proof.new_step.logical_step_key: replace(
+            dependency_proof,
+            reused_run=replace(dependency_proof.reused_run, step_id=str(uuid4())),
+        )
+    }
+
+    assert not can_reuse_result(**inputs)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (
