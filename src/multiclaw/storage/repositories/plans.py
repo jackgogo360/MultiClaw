@@ -33,8 +33,11 @@ from multiclaw.planner.models import (
     PlanSummary,
     PlanTriggerMode,
     PlanVersionConflictError,
+    TERMINAL_PLAN_STEP_STATUSES,
     PlanVersionRecord,
     ValidatedPlanDraft,
+    is_plan_run_executable,
+    is_plan_step_ready,
 )
 from multiclaw.planner.validation import (
     plan_content_digest,
@@ -1013,9 +1016,10 @@ class PlanRepository:
         plan_id: str,
         plan_version: int,
         run_id: str,
+        for_update: bool = False,
     ) -> Mapping[str, PlanStepRunRecord]:
         self._require_session()
-        result = await self._conn.execute(
+        statement = (
             select(agent_plan_step_runs)
             .where(
                 agent_plan_step_runs.c.tenant_id == self._context.tenant_id,
@@ -1030,6 +1034,9 @@ class PlanRepository:
                 agent_plan_step_runs.c.attempt.desc(),
             )
         )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self._conn.execute(statement)
         latest: dict[str, PlanStepRunRecord] = {}
         for row in result.mappings():
             step_id = str(row["step_id"])
@@ -1043,9 +1050,10 @@ class PlanRepository:
         plan_version: int,
         run_id: str,
         step_id: str,
+        for_update: bool = False,
     ) -> tuple[PlanStepRunRecord, ...]:
         self._require_session()
-        result = await self._conn.execute(
+        statement = (
             select(agent_plan_step_runs)
             .where(
                 self._step_run_scope_predicate(run_id),
@@ -1055,6 +1063,9 @@ class PlanRepository:
             )
             .order_by(agent_plan_step_runs.c.attempt)
         )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self._conn.execute(statement)
         return tuple(self._hydrate_step_run(row) for row in result.mappings())
 
     async def has_current_lease(self, lease: RunLease) -> bool:
@@ -1067,24 +1078,25 @@ class PlanRepository:
         )
         return result.scalar_one_or_none() is not None
 
-    async def create_step_attempt(
-        self,
-        lease: RunLease,
-        *,
-        plan_id: str,
-        plan_version: int,
-        step_id: str,
-    ) -> PlanStepRunRecord:
+    async def lock_run_for_execution(self, lease: RunLease) -> RowMapping:
         self._require_session()
         if not self._lease_matches_context(lease):
             raise StaleFenceError("run lease scope is stale")
-
         await self._dialect.lock_run(self._conn, lease.context)
+        return await self._require_current_executable_lease(lease)
+
+    async def _require_current_executable_lease(self, lease: RunLease) -> RowMapping:
+        if not self._lease_matches_context(lease):
+            raise StaleFenceError("run lease scope is stale")
         if not await self.has_current_lease(lease):
             raise StaleFenceError("run lease is stale")
-
-        run_result = await self._conn.execute(
-            select(agent_runs.c.plan_id, agent_runs.c.active_plan_version)
+        result = await self._conn.execute(
+            select(
+                agent_runs.c.plan_id,
+                agent_runs.c.active_plan_version,
+                agent_runs.c.run_status,
+                agent_runs.c.cancel_requested_at,
+            )
             .where(
                 agent_runs.c.tenant_id == self._context.tenant_id,
                 agent_runs.c.workspace_id == self._context.workspace_id,
@@ -1093,8 +1105,26 @@ class PlanRepository:
             )
             .with_for_update()
         )
-        run = run_result.mappings().first()
-        plan_result = await self._conn.execute(
+        run = result.mappings().first()
+        if run is None:
+            raise StaleFenceError("run lease is stale")
+        if not is_plan_run_executable(
+            RunStatus(str(run["run_status"])),
+            None
+            if run["cancel_requested_at"] is None
+            else int(run["cancel_requested_at"]),
+        ):
+            raise PlanExecutionBlocked("Plan execution run is not executable")
+        return run
+
+    async def _require_active_plan_version(
+        self,
+        run: RowMapping,
+        *,
+        plan_id: str,
+        plan_version: int,
+    ) -> None:
+        result = await self._conn.execute(
             select(
                 agent_plans.c.status,
                 agent_plans.c.current_version,
@@ -1103,10 +1133,9 @@ class PlanRepository:
             .where(self._plan_predicate(plan_id))
             .with_for_update()
         )
-        plan = plan_result.mappings().first()
+        plan = result.mappings().first()
         if (
-            run is None
-            or plan is None
+            plan is None
             or str(run["plan_id"]) != plan_id
             or PlanStatus(str(plan["status"])) is not PlanStatus.APPROVED
             or int(plan["current_version"]) != plan_version
@@ -1119,6 +1148,14 @@ class PlanRepository:
                 "Plan execution requires an approved current active version"
             )
 
+    async def _require_step_ready(
+        self,
+        *,
+        run_id: str,
+        plan_id: str,
+        plan_version: int,
+        step_id: str,
+    ) -> tuple[int, int]:
         step_result = await self._conn.execute(
             select(agent_plan_steps.c.max_attempts)
             .where(
@@ -1135,49 +1172,99 @@ class PlanRepository:
         if raw_step_limit is None:
             raise PlanExecutionBlocked("Plan step does not belong to the active version")
 
-        running_result = await self._conn.execute(
-            select(agent_plan_step_runs.c.step_run_id)
-            .where(
-                self._step_run_scope_predicate(str(lease.context.run_id)),
-                agent_plan_step_runs.c.status == PlanStepRunStatus.RUNNING.value,
-            )
-            .limit(1)
-            .with_for_update()
+        latest = await self.latest_step_attempts(
+            plan_id=plan_id,
+            plan_version=plan_version,
+            run_id=run_id,
+            for_update=True,
         )
-        if running_result.scalar_one_or_none() is not None:
+        if any(
+            attempt.status is PlanStepRunStatus.RUNNING
+            for attempt in latest.values()
+        ):
             raise PlanStepAlreadyRunningError(
                 "Plan run already has a running step attempt"
             )
-
-        prior_result = await self._conn.execute(
-            select(agent_plan_step_runs.c.attempt)
-            .where(
-                self._step_run_scope_predicate(str(lease.context.run_id)),
-                agent_plan_step_runs.c.step_id == step_id,
+        if any(
+            attempt.status in TERMINAL_PLAN_STEP_STATUSES
+            for attempt in latest.values()
+        ):
+            raise PlanExecutionBlocked(
+                "Plan execution is blocked by a failed dependency or terminal step"
             )
-            .order_by(agent_plan_step_runs.c.attempt.desc())
-            .limit(1)
+
+        dependency_result = await self._conn.execute(
+            select(agent_plan_step_dependencies.c.depends_on_step_id)
+            .where(
+                self._dependency_scope_predicate(plan_id),
+                agent_plan_step_dependencies.c.plan_version == plan_version,
+                agent_plan_step_dependencies.c.step_id == step_id,
+            )
+            .order_by(agent_plan_step_dependencies.c.depends_on_step_id)
             .with_for_update()
         )
-        previous_attempt = prior_result.scalar_one_or_none()
-        attempt = (0 if previous_attempt is None else int(previous_attempt)) + 1
+        dependency_ids = tuple(str(value) for value in dependency_result.scalars())
+        if not is_plan_step_ready(step_id, dependency_ids, latest):
+            raise PlanExecutionBlocked("Plan step is no longer ready")
 
-        step_limit = self._positive_attempt_limit(raw_step_limit, "Plan step max_attempts")
+        current = latest.get(step_id)
+        attempt = (0 if current is None else current.attempt) + 1
+        step_limit = self._positive_attempt_limit(
+            raw_step_limit,
+            "Plan step max_attempts",
+        )
         tenant_limit = self._positive_attempt_limit(
             self._settings.max_step_attempts,
             "planning.max_step_attempts",
         )
-        if attempt > min(step_limit, tenant_limit):
+        attempt_limit = min(step_limit, tenant_limit)
+        if attempt > attempt_limit:
             raise PlanAttemptLimitError("Plan step attempt limit exceeded")
+        return attempt, attempt_limit
+
+    async def create_step_attempt(
+        self,
+        lease: RunLease,
+        *,
+        plan_id: str,
+        plan_version: int,
+        step_id: str,
+    ) -> PlanStepRunRecord:
+        self._require_session()
+        if not self._lease_matches_context(lease):
+            raise StaleFenceError("run lease scope is stale")
+
+        run = await self.lock_run_for_execution(lease)
+        await self._require_active_plan_version(
+            run,
+            plan_id=plan_id,
+            plan_version=plan_version,
+        )
+        attempt, attempt_limit = await self._require_step_ready(
+            run_id=str(lease.context.run_id),
+            plan_id=plan_id,
+            plan_version=plan_version,
+            step_id=step_id,
+        )
 
         step_run_id = str(uuid4())
         started_at = await self._db_now_ms()
         savepoint = await self._conn.begin_nested()
         try:
             # The run lock serializes competing writers. This final read keeps the
-            # durable fence adjacent to the fact insert it authorizes.
-            if not await self.has_current_lease(lease):
-                raise StaleFenceError("run lease is stale")
+            # durable fence and readiness adjacent to the fact insert they authorize.
+            attempt, attempt_limit = await self._require_step_ready(
+                run_id=str(lease.context.run_id),
+                plan_id=plan_id,
+                plan_version=plan_version,
+                step_id=step_id,
+            )
+            run = await self._require_current_executable_lease(lease)
+            await self._require_active_plan_version(
+                run,
+                plan_id=plan_id,
+                plan_version=plan_version,
+            )
             await self._conn.execute(
                 insert(agent_plan_step_runs).values(
                     **self._scope_values(),
@@ -1218,7 +1305,7 @@ class PlanRepository:
                 run_id=str(lease.context.run_id),
                 step_id=step_id,
             )
-            if latest_attempt >= min(step_limit, tenant_limit):
+            if latest_attempt >= attempt_limit:
                 raise PlanAttemptLimitError("Plan step attempt limit exceeded") from primary
             raise
         except BaseException as primary:

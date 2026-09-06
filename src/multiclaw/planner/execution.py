@@ -17,6 +17,9 @@ from multiclaw.planner.models import (
     PlanStepRunRecord,
     PlanStepRunStatus,
     PlanVersionRecord,
+    TERMINAL_PLAN_STEP_STATUSES,
+    is_plan_run_executable,
+    is_plan_step_ready,
 )
 from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.memory import MemoryRepository
@@ -25,14 +28,16 @@ from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
-from multiclaw.workflow.models import CheckpointPhase, RunLease, StaleFenceError
+from multiclaw.workflow.models import (
+    CheckpointPhase,
+    RunLease,
+    RunRecord,
+    StaleFenceError,
+)
 
 
 _RESULT_REF = re.compile(r"memory:([A-Za-z0-9-]{1,64})")
-_TERMINAL_STEP_STATUSES = {
-    PlanStepRunStatus.FAILED_TERMINAL,
-    PlanStepRunStatus.CANCELLED,
-}
+MAX_PLAN_STEP_RESULT_BYTES = 262_144
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,21 +60,12 @@ def choose_ready_step(
     plan: PlanVersionRecord,
     latest: Mapping[str, PlanStepRunRecord],
 ) -> PlanStepRecord | None:
-    succeeded = {
-        step_id
-        for step_id, attempt in latest.items()
-        if attempt.status is PlanStepRunStatus.SUCCEEDED
-    }
     for step in sorted(plan.steps, key=lambda item: (item.ordinal, item.step_id)):
-        current = latest.get(step.step_id)
-        if current is not None and current.status in {
-            PlanStepRunStatus.RUNNING,
-            PlanStepRunStatus.SUCCEEDED,
-            PlanStepRunStatus.FAILED_TERMINAL,
-            PlanStepRunStatus.CANCELLED,
-        }:
-            continue
-        if set(plan.dependencies.get(step.step_id, ())) <= succeeded:
+        if is_plan_step_ready(
+            step.step_id,
+            plan.dependencies.get(step.step_id, ()),
+            latest,
+        ):
             return step
     return None
 
@@ -132,13 +128,13 @@ class PlanExecutionCoordinator:
             planning_settings=self._settings.planning,
             workflow_settings=self._settings.workflow,
         ) as uow:
-            if not await uow.plans.has_current_lease(lease):
-                raise StaleFenceError("run lease is stale")
+            await uow.plans.lock_run_for_execution(lease)
             ready = await self._select_next(
                 context=context,
                 plans=uow.plans,
                 workflow=uow.workflow,
                 memory=uow.memory,
+                for_update=True,
             )
             if ready is None:
                 return None
@@ -185,9 +181,15 @@ class PlanExecutionCoordinator:
         plans: PlanRepository,
         workflow: WorkflowRepository,
         memory: MemoryRepository,
+        for_update: bool = False,
     ) -> ReadyPlanStep | None:
         run = await workflow.get_run(context)
-        if run is None or run.plan_id is None:
+        if run is None:
+            raise PlanExecutionBlocked(
+                "Plan execution requires an approved current active version"
+            )
+        self._require_executable_run(run)
+        if run.plan_id is None:
             raise PlanExecutionBlocked(
                 "Plan execution requires an approved current active version"
             )
@@ -207,16 +209,27 @@ class PlanExecutionCoordinator:
             plan_id=plan.plan_id,
             plan_version=plan.current_version,
             run_id=str(context.run_id),
+            for_update=for_update,
         )
         if any(attempt.status is PlanStepRunStatus.RUNNING for attempt in latest.values()):
             raise PlanStepAlreadyRunningError(
                 "Plan run already has a running step attempt"
             )
-        if any(attempt.status in _TERMINAL_STEP_STATUSES for attempt in latest.values()):
+        if any(
+            attempt.status in TERMINAL_PLAN_STEP_STATUSES
+            for attempt in latest.values()
+        ):
             raise PlanExecutionBlocked(
                 "Plan execution is blocked by a failed dependency or terminal step"
             )
 
+        verified_results = await self._load_succeeded_results(
+            context=context,
+            plan=plan,
+            latest=latest,
+            memory=memory,
+            for_update=for_update,
+        )
         step = choose_ready_step(plan.current, latest)
         if step is None:
             if all(
@@ -227,18 +240,16 @@ class PlanExecutionCoordinator:
                 return None
             raise PlanExecutionBlocked("Plan execution is blocked by a failed dependency")
 
-        dependency_results = await self._load_dependency_results(
-            context=context,
-            plan=plan,
-            step=step,
-            latest=latest,
-            memory=memory,
+        dependency_results = tuple(
+            verified_results[dependency_id]
+            for dependency_id in plan.current.dependencies.get(step.step_id, ())
         )
         prior_attempts = await plans.step_attempts(
             plan_id=plan.plan_id,
             plan_version=plan.current_version,
             run_id=str(context.run_id),
             step_id=step.step_id,
+            for_update=for_update,
         )
         return ReadyPlanStep(
             plan=plan,
@@ -248,31 +259,48 @@ class PlanExecutionCoordinator:
         )
 
     @staticmethod
-    async def _load_dependency_results(
+    async def _load_succeeded_results(
         *,
         context: TenantContext,
         plan: PlanSnapshot,
-        step: PlanStepRecord,
         latest: Mapping[str, PlanStepRunRecord],
         memory: MemoryRepository,
-    ) -> tuple[PlanStepResultDocument, ...]:
+        for_update: bool,
+    ) -> Mapping[str, PlanStepResultDocument]:
         steps_by_id = {item.step_id: item for item in plan.current.steps}
-        documents: list[PlanStepResultDocument] = []
-        for dependency_id in plan.current.dependencies.get(step.step_id, ()):
-            attempt = latest.get(dependency_id)
+        documents: dict[str, PlanStepResultDocument] = {}
+        unknown_succeeded = {
+            step_id
+            for step_id, attempt in latest.items()
+            if attempt.status is PlanStepRunStatus.SUCCEEDED
+            and step_id not in steps_by_id
+        }
+        if unknown_succeeded:
+            raise PlanExecutionBlocked("Plan succeeded step result is inconsistent")
+
+        for step in sorted(
+            plan.current.steps,
+            key=lambda item: (item.ordinal, item.step_id),
+        ):
+            attempt = latest.get(step.step_id)
+            if attempt is None or attempt.status is not PlanStepRunStatus.SUCCEEDED:
+                continue
             if (
-                attempt is None
-                or attempt.status is not PlanStepRunStatus.SUCCEEDED
-                or attempt.result_ref is None
+                attempt.result_ref is None
                 or attempt.result_digest is None
+                or attempt.result_summary is None
             ):
                 raise PlanExecutionBlocked(
-                    "Plan execution is blocked by a missing succeeded dependency result"
+                    "Plan succeeded step result is incomplete"
                 )
             match = _RESULT_REF.fullmatch(attempt.result_ref)
             if match is None:
-                raise PlanExecutionBlocked("Plan dependency result reference is invalid")
-            entry = await memory.get(match.group(1), context.session_id)
+                raise PlanExecutionBlocked("Plan succeeded step result reference is invalid")
+            entry = await memory.get(
+                match.group(1),
+                context.session_id,
+                for_update=for_update,
+            )
             if (
                 entry is None
                 or entry.type != "plan_step_result"
@@ -281,31 +309,62 @@ class PlanExecutionCoordinator:
                 or entry.metadata.get("plan_id") != plan.plan_id
                 or entry.metadata.get("step_run_id") != attempt.step_run_id
             ):
-                raise PlanExecutionBlocked("Plan dependency result document is unavailable")
+                raise PlanExecutionBlocked("Plan result document is unavailable")
             try:
-                document = PlanStepResultDocument.model_validate_json(entry.content)
+                content_bytes = entry.content.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise PlanExecutionBlocked("Plan result document is invalid") from error
+            if len(content_bytes) > MAX_PLAN_STEP_RESULT_BYTES:
+                raise PlanExecutionBlocked(
+                    f"Plan result document exceeds {MAX_PLAN_STEP_RESULT_BYTES} bytes"
+                )
+            try:
+                document = PlanStepResultDocument.model_validate_json(content_bytes)
             except ValidationError as error:
                 raise PlanExecutionBlocked(
-                    "Plan dependency result document is invalid"
+                    "Plan result document is invalid"
                 ) from error
-            dependency_step = steps_by_id[dependency_id]
             if (
                 document.plan_id != plan.plan_id
                 or document.plan_version != plan.current_version
                 or document.run_id != context.run_id
-                or document.step_id != dependency_id
+                or document.step_id != step.step_id
                 or document.step_run_id != attempt.step_run_id
                 or document.attempt != attempt.attempt
                 or document.status != "succeeded"
-                or document.definition_digest != dependency_step.definition_digest
+                or document.definition_digest != step.definition_digest
                 or document.digest() != attempt.result_digest
                 or document.summary != attempt.result_summary
             ):
-                raise PlanExecutionBlocked("Plan dependency result document is inconsistent")
-            documents.append(document)
-        return tuple(documents)
+                raise PlanExecutionBlocked("Plan result document is inconsistent")
+
+            dependency_ids = plan.current.dependencies.get(step.step_id, ())
+            if any(dependency_id not in documents for dependency_id in dependency_ids):
+                raise PlanExecutionBlocked(
+                    "Plan dependency result proof is inconsistent"
+                )
+            expected_dependency_digests: dict[str, str] = {}
+            for dependency_id in dependency_ids:
+                dependency_digest = latest[dependency_id].result_digest
+                if dependency_digest is None:
+                    raise PlanExecutionBlocked(
+                        "Plan dependency result proof is inconsistent"
+                    )
+                dependency_key = steps_by_id[dependency_id].logical_step_key
+                expected_dependency_digests[dependency_key] = dependency_digest
+            if document.dependency_result_digests != expected_dependency_digests:
+                raise PlanExecutionBlocked(
+                    "Plan dependency result proof is inconsistent"
+                )
+            documents[step.step_id] = document
+        return documents
 
     @staticmethod
     def _require_run_context(context: TenantContext) -> None:
         if context.session_id is None or context.run_id is None:
             raise ValueError("Plan execution requires session and run scope")
+
+    @staticmethod
+    def _require_executable_run(run: RunRecord) -> None:
+        if not is_plan_run_executable(run.status, run.cancel_requested_at):
+            raise PlanExecutionBlocked("Plan execution run is not executable")

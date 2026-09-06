@@ -41,12 +41,13 @@ from multiclaw.storage.schema import (
     agent_plans,
     agent_runs,
     execution_checkpoints,
+    memory_entries,
     users,
 )
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
-from multiclaw.workflow.models import CheckpointPhase, RunLease, StaleFenceError
+from multiclaw.workflow.models import CheckpointPhase, RunLease, RunStatus, StaleFenceError
 
 
 _MYSQL_URL = os.getenv("MULTICLAW_TEST_MYSQL_URL")
@@ -94,6 +95,24 @@ def test_result_document_accepts_explicit_empty_collection_fields():
 
     assert document.evidence == []
     assert document.dependency_result_digests == {}
+
+
+@pytest.mark.parametrize(
+    "logical_key",
+    ("Invalid.Key", "x" * 65),
+    ids=("invalid", "overlong"),
+)
+def test_result_document_rejects_invalid_dependency_logical_keys(logical_key: str):
+    payload = _result_document_payload()
+    payload["dependency_result_digests"] = {logical_key: "a" * 64}
+
+    with pytest.raises(ValidationError) as raised:
+        PlanStepResultDocument.model_validate(payload)
+
+    assert any(
+        error["loc"] == ("dependency_result_digests", logical_key, "[key]")
+        for error in raised.value.errors()
+    )
 
 
 def _draft(
@@ -326,14 +345,50 @@ class ExecutionFixture:
                         .values(status="approved", approved_version=2)
                     )
 
+    async def update_run(self, **values: object) -> None:
+        context = self._context()
+        async with self.database.write_transaction() as conn:
+            await conn.execute(
+                update(agent_runs)
+                .where(
+                    agent_runs.c.tenant_id == context.tenant_id,
+                    agent_runs.c.workspace_id == context.workspace_id,
+                    agent_runs.c.session_id == context.session_id,
+                    agent_runs.c.run_id == context.run_id,
+                )
+                .values(**values)
+            )
+
+    async def update_step_run(
+        self,
+        step_run: PlanStepRunRecord,
+        **values: object,
+    ) -> None:
+        context = self._context()
+        async with self.database.write_transaction() as conn:
+            await conn.execute(
+                update(agent_plan_step_runs)
+                .where(
+                    agent_plan_step_runs.c.tenant_id == context.tenant_id,
+                    agent_plan_step_runs.c.workspace_id == context.workspace_id,
+                    agent_plan_step_runs.c.session_id == context.session_id,
+                    agent_plan_step_runs.c.run_id == context.run_id,
+                    agent_plan_step_runs.c.step_run_id == step_run.step_run_id,
+                )
+                .values(**values)
+            )
+
     async def finish(
         self,
         step_run: PlanStepRunRecord,
         status: PlanStepRunStatus,
         *,
         digest: str = "a" * 64,
-    ) -> None:
+        dependency_result_digests: dict[str, str] | None = None,
+        content_prefix: str = "",
+    ) -> PlanStepResultDocument | None:
         assert self.context is not None
+        document = None
         result_ref = None
         result_digest = None
         result_summary = None
@@ -357,17 +412,24 @@ class ExecutionFixture:
                     summary=f"{step.logical_step_key} complete",
                     evidence=["durable evidence"],
                     definition_digest=step.definition_digest,
-                    dependency_result_digests={},
+                    dependency_result_digests=(
+                        {}
+                        if dependency_result_digests is None
+                        else dependency_result_digests
+                    ),
                     tool_catalog_digest=digest,
                     policy_digest="b" * 64,
                     skill_set_digest="c" * 64,
                 )
                 entry = await uow.memory.save(
                     MemoryEntry(
-                        content=json.dumps(
-                            document.model_dump(mode="json"),
-                            sort_keys=True,
-                            separators=(",", ":"),
+                        content=(
+                            content_prefix
+                            + json.dumps(
+                                document.model_dump(mode="json"),
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
                         ),
                         type="plan_step_result",
                         role="assistant",
@@ -409,9 +471,25 @@ class ExecutionFixture:
                     finished_at=step_run.started_at + 1,
                 )
             )
+        return document
 
-    async def succeed(self, step_run: PlanStepRunRecord, digest: str) -> None:
-        await self.finish(step_run, PlanStepRunStatus.SUCCEEDED, digest=digest)
+    async def succeed(
+        self,
+        step_run: PlanStepRunRecord,
+        digest: str,
+        *,
+        dependency_result_digests: dict[str, str] | None = None,
+        content_prefix: str = "",
+    ) -> PlanStepResultDocument:
+        document = await self.finish(
+            step_run,
+            PlanStepRunStatus.SUCCEEDED,
+            digest=digest,
+            dependency_result_digests=dependency_result_digests,
+            content_prefix=content_prefix,
+        )
+        assert document is not None
+        return document
 
     async def approve_and_succeed_all(self) -> None:
         await self.approve_with_two_roots()
@@ -465,6 +543,70 @@ class ExecutionFixture:
 
     async def count_step_runs(self) -> int:
         return await self.count_status(None)
+
+    async def count_step_attempts(self, step_id: str) -> int:
+        context = self._context()
+        async with self.database.connect() as conn:
+            return int(
+                (
+                    await conn.execute(
+                        select(func.count())
+                        .select_from(agent_plan_step_runs)
+                        .where(
+                            agent_plan_step_runs.c.tenant_id == context.tenant_id,
+                            agent_plan_step_runs.c.workspace_id == context.workspace_id,
+                            agent_plan_step_runs.c.session_id == context.session_id,
+                            agent_plan_step_runs.c.run_id == context.run_id,
+                            agent_plan_step_runs.c.step_id == step_id,
+                        )
+                    )
+                ).scalar_one()
+            )
+
+    async def succeeded_result_ids(self, step_ids: list[str]) -> list[str]:
+        context = self._context()
+        async with self.database.connect() as conn:
+            rows = (
+                await conn.execute(
+                    select(
+                        agent_plan_step_runs.c.step_id,
+                        agent_plan_step_runs.c.result_ref,
+                    ).where(
+                        agent_plan_step_runs.c.tenant_id == context.tenant_id,
+                        agent_plan_step_runs.c.workspace_id == context.workspace_id,
+                        agent_plan_step_runs.c.session_id == context.session_id,
+                        agent_plan_step_runs.c.run_id == context.run_id,
+                        agent_plan_step_runs.c.status
+                        == PlanStepRunStatus.SUCCEEDED.value,
+                    )
+                )
+            ).mappings().all()
+        refs_by_step = {
+            str(row["step_id"]): str(row["result_ref"]).removeprefix("memory:")
+            for row in rows
+        }
+        return [refs_by_step[step_id] for step_id in step_ids]
+
+    async def count_checkpoints(self) -> int:
+        assert self.context is not None
+        async with self.database.connect() as conn:
+            return int(
+                (
+                    await conn.execute(
+                        select(func.count())
+                        .select_from(execution_checkpoints)
+                        .where(
+                            execution_checkpoints.c.tenant_id
+                            == self.context.tenant_id,
+                            execution_checkpoints.c.workspace_id
+                            == self.context.workspace_id,
+                            execution_checkpoints.c.session_id
+                            == self.context.session_id,
+                            execution_checkpoints.c.run_id == self.context.run_id,
+                        )
+                    )
+                ).scalar_one()
+            )
 
     async def count_status(self, status: PlanStepRunStatus | None) -> int:
         assert self.context is not None
@@ -583,19 +725,84 @@ async def test_selector_uses_stable_topological_ordinal(execution_fixture):
     assert second.step.logical_step_key == "test"
 
 
-@pytest.mark.parametrize("mutation", ("unapproved", "current_ahead", "active_behind"))
+@pytest.mark.parametrize(
+    ("mutation", "blocked_reason"),
+    (
+        ("unapproved", "run is not executable"),
+        ("current_ahead", "approved current active version"),
+        ("active_behind", "approved current active version"),
+    ),
+)
 @pytest.mark.asyncio
 async def test_unapproved_or_stale_active_version_dispatches_no_step(
     execution_fixture,
     mutation,
+    blocked_reason,
 ):
     await execution_fixture.prepare_version_mutation(mutation)
-    with pytest.raises(PlanExecutionBlocked, match="approved current active version"):
+    with pytest.raises(PlanExecutionBlocked, match=blocked_reason):
         await execution_fixture.coordinator.start_next_attempt(
             context=execution_fixture._context(),
             lease=execution_fixture.lease,
         )
     assert await execution_fixture.count_step_runs() == 0
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        RunStatus.AWAITING_USER,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED_TERMINAL,
+        RunStatus.CANCELLED,
+    ),
+)
+@pytest.mark.asyncio
+async def test_non_executable_run_dispatches_no_attempt_or_checkpoint(
+    execution_fixture,
+    status,
+):
+    await execution_fixture.approve()
+    before_checkpoints = await execution_fixture.count_checkpoints()
+    await execution_fixture.update_run(run_status=status.value)
+
+    with pytest.raises(PlanExecutionBlocked, match="run is not executable"):
+        await execution_fixture.coordinator.select_next(
+            context=execution_fixture._context(),
+        )
+    with pytest.raises(PlanExecutionBlocked, match="run is not executable"):
+        await execution_fixture.coordinator.start_next_attempt(
+            context=execution_fixture._context(),
+            lease=execution_fixture.lease,
+        )
+
+    assert await execution_fixture.count_step_runs() == 0
+    assert await execution_fixture.count_checkpoints() == before_checkpoints
+
+
+@pytest.mark.asyncio
+async def test_cancel_requested_run_blocks_pure_selection_and_mutation(
+    execution_fixture,
+):
+    await execution_fixture.approve()
+    before_checkpoints = await execution_fixture.count_checkpoints()
+    await execution_fixture.update_run(
+        run_status=RunStatus.RUNNING.value,
+        cancel_requested_at=123,
+    )
+
+    with pytest.raises(PlanExecutionBlocked, match="run is not executable"):
+        await execution_fixture.coordinator.select_next(
+            context=execution_fixture._context(),
+        )
+    with pytest.raises(PlanExecutionBlocked, match="run is not executable"):
+        await execution_fixture.coordinator.start_next_attempt(
+            context=execution_fixture._context(),
+            lease=execution_fixture.lease,
+        )
+
+    assert await execution_fixture.count_step_runs() == 0
+    assert await execution_fixture.count_checkpoints() == before_checkpoints
 
 
 @pytest.mark.asyncio
@@ -615,6 +822,125 @@ async def test_concurrent_ready_nodes_still_create_one_running_attempt(execution
     started = [item for item in outcomes if item is not None]
     assert len(started) == 1
     assert await execution_fixture.count_status(PlanStepRunStatus.RUNNING) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_lock_interleaving_reselects_after_prior_step_succeeds(
+    execution_fixture,
+    monkeypatch,
+):
+    await execution_fixture.approve_with_two_roots()
+    first = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert first is not None
+    await execution_fixture.succeed(first.step_run, digest="a" * 64)
+    await execution_fixture.update_step_run(
+        first.step_run,
+        status=PlanStepRunStatus.FAILED_RETRYABLE.value,
+    )
+
+    dialect_type = type(execution_fixture.database.dialect)
+    original_lock_run = dialect_type.lock_run
+    interleaved = False
+
+    async def succeed_when_run_locks(dialect, connection, context):
+        nonlocal interleaved
+        await original_lock_run(dialect, connection, context)
+        if interleaved:
+            return
+        interleaved = True
+        await connection.execute(
+            update(agent_plan_step_runs)
+            .where(
+                agent_plan_step_runs.c.tenant_id == context.tenant_id,
+                agent_plan_step_runs.c.workspace_id == context.workspace_id,
+                agent_plan_step_runs.c.session_id == context.session_id,
+                agent_plan_step_runs.c.run_id == context.run_id,
+                agent_plan_step_runs.c.step_run_id == first.step_run.step_run_id,
+            )
+            .values(status=PlanStepRunStatus.SUCCEEDED.value)
+        )
+
+    monkeypatch.setattr(dialect_type, "lock_run", succeed_when_run_locks)
+
+    started = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+
+    assert started is not None
+    assert started.step.logical_step_key == "test"
+    assert await execution_fixture.count_step_attempts(first.step.step_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_attempt_insert_rechecks_run_state_immediately_before_write(
+    execution_fixture,
+    monkeypatch,
+):
+    await execution_fixture.approve()
+    before_checkpoints = await execution_fixture.count_checkpoints()
+    original_db_now = PlanRepository._db_now_ms
+    cancel_injected = False
+
+    async def cancel_before_insert(repository):
+        nonlocal cancel_injected
+        now = await original_db_now(repository)
+        if cancel_injected:
+            return now
+        cancel_injected = True
+        await repository.connection.execute(
+            update(agent_runs)
+            .where(
+                agent_runs.c.tenant_id == execution_fixture._context().tenant_id,
+                agent_runs.c.workspace_id == execution_fixture._context().workspace_id,
+                agent_runs.c.session_id == execution_fixture._context().session_id,
+                agent_runs.c.run_id == execution_fixture._context().run_id,
+            )
+            .values(cancel_requested_at=now)
+        )
+        return now
+
+    monkeypatch.setattr(PlanRepository, "_db_now_ms", cancel_before_insert)
+
+    with pytest.raises(PlanExecutionBlocked, match="run is not executable"):
+        await execution_fixture.coordinator.start_next_attempt(
+            context=execution_fixture._context(),
+            lease=execution_fixture.lease,
+        )
+
+    assert await execution_fixture.count_step_runs() == 0
+    assert await execution_fixture.count_checkpoints() == before_checkpoints
+
+
+@pytest.mark.asyncio
+async def test_attempt_insert_revalidates_succeeded_step_is_not_ready(
+    execution_fixture,
+):
+    await execution_fixture.approve_with_two_roots()
+    first = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert first is not None
+    await execution_fixture.succeed(first.step_run, digest="a" * 64)
+
+    with pytest.raises(PlanExecutionBlocked, match="step is no longer ready"):
+        async with TenantUnitOfWork(
+            execution_fixture.database,
+            execution_fixture._context(),
+            planning_settings=execution_fixture.settings.planning,
+        ) as uow:
+            await uow.plans.create_step_attempt(
+                execution_fixture.lease,
+                plan_id=first.plan.plan_id,
+                plan_version=first.plan.current_version,
+                step_id=first.step.step_id,
+            )
+
+    assert await execution_fixture.count_step_runs() == 1
 
 
 @pytest.mark.asyncio
@@ -728,6 +1054,249 @@ async def test_selector_rejects_incomplete_persisted_dependency_document(
         await execution_fixture.coordinator.select_next(
             context=execution_fixture._context(),
         )
+
+
+@pytest.mark.asyncio
+async def test_disconnected_succeeded_step_without_result_blocks_advancement(
+    execution_fixture,
+):
+    await execution_fixture.approve_with_two_roots()
+    first = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert first is not None
+    await execution_fixture.update_step_run(
+        first.step_run,
+        status=PlanStepRunStatus.SUCCEEDED.value,
+        result_summary=None,
+        result_ref=None,
+        result_digest=None,
+        finished_at=first.step_run.started_at + 1,
+    )
+
+    with pytest.raises(PlanExecutionBlocked, match="succeeded step result"):
+        await execution_fixture.coordinator.select_next(
+            context=execution_fixture._context(),
+        )
+    with pytest.raises(PlanExecutionBlocked, match="succeeded step result"):
+        await execution_fixture.coordinator.start_next_attempt(
+            context=execution_fixture._context(),
+            lease=execution_fixture.lease,
+        )
+
+    assert await execution_fixture.count_step_runs() == 1
+
+
+@pytest.mark.asyncio
+async def test_final_succeeded_step_with_missing_result_cannot_complete(
+    execution_fixture,
+):
+    await execution_fixture.materialize(_draft(("finalize",)))
+    await execution_fixture.approve()
+    final = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert final is not None
+    await execution_fixture.update_step_run(
+        final.step_run,
+        status=PlanStepRunStatus.SUCCEEDED.value,
+        result_summary="finalize complete",
+        result_ref="memory:missing-result",
+        result_digest="a" * 64,
+        finished_at=final.step_run.started_at + 1,
+    )
+
+    with pytest.raises(PlanExecutionBlocked, match="result document is unavailable"):
+        await execution_fixture.coordinator.select_next(
+            context=execution_fixture._context(),
+        )
+    with pytest.raises(PlanExecutionBlocked, match="result document is unavailable"):
+        await execution_fixture.coordinator.start_next_attempt(
+            context=execution_fixture._context(),
+            lease=execution_fixture.lease,
+        )
+
+    assert await execution_fixture.count_step_runs() == 1
+
+
+@pytest.mark.parametrize("proof_mutation", ("missing", "extra", "mismatch"))
+@pytest.mark.asyncio
+async def test_selector_rejects_inexact_transitive_result_proof(
+    execution_fixture,
+    proof_mutation,
+):
+    await execution_fixture.approve_chain(["collect", "transform", "publish"])
+    first = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert first is not None
+    first_document = await execution_fixture.succeed(
+        first.step_run,
+        digest="a" * 64,
+    )
+    second = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert second is not None
+    expected_proof = {first.step.logical_step_key: first_document.digest()}
+    if proof_mutation == "missing":
+        actual_proof = {}
+    elif proof_mutation == "extra":
+        actual_proof = {**expected_proof, "unrelated": "e" * 64}
+    else:
+        actual_proof = {first.step.logical_step_key: "f" * 64}
+    await execution_fixture.succeed(
+        second.step_run,
+        digest="d" * 64,
+        dependency_result_digests=actual_proof,
+    )
+
+    with pytest.raises(PlanExecutionBlocked, match="dependency result proof"):
+        await execution_fixture.coordinator.select_next(
+            context=execution_fixture._context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_selector_rejects_oversized_persisted_result_before_json_parsing(
+    execution_fixture,
+):
+    await execution_fixture.approve_chain(["collect", "publish"])
+    first = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert first is not None
+    await execution_fixture.succeed(
+        first.step_run,
+        digest="a" * 64,
+        content_prefix=" " * 262_145,
+    )
+
+    with pytest.raises(PlanExecutionBlocked, match="exceeds 262144 bytes"):
+        await execution_fixture.coordinator.select_next(
+            context=execution_fixture._context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_mutation_locks_results_in_topological_order_after_run_lock(
+    execution_fixture,
+    monkeypatch,
+):
+    await execution_fixture.approve_chain(["collect", "transform", "publish"])
+    first = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert first is not None
+    first_document = await execution_fixture.succeed(
+        first.step_run,
+        digest="a" * 64,
+    )
+    second = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert second is not None
+    await execution_fixture.succeed(
+        second.step_run,
+        digest="d" * 64,
+        dependency_result_digests={
+            first.step.logical_step_key: first_document.digest(),
+        },
+    )
+    expected_result_ids = await execution_fixture.succeeded_result_ids(
+        [first.step.step_id, second.step.step_id]
+    )
+
+    dialect_type = type(execution_fixture.database.dialect)
+    original_lock_run = dialect_type.lock_run
+    original_memory_get = MemoryRepository.get
+    run_locked = False
+    locked_result_ids: list[str] = []
+
+    async def record_run_lock(dialect, connection, context):
+        nonlocal run_locked
+        await original_lock_run(dialect, connection, context)
+        run_locked = True
+
+    async def record_result_lock(
+        repository,
+        entry_id,
+        target_session_id=None,
+        *,
+        for_update=False,
+    ):
+        assert run_locked
+        assert repository.connection.in_transaction()
+        assert for_update is True
+        locked_result_ids.append(entry_id)
+        return await original_memory_get(
+            repository,
+            entry_id,
+            target_session_id,
+            for_update=for_update,
+        )
+
+    monkeypatch.setattr(dialect_type, "lock_run", record_run_lock)
+    monkeypatch.setattr(MemoryRepository, "get", record_result_lock)
+
+    started = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+
+    assert started is not None
+    assert started.step.logical_step_key == "publish"
+    assert [item.step_id for item in started.dependency_results] == [
+        second.step.step_id
+    ]
+    assert locked_result_ids == expected_result_ids
+
+
+@pytest.mark.asyncio
+async def test_pure_selection_reads_verified_results_without_row_locks(
+    execution_fixture,
+    monkeypatch,
+):
+    await execution_fixture.approve_chain(["collect", "publish"])
+    first = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert first is not None
+    await execution_fixture.succeed(first.step_run, digest="a" * 64)
+    original_memory_get = MemoryRepository.get
+    lock_requests: list[bool] = []
+
+    async def record_lock_request(
+        repository,
+        entry_id,
+        target_session_id=None,
+        *,
+        for_update=False,
+    ):
+        lock_requests.append(for_update)
+        return await original_memory_get(
+            repository,
+            entry_id,
+            target_session_id,
+            for_update=for_update,
+        )
+
+    monkeypatch.setattr(MemoryRepository, "get", record_lock_request)
+
+    ready = await execution_fixture.coordinator.select_next(
+        context=execution_fixture._context(),
+    )
+
+    assert ready is not None
+    assert lock_requests == [False]
 
 
 @pytest.mark.asyncio
@@ -847,6 +1416,50 @@ async def test_attempt_rolls_back_when_checkpoint_insert_fails(execution_fixture
             lease=execution_fixture.lease,
         )
     assert await execution_fixture.count_step_runs() == 0
+
+
+@pytest.mark.asyncio
+async def test_mysql_memory_result_lookup_compiles_with_scoped_row_lock(
+    execution_fixture,
+):
+    await execution_fixture.approve()
+    context = execution_fixture._context()
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        entry = await uow.memory.save(
+            MemoryEntry(
+                content="{}",
+                type="plan_step_result",
+                role="assistant",
+                session_id=context.session_id,
+            )
+        )
+        recording = StatementRecordingConnection(uow.conn)
+        repository = MemoryRepository(  # type: ignore[arg-type]
+            recording,
+            context,
+            MySQLDialect(),
+        )
+        assert (
+            await repository.get(
+                entry.id,
+                context.session_id,
+                for_update=True,
+            )
+            is not None
+        )
+
+    statement = next(
+        statement
+        for statement in recording.statements
+        if getattr(statement, "is_select", False)
+        and memory_entries in statement.get_final_froms()
+    )
+    sql = str(statement.compile(dialect=mysql.dialect()))
+
+    assert statement.get_final_froms() == [memory_entries]
+    assert sql.endswith(" FOR UPDATE")
+    for column in ("tenant_id", "workspace_id", "session_id", "id"):
+        assert f"memory_entries.{column}" in sql
 
 
 @pytest.mark.asyncio

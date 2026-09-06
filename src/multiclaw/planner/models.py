@@ -103,6 +103,44 @@ class PlanStepRunRecord:
     finished_at: int | None
 
 
+TERMINAL_PLAN_STEP_STATUSES = frozenset(
+    {PlanStepRunStatus.FAILED_TERMINAL, PlanStepRunStatus.CANCELLED}
+)
+EXECUTABLE_PLAN_RUN_STATUSES = frozenset({RunStatus.RESUMING, RunStatus.RUNNING})
+NON_DISPATCHABLE_PLAN_STEP_STATUSES = frozenset(
+    {
+        PlanStepRunStatus.RUNNING,
+        PlanStepRunStatus.SUCCEEDED,
+        *TERMINAL_PLAN_STEP_STATUSES,
+    }
+)
+
+
+def is_plan_run_executable(
+    status: RunStatus,
+    cancel_requested_at: int | None,
+) -> bool:
+    return status in EXECUTABLE_PLAN_RUN_STATUSES and cancel_requested_at is None
+
+
+def is_plan_step_ready(
+    step_id: str,
+    dependency_ids: tuple[str, ...],
+    latest: Mapping[str, PlanStepRunRecord],
+) -> bool:
+    current = latest.get(step_id)
+    if (
+        current is not None
+        and current.status in NON_DISPATCHABLE_PLAN_STEP_STATUSES
+    ):
+        return False
+    return all(
+        (dependency := latest.get(dependency_id)) is not None
+        and dependency.status is PlanStepRunStatus.SUCCEEDED
+        for dependency_id in dependency_ids
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PlanVersionRecord:
     plan_id: str
@@ -221,7 +259,7 @@ class PlanStepResultDocument(BaseModel):
     evidence: list[EvidenceText] = Field(max_length=20)
     definition_digest: str = Field(pattern=RESULT_DIGEST)
     dependency_result_digests: dict[
-        str,
+        Annotated[str, Field(pattern=LOGICAL_STEP_KEY)],
         Annotated[str, Field(pattern=RESULT_DIGEST)],
     ] = Field(max_length=20)
     tool_catalog_digest: str = Field(pattern=RESULT_DIGEST)
