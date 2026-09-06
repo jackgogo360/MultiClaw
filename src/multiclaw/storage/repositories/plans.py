@@ -1341,6 +1341,150 @@ class PlanRepository:
             if latest_attempt >= attempt_limit:
                 raise PlanAttemptLimitError("Plan step attempt limit exceeded") from primary
             raise
+
+    async def step_run_by_id(
+        self,
+        *,
+        run_id: str,
+        step_run_id: str,
+        for_update: bool = False,
+    ) -> PlanStepRunRecord | None:
+        """Read one scoped attempt; callers that prove reuse keep it locked."""
+        query = select(agent_plan_step_runs).where(
+            self._step_run_scope_predicate(run_id),
+            agent_plan_step_runs.c.step_run_id == step_run_id,
+        )
+        if for_update:
+            query = query.with_for_update()
+        result = await self._conn.execute(query)
+        row = result.mappings().first()
+        return None if row is None else self._hydrate_step_run(row)
+
+    async def create_reused_step_attempt(
+        self,
+        lease: RunLease,
+        *,
+        plan_id: str,
+        plan_version: int,
+        step_id: str,
+        source_step_run_id: str,
+    ) -> PlanStepRunRecord:
+        """Persist a new, explicit succeeded fact referencing a locked source fact.
+
+        The source document remains immutable.  Its result reference intentionally
+        remains the evidence reference; execution validates the explicit lineage
+        before accepting that document for a revised row.
+        """
+        self._require_session()
+        if not self._lease_matches_context(lease):
+            raise StaleFenceError("run lease scope is stale")
+        run = await self.lock_run_for_execution(lease)
+        await self._require_no_running_attempt(str(lease.context.run_id))
+        await self._require_active_plan_version(
+            run, plan_id=plan_id, plan_version=plan_version
+        )
+        source = await self.step_run_by_id(
+            run_id=str(lease.context.run_id),
+            step_run_id=source_step_run_id,
+            for_update=True,
+        )
+        if (
+            source is None
+            or source.plan_id != plan_id
+            or source.run_id != str(lease.context.run_id)
+            or source.status is not PlanStepRunStatus.SUCCEEDED
+            or source.reused_from_step_run_id is not None
+            or source.result_ref is None
+            or source.result_digest is None
+            or source.result_summary is None
+        ):
+            raise PlanExecutionBlocked("Plan reuse source is not a complete succeeded attempt")
+        attempt, _ = await self._require_step_ready(
+            run_id=str(lease.context.run_id),
+            plan_id=plan_id,
+            plan_version=plan_version,
+            step_id=step_id,
+        )
+        now = await self._db_now_ms()
+        step_run_id = str(uuid4())
+        savepoint = await self._conn.begin_nested()
+        try:
+            # Keep the final proof and insert adjacent under the run lock.
+            run = await self._require_current_executable_lease(lease)
+            await self._require_active_plan_version(
+                run, plan_id=plan_id, plan_version=plan_version
+            )
+            await self._require_no_running_attempt(str(lease.context.run_id))
+            source = await self.step_run_by_id(
+                run_id=str(lease.context.run_id),
+                step_run_id=source_step_run_id,
+                for_update=True,
+            )
+            if (
+                source is None
+                or source.status is not PlanStepRunStatus.SUCCEEDED
+                or source.reused_from_step_run_id is not None
+                or source.result_ref is None
+                or source.result_digest is None
+                or source.result_summary is None
+            ):
+                raise PlanExecutionBlocked("Plan reuse source changed while locked")
+            attempt, _ = await self._require_step_ready(
+                run_id=str(lease.context.run_id),
+                plan_id=plan_id,
+                plan_version=plan_version,
+                step_id=step_id,
+            )
+            await self._conn.execute(
+                insert(agent_plan_step_runs).values(
+                    **self._scope_values(),
+                    plan_id=plan_id,
+                    plan_version=plan_version,
+                    step_id=step_id,
+                    step_run_id=step_run_id,
+                    run_id=lease.context.run_id,
+                    attempt=attempt,
+                    status=PlanStepRunStatus.SUCCEEDED.value,
+                    result_summary=source.result_summary,
+                    result_ref=source.result_ref,
+                    result_digest=source.result_digest,
+                    error_code=None,
+                    error_detail_redacted=None,
+                    reused_from_step_run_id=source.step_run_id,
+                    version=2,
+                    started_at=now,
+                    finished_at=now,
+                )
+            )
+            inserted = await self.step_run_by_id(
+                run_id=str(lease.context.run_id),
+                step_run_id=step_run_id,
+                for_update=True,
+            )
+            if inserted is None:
+                raise RuntimeError("Reused Plan step attempt missing after insert")
+            await savepoint.commit()
+            return inserted
+        except IntegrityError as primary:
+            if not await self._rollback_savepoint(savepoint, primary):
+                raise
+            existing = await self.latest_step_attempts(
+                plan_id=plan_id,
+                plan_version=plan_version,
+                run_id=str(lease.context.run_id),
+                for_update=True,
+            )
+            current = existing.get(step_id)
+            if (
+                current is not None
+                and current.status is PlanStepRunStatus.SUCCEEDED
+                and current.reused_from_step_run_id == source_step_run_id
+            ):
+                return current
+            raise
+        except BaseException as primary:
+            await self._rollback_savepoint(savepoint, primary)
+            raise
         except BaseException as primary:
             await self._rollback_savepoint(savepoint, primary)
             raise

@@ -24,7 +24,12 @@ from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings, Settings
 from multiclaw.llm import LLMResponse, ToolCall
 from multiclaw.memory import MemoryEntry
-from multiclaw.planner.execution import PlanExecutionCoordinator, choose_ready_step
+from multiclaw.planner.execution import (
+    PlanExecutionCoordinator,
+    can_reuse_result,
+    choose_ready_step,
+)
+from multiclaw.planner.generator import PlanGenerationError
 from multiclaw.planner.models import (
     MaterializeInitialPlan,
     PlanAttemptLimitError,
@@ -37,12 +42,13 @@ from multiclaw.planner.models import (
     PlanStepAlreadyRunningError,
     PlanStepCompletion,
     PlanStepExecutionRequest,
+    PlanStepRecord,
     PlanStepResultDocument,
     PlanStepRunRecord,
     PlanStepRunStatus,
     PlanTriggerMode,
 )
-from multiclaw.planner.service import PlanningService
+from multiclaw.planner.service import FailureRevisionRequest, PlanningService
 from multiclaw.security.redaction import redact
 from multiclaw.skills import SkillManager
 from multiclaw.skills.types import Skill, SkillMetadata
@@ -87,6 +93,21 @@ class ScriptedPlanRouter:
     async def completion(self, **kwargs) -> LLMResponse:
         self.calls.append(kwargs)
         return self.responses.pop(0)
+
+
+class ObservingFailureGenerator:
+    def __init__(self, draft: PlanDraft, observe) -> None:
+        self.draft = draft
+        self.observe = observe
+        self.calls: list[object] = []
+        self.error: Exception | None = None
+
+    async def generate(self, objective: str, *, revision, **_limits):
+        self.calls.append(revision)
+        await self.observe()
+        if self.error is not None:
+            raise self.error
+        return self.draft
 
 
 class ScriptedStepRunner:
@@ -610,6 +631,8 @@ class ExecutionFixture:
         digest: str = "a" * 64,
         dependency_result_digests: dict[str, str] | None = None,
         content_prefix: str = "",
+        policy_digest: str = "b" * 64,
+        skill_set_digest: str = "c" * 64,
     ) -> PlanStepResultDocument | None:
         assert self.context is not None
         document = None
@@ -642,8 +665,8 @@ class ExecutionFixture:
                         else dependency_result_digests
                     ),
                     tool_catalog_digest=digest,
-                    policy_digest="b" * 64,
-                    skill_set_digest="c" * 64,
+                    policy_digest=policy_digest,
+                    skill_set_digest=skill_set_digest,
                 )
                 entry = await uow.memory.save(
                     MemoryEntry(
@@ -704,6 +727,8 @@ class ExecutionFixture:
         *,
         dependency_result_digests: dict[str, str] | None = None,
         content_prefix: str = "",
+        policy_digest: str = "b" * 64,
+        skill_set_digest: str = "c" * 64,
     ) -> PlanStepResultDocument:
         document = await self.finish(
             step_run,
@@ -711,6 +736,8 @@ class ExecutionFixture:
             digest=digest,
             dependency_result_digests=dependency_result_digests,
             content_prefix=content_prefix,
+            policy_digest=policy_digest,
+            skill_set_digest=skill_set_digest,
         )
         assert document is not None
         return document
@@ -2485,6 +2512,405 @@ async def test_stale_lease_and_exhausted_attempt_budget_create_no_attempt(execut
             lease=execution_fixture.lease,
         )
     assert await execution_fixture.count_step_runs() == before
+
+
+def test_reuse_requires_a_complete_source_proof() -> None:
+    """A missing immutable predecessor is never treated as compatible reuse."""
+    new_step = PlanStepRecord(
+        step_id=str(uuid4()),
+        logical_step_key="publish",
+        supersedes_step_id=str(uuid4()),
+        ordinal=1,
+        title="Publish",
+        description="Publish the verified artifact.",
+        expected_outcome="Artifact is published.",
+        assigned_agent_profile_id=None,
+        max_attempts=1,
+        definition_digest="a" * 64,
+    )
+
+    assert not can_reuse_result(
+        current_run_id=str(uuid4()),
+        new_step=new_step,
+        source_step=None,
+        source_run=None,
+        source_result=None,
+        new_dependency_ids=frozenset(),
+        dependency_proofs={},
+        current_tool_catalog_digest="b" * 64,
+        current_policy_digest="c" * 64,
+        current_skill_set_digest="d" * 64,
+    )
+
+
+@pytest.mark.asyncio
+async def test_copied_reuse_lineage_is_accepted_as_dependency_evidence(
+    execution_fixture,
+) -> None:
+    """A reused row deliberately points to its immutable source document."""
+    await execution_fixture.approve_chain(["collect", "publish"])
+    source_started = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(), lease=execution_fixture.lease
+    )
+    assert source_started is not None
+    source_document = await execution_fixture.succeed(
+        source_started.step_run, digest="a" * 64
+    )
+    context = execution_fixture._context()
+    assert execution_fixture.plan_id is not None
+    assert execution_fixture.aggregate_version is not None
+    async with TenantUnitOfWork(
+        execution_fixture.database,
+        context,
+        planning_settings=execution_fixture.settings.planning,
+    ) as uow:
+        original = await uow.plans.get(execution_fixture.plan_id)
+        assert original is not None
+        revised = await uow.plans.append_version(
+            plan_id=original.plan_id,
+            expected_version=original.aggregate_version,
+            draft=_draft(("collect", "publish"), chain=True),
+            parent_version=original.current_version,
+            revision_feedback="retain verified collection",
+            supersedes={step.logical_step_key: step.step_id for step in original.current.steps},
+        )
+        await uow.conn.execute(
+            update(agent_plans)
+            .where(agent_plans.c.id == revised.plan_id)
+            .values(status="approved", approved_version=revised.current_version)
+        )
+        await uow.conn.execute(
+            update(agent_runs)
+            .where(agent_runs.c.run_id == context.run_id)
+            .values(active_plan_version=revised.current_version)
+        )
+        source_row = await uow.plans.step_run_by_id(
+            run_id=str(context.run_id), step_run_id=source_started.step_run.step_run_id
+        )
+        assert source_row is not None
+        assert can_reuse_result(
+            current_run_id=str(context.run_id),
+            new_step=revised.current.steps[0],
+            source_step=original.current.steps[0],
+            source_run=source_row,
+            source_result=source_document,
+            new_dependency_ids=frozenset(),
+            dependency_proofs={},
+            current_tool_catalog_digest=source_document.tool_catalog_digest,
+            current_policy_digest=source_document.policy_digest,
+            current_skill_set_digest=source_document.skill_set_digest,
+        )
+        revised_collect = next(
+            step for step in revised.current.steps if step.logical_step_key == "collect"
+        )
+        reused = await uow.plans.create_reused_step_attempt(
+            execution_fixture.lease,
+            plan_id=revised.plan_id,
+            plan_version=revised.current_version,
+            step_id=revised_collect.step_id,
+            source_step_run_id=source_started.step_run.step_run_id,
+        )
+        source_row = await uow.plans.step_run_by_id(
+            run_id=str(context.run_id),
+            step_run_id=source_started.step_run.step_run_id,
+        )
+        assert source_row is not None
+
+    ready = await execution_fixture.coordinator.select_next(context=context)
+
+    assert reused.result_ref == source_row.result_ref
+    assert reused.result_digest == source_document.digest()
+    assert ready is not None
+    assert ready.step.logical_step_key == "publish"
+    assert ready.dependency_results == (source_document,)
+
+
+@pytest.mark.asyncio
+async def test_failure_revision_materializes_waiting_version_after_replan_checkpoint(
+    execution_fixture,
+) -> None:
+    """Failure revision appends review work without advancing the active version."""
+    await execution_fixture.approve_chain(["collect", "publish"])
+    execution_fixture.current_lease = await WorkflowCoordinator(
+        execution_fixture.database, settings=execution_fixture.settings
+    ).transition_run(execution_fixture.lease, RunStatus.RUNNING)
+    started = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(), lease=execution_fixture.lease
+    )
+    assert started is not None
+    await execution_fixture.finish(started.step_run, PlanStepRunStatus.FAILED_TERMINAL)
+    plan = await execution_fixture.coordinator._load_active_plan(execution_fixture._context())
+    failed = await execution_fixture.latest_attempt()
+    failure_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "step_run_id": failed.step_run_id,
+                "error_code": failed.error_code,
+                "error_detail_redacted": failed.error_detail_redacted,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    await WorkflowCoordinator(
+        execution_fixture.database, settings=execution_fixture.settings
+    ).checkpoint(
+        execution_fixture.lease,
+        CheckpointPhase.PLAN_REPLAN_REQUIRED,
+        {
+            "run_id": str(execution_fixture._context().run_id),
+            "plan_id": plan.plan_id,
+            "plan_version": plan.current_version,
+            "plan_digest": plan.current.content_digest,
+            "failed_step_run_id": failed.step_run_id,
+            "failure_digest": failure_digest,
+            "revision_cursor": "generate_revision",
+            "cursor": "generate_revision",
+        },
+    )
+
+    materialized = await execution_fixture.service.materialize_failure_revision(
+        FailureRevisionRequest(
+            context=execution_fixture._context(),
+            lease=execution_fixture.lease,
+            plan=plan,
+            failed_step_run=failed,
+            draft=_draft(("collect", "publish"), chain=True),
+        )
+    )
+
+    assert materialized.plan.current_version == 2
+    assert materialized.plan.approved_version == 1
+    assert materialized.run.status is RunStatus.AWAITING_USER
+    assert materialized.run.active_plan_version == 1
+    assert [checkpoint["phase"] for checkpoint in (await execution_fixture.checkpoints())[-2:]] == [
+        CheckpointPhase.PLAN_REPLAN_REQUIRED.value,
+        CheckpointPhase.PLAN_AWAITING_APPROVAL.value,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_execution_checkpoints_before_generator_and_waits_for_revision(
+    execution_fixture,
+) -> None:
+    """The generator must observe a durable replan boundary, never a bare failure."""
+    draft = _draft(("lint",), max_attempts=1)
+    observed_phases: list[str] = []
+
+    async def observe_checkpoint() -> None:
+        observed_phases.extend(
+            str(item["phase"]) for item in await execution_fixture.checkpoints()
+        )
+
+    generator = ObservingFailureGenerator(draft, observe_checkpoint)
+    execution_fixture.service._generator = generator
+    coordinator = PlanExecutionCoordinator(
+        execution_fixture.database,
+        settings=execution_fixture.settings,
+        planning_service=execution_fixture.service,
+    )
+    await execution_fixture.materialize(draft)
+    await execution_fixture.approve()
+    outcome = await coordinator.execute_to_boundary(
+        context=execution_fixture._context(),
+        run_lease_handle=RunLeaseHandle(execution_fixture.lease),
+        runner=ScriptedStepRunner(
+            [
+                PlanStepCompletion(
+                    status="failed",
+                    summary="bounded failure",
+                    evidence=[],
+                    retryable=False,
+                )
+            ]
+        ),
+    )
+
+    assert CheckpointPhase.PLAN_REPLAN_REQUIRED.value in observed_phases
+    assert len(generator.calls) == 1
+    assert outcome.state == "awaiting_user"
+    assert outcome.plan.current_version == 2
+    assert outcome.plan.approved_version == 1
+    assert outcome.run.status is RunStatus.AWAITING_USER
+    assert [item["phase"] for item in (await execution_fixture.checkpoints())[-2:]] == [
+        CheckpointPhase.PLAN_REPLAN_REQUIRED.value,
+        CheckpointPhase.PLAN_AWAITING_APPROVAL.value,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_revision_generation_terminates_without_extra_version(
+    execution_fixture,
+) -> None:
+    draft = _draft(("lint",), max_attempts=1)
+
+    async def observe_checkpoint() -> None:
+        return None
+
+    generator = ObservingFailureGenerator(draft, observe_checkpoint)
+    generator.error = PlanGenerationError("two invalid structured responses")
+    execution_fixture.service._generator = generator
+    coordinator = PlanExecutionCoordinator(
+        execution_fixture.database,
+        settings=execution_fixture.settings,
+        planning_service=execution_fixture.service,
+    )
+    await execution_fixture.materialize(draft)
+    await execution_fixture.approve()
+    outcome = await coordinator.execute_to_boundary(
+        context=execution_fixture._context(),
+        run_lease_handle=RunLeaseHandle(execution_fixture.lease),
+        runner=ScriptedStepRunner(
+            [PlanStepCompletion(status="failed", summary="no repair", evidence=[])]
+        ),
+    )
+
+    snapshot = await coordinator._load_active_plan(execution_fixture._context())
+    assert outcome.state == "failed_terminal"
+    assert outcome.run.status is RunStatus.FAILED_TERMINAL
+    assert snapshot.current_version == 1
+    assert len(snapshot.versions) == 1
+    assert (await execution_fixture.latest_checkpoint())["phase"] == CheckpointPhase.RUN_TERMINAL.value
+
+
+@pytest.mark.asyncio
+async def test_revision_quota_fails_closed_before_generator_call(execution_fixture) -> None:
+    draft = _draft(("lint",), max_attempts=1)
+
+    async def observe_checkpoint() -> None:
+        return None
+
+    generator = ObservingFailureGenerator(draft, observe_checkpoint)
+    execution_fixture.service._generator = generator
+    execution_fixture.settings.planning.max_revisions = 0
+    coordinator = PlanExecutionCoordinator(
+        execution_fixture.database,
+        settings=execution_fixture.settings,
+        planning_service=execution_fixture.service,
+    )
+    await execution_fixture.materialize(draft)
+    await execution_fixture.approve()
+    outcome = await coordinator.execute_to_boundary(
+        context=execution_fixture._context(),
+        run_lease_handle=RunLeaseHandle(execution_fixture.lease),
+        runner=ScriptedStepRunner(
+            [PlanStepCompletion(status="failed", summary="quota", evidence=[])]
+        ),
+    )
+
+    assert outcome.state == "failed_terminal"
+    assert generator.calls == []
+    assert outcome.plan.current_version == 1
+
+
+@pytest.mark.asyncio
+async def test_omitted_failed_work_raises_without_appending_or_terminalizing(
+    execution_fixture,
+) -> None:
+    draft = _draft(("lint",), max_attempts=1)
+
+    async def observe_checkpoint() -> None:
+        return None
+
+    generator = ObservingFailureGenerator(
+        _draft(("replacement",), max_attempts=1), observe_checkpoint
+    )
+    execution_fixture.service._generator = generator
+    coordinator = PlanExecutionCoordinator(
+        execution_fixture.database,
+        settings=execution_fixture.settings,
+        planning_service=execution_fixture.service,
+    )
+    await execution_fixture.materialize(draft)
+    await execution_fixture.approve()
+    with pytest.raises(PlanGenerationError, match="failed step must be retained"):
+        await coordinator.execute_to_boundary(
+            context=execution_fixture._context(),
+            run_lease_handle=RunLeaseHandle(execution_fixture.lease),
+            runner=ScriptedStepRunner(
+                [PlanStepCompletion(status="failed", summary="omitted", evidence=[])]
+            ),
+        )
+
+    snapshot = await coordinator._load_active_plan(execution_fixture._context())
+    run = await execution_fixture.service.workflow.get_run(execution_fixture._context())
+    assert snapshot.current_version == 1
+    assert run is not None and run.status is RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_apply_compatible_reuse_creates_explicit_reused_attempt(
+    execution_fixture,
+) -> None:
+    draft = _draft(("collect",), max_attempts=2)
+    await execution_fixture.approve_chain(["collect"])
+    runner = ScriptedStepRunner([])
+    tool_digest = hashlib.sha256(b"[]").hexdigest()
+    policy_digest = hashlib.sha256(
+        json.dumps(
+            redact(execution_fixture.settings.governance.model_dump(mode="json")),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    skill_digest = hashlib.sha256(b"[]").hexdigest()
+    source_started = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(), lease=execution_fixture.lease
+    )
+    assert source_started is not None
+    source_document = await execution_fixture.succeed(
+        source_started.step_run,
+        digest=tool_digest,
+        policy_digest=policy_digest,
+        skill_set_digest=skill_digest,
+    )
+    assert source_document.tool_catalog_digest == hashlib.sha256(
+        json.dumps(runner.registry.to_openai_schemas(), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert source_document.policy_digest == hashlib.sha256(
+        json.dumps(redact(execution_fixture.settings.governance.model_dump(mode="json")), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert source_document.skill_set_digest == hashlib.sha256(
+        json.dumps(sorted(skill.name for skill in runner.skill_manager.active_skills), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    context = execution_fixture._context()
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        original = await uow.plans.get(execution_fixture.plan_id)
+        assert original is not None
+        revised = await uow.plans.append_version(
+            plan_id=original.plan_id,
+            expected_version=original.aggregate_version,
+            draft=draft,
+            parent_version=original.current_version,
+            revision_feedback="reuse compatible result",
+            supersedes={"collect": original.current.steps[0].step_id},
+        )
+        await uow.conn.execute(
+            update(agent_plans)
+            .where(agent_plans.c.id == revised.plan_id)
+            .values(status="approved", approved_version=revised.current_version)
+        )
+        await uow.conn.execute(
+            update(agent_runs)
+            .where(agent_runs.c.run_id == context.run_id)
+            .values(active_plan_version=revised.current_version)
+        )
+    reused = await execution_fixture.coordinator.apply_compatible_reuse(
+        context=context,
+        lease=execution_fixture.lease,
+        runner=runner,
+    )
+    repeated = await execution_fixture.coordinator.apply_compatible_reuse(
+        context=context,
+        lease=execution_fixture.lease,
+        runner=runner,
+    )
+
+    assert len(reused) == 1
+    assert repeated == ()
+    assert reused[0].status is PlanStepRunStatus.SUCCEEDED
+    assert reused[0].reused_from_step_run_id == source_started.step_run.step_run_id
+    assert reused[0].result_digest == source_document.digest()
 
 
 @pytest.mark.asyncio

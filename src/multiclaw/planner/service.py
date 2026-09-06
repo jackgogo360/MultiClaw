@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from uuid import uuid4
 
 from multiclaw.config import Settings
 from multiclaw.events.types import ScopedEvent
 from multiclaw.memory.models import MemoryEntry
-from multiclaw.planner.generator import PlanGenerator
+from multiclaw.planner.generator import PlanGenerationError, PlanGenerator
 from multiclaw.planner.models import (
     MaterializeInitialPlan,
     PlanDecisionAction,
@@ -22,6 +22,7 @@ from multiclaw.planner.models import (
     PlanRevisionContext,
     PlanRevisionLimitError,
     PlanSnapshot,
+    PlanStepRunRecord,
     ValidatedPlanDraft,
 )
 from multiclaw.planner.validation import sanitize_plan_text, validate_plan_draft
@@ -31,7 +32,25 @@ from multiclaw.storage.repositories.plans import PlanRepository
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
-from multiclaw.workflow.models import RunRecord
+from multiclaw.workflow.models import CheckpointPhase, RunLease, RunRecord, RunStatus
+
+
+@dataclass(frozen=True, slots=True)
+class FailureRevisionRequest:
+    """A generated, validated replacement for an exhausted Plan step."""
+
+    context: TenantContext
+    lease: RunLease
+    plan: PlanSnapshot
+    failed_step_run: PlanStepRunRecord
+    draft: PlanDraft
+
+
+@dataclass(frozen=True, slots=True)
+class FailureRevisionResult:
+    plan: PlanSnapshot
+    run: RunRecord
+    lease: RunLease
 
 
 class PlanningService:
@@ -101,6 +120,93 @@ class PlanningService:
                 reference.model_dump(mode="json"),
             ),
         )
+
+    async def materialize_failure_revision(
+        self,
+        request: FailureRevisionRequest,
+    ) -> FailureRevisionResult:
+        """Append an immutable review version and park the active run atomically."""
+        if request.context.session_id is None or request.context.run_id is None:
+            raise ValueError("failure revision requires session and run scope")
+        if request.lease.context != request.context:
+            raise ValueError("failure revision lease scope is stale")
+        if request.failed_step_run.plan_id != request.plan.plan_id:
+            raise ValueError("failed step does not belong to failure revision Plan")
+
+        async with TenantUnitOfWork(
+            self._database,
+            request.context,
+            planning_settings=self._settings.planning,
+            workflow_settings=self._settings.workflow,
+        ) as uow:
+            await uow.plans.lock_run_for_execution(request.lease)
+            current = await uow.plans.get(request.plan.plan_id)
+            if (
+                current is None
+                or current.current_version != request.plan.current_version
+                or current.aggregate_version != request.plan.aggregate_version
+            ):
+                raise ValueError("failure revision Plan changed")
+            if current.current_version - 1 >= self._settings.planning.max_revisions:
+                raise PlanRevisionLimitError("Plan revision limit exceeded")
+
+            failed_step = next(
+                (
+                    step
+                    for step in current.current.steps
+                    if step.step_id == request.failed_step_run.step_id
+                ),
+                None,
+            )
+            if failed_step is None:
+                raise ValueError("failed step is not in the current Plan version")
+            new_keys = {step.logical_step_key for step in request.draft.steps}
+            if failed_step.logical_step_key not in new_keys:
+                raise PlanGenerationError("failed step must be retained or superseded")
+
+            revised = await uow.plans.append_version(
+                plan_id=current.plan_id,
+                expected_version=current.aggregate_version,
+                draft=request.draft,
+                parent_version=current.current_version,
+                revision_feedback=f"failure:{request.failed_step_run.step_run_id}",
+                supersedes={
+                    step.logical_step_key: prior.step_id
+                    for step in request.draft.steps
+                    if (prior := next(
+                        (
+                            item
+                            for item in current.current.steps
+                            if item.logical_step_key == step.logical_step_key
+                        ),
+                        None,
+                    ))
+                    is not None
+                },
+            )
+            coordinator = WorkflowCoordinator(
+                self._database, settings=self._settings, connection=uow.conn
+            )
+            waiting_lease = await coordinator.transition_run(
+                request.lease, RunStatus.AWAITING_USER
+            )
+            await coordinator.checkpoint(
+                waiting_lease,
+                CheckpointPhase.PLAN_AWAITING_APPROVAL,
+                {
+                    "run_id": str(request.context.run_id),
+                    "plan_id": revised.plan_id,
+                    "plan_version": revised.current_version,
+                    "plan_digest": revised.current.content_digest,
+                    "decision_cursor": f"plan:{revised.plan_id}:v{revised.current_version}:decision",
+                    "cursor": f"plan:{revised.plan_id}:v{revised.current_version}:decision",
+                },
+                checkpoint_seq=await uow.workflow.get_next_checkpoint_seq(request.context),
+            )
+            run = await uow.workflow.get_run(request.context)
+            if run is None:
+                raise RuntimeError("failure revision run is missing")
+        return FailureRevisionResult(plan=revised, run=run, lease=waiting_lease)
 
     async def decide(
         self,
@@ -458,4 +564,9 @@ class PlanningService:
         )
 
 
-__all__ = ["MaterializeInitialPlan", "PlanningService"]
+__all__ = [
+    "FailureRevisionRequest",
+    "FailureRevisionResult",
+    "MaterializeInitialPlan",
+    "PlanningService",
+]

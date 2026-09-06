@@ -13,6 +13,7 @@ from multiclaw.planner.models import (
     TERMINAL_PLAN_STEP_STATUSES,
     PlanExecutionBlocked,
     PlanExecutionOutcome,
+    PlanRevisionLimitError,
     PlanSnapshot,
     PlanStatus,
     PlanStepAlreadyRunningError,
@@ -27,6 +28,8 @@ from multiclaw.planner.models import (
     is_plan_run_executable,
     is_plan_step_ready,
 )
+from multiclaw.planner.generator import PlanGenerationError
+from multiclaw.planner.service import FailureRevisionRequest, PlanningService
 from multiclaw.security.redaction import redact
 from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.memory import MemoryRepository
@@ -81,6 +84,96 @@ class StartedPlanStep:
     dependency_results: tuple[PlanStepResultDocument, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class DependencyReuseProof:
+    """The already-verified revised dependency and its immutable predecessor."""
+
+    new_step: PlanStepRecord
+    reused_run: PlanStepRunRecord
+    source_step: PlanStepRecord
+    source_run: PlanStepRunRecord
+    source_result: PlanStepResultDocument
+
+
+def can_reuse_result(
+    *,
+    current_run_id: str,
+    new_step: PlanStepRecord,
+    source_step: PlanStepRecord | None,
+    source_run: PlanStepRunRecord | None,
+    source_result: PlanStepResultDocument | None,
+    new_dependency_ids: frozenset[str],
+    dependency_proofs: Mapping[str, DependencyReuseProof],
+    current_tool_catalog_digest: str | None,
+    current_policy_digest: str | None,
+    current_skill_set_digest: str | None,
+) -> bool:
+    """Return true only for a complete, same-run immutable reuse proof.
+
+    Compatibility is deliberately all-or-nothing.  Missing current compatibility
+    inputs are not a reason to guess that old tool or policy state is safe.
+    """
+    if (
+        source_step is None
+        or source_run is None
+        or source_result is None
+        or current_tool_catalog_digest is None
+        or current_policy_digest is None
+        or current_skill_set_digest is None
+    ):
+        return False
+    if (
+        source_run.run_id != current_run_id
+        or source_run.status is not PlanStepRunStatus.SUCCEEDED
+        or source_run.reused_from_step_run_id is not None
+        or new_step.supersedes_step_id != source_step.step_id
+        or new_step.definition_digest != source_step.definition_digest
+    ):
+        return False
+    if (
+        source_result.run_id != current_run_id
+        or source_result.step_id != source_step.step_id
+        or source_result.step_run_id != source_run.step_run_id
+        or source_result.definition_digest != source_step.definition_digest
+        or source_run.result_digest != source_result.digest()
+        or source_run.result_summary != source_result.summary
+        or source_run.result_ref is None
+    ):
+        return False
+    if (
+        source_result.tool_catalog_digest != current_tool_catalog_digest
+        or source_result.policy_digest != current_policy_digest
+        or source_result.skill_set_digest != current_skill_set_digest
+    ):
+        return False
+    if set(source_result.dependency_result_digests) != set(dependency_proofs):
+        return False
+    if {proof.new_step.step_id for proof in dependency_proofs.values()} != new_dependency_ids:
+        return False
+    for predecessor_key, proof in dependency_proofs.items():
+        expected = source_result.dependency_result_digests.get(predecessor_key)
+        if expected is None:
+            return False
+        if (
+            proof.new_step.supersedes_step_id != proof.source_step.step_id
+            or proof.new_step.definition_digest != proof.source_step.definition_digest
+            or proof.source_run.run_id != current_run_id
+            or proof.source_run.status is not PlanStepRunStatus.SUCCEEDED
+            or proof.source_run.reused_from_step_run_id is not None
+            or proof.source_result.run_id != current_run_id
+            or proof.source_result.step_id != proof.source_step.step_id
+            or proof.source_result.step_run_id != proof.source_run.step_run_id
+            or proof.source_result.definition_digest != proof.source_step.definition_digest
+            or proof.source_run.result_digest != expected
+            or proof.source_result.digest() != expected
+            or proof.reused_run.reused_from_step_run_id != proof.source_run.step_run_id
+            or proof.reused_run.status is not PlanStepRunStatus.SUCCEEDED
+            or proof.reused_run.result_digest != expected
+        ):
+            return False
+    return True
+
+
 def choose_ready_step(
     plan: PlanVersionRecord,
     latest: Mapping[str, PlanStepRunRecord],
@@ -101,9 +194,11 @@ class PlanExecutionCoordinator:
         database: Database,
         *,
         settings: Settings | None = None,
+        planning_service: PlanningService | None = None,
     ) -> None:
         self._database = database
         self._settings = settings or Settings(_config_file="/nonexistent")
+        self._planning_service = planning_service
 
     async def select_next(
         self,
@@ -198,6 +293,138 @@ class PlanExecutionCoordinator:
             step_run=step_run,
             dependency_results=ready.dependency_results,
         )
+
+    async def apply_compatible_reuse(
+        self,
+        *,
+        context: TenantContext,
+        lease: RunLease,
+        runner: PlanStepRunner,
+    ) -> tuple[PlanStepRunRecord, ...]:
+        """Materialize only fully proven same-run results in stable DAG order."""
+        tool_digest = _canonical_digest(runner.registry.to_openai_schemas())
+        policy_digest = _canonical_digest(self._settings.governance.model_dump(mode="json"))
+        skill_digest = _canonical_digest(sorted(skill.name for skill in runner.skill_manager.active_skills))
+        created: list[PlanStepRunRecord] = []
+        async with TenantUnitOfWork(
+            self._database,
+            context,
+            planning_settings=self._settings.planning,
+            workflow_settings=self._settings.workflow,
+        ) as uow:
+            await uow.plans.lock_run_for_execution(lease)
+            plan = await self._load_executable_plan(
+                context=context, plans=uow.plans, workflow=uow.workflow
+            )
+            all_steps = {
+                step.step_id: (version, step)
+                for version in plan.versions
+                for step in version.steps
+            }
+            current_latest = dict(await uow.plans.latest_step_attempts(
+                plan_id=plan.plan_id,
+                plan_version=plan.current_version,
+                run_id=str(context.run_id),
+                for_update=True,
+            ))
+            for step in sorted(plan.current.steps, key=lambda item: (item.ordinal, item.step_id)):
+                if step.step_id in current_latest or step.supersedes_step_id is None:
+                    continue
+                source_item = all_steps.get(step.supersedes_step_id)
+                if source_item is None:
+                    continue
+                source_version, source_step = source_item
+                source_latest = await uow.plans.latest_step_attempts(
+                    plan_id=plan.plan_id,
+                    plan_version=source_version.plan_version,
+                    run_id=str(context.run_id),
+                    for_update=True,
+                )
+                source_run = source_latest.get(source_step.step_id)
+                source_result = await self._reuse_document(
+                    uow.memory, context, source_run
+                )
+                proofs: dict[str, DependencyReuseProof] = {}
+                valid_dependencies = True
+                dependency_ids = frozenset(plan.current.dependencies.get(step.step_id, ()))
+                for dependency_id in dependency_ids:
+                    reused_run = current_latest.get(dependency_id)
+                    if reused_run is None or reused_run.reused_from_step_run_id is None:
+                        valid_dependencies = False
+                        break
+                    source_dependency = await uow.plans.step_run_by_id(
+                        run_id=str(context.run_id),
+                        step_run_id=reused_run.reused_from_step_run_id,
+                        for_update=True,
+                    )
+                    if source_dependency is None:
+                        valid_dependencies = False
+                        break
+                    source_dependency_item = all_steps.get(source_dependency.step_id)
+                    if source_dependency_item is None:
+                        valid_dependencies = False
+                        break
+                    _, source_dependency_step = source_dependency_item
+                    source_dependency_document = await self._reuse_document(
+                        uow.memory, context, source_dependency
+                    )
+                    if source_dependency_document is None:
+                        valid_dependencies = False
+                        break
+                    new_dependency_step = next(
+                        item for item in plan.current.steps if item.step_id == dependency_id
+                    )
+                    proofs[new_dependency_step.logical_step_key] = DependencyReuseProof(
+                        new_step=next(
+                            item for item in plan.current.steps if item.step_id == dependency_id
+                        ),
+                        reused_run=reused_run,
+                        source_step=source_dependency_step,
+                        source_run=source_dependency,
+                        source_result=source_dependency_document,
+                    )
+                if not valid_dependencies or not can_reuse_result(
+                    current_run_id=str(context.run_id),
+                    new_step=step,
+                    source_step=source_step,
+                    source_run=source_run,
+                    source_result=source_result,
+                    new_dependency_ids=dependency_ids,
+                    dependency_proofs=proofs,
+                    current_tool_catalog_digest=tool_digest,
+                    current_policy_digest=policy_digest,
+                    current_skill_set_digest=skill_digest,
+                ):
+                    continue
+                reused = await uow.plans.create_reused_step_attempt(
+                    lease,
+                    plan_id=plan.plan_id,
+                    plan_version=plan.current_version,
+                    step_id=step.step_id,
+                    source_step_run_id=source_run.step_run_id,
+                )
+                current_latest[step.step_id] = reused
+                created.append(reused)
+        return tuple(created)
+
+    @staticmethod
+    async def _reuse_document(
+        memory: MemoryRepository,
+        context: TenantContext,
+        attempt: PlanStepRunRecord | None,
+    ) -> PlanStepResultDocument | None:
+        if attempt is None or attempt.result_ref is None:
+            return None
+        match = _RESULT_REF.fullmatch(attempt.result_ref)
+        if match is None:
+            return None
+        entry = await memory.get(match.group(1), context.session_id, for_update=True)
+        if entry is None:
+            return None
+        try:
+            return PlanStepResultDocument.model_validate_json(entry.content)
+        except ValidationError:
+            return None
 
     async def execute_to_boundary(
         self,
@@ -302,11 +529,138 @@ class PlanExecutionCoordinator:
             )
 
             if target_status is PlanStepRunStatus.FAILED_TERMINAL:
+                if self._planning_service is not None:
+                    return await self._replan_terminal_failure(
+                        context=context,
+                        run_lease_handle=run_lease_handle,
+                        plan=started.plan,
+                        failed_step=started.step,
+                        failed_step_run_id=started.step_run.step_run_id,
+                    )
                 return PlanExecutionOutcome(
                     state="replan_required",
                     plan=started.plan,
                     run=await self._load_run(context),
                 )
+
+    async def _replan_terminal_failure(
+        self,
+        *,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        plan: PlanSnapshot,
+        failed_step: PlanStepRecord,
+        failed_step_run_id: str,
+    ) -> PlanExecutionOutcome:
+        """Durably mark failure before the no-tools revision generation boundary."""
+        failed = await self._step_attempt(context, failed_step_run_id)
+        if failed.status is not PlanStepRunStatus.FAILED_TERMINAL:
+            raise PlanExecutionBlocked("Plan replan requires a terminal failed attempt")
+        lease = await run_lease_handle.current()
+        failure_digest = _canonical_digest(
+            {
+                "step_run_id": failed.step_run_id,
+                "error_code": failed.error_code,
+                "error_detail_redacted": failed.error_detail_redacted,
+            }
+        )
+        await WorkflowCoordinator(self._database, settings=self._settings).checkpoint(
+            lease,
+            CheckpointPhase.PLAN_REPLAN_REQUIRED,
+            {
+                "run_id": str(context.run_id),
+                "plan_id": plan.plan_id,
+                "plan_version": plan.current_version,
+                "plan_digest": plan.current.content_digest,
+                "failed_step_run_id": failed.step_run_id,
+                "failure_digest": failure_digest,
+                "revision_cursor": "generate_revision",
+                "cursor": "generate_revision",
+            },
+        )
+        if plan.current_version - 1 >= self._settings.planning.max_revisions:
+            return await self._fail_replan_terminal(run_lease_handle, plan)
+        generator = self._planning_service._generator
+        if generator is None:
+            return await self._fail_replan_terminal(run_lease_handle, plan)
+        revision = self._revision_context(plan, failed_step, failed, failure_digest)
+        try:
+            generated = await generator.generate(
+                plan.current.objective,
+                revision=revision,
+                max_steps=self._settings.planning.max_steps,
+                max_depth=self._settings.planning.max_dependency_depth,
+                max_attempts=self._settings.planning.max_step_attempts,
+            )
+        except PlanGenerationError:
+            return await self._fail_replan_terminal(run_lease_handle, plan)
+        draft = PlanningService._draft(generated)
+        if failed_step.logical_step_key not in {
+            step.logical_step_key for step in draft.steps
+        }:
+            raise PlanGenerationError("failed step must be retained or superseded")
+        try:
+            result = await self._planning_service.materialize_failure_revision(
+                FailureRevisionRequest(
+                    context=context,
+                    lease=lease,
+                    plan=plan,
+                    failed_step_run=failed,
+                    draft=draft,
+                )
+            )
+        except PlanRevisionLimitError:
+            return await self._fail_replan_terminal(run_lease_handle, plan)
+        await run_lease_handle.replace(result.lease)
+        return PlanExecutionOutcome(state="awaiting_user", plan=result.plan, run=result.run)
+
+    async def _fail_replan_terminal(
+        self,
+        run_lease_handle: RunLeaseHandle,
+        plan: PlanSnapshot,
+    ) -> PlanExecutionOutcome:
+        lease = await run_lease_handle.current()
+        terminal = await WorkflowCoordinator(
+            self._database, settings=self._settings
+        ).finish_run_with_checkpoint(lease, RunStatus.FAILED_TERMINAL)
+        await run_lease_handle.replace(terminal)
+        return PlanExecutionOutcome(
+            state="failed_terminal",
+            plan=plan,
+            run=await self._load_run(lease.context),
+        )
+
+    @staticmethod
+    def _revision_context(
+        plan: PlanSnapshot,
+        failed_step: PlanStepRecord,
+        failed: PlanStepRunRecord,
+        failure_digest: str,
+    ):
+        from multiclaw.planner.models import PlanRevisionContext
+
+        return PlanRevisionContext(
+            plan_id=plan.plan_id,
+            parent_version=plan.current_version,
+            feedback=None,
+            failed_step_key=failed_step.logical_step_key,
+            failed_error=f"failure_digest:{failure_digest}",
+            completed=[],
+        )
+
+    async def _step_attempt(
+        self, context: TenantContext, step_run_id: str
+    ) -> PlanStepRunRecord:
+        async with self._database.connect() as conn:
+            plans = PlanRepository(
+                conn, self._database.dialect, context, self._settings.planning
+            )
+            attempt = await plans.step_run_by_id(
+                run_id=str(context.run_id), step_run_id=step_run_id
+            )
+        if attempt is None:
+            raise PlanExecutionBlocked("Plan failed step attempt is unavailable")
+        return attempt
 
     async def _finalize_step_attempt(
         self,
@@ -438,6 +792,7 @@ class PlanExecutionCoordinator:
                 plan=plan,
                 latest=latest,
                 memory=uow.memory,
+                plans=uow.plans,
                 for_update=True,
             )
             dependency_ids = plan.current.dependencies.get(attempt.step_id, ())
@@ -563,6 +918,7 @@ class PlanExecutionCoordinator:
             plan=plan,
             latest=latest,
             memory=memory,
+            plans=plans,
             for_update=for_update,
         )
         step = choose_ready_step(plan.current, latest)
@@ -630,6 +986,7 @@ class PlanExecutionCoordinator:
         plan: PlanSnapshot,
         latest: Mapping[str, PlanStepRunRecord],
         memory: MemoryRepository,
+        plans: PlanRepository,
         for_update: bool,
     ) -> Mapping[str, PlanStepResultDocument]:
         steps_by_id = {item.step_id: item for item in plan.current.steps}
@@ -661,6 +1018,47 @@ class PlanExecutionCoordinator:
             match = _RESULT_REF.fullmatch(attempt.result_ref)
             if match is None:
                 raise PlanExecutionBlocked("Plan succeeded step result reference is invalid")
+            source = attempt
+            source_step = step
+            if attempt.reused_from_step_run_id is not None:
+                source = await plans.step_run_by_id(
+                    run_id=str(context.run_id),
+                    step_run_id=attempt.reused_from_step_run_id,
+                    for_update=for_update,
+                )
+                if (
+                    source is None
+                    or source.reused_from_step_run_id is not None
+                    or source.plan_id != plan.plan_id
+                    or source.run_id != str(context.run_id)
+                    or source.status is not PlanStepRunStatus.SUCCEEDED
+                    or source.result_ref != attempt.result_ref
+                    or source.result_digest != attempt.result_digest
+                    or source.result_summary != attempt.result_summary
+                ):
+                    raise PlanExecutionBlocked("Plan reused result lineage is inconsistent")
+                source_version = next(
+                    (
+                        version
+                        for version in plan.versions
+                        if version.plan_version == source.plan_version
+                    ),
+                    None,
+                )
+                source_step = (
+                    None
+                    if source_version is None
+                    else next(
+                        (item for item in source_version.steps if item.step_id == source.step_id),
+                        None,
+                    )
+                )
+                if (
+                    source_step is None
+                    or step.supersedes_step_id != source_step.step_id
+                    or step.definition_digest != source_step.definition_digest
+                ):
+                    raise PlanExecutionBlocked("Plan reused result lineage is inconsistent")
             entry = await memory.get(
                 match.group(1),
                 context.session_id,
@@ -672,7 +1070,7 @@ class PlanExecutionCoordinator:
                 or entry.role != "assistant"
                 or entry.metadata.get("schema_version") != 1
                 or entry.metadata.get("plan_id") != plan.plan_id
-                or entry.metadata.get("step_run_id") != attempt.step_run_id
+                or entry.metadata.get("step_run_id") != source.step_run_id
             ):
                 raise PlanExecutionBlocked("Plan result document is unavailable")
             try:
@@ -691,13 +1089,13 @@ class PlanExecutionCoordinator:
                 ) from error
             if (
                 document.plan_id != plan.plan_id
-                or document.plan_version != plan.current_version
+                or document.plan_version != source.plan_version
                 or document.run_id != context.run_id
-                or document.step_id != step.step_id
-                or document.step_run_id != attempt.step_run_id
-                or document.attempt != attempt.attempt
+                or document.step_id != source_step.step_id
+                or document.step_run_id != source.step_run_id
+                or document.attempt != source.attempt
                 or document.status != "succeeded"
-                or document.definition_digest != step.definition_digest
+                or document.definition_digest != source_step.definition_digest
                 or document.digest() != attempt.result_digest
                 or document.summary != attempt.result_summary
             ):
@@ -717,6 +1115,13 @@ class PlanExecutionCoordinator:
                     )
                 dependency_key = steps_by_id[dependency_id].logical_step_key
                 expected_dependency_digests[dependency_key] = dependency_digest
+                if (
+                    attempt.reused_from_step_run_id is not None
+                    and latest[dependency_id].reused_from_step_run_id is None
+                ):
+                    raise PlanExecutionBlocked(
+                        "Plan reused dependency lineage is inconsistent"
+                    )
             if document.dependency_result_digests != expected_dependency_digests:
                 raise PlanExecutionBlocked(
                     "Plan dependency result proof is inconsistent"
