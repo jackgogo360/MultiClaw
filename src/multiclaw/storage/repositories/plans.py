@@ -1074,6 +1074,31 @@ class PlanRepository:
         result = await self._conn.execute(statement)
         return tuple(self._hydrate_step_run(row) for row in result.mappings())
 
+    async def running_step_attempts(
+        self,
+        *,
+        run_id: str,
+        for_update: bool = False,
+    ) -> tuple[PlanStepRunRecord, ...]:
+        self._require_session()
+        statement = (
+            select(agent_plan_step_runs)
+            .where(
+                self._step_run_scope_predicate(run_id),
+                agent_plan_step_runs.c.status == PlanStepRunStatus.RUNNING.value,
+            )
+            .order_by(
+                agent_plan_step_runs.c.plan_version,
+                agent_plan_step_runs.c.step_id,
+                agent_plan_step_runs.c.attempt,
+                agent_plan_step_runs.c.step_run_id,
+            )
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self._conn.execute(statement)
+        return tuple(self._hydrate_step_run(row) for row in result.mappings())
+
     async def has_current_lease(self, lease: RunLease) -> bool:
         if not self._lease_matches_context(lease):
             return False

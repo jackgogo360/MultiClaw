@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -14,6 +14,13 @@ from multiclaw.events.types import ScopedEvent
 from multiclaw.security.redaction import redact
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import RunLease, RunRecord, RunStatus
+
+if TYPE_CHECKING:
+    from multiclaw.workflow.continuation import (
+        PersistedToolResult,
+        WorkflowContinuationService,
+    )
+    from multiclaw.workflow.models import RunLeaseHandle
 
 
 class PlanningMode(StrEnum):
@@ -426,6 +433,18 @@ class PlanStepExecutionRequest:
     step: PlanStepRecord
     step_run: PlanStepRunRecord
     dependency_results: tuple[PlanStepResultDocument, ...]
+
+
+class PlanStepRunner(Protocol):
+    async def run_plan_step(
+        self,
+        request: PlanStepExecutionRequest,
+        *,
+        run_lease_handle: RunLeaseHandle,
+        workflow_continuation: WorkflowContinuationService,
+        recovered_tool_result: PersistedToolResult | None = None,
+        recovered_tool_input_json: str | None = None,
+    ) -> PlanStepCompletion: ...
 
 
 @dataclass(frozen=True, slots=True)

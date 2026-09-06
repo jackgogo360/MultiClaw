@@ -20,6 +20,7 @@ from multiclaw.planner.models import (
     PlanStepExecutionRequest,
     PlanStepRecord,
     PlanStepResultDocument,
+    PlanStepRunner,
     PlanStepRunRecord,
     PlanStepRunStatus,
     PlanVersionRecord,
@@ -36,6 +37,7 @@ from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.continuation import (
     ContinuationOutcome,
     ContinuationState,
+    PersistedToolResult,
     WorkflowContinuationService,
 )
 from multiclaw.workflow.coordinator import WorkflowCoordinator
@@ -202,10 +204,13 @@ class PlanExecutionCoordinator:
         *,
         context: TenantContext,
         run_lease_handle: RunLeaseHandle,
-        runner,
-        recovered_tool_result=None,
+        runner: PlanStepRunner,
+        recovered_tool_result: PersistedToolResult | None = None,
         recovered_tool_input_json: str | None = None,
     ) -> PlanExecutionOutcome:
+        if (recovered_tool_result is None) != (recovered_tool_input_json is None):
+            raise ValueError("recovered tool result and input must be provided together")
+        resume_running_attempt = recovered_tool_result is not None
         last_plan: PlanSnapshot | None = None
         while True:
             lease = await run_lease_handle.current()
@@ -216,7 +221,11 @@ class PlanExecutionCoordinator:
                     settings=self._settings,
                 ).transition_run(lease, RunStatus.RUNNING)
                 await run_lease_handle.replace(lease)
-            started = await self.start_next_attempt(context=context, lease=lease)
+            started = (
+                await self._resume_running_attempt(context=context, lease=lease)
+                if resume_running_attempt
+                else await self.start_next_attempt(context=context, lease=lease)
+            )
             if started is None:
                 if last_plan is None:
                     last_plan = await self._load_active_plan(context)
@@ -247,6 +256,7 @@ class PlanExecutionCoordinator:
             )
             recovered_tool_result = None
             recovered_tool_input_json = None
+            resume_running_attempt = False
             if isinstance(completion, ContinuationOutcome):
                 if completion.state is not ContinuationState.AWAITING_USER:
                     raise PlanExecutionBlocked(
@@ -341,6 +351,91 @@ class PlanExecutionCoordinator:
                     run=await self._load_run(context),
                 )
 
+    async def _resume_running_attempt(
+        self,
+        *,
+        context: TenantContext,
+        lease: RunLease,
+    ) -> StartedPlanStep:
+        self._require_run_context(context)
+        if lease.context != context:
+            raise StaleFenceError("run lease scope is stale")
+        async with TenantUnitOfWork(
+            self._database,
+            context,
+            planning_settings=self._settings.planning,
+            workflow_settings=self._settings.workflow,
+        ) as uow:
+            await uow.plans.lock_run_for_execution(lease)
+            plan = await self._load_executable_plan(
+                context=context,
+                plans=uow.plans,
+                workflow=uow.workflow,
+            )
+            running = await uow.plans.running_step_attempts(
+                run_id=str(context.run_id),
+                for_update=True,
+            )
+            if len(running) != 1:
+                raise PlanExecutionBlocked(
+                    "Plan recovery requires exactly one running step attempt"
+                )
+            attempt = running[0]
+            steps_by_id = {step.step_id: step for step in plan.current.steps}
+            step = steps_by_id.get(attempt.step_id)
+            if (
+                attempt.plan_id != plan.plan_id
+                or attempt.plan_version != plan.current_version
+                or attempt.run_id != context.run_id
+                or step is None
+            ):
+                raise PlanExecutionBlocked(
+                    "Plan recovery running step attempt is inconsistent"
+                )
+            latest = await uow.plans.latest_step_attempts(
+                plan_id=plan.plan_id,
+                plan_version=plan.current_version,
+                run_id=str(context.run_id),
+                for_update=True,
+            )
+            current = latest.get(attempt.step_id)
+            if (
+                current is None
+                or current.step_run_id != attempt.step_run_id
+                or current.status is not PlanStepRunStatus.RUNNING
+                or any(
+                    item.status in TERMINAL_PLAN_STEP_STATUSES
+                    for item in latest.values()
+                )
+            ):
+                raise PlanExecutionBlocked(
+                    "Plan recovery running step attempt is inconsistent"
+                )
+            verified_results = await self._load_succeeded_results(
+                context=context,
+                plan=plan,
+                latest=latest,
+                memory=uow.memory,
+                for_update=True,
+            )
+            dependency_ids = plan.current.dependencies.get(attempt.step_id, ())
+            if any(
+                dependency_id not in verified_results
+                for dependency_id in dependency_ids
+            ):
+                raise PlanExecutionBlocked(
+                    "Plan recovery dependency result proof is inconsistent"
+                )
+            return StartedPlanStep(
+                plan=plan,
+                step=step,
+                step_run=attempt,
+                dependency_results=tuple(
+                    verified_results[dependency_id]
+                    for dependency_id in dependency_ids
+                ),
+            )
+
     def _build_result_document(
         self,
         *,
@@ -417,27 +512,11 @@ class PlanExecutionCoordinator:
         memory: MemoryRepository,
         for_update: bool = False,
     ) -> ReadyPlanStep | None:
-        run = await workflow.get_run(context)
-        if run is None:
-            raise PlanExecutionBlocked(
-                "Plan execution requires an approved current active version"
-            )
-        self._require_executable_run(run)
-        if run.plan_id is None:
-            raise PlanExecutionBlocked(
-                "Plan execution requires an approved current active version"
-            )
-        plan = await plans.get(run.plan_id)
-        if (
-            plan is None
-            or plan.status is not PlanStatus.APPROVED
-            or plan.approved_version is None
-            or plan.current_version != plan.approved_version
-            or run.active_plan_version != plan.current_version
-        ):
-            raise PlanExecutionBlocked(
-                "Plan execution requires an approved current active version"
-            )
+        plan = await self._load_executable_plan(
+            context=context,
+            plans=plans,
+            workflow=workflow,
+        )
 
         latest = await plans.latest_step_attempts(
             plan_id=plan.plan_id,
@@ -491,6 +570,36 @@ class PlanExecutionCoordinator:
             prior_attempts=prior_attempts,
             dependency_results=dependency_results,
         )
+
+    async def _load_executable_plan(
+        self,
+        *,
+        context: TenantContext,
+        plans: PlanRepository,
+        workflow: WorkflowRepository,
+    ) -> PlanSnapshot:
+        run = await workflow.get_run(context)
+        if run is None:
+            raise PlanExecutionBlocked(
+                "Plan execution requires an approved current active version"
+            )
+        self._require_executable_run(run)
+        if run.plan_id is None:
+            raise PlanExecutionBlocked(
+                "Plan execution requires an approved current active version"
+            )
+        plan = await plans.get(run.plan_id)
+        if (
+            plan is None
+            or plan.status is not PlanStatus.APPROVED
+            or plan.approved_version is None
+            or plan.current_version != plan.approved_version
+            or run.active_plan_version != plan.current_version
+        ):
+            raise PlanExecutionBlocked(
+                "Plan execution requires an approved current active version"
+            )
+        return plan
 
     @staticmethod
     async def _load_succeeded_results(
