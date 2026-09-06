@@ -16,6 +16,7 @@ from multiclaw.planner.models import (
     PlanDecisionResult,
     PlanDraft,
     PlanDraftStep,
+    PlanExecutionBlocked,
     PlanMaterializationResult,
     PlanNotFoundError,
     PlanReference,
@@ -23,6 +24,7 @@ from multiclaw.planner.models import (
     PlanRevisionLimitError,
     PlanSnapshot,
     PlanStepRunRecord,
+    PlanStepRunStatus,
     ValidatedPlanDraft,
     revision_current_plan_context,
 )
@@ -131,8 +133,6 @@ class PlanningService:
             raise ValueError("failure revision requires session and run scope")
         if request.lease.context != request.context:
             raise ValueError("failure revision lease scope is stale")
-        if request.failed_step_run.plan_id != request.plan.plan_id:
-            raise ValueError("failed step does not belong to failure revision Plan")
 
         async with TenantUnitOfWork(
             self._database,
@@ -140,27 +140,55 @@ class PlanningService:
             planning_settings=self._settings.planning,
             workflow_settings=self._settings.workflow,
         ) as uow:
-            await uow.plans.lock_run_for_execution(request.lease)
+            locked_run = await uow.plans.lock_run_for_execution(request.lease)
             current = await uow.plans.get(request.plan.plan_id)
             if (
                 current is None
                 or current.current_version != request.plan.current_version
                 or current.aggregate_version != request.plan.aggregate_version
+                or locked_run["plan_id"] is None
+                or str(locked_run["plan_id"]) != current.plan_id
+                or locked_run["active_plan_version"] is None
+                or int(locked_run["active_plan_version"]) != current.current_version
             ):
                 raise ValueError("failure revision Plan changed")
             if current.current_version - 1 >= self._settings.planning.max_revisions:
                 raise PlanRevisionLimitError("Plan revision limit exceeded")
 
+            failed = await uow.plans.step_run_by_id(
+                run_id=str(request.context.run_id),
+                step_run_id=request.failed_step_run.step_run_id,
+                for_update=True,
+            )
+            if (
+                failed is None
+                or failed.step_run_id != request.failed_step_run.step_run_id
+                or failed.run_id != request.failed_step_run.run_id
+                or failed.plan_id != request.failed_step_run.plan_id
+                or failed.plan_version != request.failed_step_run.plan_version
+                or failed.step_id != request.failed_step_run.step_id
+                or failed.status is not request.failed_step_run.status
+                or failed.run_id != str(request.context.run_id)
+                or failed.plan_id != current.plan_id
+                or failed.plan_version != current.current_version
+                or failed.status is not PlanStepRunStatus.FAILED_TERMINAL
+            ):
+                raise PlanExecutionBlocked(
+                    "failure revision requires a current terminal step attempt"
+                )
+
             failed_step = next(
                 (
                     step
                     for step in current.current.steps
-                    if step.step_id == request.failed_step_run.step_id
+                    if step.step_id == failed.step_id
                 ),
                 None,
             )
             if failed_step is None:
-                raise ValueError("failed step is not in the current Plan version")
+                raise PlanExecutionBlocked(
+                    "failure revision requires a current terminal step attempt"
+                )
             new_keys = {step.logical_step_key for step in request.draft.steps}
             if failed_step.logical_step_key not in new_keys:
                 raise PlanGenerationError("failed step must be retained or superseded")
@@ -170,7 +198,7 @@ class PlanningService:
                 expected_version=current.aggregate_version,
                 draft=request.draft,
                 parent_version=current.current_version,
-                revision_feedback=f"failure:{request.failed_step_run.step_run_id}",
+                revision_feedback=f"failure:{failed.step_run_id}",
                 supersedes={
                     step.logical_step_key: prior.step_id
                     for step in request.draft.steps

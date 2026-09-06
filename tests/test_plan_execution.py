@@ -2995,6 +2995,78 @@ async def test_failure_revision_materializes_waiting_version_after_replan_checkp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "succeeded_status",
+        "other_run",
+        "old_plan_version",
+        "other_step",
+        "other_step_run_id",
+    ),
+)
+async def test_failure_revision_rejects_forged_terminal_attempt_without_writes(
+    execution_fixture,
+    forgery: str,
+) -> None:
+    """Only the locked current terminal row may authorize a failure revision."""
+    await execution_fixture.approve_chain(["collect", "publish"])
+    execution_fixture.current_lease = await WorkflowCoordinator(
+        execution_fixture.database,
+        settings=execution_fixture.settings,
+    ).transition_run(execution_fixture.lease, RunStatus.RUNNING)
+    started = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert started is not None
+    await execution_fixture.finish(
+        started.step_run,
+        (
+            PlanStepRunStatus.SUCCEEDED
+            if forgery == "succeeded_status"
+            else PlanStepRunStatus.FAILED_TERMINAL
+        ),
+    )
+    context = execution_fixture._context()
+    plan_before = await execution_fixture.coordinator._load_active_plan(context)
+    failed = await execution_fixture.latest_attempt()
+    run_before = await execution_fixture.service.workflow.get_run(context)
+    checkpoints_before = await execution_fixture.checkpoints()
+    assert run_before is not None
+
+    if forgery == "succeeded_status":
+        forged = failed
+    elif forgery == "other_run":
+        forged = replace(failed, run_id=str(uuid4()))
+    elif forgery == "old_plan_version":
+        forged = replace(failed, plan_version=failed.plan_version - 1)
+    elif forgery == "other_step":
+        forged = replace(failed, step_id=plan_before.current.steps[1].step_id)
+    else:
+        assert forgery == "other_step_run_id"
+        forged = replace(failed, step_run_id=str(uuid4()))
+
+    with pytest.raises(
+        PlanExecutionBlocked,
+        match="failure revision requires a current terminal step attempt",
+    ):
+        await execution_fixture.service.materialize_failure_revision(
+            FailureRevisionRequest(
+                context=context,
+                lease=execution_fixture.lease,
+                plan=plan_before,
+                failed_step_run=forged,
+                draft=_draft(("collect", "publish"), chain=True),
+            )
+        )
+
+    assert await execution_fixture.coordinator._load_active_plan(context) == plan_before
+    assert await execution_fixture.service.workflow.get_run(context) == run_before
+    assert await execution_fixture.checkpoints() == checkpoints_before
+
+
+@pytest.mark.asyncio
 async def test_terminal_execution_checkpoints_before_generator_and_waits_for_revision(
     execution_fixture,
 ) -> None:
