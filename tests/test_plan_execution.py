@@ -33,7 +33,7 @@ from multiclaw.planner.models import (
 )
 from multiclaw.planner.service import PlanningService
 from multiclaw.storage import Database
-from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
+from multiclaw.storage.dialect import MySQLDialect
 from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.repositories.plans import PlanRepository
 from multiclaw.storage.schema import (
@@ -190,26 +190,38 @@ async def execution_database(tmp_path: Path):
 
 
 class StatementRecordingConnection:
-    def __init__(self, connection) -> None:
+    def __init__(self, connection, *, mysql_run_id: str | None = None) -> None:
         self.connection = connection
         self.statements: list[object] = []
+        self.mysql_run_id = mysql_run_id
 
     async def begin_nested(self):
         return await self.connection.begin_nested()
 
     async def execute(self, statement, *args, **kwargs):
         self.statements.append(statement)
+        if self.mysql_run_id is not None:
+            mysql_sql = str(statement.compile(dialect=mysql.dialect())).lower()
+            if "unix_timestamp" in mysql_sql:
+                final_froms = (
+                    statement.get_final_froms()
+                    if getattr(statement, "is_select", False)
+                    else []
+                )
+                value = self.mysql_run_id if agent_runs in final_froms else 1
+                return ScalarResult(value)
         return await self.connection.execute(statement, *args, **kwargs)
 
 
-class MySQLCompilationDialect:
-    name = "mysql"
+class ScalarResult:
+    def __init__(self, value: object) -> None:
+        self.value = value
 
-    def db_now_ms(self):
-        return SQLiteDialect().db_now_ms()
+    def scalar_one(self):
+        return self.value
 
-    async def lock_run(self, connection, context) -> None:
-        await MySQLDialect().lock_run(connection, context)
+    def scalar_one_or_none(self):
+        return self.value
 
 
 @dataclass(slots=True)
@@ -848,10 +860,13 @@ async def test_mysql_plan_attempt_statements_compile_with_lock_fence_and_scope(
         context,
         planning_settings=execution_fixture.settings.planning,
     ) as uow:
-        recording = StatementRecordingConnection(uow.conn)
+        recording = StatementRecordingConnection(
+            uow.conn,
+            mysql_run_id=str(context.run_id),
+        )
         repository = PlanRepository(  # type: ignore[arg-type]
             recording,
-            MySQLCompilationDialect(),  # type: ignore[arg-type]
+            MySQLDialect(),
             context,
             execution_fixture.settings.planning,
         )
@@ -893,6 +908,10 @@ async def test_mysql_plan_attempt_statements_compile_with_lock_fence_and_scope(
 
     assert lock_statement.get_final_froms() == [agent_runs]
     assert lock_sql.endswith(" FOR UPDATE")
+    normalized_fence_sql = fence_sql.lower()
+    assert "unix_timestamp" in normalized_fence_sql
+    assert "current_timestamp" in normalized_fence_sql
+    assert "julianday" not in normalized_fence_sql
     for column in ("tenant_id", "workspace_id", "session_id", "run_id"):
         assert f"agent_runs.{column}" in lock_sql
         assert f"agent_runs.{column}" in fence_sql
