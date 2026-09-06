@@ -85,6 +85,7 @@ class PlanRecoveryContext:
     version: PlanVersionRecord
     running_step: PlanStepRunRecord | None
     failed_step: PlanStepRunRecord | None
+    revision_awaiting_decision: bool
     cursor: str
 
 
@@ -348,6 +349,11 @@ class RecoveryService:
             if run is None:
                 return RecoveryOutcome(action=RecoveryAction.RESUME_PLAN_REVISION)
             assert plan_context is not None
+            if plan_context.revision_awaiting_decision:
+                return RecoveryOutcome(
+                    action=RecoveryAction.AWAIT_PLAN_DECISION,
+                    plan_recovery_context=plan_context,
+                )
             if run.status not in {RunStatus.RUNNING, RunStatus.RESUMING}:
                 raise CorruptCheckpointError("Plan revision checkpoint has incompatible run state")
             return RecoveryOutcome(
@@ -439,11 +445,22 @@ class RecoveryService:
             plan_digest = getattr(payload, "plan_digest", None) or version.content_digest
             if plan_digest != version.content_digest:
                 raise CorruptCheckpointError("checkpoint Plan digest does not match version")
+            revision_awaiting_decision = (
+                isinstance(payload, PlanReplanRequiredPayload)
+                and plan.status is PlanStatus.AWAITING_APPROVAL
+                and run.status is RunStatus.AWAITING_USER
+                and run.active_plan_version == plan_version
+                and plan.current_version == plan_version + 1
+                and plan.current.parent_version == plan_version
+            )
             if plan.current_version != plan.approved_version:
                 if not (
-                    phase is CheckpointPhase.PLAN_AWAITING_APPROVAL
-                    and plan.status is PlanStatus.AWAITING_APPROVAL
-                    and run.status is RunStatus.AWAITING_USER
+                    revision_awaiting_decision
+                    or (
+                        phase is CheckpointPhase.PLAN_AWAITING_APPROVAL
+                        and plan.status is PlanStatus.AWAITING_APPROVAL
+                        and run.status is RunStatus.AWAITING_USER
+                    )
                 ):
                     raise CorruptCheckpointError("unapproved Plan is not at approval boundary")
             elif (
@@ -503,6 +520,7 @@ class RecoveryService:
             version=version,
             running_step=running_step,
             failed_step=failed_step,
+            revision_awaiting_decision=revision_awaiting_decision,
             cursor=str(getattr(payload, "cursor", "")),
         )
 
@@ -1066,14 +1084,27 @@ class RuntimeRecoveryContinuationService:
                 execution = await workflow.get_execution_recovery(context, result_payload.execution_id)
                 if execution is not None:
                     recovered_tool_input_json = execution.input_payload_json
-                    recovered_tool_result = await continuation.load_tool_result(
-                        context=context,
-                        result_ref=result_payload.result_ref,
-                        expected_digest=result_payload.result_digest,
-                        expected_execution_id=execution.execution_id,
-                        expected_tool_call_id=execution.tool_call_id,
-                        expected_tool_name=execution.tool_name,
-                    )
+                    try:
+                        recovered_tool_result = await continuation.load_tool_result(
+                            context=context,
+                            result_ref=result_payload.result_ref,
+                            expected_digest=result_payload.result_digest,
+                            expected_execution_id=execution.execution_id,
+                            expected_tool_call_id=execution.tool_call_id,
+                            expected_tool_name=execution.tool_name,
+                        )
+                    except ValueError:
+                        if recovery_outcome.plan_recovery_context is None:
+                            raise
+                        await run_lease_handle.refresh(
+                            lambda lease: WorkflowCoordinator(
+                                database,
+                                settings=settings,
+                            ).finish_run_with_checkpoint(
+                                lease, RunStatus.BLOCKED_CORRUPT
+                            )
+                        )
+                        return
         current_run = await WorkflowCoordinator(database, settings=settings).get_run(context)
         if current_run is not None and current_run.status is RunStatus.RESUMING:
             await run_lease_handle.refresh(

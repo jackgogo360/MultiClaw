@@ -9,11 +9,14 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import update
+from pydantic import BaseModel
+from sqlalchemy import func, select, update
 
 from alembic import command
 from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings, Settings
+from multiclaw.events import EventBus
+from multiclaw.governance import ExecutionGuard, InMemoryAuditLogger, PermissionChecker
 from multiclaw.memory import MemoryEntry
 from multiclaw.planner.execution import PlanExecutionCoordinator
 from multiclaw.planner.models import (
@@ -23,16 +26,38 @@ from multiclaw.planner.models import (
     PlanDraft,
     PlanDraftStep,
     PlanStepCompletion,
+    PlanStepRunStatus,
     PlanTriggerMode,
 )
 from multiclaw.planner.service import PlanningService
 from multiclaw.storage import Database
-from multiclaw.storage.schema import agent_runs, execution_checkpoints
+from multiclaw.storage.schema import (
+    agent_plan_step_runs,
+    agent_runs,
+    execution_checkpoints,
+    tool_executions,
+)
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
-from multiclaw.tools import ToolRegistry
-from multiclaw.workflow.models import RecoveryAction, RunLeaseHandle, RunStatus
-from multiclaw.workflow.recovery import RecoveryService
+from multiclaw.tools import CoreToolScheduler, ToolRegistry
+from multiclaw.tools.base import (
+    ToolBuilder,
+    ToolExecutionResult,
+    ToolInvocation,
+    ToolStatus,
+)
+from multiclaw.workflow.models import (
+    CheckpointPhase,
+    RecoveryAction,
+    RecoveryStrategy,
+    RunLeaseHandle,
+    RunStatus,
+)
+from multiclaw.workflow.recovery import (
+    RecoveryService,
+    RuntimeRecoveryContinuationService,
+    WorkflowRecoveryWorker,
+)
 
 
 def _sqlite_url(tmp_path: Path) -> str:
@@ -290,5 +315,318 @@ async def test_corrupt_plan_recovery_fails_closed_before_effects(
 
         assert outcome.status in {RunStatus.BLOCKED_CORRUPT, RunStatus.BLOCKED_INCOMPATIBLE}
         assert outcome.executions_started == 0
+    finally:
+        await database.dispose()
+
+
+class _ObservedToolParams(BaseModel):
+    idempotency_key: str
+
+
+class _ObservedToolInvocation(ToolInvocation[_ObservedToolParams]):
+    def __init__(self, params: _ObservedToolParams, effect_counts: dict[str, int]) -> None:
+        super().__init__(name="observed_plan_effect", params=params)
+        self._effect_counts = effect_counts
+
+    async def execute(self) -> ToolExecutionResult:
+        self._effect_counts[self.params.idempotency_key] = (
+            self._effect_counts.get(self.params.idempotency_key, 0) + 1
+        )
+        return ToolExecutionResult(
+            status=ToolStatus.SUCCESS,
+            content="durable external result",
+            external_request_id="external-observed-1",
+        )
+
+
+class _ObservedToolBuilder(ToolBuilder[_ObservedToolParams]):
+    parameters_schema = _ObservedToolParams
+    name = "observed_plan_effect"
+    description = "A deterministic durable test effect."
+    recovery_strategy = RecoveryStrategy.IDEMPOTENT_RETRY
+    idempotency_key_field = "idempotency_key"
+
+    def __init__(self, effect_counts: dict[str, int]) -> None:
+        self._effect_counts = effect_counts
+
+    def validate(self, params: dict[str, object]) -> _ObservedToolParams:
+        return _ObservedToolParams.model_validate(params)
+
+    def build(self, params: _ObservedToolParams) -> ToolInvocation[_ObservedToolParams]:
+        return _ObservedToolInvocation(params, self._effect_counts)
+
+
+class _ObservedPlanAgent:
+    def __init__(self, database: Database, settings: Settings) -> None:
+        self.database = database
+        self.settings = settings
+        self.registry = ToolRegistry()
+        self.skill_manager = SimpleNamespace(active_skills=())
+        self.plan_calls: list[tuple[object, object]] = []
+        self.generic_recovery_calls = 0
+
+    async def run_plan_step(
+        self,
+        request,
+        *,
+        recovered_tool_result=None,
+        recovered_tool_input_json=None,
+        **_kwargs,
+    ) -> PlanStepCompletion:
+        self.plan_calls.append((recovered_tool_result, recovered_tool_input_json))
+        assert recovered_tool_result is not None
+        assert recovered_tool_result.content == "durable external result"
+        assert recovered_tool_input_json == '{"idempotency_key":"observed-key"}'
+        return PlanStepCompletion(status="succeeded", summary="observed", evidence=[])
+
+    async def resume_recovery(self, **_kwargs):
+        self.generic_recovery_calls += 1
+        raise AssertionError("Plan-bound observed results must not use generic recovery")
+
+
+class _ObservedRuntimeLease:
+    def close(self) -> None:
+        return None
+
+
+class _ObservedRuntime:
+    def __init__(
+        self,
+        *,
+        database: Database,
+        settings: Settings,
+        scheduler: CoreToolScheduler,
+        builder: _ObservedToolBuilder,
+    ) -> None:
+        self.runtime_instance_id = "observed-recovery-runtime"
+        self.agent = _ObservedPlanAgent(database, settings)
+        self.scheduler = scheduler
+        self.registry = ToolRegistry()
+        self.registry.register(builder)
+        self.recovery_continuation = RuntimeRecoveryContinuationService()
+        self.plan_execution = PlanExecutionCoordinator(database, settings=settings)
+
+    def begin_run(self) -> _ObservedRuntimeLease:
+        return _ObservedRuntimeLease()
+
+
+class _ObservedRuntimePool:
+    def __init__(self, runtime: _ObservedRuntime) -> None:
+        self._runtime = runtime
+
+    async def acquire(self, _context: TenantContext) -> _ObservedRuntime:
+        return self._runtime
+
+
+def _durable_scheduler(database: Database, settings: Settings) -> CoreToolScheduler:
+    return CoreToolScheduler(
+        permission_checker=PermissionChecker(),
+        execution_guard=ExecutionGuard(timeout=1.0),
+        audit_logger=InMemoryAuditLogger(),
+        event_bus=EventBus(),
+        database=database,
+        settings=settings,
+    )
+
+
+async def _observed_result_boundary(database: Database):
+    settings, context, service, result = await _materialized(database)
+    decision = await _approve(service, context, result)
+    assert decision.lease is not None
+    plan_execution = PlanExecutionCoordinator(database, settings=settings)
+    started = await plan_execution.start_next_attempt(
+        context=context,
+        lease=decision.lease,
+    )
+    assert started is not None
+    effects: dict[str, int] = {}
+    builder = _ObservedToolBuilder(effects)
+    scheduler = _durable_scheduler(database, settings)
+    observed = await scheduler.run(
+        builder,
+        {"idempotency_key": "observed-key"},
+        context=context,
+        call_id="observed-call",
+        run_lease_handle=RunLeaseHandle(decision.lease),
+    )
+    assert observed.status is ToolStatus.SUCCESS
+    checkpoint = await service.workflow.get_latest_checkpoint(context)
+    assert checkpoint is not None
+    assert checkpoint.phase == "execution_result_observed"
+    return settings, context, service, effects, builder, scheduler, checkpoint
+
+
+async def _execution_count(database: Database, context: TenantContext) -> int:
+    async with database.connect() as conn:
+        result = await conn.scalar(
+            select(func.count())
+            .select_from(tool_executions)
+            .where(tool_executions.c.run_id == context.run_id)
+        )
+    return int(result or 0)
+
+
+async def _step_attempt_count(database: Database, context: TenantContext) -> int:
+    async with database.connect() as conn:
+        result = await conn.scalar(
+            select(func.count())
+            .select_from(agent_plan_step_runs)
+            .where(agent_plan_step_runs.c.run_id == context.run_id)
+        )
+    return int(result or 0)
+
+
+@pytest.mark.asyncio
+async def test_real_observed_tool_result_resumes_plan_without_redispatch(tmp_path: Path):
+    database = await _database(tmp_path)
+    try:
+        settings, context, _service, effects, builder, scheduler, _ = await _observed_result_boundary(database)
+        runtime = _ObservedRuntime(
+            database=database,
+            settings=settings,
+            scheduler=scheduler,
+            builder=builder,
+        )
+        await _expire(database, context)
+
+        await WorkflowRecoveryWorker(
+            database=database,
+            settings=settings,
+            runtime_pool=_ObservedRuntimePool(runtime),
+        ).run_once()
+
+        assert effects == {"observed-key": 1}
+        assert runtime.agent.generic_recovery_calls == 0
+        assert len(runtime.agent.plan_calls) == 1
+        recovered_result, recovered_input = runtime.agent.plan_calls[0]
+        assert recovered_result is not None
+        assert recovered_result.result_ref.startswith("memory://")
+        assert recovered_input == '{"idempotency_key":"observed-key"}'
+        assert await _execution_count(database, context) == 1
+        assert await _step_attempt_count(database, context) == 1
+        async with TenantUnitOfWork(database, context) as uow:
+            attempts = await uow.plans.running_step_attempts(run_id=str(context.run_id))
+        assert attempts == ()
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_missing_observed_tool_result_blocks_plan_before_redispatch(tmp_path: Path):
+    database = await _database(tmp_path)
+    try:
+        settings, context, service, effects, builder, scheduler, checkpoint = await _observed_result_boundary(database)
+        payload = json.loads(checkpoint.payload_json)
+        payload["result_ref"] = "memory://missing-observed-result"
+        await _replace_checkpoint_payload(database, checkpoint.checkpoint_id, payload)
+        async with database.write_transaction() as conn:
+            await conn.execute(
+                update(tool_executions)
+                .where(tool_executions.c.run_id == context.run_id)
+                .values(result_ref="memory://missing-observed-result")
+            )
+        runtime = _ObservedRuntime(
+            database=database,
+            settings=settings,
+            scheduler=scheduler,
+            builder=builder,
+        )
+        await _expire(database, context)
+
+        await WorkflowRecoveryWorker(
+            database=database,
+            settings=settings,
+            runtime_pool=_ObservedRuntimePool(runtime),
+        ).run_once()
+
+        run = await service.workflow.get_run(context)
+        assert run is not None
+        assert run.status is RunStatus.BLOCKED_CORRUPT
+        assert effects == {"observed-key": 1}
+        assert runtime.agent.plan_calls == []
+        assert runtime.agent.generic_recovery_calls == 0
+        assert await _execution_count(database, context) == 1
+        assert await _step_attempt_count(database, context) == 1
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_replan_checkpoint_with_committed_next_version_awaits_decision(
+    tmp_path: Path,
+):
+    database = await _database(tmp_path)
+    try:
+        settings, context, service, result = await _materialized(database)
+        decision = await _approve(service, context, result)
+        assert decision.lease is not None
+        execution = PlanExecutionCoordinator(database, settings=settings)
+        started = await execution.start_next_attempt(context=context, lease=decision.lease)
+        assert started is not None
+        async with database.write_transaction() as conn:
+            await conn.execute(
+                update(agent_plan_step_runs)
+                .where(agent_plan_step_runs.c.step_run_id == started.step_run.step_run_id)
+                .values(status=PlanStepRunStatus.FAILED_TERMINAL.value)
+            )
+        await service.workflow.checkpoint(
+            decision.lease,
+            CheckpointPhase.PLAN_REPLAN_REQUIRED,
+            {
+                "run_id": context.run_id,
+                "plan_id": result.plan.plan_id,
+                "plan_version": 1,
+                "plan_digest": result.plan.current.content_digest,
+                "failed_step_run_id": started.step_run.step_run_id,
+                "failure_digest": "a" * 64,
+                "revision_cursor": "generate_revision",
+                "cursor": "generate_revision",
+            },
+        )
+        async with TenantUnitOfWork(
+            database,
+            context,
+            planning_settings=settings.planning,
+            workflow_settings=settings.workflow,
+        ) as uow:
+            revised = await uow.plans.append_version(
+                plan_id=result.plan.plan_id,
+                expected_version=decision.snapshot.aggregate_version,
+                draft=PlanDraft(
+                    objective="Recover exactly once",
+                    constraints=[],
+                    generation_reason="durable replay",
+                    steps=[
+                        PlanDraftStep(
+                            logical_step_key="execute",
+                            title="Execute again",
+                            description="Revised step.",
+                            expected_outcome="one durable result",
+                            max_attempts=1,
+                            depends_on=[],
+                        )
+                    ],
+                ),
+                parent_version=1,
+                revision_feedback=f"failure:{started.step_run.step_run_id}",
+                supersedes={"execute": started.step.step_id},
+            )
+        running_lease = await service.workflow.transition_run(
+            decision.lease, RunStatus.RUNNING
+        )
+        await service.workflow.transition_run(running_lease, RunStatus.AWAITING_USER)
+        await _expire(database, context)
+
+        outcome = await RecoveryService(database).recover(context, "runtime-b")
+
+        assert revised.current_version == 2
+        assert outcome.action is RecoveryAction.AWAIT_PLAN_DECISION
+        assert outcome.lease is None
+        assert await _execution_count(database, context) == 0
+        async with TenantUnitOfWork(database, context) as uow:
+            persisted = await uow.plans.get(result.plan.plan_id)
+        assert persisted is not None
+        assert persisted.current_version == 2
+        assert len(persisted.versions) == 2
     finally:
         await database.dispose()
