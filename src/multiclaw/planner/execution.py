@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -10,9 +12,12 @@ from multiclaw.config import Settings
 from multiclaw.planner.models import (
     TERMINAL_PLAN_STEP_STATUSES,
     PlanExecutionBlocked,
+    PlanExecutionOutcome,
     PlanSnapshot,
     PlanStatus,
     PlanStepAlreadyRunningError,
+    PlanStepCompletion,
+    PlanStepExecutionRequest,
     PlanStepRecord,
     PlanStepResultDocument,
     PlanStepRunRecord,
@@ -21,22 +26,41 @@ from multiclaw.planner.models import (
     is_plan_run_executable,
     is_plan_step_ready,
 )
+from multiclaw.security.redaction import redact
 from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.repositories.plans import PlanRepository
 from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
+from multiclaw.workflow.continuation import (
+    ContinuationOutcome,
+    ContinuationState,
+    WorkflowContinuationService,
+)
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     CheckpointPhase,
     RunLease,
+    RunLeaseHandle,
     RunRecord,
+    RunStatus,
     StaleFenceError,
 )
 
 _RESULT_REF = re.compile(r"memory:([A-Za-z0-9-]{1,64})")
 MAX_PLAN_STEP_RESULT_BYTES = 262_144
+
+
+def _canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        redact(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +196,217 @@ class PlanExecutionCoordinator:
             step_run=step_run,
             dependency_results=ready.dependency_results,
         )
+
+    async def execute_to_boundary(
+        self,
+        *,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        runner,
+        recovered_tool_result=None,
+        recovered_tool_input_json: str | None = None,
+    ) -> PlanExecutionOutcome:
+        last_plan: PlanSnapshot | None = None
+        while True:
+            lease = await run_lease_handle.current()
+            run = await self._load_run(context)
+            if run.status is RunStatus.RESUMING:
+                lease = await WorkflowCoordinator(
+                    self._database,
+                    settings=self._settings,
+                ).transition_run(lease, RunStatus.RUNNING)
+                await run_lease_handle.replace(lease)
+            started = await self.start_next_attempt(context=context, lease=lease)
+            if started is None:
+                if last_plan is None:
+                    last_plan = await self._load_active_plan(context)
+                run = await self._load_run(context)
+                return PlanExecutionOutcome(
+                    state="completed",
+                    plan=last_plan,
+                    run=run,
+                )
+            last_plan = started.plan
+            request = PlanStepExecutionRequest(
+                context=context,
+                lease=lease,
+                plan=started.plan,
+                step=started.step,
+                step_run=started.step_run,
+                dependency_results=started.dependency_results,
+            )
+            completion = await runner.run_plan_step(
+                request,
+                run_lease_handle=run_lease_handle,
+                workflow_continuation=WorkflowContinuationService(
+                    self._database,
+                    settings=self._settings,
+                ),
+                recovered_tool_result=recovered_tool_result,
+                recovered_tool_input_json=recovered_tool_input_json,
+            )
+            recovered_tool_result = None
+            recovered_tool_input_json = None
+            if isinstance(completion, ContinuationOutcome):
+                if completion.state is not ContinuationState.AWAITING_USER:
+                    raise PlanExecutionBlocked(
+                        "Plan step runner returned an invalid continuation boundary"
+                    )
+                return PlanExecutionOutcome(
+                    state="awaiting_user",
+                    plan=started.plan,
+                    run=await self._load_run(context),
+                    assistant_content=completion.assistant_content,
+                )
+            if not isinstance(completion, PlanStepCompletion):
+                raise PlanExecutionBlocked(
+                    "Plan step runner returned an invalid completion"
+                )
+
+            if completion.status == "succeeded":
+                target_status = PlanStepRunStatus.SUCCEEDED
+            elif completion.retryable and started.step_run.attempt < min(
+                started.step.max_attempts,
+                self._settings.planning.max_step_attempts,
+            ):
+                target_status = PlanStepRunStatus.FAILED_RETRYABLE
+            else:
+                target_status = PlanStepRunStatus.FAILED_TERMINAL
+            document = self._build_result_document(
+                request=request,
+                completion=completion,
+                runner=runner,
+            )
+
+            async with TenantUnitOfWork(
+                self._database,
+                context,
+                planning_settings=self._settings.planning,
+                workflow_settings=self._settings.workflow,
+            ) as uow:
+                await uow.plans.lock_run_for_execution(lease)
+                assert uow.conn is not None
+                continuation = WorkflowContinuationService(
+                    self._database,
+                    settings=self._settings,
+                    connection=uow.conn,
+                )
+                persisted = await continuation.persist_plan_step_result(
+                    context=context,
+                    document=document,
+                )
+                finished = await uow.plans.finish_step_attempt(
+                    lease,
+                    step_run_id=started.step_run.step_run_id,
+                    expected_version=started.step_run.version,
+                    status=target_status,
+                    result=document,
+                    result_ref=persisted.result_ref,
+                    error_code=(
+                        None
+                        if target_status is PlanStepRunStatus.SUCCEEDED
+                        else str(redact("plan_step_failed"))
+                    ),
+                    error_detail_redacted=(
+                        None
+                        if target_status is PlanStepRunStatus.SUCCEEDED
+                        else str(redact(document.summary))
+                    ),
+                )
+                workflow = WorkflowCoordinator(
+                    self._database,
+                    settings=self._settings,
+                    connection=uow.conn,
+                )
+                await workflow.checkpoint(
+                    lease,
+                    CheckpointPhase.PLAN_STEP_READY,
+                    {
+                        "run_id": context.run_id,
+                        "plan_id": started.plan.plan_id,
+                        "plan_version": started.plan.current_version,
+                        "plan_digest": started.plan.current.content_digest,
+                        "step_id": started.step.step_id,
+                        "step_run_id": finished.step_run_id,
+                        "attempt": finished.attempt,
+                        "execution_cursor": "select_next",
+                        "cursor": "select_next",
+                    },
+                )
+
+            if target_status is PlanStepRunStatus.FAILED_TERMINAL:
+                return PlanExecutionOutcome(
+                    state="replan_required",
+                    plan=started.plan,
+                    run=await self._load_run(context),
+                )
+
+    def _build_result_document(
+        self,
+        *,
+        request: PlanStepExecutionRequest,
+        completion: PlanStepCompletion,
+        runner,
+    ) -> PlanStepResultDocument:
+        steps_by_id = {
+            step.step_id: step for step in request.plan.current.steps
+        }
+        dependency_result_digests = {
+            steps_by_id[result.step_id].logical_step_key: result.digest()
+            for result in request.dependency_results
+        }
+        summary = str(redact(completion.summary))
+        evidence = [str(redact(item)) for item in completion.evidence]
+        tool_schemas = runner.registry.to_openai_schemas()
+        active_skill_names = sorted(
+            skill.name for skill in runner.skill_manager.active_skills
+        )
+        return PlanStepResultDocument(
+            plan_id=request.plan.plan_id,
+            plan_version=request.plan.current_version,
+            run_id=str(request.context.run_id),
+            step_id=request.step.step_id,
+            step_run_id=request.step_run.step_run_id,
+            attempt=request.step_run.attempt,
+            status=completion.status,
+            summary=summary,
+            evidence=evidence,
+            definition_digest=request.step.definition_digest,
+            dependency_result_digests=dependency_result_digests,
+            tool_catalog_digest=_canonical_digest(tool_schemas),
+            policy_digest=_canonical_digest(
+                self._settings.governance.model_dump(mode="json")
+            ),
+            skill_set_digest=_canonical_digest(active_skill_names),
+        )
+
+    async def _load_run(self, context: TenantContext) -> RunRecord:
+        async with self._database.connect() as conn:
+            repository = WorkflowRepository(
+                conn,
+                self._database.dialect,
+                self._settings.workflow.heartbeat_ms,
+                self._settings.workflow.lease_ttl_ms,
+            )
+            run = await repository.get_run(context)
+        if run is None:
+            raise PlanExecutionBlocked("Plan execution run is unavailable")
+        return run
+
+    async def _load_active_plan(self, context: TenantContext) -> PlanSnapshot:
+        run = await self._load_run(context)
+        if run.plan_id is None:
+            raise PlanExecutionBlocked("Plan execution has no active Plan")
+        async with self._database.connect() as conn:
+            plan = await PlanRepository(
+                conn,
+                self._database.dialect,
+                context,
+                self._settings.planning,
+            ).get(run.plan_id)
+        if plan is None:
+            raise PlanExecutionBlocked("Plan execution Plan is unavailable")
+        return plan
 
     async def _select_next(
         self,

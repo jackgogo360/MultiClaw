@@ -29,6 +29,7 @@ from multiclaw.planner.models import (
     PlanStatus,
     PlanStepAlreadyRunningError,
     PlanStepRecord,
+    PlanStepResultDocument,
     PlanStepRunRecord,
     PlanStepRunStatus,
     PlanSummary,
@@ -56,7 +57,12 @@ from multiclaw.storage.schema import (
     agent_runs,
 )
 from multiclaw.tenancy.context import TenantContext
-from multiclaw.workflow.models import RunLease, RunStatus, StaleFenceError
+from multiclaw.workflow.models import (
+    RunLease,
+    RunStatus,
+    StaleFenceError,
+    VersionConflictError,
+)
 
 Dialect = SQLiteDialect | MySQLDialect
 
@@ -1313,6 +1319,114 @@ class PlanRepository:
         except BaseException as primary:
             await self._rollback_savepoint(savepoint, primary)
             raise
+
+    async def finish_step_attempt(
+        self,
+        lease: RunLease,
+        *,
+        step_run_id: str,
+        expected_version: int,
+        status: PlanStepRunStatus,
+        result: PlanStepResultDocument,
+        result_ref: str,
+        error_code: str | None = None,
+        error_detail_redacted: str | None = None,
+    ) -> PlanStepRunRecord:
+        if not self._lease_matches_context(lease):
+            raise StaleFenceError("run lease scope is stale")
+        if status not in {
+            PlanStepRunStatus.SUCCEEDED,
+            PlanStepRunStatus.FAILED_RETRYABLE,
+            PlanStepRunStatus.FAILED_TERMINAL,
+        }:
+            raise ValueError("Plan step attempt target status is not terminal")
+        if not result_ref.startswith("memory:") or not result_ref.removeprefix(
+            "memory:"
+        ):
+            raise ValueError("Plan step result reference is invalid")
+        expected_result_status = (
+            "succeeded" if status is PlanStepRunStatus.SUCCEEDED else "failed"
+        )
+        if result.status != expected_result_status:
+            raise ValueError("Plan step result status does not match attempt status")
+        if status is PlanStepRunStatus.SUCCEEDED:
+            if error_code is not None or error_detail_redacted is not None:
+                raise ValueError("Succeeded Plan step attempts cannot carry errors")
+        elif not error_code or not error_detail_redacted:
+            raise ValueError("Failed Plan step attempts require redacted error detail")
+
+        await self._require_current_executable_lease(lease)
+        current_result = await self._conn.execute(
+            select(agent_plan_step_runs)
+            .where(
+                self._step_run_scope_predicate(str(lease.context.run_id)),
+                agent_plan_step_runs.c.step_run_id == step_run_id,
+            )
+            .with_for_update()
+        )
+        row = current_result.mappings().first()
+        if row is None:
+            raise PlanExecutionBlocked("Plan step attempt does not exist")
+        current = self._hydrate_step_run(row)
+        if current.status is not PlanStepRunStatus.RUNNING:
+            raise PlanExecutionBlocked("Plan step attempt is no longer running")
+        if current.version != expected_version:
+            raise VersionConflictError("Plan step attempt version conflict")
+        if (
+            result.plan_id != current.plan_id
+            or result.plan_version != current.plan_version
+            or result.run_id != current.run_id
+            or result.step_id != current.step_id
+            or result.step_run_id != current.step_run_id
+            or result.attempt != current.attempt
+        ):
+            raise ValueError("Plan step result identity does not match attempt")
+
+        definition_result = await self._conn.execute(
+            select(agent_plan_steps.c.definition_digest).where(
+                agent_plan_steps.c.tenant_id == self._context.tenant_id,
+                agent_plan_steps.c.workspace_id == self._context.workspace_id,
+                agent_plan_steps.c.session_id == self._require_session(),
+                agent_plan_steps.c.plan_id == current.plan_id,
+                agent_plan_steps.c.plan_version == current.plan_version,
+                agent_plan_steps.c.step_id == current.step_id,
+            )
+        )
+        definition_digest = definition_result.scalar_one_or_none()
+        if definition_digest is None or result.definition_digest != str(
+            definition_digest
+        ):
+            raise ValueError("Plan step result definition proof is invalid")
+
+        finished_at = await self._db_now_ms()
+        updated = await self._conn.execute(
+            update(agent_plan_step_runs)
+            .where(
+                self._step_run_scope_predicate(str(lease.context.run_id)),
+                agent_plan_step_runs.c.step_run_id == step_run_id,
+                agent_plan_step_runs.c.status == PlanStepRunStatus.RUNNING.value,
+                agent_plan_step_runs.c.version == expected_version,
+            )
+            .values(
+                status=status.value,
+                result_summary=result.summary,
+                result_ref=result_ref,
+                result_digest=result.digest(),
+                error_code=error_code,
+                error_detail_redacted=error_detail_redacted,
+                version=expected_version + 1,
+                finished_at=finished_at,
+            )
+        )
+        if int(updated.rowcount or 0) != 1:
+            raise VersionConflictError("Plan step attempt version conflict")
+        finished = await self._get_step_run(
+            run_id=str(lease.context.run_id),
+            step_run_id=step_run_id,
+        )
+        if finished is None:
+            raise RuntimeError("Plan step attempt missing after finish")
+        return finished
 
     async def _insert_version(
         self,

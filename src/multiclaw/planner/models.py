@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from multiclaw.events.types import ScopedEvent
+from multiclaw.security.redaction import redact
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import RunLease, RunRecord, RunStatus
 
@@ -266,15 +267,26 @@ class PlanStepResultDocument(BaseModel):
     policy_digest: str = Field(pattern=RESULT_DIGEST)
     skill_set_digest: str = Field(pattern=RESULT_DIGEST)
 
-    def digest(self) -> str:
-        encoded = json.dumps(
+    def canonical_json(self) -> str:
+        return json.dumps(
             self.model_dump(mode="json"),
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
             allow_nan=False,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        )
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+
+    def public_context(self) -> dict[str, object]:
+        return {
+            "step_id": self.step_id,
+            "status": self.status,
+            "summary": redact(self.summary),
+            "evidence": redact(list(self.evidence)),
+            "result_digest": self.digest(),
+        }
 
 
 class PlanDraftStep(BaseModel):
@@ -404,6 +416,30 @@ class PlanStepCompletion(BaseModel):
     summary: str = Field(min_length=1, max_length=4_000)
     evidence: list[EvidenceText] = Field(default_factory=list, max_length=20)
     retryable: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PlanStepExecutionRequest:
+    context: TenantContext
+    lease: RunLease
+    plan: PlanSnapshot
+    step: PlanStepRecord
+    step_run: PlanStepRunRecord
+    dependency_results: tuple[PlanStepResultDocument, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PlanExecutionOutcome:
+    state: Literal[
+        "awaiting_user",
+        "completed",
+        "cancelled",
+        "failed_terminal",
+        "replan_required",
+    ]
+    plan: PlanSnapshot
+    run: RunRecord
+    assistant_content: str | None = None
 
 
 class PlanStep(BaseModel):

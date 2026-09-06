@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -13,8 +15,12 @@ from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.dialects import mysql
 
 from alembic import command
+from multiclaw.agent.models import Observation, ObservationType
+from multiclaw.agent.multiclaw import MultiClawAgent
+from multiclaw.agent.tool_batch import ToolCallOutcome
 from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings, Settings
+from multiclaw.llm import LLMResponse, ToolCall
 from multiclaw.memory import MemoryEntry
 from multiclaw.planner.execution import PlanExecutionCoordinator, choose_ready_step
 from multiclaw.planner.models import (
@@ -25,13 +31,19 @@ from multiclaw.planner.models import (
     PlanDraft,
     PlanDraftStep,
     PlanExecutionBlocked,
+    PlanExecutionOutcome,
     PlanStepAlreadyRunningError,
+    PlanStepCompletion,
+    PlanStepExecutionRequest,
     PlanStepResultDocument,
     PlanStepRunRecord,
     PlanStepRunStatus,
     PlanTriggerMode,
 )
 from multiclaw.planner.service import PlanningService
+from multiclaw.security.redaction import redact
+from multiclaw.skills import SkillManager
+from multiclaw.skills.types import Skill, SkillMetadata
 from multiclaw.storage import Database
 from multiclaw.storage.dialect import MySQLDialect
 from multiclaw.storage.repositories.memory import MemoryRepository
@@ -46,10 +58,18 @@ from multiclaw.storage.schema import (
 )
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
+from multiclaw.tools import ToolExecutionResult, ToolRegistry, ToolStatus
+from multiclaw.workflow.continuation import (
+    ContinuationOutcome,
+    ContinuationState,
+    PersistedToolResult,
+    WorkflowContinuationService,
+)
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
     CheckpointPhase,
     RunLease,
+    RunLeaseHandle,
     RunStatus,
     StaleFenceError,
 )
@@ -57,11 +77,98 @@ from multiclaw.workflow.models import (
 _MYSQL_URL = os.getenv("MULTICLAW_TEST_MYSQL_URL")
 
 
+class ScriptedPlanRouter:
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    async def completion(self, **kwargs) -> LLMResponse:
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+class ScriptedStepRunner:
+    def __init__(self, completions: list[PlanStepCompletion]) -> None:
+        self.completions = list(completions)
+        self.calls: list[object] = []
+        self.registry = ToolRegistry()
+        self.skill_manager = SkillManager()
+
+    async def run_plan_step(self, request, **_kwargs):
+        self.calls.append(request)
+        return self.completions.pop(0)
+
+
+class ApprovalStepRunner:
+    def __init__(self, database: Database, settings: Settings) -> None:
+        self.database = database
+        self.settings = settings
+        self.registry = ToolRegistry()
+        self.skill_manager = SkillManager()
+
+    async def run_plan_step(self, request, *, run_lease_handle, **_kwargs):
+        lease = await run_lease_handle.current()
+        approval_id = str(uuid4())
+        async with self.database.write_transaction() as conn:
+            workflow = WorkflowCoordinator(
+                self.database,
+                settings=self.settings,
+                connection=conn,
+            )
+            transitioned = await workflow.transition_run(
+                lease,
+                RunStatus.AWAITING_USER,
+            )
+            approval = await workflow.create_approval(
+                transitioned,
+                approval_id=approval_id,
+                tool_call_id="approval-tool-1",
+                expires_at=9_999_999_999_999,
+            )
+            await workflow.checkpoint(
+                transitioned,
+                CheckpointPhase.AWAITING_APPROVAL,
+                {
+                    "run_id": request.context.run_id,
+                    "approval_id": approval.approval_id,
+                    "tool_call_id": "approval-tool-1",
+                    "approval_expires_at_ms": approval.expires_at,
+                    "resume_cursor": "approval:resume",
+                    "cursor": "approval:resume",
+                },
+                approval_id=approval.approval_id,
+            )
+        await run_lease_handle.replace(transitioned)
+        return ContinuationOutcome(
+            state=ContinuationState.AWAITING_USER,
+            detail="tool awaiting approval",
+        )
+
+
 def _settings(*, max_step_attempts: int = 2) -> Settings:
     return Settings(
         _config_file="/nonexistent",
         planning={"max_step_attempts": max_step_attempts},
     )
+
+
+def _digest(value: object) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _activate_test_skill(manager: SkillManager) -> Skill:
+    skill = Skill(
+        "audit", SkillMetadata("audit"), body="Preserve durable evidence.", active=True
+    )
+    manager.skills[skill.name] = skill
+    return skill
 
 
 def _result_document_payload() -> dict[str, object]:
@@ -305,6 +412,21 @@ class ExecutionFixture:
         assert result.lease is not None
         self.current_lease = result.lease
         self.aggregate_version = result.snapshot.aggregate_version
+
+    async def execute(
+        self,
+        runner: object,
+        *,
+        draft: PlanDraft | None = None,
+    ) -> PlanExecutionOutcome:
+        if draft is not None:
+            await self.materialize(draft)
+        await self.approve()
+        return await self.coordinator.execute_to_boundary(
+            context=self._context(),
+            run_lease_handle=RunLeaseHandle(self.lease),
+            runner=runner,
+        )
 
     async def approve_with_two_roots(self) -> None:
         await self.materialize(_draft())
@@ -587,6 +709,76 @@ class ExecutionFixture:
     async def count_step_runs(self) -> int:
         return await self.count_status(None)
 
+    async def latest_attempt(self) -> PlanStepRunRecord:
+        attempts = await self.all_attempts()
+        assert attempts
+        return attempts[-1]
+
+    async def attempt_statuses(self) -> list[PlanStepRunStatus]:
+        return [attempt.status for attempt in await self.all_attempts()]
+
+    async def all_attempts(self) -> tuple[PlanStepRunRecord, ...]:
+        context = self._context()
+        assert self.plan_id is not None
+        async with TenantUnitOfWork(
+            self.database,
+            context,
+            planning_settings=self.settings.planning,
+        ) as uow:
+            snapshot = await uow.plans.get(self.plan_id)
+            assert snapshot is not None
+            return await uow.plans.step_attempts(
+                plan_id=self.plan_id,
+                plan_version=snapshot.current_version,
+                run_id=str(context.run_id),
+                step_id=snapshot.current.steps[0].step_id,
+            )
+
+    async def load_result(self, result_ref: str | None) -> PlanStepResultDocument:
+        assert result_ref is not None
+        entry_id = result_ref.removeprefix("memory:")
+        context = self._context()
+        async with TenantUnitOfWork(self.database, context) as uow:
+            entry = await uow.memory.get(entry_id, context.session_id)
+        assert entry is not None
+        return PlanStepResultDocument.model_validate_json(entry.content)
+
+    async def latest_checkpoint(self) -> dict[str, object]:
+        context = self._context()
+        async with self.database.connect() as conn:
+            checkpoint = (
+                await conn.execute(
+                    select(execution_checkpoints)
+                    .where(
+                        execution_checkpoints.c.tenant_id == context.tenant_id,
+                        execution_checkpoints.c.workspace_id == context.workspace_id,
+                        execution_checkpoints.c.session_id == context.session_id,
+                        execution_checkpoints.c.run_id == context.run_id,
+                    )
+                    .order_by(execution_checkpoints.c.checkpoint_seq.desc())
+                    .limit(1)
+                )
+            ).mappings().one()
+        return dict(checkpoint)
+
+    async def count_results(self) -> int:
+        context = self._context()
+        async with self.database.connect() as conn:
+            return int(
+                (
+                    await conn.execute(
+                        select(func.count())
+                        .select_from(memory_entries)
+                        .where(
+                            memory_entries.c.tenant_id == context.tenant_id,
+                            memory_entries.c.workspace_id == context.workspace_id,
+                            memory_entries.c.session_id == context.session_id,
+                            memory_entries.c.type == "plan_step_result",
+                        )
+                    )
+                ).scalar_one()
+            )
+
     async def count_step_attempts(self, step_id: str) -> int:
         context = self._context()
         async with self.database.connect() as conn:
@@ -706,6 +898,551 @@ async def execution_fixture(execution_database: Database) -> ExecutionFixture:
             workflow=workflow,
         ),
     )
+
+
+@dataclass(slots=True)
+class PlanAgentHarness:
+    fixture: ExecutionFixture
+    router: ScriptedPlanRouter
+    agent: MultiClawAgent
+    request: PlanStepExecutionRequest
+
+    async def run(
+        self,
+        *,
+        recovered_tool_result: PersistedToolResult | None = None,
+        recovered_tool_input_json: str | None = None,
+    ):
+        return await self.agent.run_plan_step(
+            self.request,
+            run_lease_handle=RunLeaseHandle(self.fixture.lease),
+            workflow_continuation=WorkflowContinuationService(
+                self.fixture.database,
+                settings=self.fixture.settings,
+            ),
+            recovered_tool_result=recovered_tool_result,
+            recovered_tool_input_json=recovered_tool_input_json,
+        )
+
+
+async def _plan_agent_harness(
+    fixture: ExecutionFixture,
+    responses: list[LLMResponse],
+    *,
+    outcomes: list[ToolCallOutcome] | None = None,
+) -> PlanAgentHarness:
+    await fixture.approve()
+    started = await fixture.coordinator.start_next_attempt(
+        context=fixture._context(),
+        lease=fixture.lease,
+    )
+    assert started is not None
+    router = ScriptedPlanRouter(responses)
+    agent = MultiClawAgent.__new__(MultiClawAgent)
+    agent.settings = fixture.settings
+    agent.router = router
+    agent.registry = ToolRegistry()
+    agent.skill_manager = SkillManager()
+    if outcomes is not None:
+        agent._execute_tool_batch = AsyncMock(return_value=outcomes)
+    request = PlanStepExecutionRequest(
+        context=fixture._context(),
+        lease=fixture.lease,
+        plan=started.plan,
+        step=started.step,
+        step_run=started.step_run,
+        dependency_results=started.dependency_results,
+    )
+    return PlanAgentHarness(fixture, router, agent, request)
+
+
+def _completion_response(completion: PlanStepCompletion) -> LLMResponse:
+    return LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(
+                id="complete-1",
+                name="complete_plan_step",
+                arguments=completion.model_dump(mode="json"),
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_free_text_cannot_complete_a_plan_step(execution_fixture):
+    harness = await _plan_agent_harness(
+        execution_fixture,
+        [
+            LLMResponse(content="Done", tool_calls=[]),
+            LLMResponse(content="Still done", tool_calls=[]),
+        ],
+    )
+    active_skill = _activate_test_skill(harness.agent.skill_manager)
+
+    completion = await harness.run()
+
+    assert completion.status == "failed"
+    assert completion.summary == "Step completion protocol was not satisfied"
+    assert completion.evidence == []
+    assert completion.retryable is False
+    assert len(harness.router.calls) == (
+        execution_fixture.settings.agent.reflection_max_attempts + 1
+    )
+    assert await execution_fixture.count_status(PlanStepRunStatus.SUCCEEDED) == 0
+    assert harness.router.calls[0]["tools"][-1] == {
+        "type": "function",
+        "function": {
+            "name": "complete_plan_step",
+            "description": "Finish the current Plan step with structured evidence.",
+            "parameters": PlanStepCompletion.model_json_schema(),
+        },
+    }
+    first_messages = harness.router.calls[0]["messages"]
+    assert first_messages[:2] == [
+        {
+            "role": "system",
+            "content": execution_fixture.settings.agent.system_prompt,
+        },
+        {
+            "role": "system",
+            "content": "Execute exactly one Plan step and finish with complete_plan_step.",
+        },
+    ]
+    assert json.loads(first_messages[2]["content"]) == {
+        "attempt": 1,
+        "constraints": ["Keep execution serial"],
+        "dependencies": [],
+        "objective": "Deliver the durable Plan execution boundary",
+        "remaining_attempts": 1,
+        "step": {
+            "description": "Execute lint.",
+            "expected_outcome": "Lint succeeds.",
+            "logical_step_key": "lint",
+            "title": "Lint",
+        },
+    }
+    assert first_messages[3]["role"] == "system"
+    assert first_messages[3]["content"] == active_skill.format_instructions()
+
+
+@pytest.mark.asyncio
+async def test_valid_completion_call_returns_structured_plan_step_completion(
+    execution_fixture,
+):
+    expected = PlanStepCompletion(
+        status="succeeded",
+        summary="The schema contract passes.",
+        evidence=["pytest tests/test_migrations.py: pass"],
+        retryable=False,
+    )
+    harness = await _plan_agent_harness(
+        execution_fixture,
+        [_completion_response(expected)],
+    )
+
+    completion = await harness.run()
+
+    assert completion == expected
+
+
+@pytest.mark.asyncio
+async def test_malformed_completion_uses_only_bounded_repairs(execution_fixture):
+    malformed = LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(
+                id="complete-invalid",
+                name="complete_plan_step",
+                arguments={"status": "succeeded"},
+            )
+        ],
+    )
+    harness = await _plan_agent_harness(
+        execution_fixture,
+        [malformed, malformed],
+    )
+
+    completion = await harness.run()
+
+    assert completion == PlanStepCompletion(
+        status="failed",
+        summary="Step completion protocol was not satisfied",
+        evidence=[],
+        retryable=False,
+    )
+    assert len(harness.router.calls) == (
+        execution_fixture.settings.agent.reflection_max_attempts + 1
+    )
+    assert "valid" in harness.router.calls[1]["messages"][-1]["content"].lower()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_tool_result_returns_to_step_completion(execution_fixture):
+    expected = PlanStepCompletion(
+        status="succeeded",
+        summary="Inspected the file",
+        evidence=["read_file result"],
+    )
+    outcomes = [
+        ToolCallOutcome(
+            call_id="read-1",
+            name="read_file",
+            observation=Observation(
+                type=ObservationType.TOOL_RESULT,
+                content="README contents",
+            ),
+            result=ToolExecutionResult(
+                status=ToolStatus.SUCCESS,
+                content="README contents",
+            ),
+        )
+    ]
+    harness = await _plan_agent_harness(
+        execution_fixture,
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="read-1",
+                        name="read_file",
+                        arguments={"path": "README.md"},
+                    )
+                ],
+            ),
+            _completion_response(expected),
+        ],
+        outcomes=outcomes,
+    )
+
+    completion = await harness.run()
+
+    assert completion == expected
+    harness.agent._execute_tool_batch.assert_awaited_once()
+    second_messages = harness.router.calls[1]["messages"]
+    assert second_messages[-1] == {
+        "role": "tool",
+        "tool_call_id": "read-1",
+        "content": "README contents",
+    }
+
+
+def test_internal_completion_protocol_is_not_a_registered_tool():
+    registry = ToolRegistry()
+
+    assert registry.get("complete_plan_step") is None
+    assert all(
+        schema["function"]["name"] != "complete_plan_step"
+        for schema in registry.to_openai_schemas()
+    )
+
+
+@pytest.mark.asyncio
+async def test_completion_call_cannot_mix_with_ordinary_tools(execution_fixture):
+    mixed = LLMResponse(
+        content="",
+        tool_calls=[
+            ToolCall(id="read-1", name="read_file", arguments={"path": "README.md"}),
+            ToolCall(
+                id="complete-1",
+                name="complete_plan_step",
+                arguments={
+                    "status": "succeeded",
+                    "summary": "Must not be accepted",
+                    "evidence": [],
+                    "retryable": False,
+                },
+            ),
+        ],
+    )
+    harness = await _plan_agent_harness(
+        execution_fixture,
+        [mixed, mixed],
+        outcomes=[],
+    )
+
+    completion = await harness.run()
+
+    assert completion.status == "failed"
+    harness.agent._execute_tool_batch.assert_not_awaited()
+    assert len(harness.router.calls) == 2
+    assert "exactly once" in harness.router.calls[1]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_recovered_tool_result_returns_to_step_completion_without_redispatch(
+    execution_fixture,
+):
+    expected = PlanStepCompletion(
+        status="succeeded",
+        summary="Recovered result inspected",
+        evidence=["persisted tool result"],
+    )
+    harness = await _plan_agent_harness(
+        execution_fixture,
+        [_completion_response(expected)],
+        outcomes=[],
+    )
+    recovered = PersistedToolResult(
+        entry_id="result-1",
+        result_ref="memory://result-1",
+        result_digest="a" * 64,
+        content="persisted README contents",
+        tool_call_id="read-1",
+        tool_name="read_file",
+    )
+
+    completion = await harness.run(
+        recovered_tool_result=recovered,
+        recovered_tool_input_json=json.dumps({"path": "README.md"}),
+    )
+
+    assert completion == expected
+    harness.agent._execute_tool_batch.assert_not_awaited()
+    first_messages = harness.router.calls[0]["messages"]
+    assert first_messages[-2]["tool_calls"][0]["function"] == {
+        "name": "read_file",
+        "arguments": json.dumps({"path": "README.md"}, ensure_ascii=False),
+    }
+    assert first_messages[-1] == {
+        "role": "tool",
+        "tool_call_id": "read-1",
+        "content": "persisted README contents",
+    }
+
+
+@pytest.mark.asyncio
+async def test_tool_approval_stops_plan_step_without_completion(execution_fixture):
+    outcomes = [
+        ToolCallOutcome(
+            call_id="write-1",
+            name="write_file",
+            observation=Observation(
+                type=ObservationType.TOOL_RESULT,
+                content="approval required",
+            ),
+            result=ToolExecutionResult(
+                status=ToolStatus.AWAITING_APPROVAL,
+                content="approval required",
+            ),
+        )
+    ]
+    harness = await _plan_agent_harness(
+        execution_fixture,
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="write-1",
+                        name="write_file",
+                        arguments={"path": "artifact.txt", "content": "result"},
+                    )
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="complete-1",
+                        name="complete_plan_step",
+                        arguments={
+                            "status": "succeeded",
+                            "summary": "Must not be reached",
+                            "evidence": [],
+                            "retryable": False,
+                        },
+                    )
+                ],
+            ),
+        ],
+        outcomes=outcomes,
+    )
+
+    outcome = await harness.run()
+
+    assert outcome == ContinuationOutcome(
+        state=ContinuationState.AWAITING_USER,
+        detail="tool awaiting approval",
+    )
+    assert len(harness.router.calls) == 1
+    assert await execution_fixture.count_status(PlanStepRunStatus.RUNNING) == 1
+
+
+@pytest.mark.asyncio
+async def test_valid_completion_is_persisted_before_step_success(
+    execution_fixture,
+    monkeypatch,
+):
+    completion = PlanStepCompletion(
+        status="succeeded",
+        summary="The schema passes with api_key=sk_live_secret.",
+        evidence=["Authorization: Bearer secret-token"],
+    )
+    runner = ScriptedStepRunner([completion])
+    _activate_test_skill(runner.skill_manager)
+    tool_schemas = [
+        {"function": {"name": "inspect", "api_key": "sk_tool_secret"}}
+    ]
+    monkeypatch.setattr(runner.registry, "to_openai_schemas", lambda: tool_schemas)
+    original_finish = PlanRepository.finish_step_attempt
+    result_was_visible_before_finish = False
+
+    async def observe_finish(repository, lease, **kwargs):
+        nonlocal result_was_visible_before_finish
+        result_ref = kwargs["result_ref"]
+        entry = await MemoryRepository(
+            repository.connection,
+            execution_fixture._context(),
+            execution_fixture.database.dialect,
+        ).get(result_ref.removeprefix("memory:"), execution_fixture._context().session_id)
+        result_was_visible_before_finish = entry is not None
+        return await original_finish(repository, lease, **kwargs)
+
+    monkeypatch.setattr(PlanRepository, "finish_step_attempt", observe_finish)
+
+    outcome = await execution_fixture.execute(
+        runner,
+        draft=_draft(("lint",)),
+    )
+    attempt = await execution_fixture.latest_attempt()
+    document = await execution_fixture.load_result(attempt.result_ref)
+
+    assert outcome.state == "completed"
+    assert result_was_visible_before_finish is True
+    assert attempt.status is PlanStepRunStatus.SUCCEEDED
+    assert attempt.result_digest == document.digest()
+    assert document.definition_digest == runner.calls[0].step.definition_digest
+    assert document.dependency_result_digests == {}
+    assert document.summary == redact(completion.summary)
+    assert document.evidence == redact(completion.evidence)
+    assert document.tool_catalog_digest == _digest(redact(tool_schemas))
+    assert document.policy_digest == _digest(
+        redact(execution_fixture.settings.governance.model_dump(mode="json"))
+    )
+    assert document.skill_set_digest == _digest(["audit"])
+    assert document.public_context() == {
+        "step_id": document.step_id,
+        "status": "succeeded",
+        "summary": document.summary,
+        "evidence": document.evidence,
+        "result_digest": document.digest(),
+    }
+    checkpoint = await execution_fixture.latest_checkpoint()
+    payload = json.loads(str(checkpoint["payload_json"]))
+    assert checkpoint["phase"] == CheckpointPhase.PLAN_STEP_READY.value
+    assert payload["execution_cursor"] == "select_next"
+
+
+@pytest.mark.asyncio
+async def test_result_and_attempt_finish_roll_back_when_checkpoint_fails(
+    execution_fixture,
+    monkeypatch,
+):
+    runner = ScriptedStepRunner(
+        [
+            PlanStepCompletion(
+                status="succeeded",
+                summary="Must roll back",
+                evidence=[],
+            )
+        ]
+    )
+    original_checkpoint = WorkflowCoordinator.checkpoint
+
+    async def fail_select_next(workflow, lease, phase, payload, **kwargs):
+        if (
+            phase is CheckpointPhase.PLAN_STEP_READY
+            and payload.get("execution_cursor") == "select_next"
+        ):
+            raise RuntimeError("injected completion checkpoint failure")
+        return await original_checkpoint(
+            workflow,
+            lease,
+            phase,
+            payload,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(WorkflowCoordinator, "checkpoint", fail_select_next)
+
+    with pytest.raises(RuntimeError, match="injected completion checkpoint failure"):
+        await execution_fixture.execute(
+            runner,
+            draft=_draft(("lint",)),
+        )
+
+    attempt = await execution_fixture.latest_attempt()
+    assert attempt.status is PlanStepRunStatus.RUNNING
+    assert attempt.result_ref is None
+    assert await execution_fixture.count_results() == 0
+
+
+@pytest.mark.asyncio
+async def test_retryable_completion_creates_only_bounded_attempts(execution_fixture):
+    execution_fixture.settings.planning.max_step_attempts = 3
+    await execution_fixture.materialize(_draft(("lint",), max_attempts=3))
+    execution_fixture.settings.planning.max_step_attempts = 2
+    runner = ScriptedStepRunner(
+        [
+            PlanStepCompletion(
+                status="failed",
+                summary="Transient one",
+                evidence=[],
+                retryable=True,
+            ),
+            PlanStepCompletion(
+                status="failed",
+                summary="Transient two",
+                evidence=[],
+                retryable=True,
+            ),
+            PlanStepCompletion(
+                status="succeeded",
+                summary="Late success",
+                evidence=[],
+            ),
+        ]
+    )
+
+    outcome = await execution_fixture.execute(runner)
+
+    assert outcome.state == "replan_required"
+    assert await execution_fixture.attempt_statuses() == [
+        PlanStepRunStatus.FAILED_RETRYABLE,
+        PlanStepRunStatus.FAILED_TERMINAL,
+    ]
+    assert len(runner.calls) == 2
+    attempts = await execution_fixture.all_attempts()
+    for attempt in attempts:
+        document = await execution_fixture.load_result(attempt.result_ref)
+        assert document.status == "failed"
+        assert document.summary == attempt.result_summary
+        assert document.digest() == attempt.result_digest
+        assert attempt.error_code == "plan_step_failed"
+        assert attempt.error_detail_redacted == document.summary
+
+
+@pytest.mark.asyncio
+async def test_tool_approval_keeps_run_and_attempt_resumable(execution_fixture):
+    outcome = await execution_fixture.execute(
+        ApprovalStepRunner(
+            execution_fixture.database,
+            execution_fixture.settings,
+        ),
+        draft=_draft(("lint",)),
+    )
+
+    run = await execution_fixture.service.workflow.get_run(execution_fixture._context())
+    attempt = await execution_fixture.latest_attempt()
+    assert outcome.state == "awaiting_user"
+    assert run is not None
+    assert run.status is RunStatus.AWAITING_USER
+    assert attempt.status is PlanStepRunStatus.RUNNING
+    assert attempt.result_ref is None
+    checkpoint = await execution_fixture.latest_checkpoint()
+    assert checkpoint["phase"] == CheckpointPhase.AWAITING_APPROVAL.value
 
 
 def test_selector_uses_persisted_ordinal_then_step_id_as_tie_breaker():
