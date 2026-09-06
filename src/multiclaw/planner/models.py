@@ -16,6 +16,8 @@ from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import RunLease, RunRecord, RunStatus
 
 if TYPE_CHECKING:
+    from multiclaw.skills import SkillManager
+    from multiclaw.tools import ToolRegistry
     from multiclaw.workflow.continuation import (
         ContinuationOutcome,
         PersistedToolResult,
@@ -514,6 +516,12 @@ class PlanStepExecutionRequest:
 
 
 class PlanStepRunner(Protocol):
+    @property
+    def registry(self) -> ToolRegistry: ...
+
+    @property
+    def skill_manager(self) -> SkillManager: ...
+
     async def run_plan_step(
         self,
         request: PlanStepExecutionRequest,

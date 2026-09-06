@@ -364,6 +364,8 @@ class PlanExecutionCoordinator:
                 source_result = await self._reuse_document(
                     uow.memory, context, source_run, source_step
                 )
+                if source_run is None or source_result is None:
+                    continue
                 proofs: dict[str, DependencyReuseProof] = {}
                 valid_dependencies = True
                 dependency_ids = frozenset(plan.current.dependencies.get(step.step_id, ()))
@@ -496,6 +498,7 @@ class PlanExecutionCoordinator:
             raise ValueError("recovered tool result and input must be provided together")
         resume_running_attempt = recovered_tool_result is not None
         last_plan: PlanSnapshot | None = None
+        started: StartedPlanStep | None
         while True:
             lease = await run_lease_handle.current()
             run = await self._load_run(context)
@@ -641,7 +644,10 @@ class PlanExecutionCoordinator:
         )
         if plan.current_version - 1 >= self._settings.planning.max_revisions:
             return await self._fail_replan_terminal(run_lease_handle, plan)
-        generator = self._planning_service._generator
+        planning_service = self._planning_service
+        if planning_service is None:
+            return await self._fail_replan_terminal(run_lease_handle, plan)
+        generator = planning_service._generator
         if generator is None:
             return await self._fail_replan_terminal(run_lease_handle, plan)
         revision = await self._revision_context(
@@ -668,7 +674,7 @@ class PlanExecutionCoordinator:
         }:
             raise PlanGenerationError("failed step must be retained or superseded")
         try:
-            result = await self._planning_service.materialize_failure_revision(
+            result = await planning_service.materialize_failure_revision(
                 FailureRevisionRequest(
                     context=context,
                     lease=lease,
@@ -942,7 +948,7 @@ class PlanExecutionCoordinator:
         *,
         request: PlanStepExecutionRequest,
         completion: PlanStepCompletion,
-        runner,
+        runner: PlanStepRunner,
     ) -> PlanStepResultDocument:
         steps_by_id = {
             step.step_id: step for step in request.plan.current.steps
@@ -1142,47 +1148,53 @@ class PlanExecutionCoordinator:
             match = _RESULT_REF.fullmatch(attempt.result_ref)
             if match is None:
                 raise PlanExecutionBlocked("Plan succeeded step result reference is invalid")
-            source = attempt
-            source_step = step
+            document_source_attempt = attempt
+            document_source_step = step
             if attempt.reused_from_step_run_id is not None:
-                source = await plans.step_run_by_id(
+                lineage_source_attempt = await plans.step_run_by_id(
                     run_id=str(context.run_id),
                     step_run_id=attempt.reused_from_step_run_id,
                     for_update=for_update,
                 )
                 if (
-                    source is None
-                    or source.reused_from_step_run_id is not None
-                    or source.plan_id != plan.plan_id
-                    or source.run_id != str(context.run_id)
-                    or source.status is not PlanStepRunStatus.SUCCEEDED
-                    or source.result_ref != attempt.result_ref
-                    or source.result_digest != attempt.result_digest
-                    or source.result_summary != attempt.result_summary
+                    lineage_source_attempt is None
+                    or lineage_source_attempt.reused_from_step_run_id is not None
+                    or lineage_source_attempt.plan_id != plan.plan_id
+                    or lineage_source_attempt.run_id != str(context.run_id)
+                    or lineage_source_attempt.status is not PlanStepRunStatus.SUCCEEDED
+                    or lineage_source_attempt.result_ref != attempt.result_ref
+                    or lineage_source_attempt.result_digest != attempt.result_digest
+                    or lineage_source_attempt.result_summary != attempt.result_summary
                 ):
                     raise PlanExecutionBlocked("Plan reused result lineage is inconsistent")
-                source_version = next(
+                lineage_source_version = next(
                     (
                         version
                         for version in plan.versions
-                        if version.plan_version == source.plan_version
+                        if version.plan_version == lineage_source_attempt.plan_version
                     ),
                     None,
                 )
-                source_step = (
+                lineage_source_step = (
                     None
-                    if source_version is None
+                    if lineage_source_version is None
                     else next(
-                        (item for item in source_version.steps if item.step_id == source.step_id),
+                        (
+                            item
+                            for item in lineage_source_version.steps
+                            if item.step_id == lineage_source_attempt.step_id
+                        ),
                         None,
                     )
                 )
                 if (
-                    source_step is None
-                    or step.supersedes_step_id != source_step.step_id
-                    or step.definition_digest != source_step.definition_digest
+                    lineage_source_step is None
+                    or step.supersedes_step_id != lineage_source_step.step_id
+                    or step.definition_digest != lineage_source_step.definition_digest
                 ):
                     raise PlanExecutionBlocked("Plan reused result lineage is inconsistent")
+                document_source_attempt = lineage_source_attempt
+                document_source_step = lineage_source_step
             entry = await memory.get(
                 match.group(1),
                 context.session_id,
@@ -1194,7 +1206,7 @@ class PlanExecutionCoordinator:
                 or entry.role != "assistant"
                 or entry.metadata.get("schema_version") != 1
                 or entry.metadata.get("plan_id") != plan.plan_id
-                or entry.metadata.get("step_run_id") != source.step_run_id
+                or entry.metadata.get("step_run_id") != document_source_attempt.step_run_id
             ):
                 raise PlanExecutionBlocked("Plan result document is unavailable")
             try:
@@ -1213,13 +1225,13 @@ class PlanExecutionCoordinator:
                 ) from error
             if (
                 document.plan_id != plan.plan_id
-                or document.plan_version != source.plan_version
+                or document.plan_version != document_source_attempt.plan_version
                 or document.run_id != context.run_id
-                or document.step_id != source_step.step_id
-                or document.step_run_id != source.step_run_id
-                or document.attempt != source.attempt
+                or document.step_id != document_source_step.step_id
+                or document.step_run_id != document_source_attempt.step_run_id
+                or document.attempt != document_source_attempt.attempt
                 or document.status != "succeeded"
-                or document.definition_digest != source_step.definition_digest
+                or document.definition_digest != document_source_step.definition_digest
                 or document.digest() != attempt.result_digest
                 or document.summary != attempt.result_summary
             ):
