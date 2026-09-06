@@ -940,6 +940,43 @@ class PlanRepository:
         key_name = message.rsplit("for key", 1)[1].strip().strip("'`")
         return key_name in {"primary", "agent_plan_decisions.primary"}
 
+    def _is_step_attempt_duplicate(self, error: IntegrityError) -> bool:
+        """Recognize only the target reuse-attempt uniqueness collision."""
+        original = error.orig
+        if self._dialect.name == "sqlite":
+            duplicate_codes = {
+                sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
+                sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+            }
+            if getattr(original, "sqlite_errorcode", None) not in duplicate_codes:
+                return False
+            prefix = "UNIQUE constraint failed: "
+            message = str(original)
+            if not message.startswith(prefix):
+                return False
+            columns = tuple(
+                column.strip() for column in message.removeprefix(prefix).split(",")
+            )
+            return columns == (
+                "agent_plan_step_runs.tenant_id",
+                "agent_plan_step_runs.workspace_id",
+                "agent_plan_step_runs.session_id",
+                "agent_plan_step_runs.run_id",
+                "agent_plan_step_runs.step_id",
+                "agent_plan_step_runs.attempt",
+            )
+        arguments = getattr(original, "args", ())
+        if not arguments or arguments[0] != 1062:
+            return False
+        message = str(arguments[1] if len(arguments) > 1 else original).lower()
+        if "duplicate entry" not in message or "for key" not in message:
+            return False
+        key_name = message.rsplit("for key", 1)[1].strip().strip("'`")
+        normalized_key = key_name.replace("'", "").replace("`", "")
+        return normalized_key.rsplit(".", 1)[-1] == (
+            "uq_agent_plan_step_runs_scope_run_step_attempt"
+        )
+
     async def list_for_session(self) -> list[PlanSummary]:
         session_id = self._require_session()
         latest_runs = (
@@ -1467,6 +1504,8 @@ class PlanRepository:
             return inserted
         except IntegrityError as primary:
             if not await self._rollback_savepoint(savepoint, primary):
+                raise
+            if not self._is_step_attempt_duplicate(primary):
                 raise
             existing = await self.latest_step_attempts(
                 plan_id=plan_id,

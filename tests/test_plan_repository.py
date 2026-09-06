@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 from typing import Any, cast
@@ -39,6 +40,7 @@ from multiclaw.planner.models import (
 from multiclaw.planner.service import MaterializeInitialPlan, PlanningService
 from multiclaw.planner.validation import sanitize_plan_text
 from multiclaw.storage import Database
+from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
 from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.repositories.plans import PlanRepository
 from multiclaw.storage.repositories.workflow import WorkflowRepository
@@ -456,6 +458,41 @@ class DecisionIntegrityFailureConnection:
         return await self.connection.execute(statement, *args, **kwargs)
 
 
+class ReusedAttemptIntegrityFailureConnection:
+    def __init__(self, connection, error: IntegrityError) -> None:
+        self.connection = connection
+        self.error = error
+        self.insert_failed = False
+
+    async def begin_nested(self):
+        return await self.connection.begin_nested()
+
+    async def execute(self, statement, *args, **kwargs):
+        if self.insert_failed:
+            raise AssertionError("replay query attempted after non-duplicate error")
+        if (
+            getattr(statement, "is_insert", False)
+            and statement.table is agent_plan_step_runs
+        ):
+            self.insert_failed = True
+            raise self.error
+        return await self.connection.execute(statement, *args, **kwargs)
+
+
+class SQLiteConstraintError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        self.sqlite_errorcode = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+
+class MySQLConstraintError(Exception):
+    def __init__(self, errno: int, message: str) -> None:
+        self.args = (errno, message)
+
+
 class FailingDecisionRollbackSavepoint:
     is_active = True
 
@@ -515,6 +552,107 @@ class StatementRecordingConnection:
     async def execute(self, statement, *args, **kwargs):
         self.statements.append(statement)
         return await self.connection.execute(statement, *args, **kwargs)
+
+
+def _duplicate_classifier_repository(dialect) -> PlanRepository:
+    context = TenantContext(
+        tenant_id=str(uuid4()),
+        workspace_id=str(uuid4()),
+        session_id=str(uuid4()),
+        run_id=str(uuid4()),
+    )
+    return PlanRepository(  # type: ignore[arg-type]
+        None,
+        dialect,
+        context,
+        PlanningSettings(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "expected"),
+    (
+        (
+            sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+            (
+                "UNIQUE constraint failed: agent_plan_step_runs.tenant_id, "
+                "agent_plan_step_runs.workspace_id, agent_plan_step_runs.session_id, "
+                "agent_plan_step_runs.run_id, agent_plan_step_runs.step_id, "
+                "agent_plan_step_runs.attempt"
+            ),
+            True,
+        ),
+        (
+            sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
+            (
+                "UNIQUE constraint failed: agent_plan_step_runs.tenant_id, "
+                "agent_plan_step_runs.workspace_id, agent_plan_step_runs.session_id, "
+                "agent_plan_step_runs.run_id, agent_plan_step_runs.step_id, "
+                "agent_plan_step_runs.attempt"
+            ),
+            True,
+        ),
+        (sqlite3.SQLITE_CONSTRAINT_CHECK, "CHECK constraint failed", False),
+        (sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY, "FOREIGN KEY constraint failed", False),
+        (sqlite3.SQLITE_CONSTRAINT_NOTNULL, "NOT NULL constraint failed", False),
+        (
+            sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+            (
+                "UNIQUE constraint failed: agent_plan_step_runs.tenant_id, "
+                "agent_plan_step_runs.workspace_id, agent_plan_step_runs.session_id, "
+                "agent_plan_step_runs.plan_id, agent_plan_step_runs.run_id, "
+                "agent_plan_step_runs.step_run_id"
+            ),
+            False,
+        ),
+    ),
+)
+def test_reused_step_attempt_duplicate_classifier_scopes_sqlite_constraint(
+    code: int,
+    message: str,
+    expected: bool,
+) -> None:
+    error = IntegrityError("INSERT", {}, SQLiteConstraintError(code, message))
+
+    assert (
+        _duplicate_classifier_repository(SQLiteDialect())._is_step_attempt_duplicate(
+            error
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("errno", "message", "expected"),
+    (
+        (
+            1062,
+            "Duplicate entry 'x' for key 'uq_agent_plan_step_runs_scope_run_step_attempt'",
+            True,
+        ),
+        (
+            1062,
+            "Duplicate entry 'x' for key `db`.`uq_agent_plan_step_runs_scope_run_step_attempt`",
+            True,
+        ),
+        (1452, "Cannot add or update a child row", False),
+        (1062, "Duplicate entry 'x' for key 'PRIMARY'", False),
+        (1062, "Duplicate entry 'x' for key 'other_unique_key'", False),
+    ),
+)
+def test_reused_step_attempt_duplicate_classifier_scopes_mysql_constraint(
+    errno: int,
+    message: str,
+    expected: bool,
+) -> None:
+    error = IntegrityError("INSERT", {}, MySQLConstraintError(errno, message))
+
+    assert (
+        _duplicate_classifier_repository(MySQLDialect())._is_step_attempt_duplicate(
+            error
+        )
+        is expected
+    )
 
 
 @pytest.fixture
@@ -3877,6 +4015,142 @@ async def test_create_reused_step_attempt_copies_immutable_source_fact(
     assert created.attempt == 1 and created.version == 2 and created.finished_at is not None
     assert source_before.reused_from_step_run_id is None and source_before.version == 2
     assert entry_after.content == document.canonical_json()
+
+
+@pytest.mark.asyncio
+async def test_reused_attempt_nonduplicate_integrity_error_is_not_replayed(
+    plan_database,
+    seeded_revised_plan,
+):
+    context = seeded_revised_plan.context
+    async with TenantUnitOfWork(plan_database, context) as uow:
+        snapshot = await uow.plans.get(seeded_revised_plan.plan_id)
+        assert snapshot is not None
+        source_step = snapshot.versions[0].steps[0]
+        target_step = snapshot.current.steps[0]
+        run_id = str(uuid4())
+        await uow.conn.execute(
+            update(agent_plans)
+            .where(agent_plans.c.id == snapshot.plan_id)
+            .values(status="approved", approved_version=2)
+        )
+        await uow.conn.execute(
+            insert(agent_runs).values(
+                run_id=run_id,
+                tenant_id=context.tenant_id,
+                workspace_id=context.workspace_id,
+                session_id=context.session_id,
+                plan_id=snapshot.plan_id,
+                initial_plan_version=1,
+                active_plan_version=2,
+                cancel_requested_at=None,
+                run_status="running",
+                runtime_instance_id="runtime-a",
+                lease_owner="runtime-a",
+                fencing_token=1,
+                lease_expires_at=9_999_999_999_999,
+                heartbeat_at=1,
+                schema_version=1,
+                version=1,
+                created_at=1,
+                updated_at=1,
+                finished_at=None,
+            )
+        )
+        source_id = str(uuid4())
+        document = PlanStepResultDocument(
+            plan_id=snapshot.plan_id,
+            plan_version=1,
+            run_id=run_id,
+            step_id=source_step.step_id,
+            step_run_id=source_id,
+            attempt=1,
+            status="succeeded",
+            summary="source summary",
+            evidence=[],
+            definition_digest=source_step.definition_digest,
+            dependency_result_digests={},
+            tool_catalog_digest="b" * 64,
+            policy_digest="c" * 64,
+            skill_set_digest="d" * 64,
+        )
+        entry = await uow.memory.save(
+            MemoryEntry(
+                content=document.canonical_json(),
+                type="plan_step_result",
+                role="assistant",
+                session_id=context.session_id,
+            )
+        )
+        await uow.conn.execute(
+            insert(agent_plan_step_runs).values(
+                tenant_id=context.tenant_id,
+                workspace_id=context.workspace_id,
+                session_id=context.session_id,
+                plan_id=snapshot.plan_id,
+                plan_version=1,
+                step_id=source_step.step_id,
+                step_run_id=source_id,
+                run_id=run_id,
+                attempt=1,
+                status="succeeded",
+                result_summary=document.summary,
+                result_ref=f"memory:{entry.id}",
+                result_digest=document.digest(),
+                error_code=None,
+                error_detail_redacted=None,
+                reused_from_step_run_id=None,
+                version=2,
+                started_at=1,
+                finished_at=2,
+            )
+        )
+        lease = RunLease(
+            context=context.for_run(context.session_id, run_id),
+            lease_owner="runtime-a",
+            fencing_token=1,
+            version=1,
+            lease_expires_at=9_999_999_999_999,
+        )
+        source_before = await uow.plans.step_run_by_id(
+            run_id=run_id,
+            step_run_id=source_id,
+        )
+        assert source_before is not None
+        primary = IntegrityError(
+            "INSERT INTO agent_plan_step_runs",
+            {},
+            RuntimeError("injected non-duplicate reused-attempt integrity failure"),
+        )
+        repository = PlanRepository(
+            ReusedAttemptIntegrityFailureConnection(uow.conn, primary),  # type: ignore[arg-type]
+            plan_database.dialect,
+            context,
+            PlanningSettings(),
+        )
+        with pytest.raises(IntegrityError) as raised:
+            await repository.create_reused_step_attempt(
+                lease,
+                plan_id=snapshot.plan_id,
+                plan_version=2,
+                step_id=target_step.step_id,
+                source_step_run_id=source_id,
+            )
+
+    async with TenantUnitOfWork(plan_database, context) as uow:
+        source_after = await uow.plans.step_run_by_id(
+            run_id=run_id,
+            step_run_id=source_id,
+        )
+        target_attempts = await uow.plans.step_attempts(
+            plan_id=snapshot.plan_id,
+            plan_version=2,
+            run_id=run_id,
+            step_id=target_step.step_id,
+        )
+    assert raised.value is primary
+    assert source_after == source_before
+    assert target_attempts == ()
 
 
 @pytest.mark.asyncio
