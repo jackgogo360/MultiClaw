@@ -47,8 +47,12 @@ from multiclaw.storage.schema import (
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.coordinator import WorkflowCoordinator
-from multiclaw.workflow.models import CheckpointPhase, RunLease, RunStatus, StaleFenceError
-
+from multiclaw.workflow.models import (
+    CheckpointPhase,
+    RunLease,
+    RunStatus,
+    StaleFenceError,
+)
 
 _MYSQL_URL = os.getenv("MULTICLAW_TEST_MYSQL_URL")
 
@@ -708,8 +712,8 @@ def test_selector_uses_persisted_ordinal_then_step_id_as_tie_breaker():
     plan = _draft()
     # This direct pure-function test is supplied with records in reverse ID order;
     # ordinal remains authoritative and step_id only breaks corrupt/equal ordinals.
-    from multiclaw.planner.validation import validate_plan_draft
     from multiclaw.planner.models import PlanStepRecord, PlanVersionRecord
+    from multiclaw.planner.validation import validate_plan_draft
 
     validated = validate_plan_draft(plan, max_steps=20, max_depth=10, max_attempts=20)
     steps = tuple(

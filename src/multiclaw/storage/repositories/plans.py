@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncTransaction
 
 from multiclaw.config.settings import PlanningSettings
 from multiclaw.planner.models import (
+    TERMINAL_PLAN_STEP_STATUSES,
     PlanAttemptLimitError,
     PlanDecisionAction,
     PlanDecisionIdempotencyError,
@@ -33,7 +34,6 @@ from multiclaw.planner.models import (
     PlanSummary,
     PlanTriggerMode,
     PlanVersionConflictError,
-    TERMINAL_PLAN_STEP_STATUSES,
     PlanVersionRecord,
     ValidatedPlanDraft,
     is_plan_run_executable,

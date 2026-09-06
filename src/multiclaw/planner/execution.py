@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from multiclaw.config import Settings
 from multiclaw.planner.models import (
+    TERMINAL_PLAN_STEP_STATUSES,
     PlanExecutionBlocked,
     PlanSnapshot,
     PlanStatus,
@@ -17,7 +18,6 @@ from multiclaw.planner.models import (
     PlanStepRunRecord,
     PlanStepRunStatus,
     PlanVersionRecord,
-    TERMINAL_PLAN_STEP_STATUSES,
     is_plan_run_executable,
     is_plan_step_ready,
 )
@@ -34,7 +34,6 @@ from multiclaw.workflow.models import (
     RunRecord,
     StaleFenceError,
 )
-
 
 _RESULT_REF = re.compile(r"memory:([A-Za-z0-9-]{1,64})")
 MAX_PLAN_STEP_RESULT_BYTES = 262_144
