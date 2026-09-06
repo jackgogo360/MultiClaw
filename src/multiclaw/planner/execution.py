@@ -656,20 +656,30 @@ class PlanExecutionCoordinator:
             )
         if run.lease_owner is None or run.lease_expires_at is None:
             raise PlanExecutionBlocked("cancelled Plan run has no current lease")
-        lease = RunLease(
-            context=context,
-            lease_owner=run.lease_owner,
-            fencing_token=run.fencing_token,
-            version=run.version,
-            lease_expires_at=run.lease_expires_at,
-        )
-        await run_lease_handle.replace(lease)
         async with TenantUnitOfWork(
             self._database,
             context,
             planning_settings=self._settings.planning,
             workflow_settings=self._settings.workflow,
         ) as uow:
+            assert uow.conn is not None
+            workflow = WorkflowCoordinator(
+                self._database, settings=self._settings, connection=uow.conn
+            )
+            current = await workflow.get_run(context)
+            if (
+                current is None
+                or current.lease_owner is None
+                or current.lease_expires_at is None
+            ):
+                raise PlanExecutionBlocked("cancelled Plan run has no current lease")
+            lease = RunLease(
+                context=context,
+                lease_owner=current.lease_owner,
+                fencing_token=current.fencing_token,
+                version=current.version,
+                lease_expires_at=current.lease_expires_at,
+            )
             running = await uow.plans.running_step_attempts(
                 run_id=str(context.run_id), for_update=True
             )
@@ -682,9 +692,7 @@ class PlanExecutionCoordinator:
                     step_run_id=attempt.step_run_id,
                     expected_version=attempt.version,
                 )
-        terminal = await WorkflowCoordinator(
-            self._database, settings=self._settings
-        ).finish_run_with_checkpoint(lease, RunStatus.CANCELLED)
+            terminal = await workflow.finish_run_with_checkpoint(lease, RunStatus.CANCELLED)
         await run_lease_handle.replace(terminal)
         plan = await self._load_active_plan(context)
         final_run = await self._load_run(context)

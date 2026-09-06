@@ -9,7 +9,10 @@ from uuid import uuid4
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from multiclaw.config import Settings
+from multiclaw.events import EventRouter, ScopedEvent
+from multiclaw.planner.models import PlanReference
 from multiclaw.storage.engine import Database
+from multiclaw.storage.repositories.plans import PlanRepository
 from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import (
@@ -64,10 +67,12 @@ class WorkflowCoordinator:
         *,
         settings: Settings | None = None,
         connection: AsyncConnection | None = None,
+        event_router: EventRouter | None = None,
     ) -> None:
         self._database = database
         self._settings = settings or Settings(_config_file="/nonexistent")
         self._connection = connection
+        self._event_router = event_router
 
     async def start_run(self, context: TenantContext, runtime_instance_id: str) -> RunLease:
         async with self._write_connection() as conn:
@@ -279,8 +284,10 @@ class WorkflowCoordinator:
     async def request_cancellation(self, context: TenantContext) -> RunRecord:
         """Persist a cancellation request, terminalizing waiting runs atomically."""
         run_id = cast(str, context.run_id)
+        publish_plan_id: str | None = None
         async with self._write_connection() as conn:
             repository = self._repository(conn)
+            before = await repository.get_run(context)
             record = await repository._request_cancellation(context)
             if record is None:
                 raise RuntimeError("run record missing for cancellation")
@@ -314,7 +321,35 @@ class WorkflowCoordinator:
                 },
                 checkpoint_seq=await repository.get_next_checkpoint_seq(context),
             )
-            return record
+            if before is not None and before.status is RunStatus.AWAITING_USER:
+                publish_plan_id = record.plan_id
+        if publish_plan_id is not None and self._event_router is not None and self._connection is None:
+            async with self._database.connect() as conn:
+                plan = await PlanRepository(
+                    conn,
+                    self._database.dialect,
+                    context,
+                    self._settings.planning,
+                ).get(publish_plan_id)
+            if plan is not None:
+                assert context.session_id is not None and context.run_id is not None
+                data = PlanReference(
+                    tenant_id=context.tenant_id,
+                    workspace_id=context.workspace_id,
+                    session_id=context.session_id,
+                    run_id=context.run_id,
+                    plan_id=plan.plan_id,
+                    plan_version=plan.current_version,
+                    aggregate_version=plan.aggregate_version,
+                ).model_dump(mode="json")
+                await self._event_router.publish(
+                    ScopedEvent.from_context(
+                        context,
+                        "plan.run_status",
+                        {**data, "status": RunStatus.CANCELLED.value},
+                    )
+                )
+        return record
 
     async def raise_if_cancel_requested(self, context: TenantContext) -> None:
         run = await self.get_run(context)

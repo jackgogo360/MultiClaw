@@ -592,6 +592,10 @@ class CoreToolScheduler:
         async with self.database.write_transaction() as conn:
             workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
             repository = self._workflow_repository(conn)
+            await repository._dialect.lock_run(conn, context)
+            lease = await self._lease_for_observed_result(
+                workflow, prepared.lease, context
+            )
             continuation = WorkflowContinuationService(self.database, settings=self.settings)
             persisted_result = await continuation.persist_tool_result(
                 repository=MemoryRepository(conn, context, self.database.dialect),
@@ -603,7 +607,7 @@ class CoreToolScheduler:
                 result_status=resolved_status.value,
             )
             updated = await workflow.complete_execution(
-                prepared.lease,
+                lease,
                 prepared.execution_id,
                 expected_status=ExecutionStatus.EXECUTING,
                 expected_version=prepared.progress_state.execution_version,
@@ -616,7 +620,7 @@ class CoreToolScheduler:
             prepared.progress_state.external_request_id = updated.external_request_id
             resume_cursor = self._result_cursor(context.run_id, call_id or prepared.execution_id)
             await workflow.checkpoint(
-                prepared.lease,
+                lease,
                 CheckpointPhase.EXECUTION_RESULT_OBSERVED,
                 {
                     "run_id": context.run_id,
@@ -644,7 +648,7 @@ class CoreToolScheduler:
                 execution_id=prepared.execution_id,
             )
         if run_lease_handle is not None:
-            await run_lease_handle.replace(prepared.lease)
+            await run_lease_handle.replace(lease)
         await self._publish_result_event(
             tool_name,
             result,
@@ -652,6 +656,33 @@ class CoreToolScheduler:
             call_id=call_id,
             error_label="tool execution failed" if result.status is ToolStatus.ERROR else None,
         )
+
+    @staticmethod
+    async def _lease_for_observed_result(
+        workflow: WorkflowCoordinator,
+        lease: RunLease,
+        context: TenantContext,
+    ) -> RunLease:
+        current = await workflow.get_run(context)
+        if current is None:
+            return lease
+        if current.version == lease.version:
+            return lease
+        if (
+            current.cancel_requested_at is not None
+            and current.status in {RunStatus.RUNNING, RunStatus.RESUMING}
+            and current.lease_owner == lease.lease_owner
+            and current.fencing_token == lease.fencing_token
+            and current.lease_expires_at is not None
+        ):
+            return RunLease(
+                context=context,
+                lease_owner=lease.lease_owner,
+                fencing_token=lease.fencing_token,
+                version=current.version,
+                lease_expires_at=current.lease_expires_at,
+            )
+        return lease
 
     async def recover_execution(
         self,

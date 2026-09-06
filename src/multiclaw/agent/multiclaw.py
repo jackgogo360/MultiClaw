@@ -131,7 +131,11 @@ class MultiClawAgent(ToolCallAgent):
         self,
         messages: list[dict[str, Any]],
         reason: str,
+        *,
+        before_model: Callable[[], Awaitable[None]] | None = None,
     ) -> str:
+        if before_model is not None:
+            await before_model()
         prompt = REFLECTION_PROMPT.format(reason=reason)
         response = await self.router.completion(
             model=self.settings.llm.default_model,
@@ -145,9 +149,15 @@ class MultiClawAgent(ToolCallAgent):
         self,
         messages: list[dict[str, Any]],
         reason: str,
+        *,
+        before_model: Callable[[], Awaitable[None]] | None = None,
     ) -> str | None:
         try:
-            reflection = await self._generate_reflection(messages, reason)
+            reflection = await self._generate_reflection(
+                messages, reason, before_model=before_model
+            )
+        except PlanCancellationRequested:
+            raise
         except Exception:
             logger.exception("reflection generation failed")
             return None
@@ -466,7 +476,9 @@ class MultiClawAgent(ToolCallAgent):
                     call_decision = controller.observe_calls(normalized_calls)
                     if call_decision.action == ResilienceAction.REFLECT:
                         reflection = await self._attempt_reflection(
-                            messages, call_decision.reason
+                            messages,
+                            call_decision.reason,
+                            before_model=lambda: self._raise_if_cancel_requested(context),
                         )
                         if reflection is None:
                             break
@@ -497,7 +509,9 @@ class MultiClawAgent(ToolCallAgent):
                     result_decision = controller.observe_results(result_contents)
                     if result_decision.action == ResilienceAction.REFLECT:
                         reflection = await self._attempt_reflection(
-                            messages, result_decision.reason
+                            messages,
+                            result_decision.reason,
+                            before_model=lambda: self._raise_if_cancel_requested(context),
                         )
                         if reflection is None:
                             break
@@ -712,7 +726,9 @@ class MultiClawAgent(ToolCallAgent):
                                 call_decision = controller.observe_calls(normalized_calls)
                                 if call_decision.action == ResilienceAction.REFLECT:
                                     reflection = await self._attempt_reflection(
-                                        messages, call_decision.reason
+                                        messages,
+                                        call_decision.reason,
+                                        before_model=lambda: self._raise_if_cancel_requested(context),
                                     )
                                     if reflection is None:
                                         terminate_requested = True
@@ -783,7 +799,9 @@ class MultiClawAgent(ToolCallAgent):
                                 result_decision = controller.observe_results(result_contents)
                                 if result_decision.action == ResilienceAction.REFLECT:
                                     reflection = await self._attempt_reflection(
-                                        messages, result_decision.reason
+                                        messages,
+                                        result_decision.reason,
+                                        before_model=lambda: self._raise_if_cancel_requested(context),
                                     )
                                     if reflection is None:
                                         terminate_requested = True

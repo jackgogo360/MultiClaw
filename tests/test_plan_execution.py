@@ -2005,6 +2005,32 @@ async def test_cancelled_plan_emits_one_post_commit_status_event(execution_fixtu
 
 
 @pytest.mark.asyncio
+async def test_cancelled_attempt_rolls_back_when_terminal_checkpoint_fails(
+    execution_fixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    original_finish = WorkflowCoordinator.finish_run_with_checkpoint
+
+    async def fail_cancel_finish(self, lease, target):
+        if target is RunStatus.CANCELLED:
+            raise RuntimeError("terminal checkpoint failed")
+        return await original_finish(self, lease, target)
+
+    monkeypatch.setattr(WorkflowCoordinator, "finish_run_with_checkpoint", fail_cancel_finish)
+
+    with pytest.raises(RuntimeError, match="terminal checkpoint failed"):
+        await execution_fixture.execute(
+            CancellingStepRunner(execution_fixture.database, execution_fixture.settings),
+            draft=_draft(("lint",)),
+        )
+
+    attempt = await execution_fixture.latest_attempt()
+    run = await execution_fixture.service.workflow.get_run(execution_fixture._context())
+    assert attempt.status is PlanStepRunStatus.RUNNING
+    assert run is not None and run.status is RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
 async def test_cancellation_preserves_succeeded_attempts_and_plan_versions(
     execution_fixture,
 ):

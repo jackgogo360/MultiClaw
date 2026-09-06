@@ -246,6 +246,30 @@ def agent(test_config_path):
 
 class TestMultiClawAgent:
     @pytest.mark.asyncio
+    async def test_reflection_cancellation_skips_model_and_propagates(self):
+        from multiclaw.planner.models import PlanCancellationRequested
+
+        agent = _build_stub_agent(
+            completion_responses=[LLMResponse(content="must not run")],
+            act_results=[],
+            resilience_enabled=True,
+            repeat_limit=1,
+            max_reflections=1,
+        )
+
+        async def cancelled() -> None:
+            raise PlanCancellationRequested
+
+        with pytest.raises(PlanCancellationRequested):
+            await agent._attempt_reflection(
+                [{"role": "user", "content": "hello"}],
+                "repeat",
+                before_model=cancelled,
+            )
+
+        assert agent.router.completion.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_llm_calls_echo_tool(self, agent):
         from multiclaw.agent import ObservationType
 

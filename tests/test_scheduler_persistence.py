@@ -251,6 +251,43 @@ async def _checkpoint_phases(database: Database, context: TenantContext) -> list
     return [str(row) for row in rows]
 
 
+@pytest.mark.asyncio
+async def test_cancel_after_non_idempotent_dispatch_persists_observed_result_once(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-cancel-observed")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-cancel-observed")
+    calls = 0
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        nonlocal calls
+        calls += 1
+        await coordinator.request_cancellation(context)
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    result = await _scheduler(workflow_database).run(
+        PersistedToolBuilder(
+            name="post_dispatch_mutation",
+            runner=runner,
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        ),
+        {"label": "observed"},
+        context=context,
+        call_id="call-cancel-observed",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+
+    row = await _latest_execution_row(workflow_database, context)
+    assert result.status is ToolStatus.SUCCESS
+    assert calls == 1
+    assert row["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert row["result_ref"] is not None
+    assert CheckpointPhase.EXECUTION_RESULT_OBSERVED.value in await _checkpoint_phases(
+        workflow_database, context
+    )
+
+
 class PersistedParams(BaseModel):
     label: str
     delay: float = 0.0

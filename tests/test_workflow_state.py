@@ -21,6 +21,7 @@ from multiclaw.api.dependencies import tenant_context
 from multiclaw.auth.models import UserRecord
 from multiclaw.cli import alembic_config
 from multiclaw.config import DatabaseSettings, Settings
+from multiclaw.events import EventRouter, EventScope
 from multiclaw.memory import MemoryEntry
 from multiclaw.planner import PlanDraft, PlanDraftStep, PlanTriggerMode
 from multiclaw.storage import Database
@@ -1461,6 +1462,45 @@ async def test_request_cancellation_is_idempotent_and_immediately_finishes_waiti
     assert first.finished_at is not None
     assert second == first
     assert checkpoint["phase"] == CheckpointPhase.RUN_TERMINAL.value
+
+
+@pytest.mark.asyncio
+async def test_waiting_plan_cancellation_emits_one_post_commit_status_event(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-waiting-cancel-event")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    router = EventRouter()
+    events = []
+
+    async def capture(event):
+        run = await _coordinator(workflow_database).get_run(context)
+        rows = await _checkpoint_rows(workflow_database, context)
+        assert run is not None and run.status is RunStatus.CANCELLED
+        assert rows[-1]["phase"] == CheckpointPhase.RUN_TERMINAL.value
+        events.append(event)
+
+    router.subscribe(EventScope.from_context(context), capture)
+    coordinator = WorkflowCoordinator(
+        workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        event_router=router,
+    )
+    await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+
+    await coordinator.request_cancellation(context)
+    await coordinator.request_cancellation(context)
+
+    assert len(events) == 1
+    assert events[0].event_type == "plan.run_status"
+    assert events[0].data["status"] == "cancelled"
+    assert events[0].data["plan_id"] == plan_id
 
 
 @pytest.mark.asyncio
