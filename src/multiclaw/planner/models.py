@@ -218,12 +218,12 @@ class PlanStepResultDocument(BaseModel):
     attempt: int = Field(ge=1, le=20, strict=True)
     status: Literal["succeeded", "failed"]
     summary: str = Field(min_length=1, max_length=4_000)
-    evidence: list[EvidenceText] = Field(default_factory=list, max_length=20)
+    evidence: list[EvidenceText] = Field(max_length=20)
     definition_digest: str = Field(pattern=RESULT_DIGEST)
     dependency_result_digests: dict[
         str,
         Annotated[str, Field(pattern=RESULT_DIGEST)],
-    ] = Field(default_factory=dict, max_length=20)
+    ] = Field(max_length=20)
     tool_catalog_digest: str = Field(pattern=RESULT_DIGEST)
     policy_digest: str = Field(pattern=RESULT_DIGEST)
     skill_set_digest: str = Field(pattern=RESULT_DIGEST)

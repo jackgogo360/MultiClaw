@@ -8,7 +8,9 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import func, insert, select, text, update
+from sqlalchemy.dialects import mysql
 
 from alembic import command
 from multiclaw.cli import alembic_config
@@ -31,10 +33,13 @@ from multiclaw.planner.models import (
 )
 from multiclaw.planner.service import PlanningService
 from multiclaw.storage import Database
+from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
 from multiclaw.storage.repositories.memory import MemoryRepository
+from multiclaw.storage.repositories.plans import PlanRepository
 from multiclaw.storage.schema import (
     agent_plan_step_runs,
     agent_plans,
+    agent_runs,
     execution_checkpoints,
     users,
 )
@@ -52,6 +57,43 @@ def _settings(*, max_step_attempts: int = 2) -> Settings:
         _config_file="/nonexistent",
         planning={"max_step_attempts": max_step_attempts},
     )
+
+
+def _result_document_payload() -> dict[str, object]:
+    return {
+        "plan_id": str(uuid4()),
+        "plan_version": 1,
+        "run_id": str(uuid4()),
+        "step_id": str(uuid4()),
+        "step_run_id": str(uuid4()),
+        "attempt": 1,
+        "status": "succeeded",
+        "summary": "Dependency completed.",
+        "evidence": [],
+        "definition_digest": "a" * 64,
+        "dependency_result_digests": {},
+        "tool_catalog_digest": "b" * 64,
+        "policy_digest": "c" * 64,
+        "skill_set_digest": "d" * 64,
+    }
+
+
+@pytest.mark.parametrize("missing", ("evidence", "dependency_result_digests"))
+def test_result_document_requires_durable_collection_fields(missing: str):
+    payload = _result_document_payload()
+    del payload[missing]
+
+    with pytest.raises(ValidationError) as raised:
+        PlanStepResultDocument.model_validate(payload)
+
+    assert any(error["loc"] == (missing,) for error in raised.value.errors())
+
+
+def test_result_document_accepts_explicit_empty_collection_fields():
+    document = PlanStepResultDocument.model_validate(_result_document_payload())
+
+    assert document.evidence == []
+    assert document.dependency_result_digests == {}
 
 
 def _draft(
@@ -145,6 +187,29 @@ async def execution_database(tmp_path: Path):
         yield database
     finally:
         await database.dispose()
+
+
+class StatementRecordingConnection:
+    def __init__(self, connection) -> None:
+        self.connection = connection
+        self.statements: list[object] = []
+
+    async def begin_nested(self):
+        return await self.connection.begin_nested()
+
+    async def execute(self, statement, *args, **kwargs):
+        self.statements.append(statement)
+        return await self.connection.execute(statement, *args, **kwargs)
+
+
+class MySQLCompilationDialect:
+    name = "mysql"
+
+    def db_now_ms(self):
+        return SQLiteDialect().db_now_ms()
+
+    async def lock_run(self, connection, context) -> None:
+        await MySQLDialect().lock_run(connection, context)
 
 
 @dataclass(slots=True)
@@ -578,6 +643,82 @@ async def test_selector_returns_only_succeeded_dependency_documents(execution_fi
 
 
 @pytest.mark.asyncio
+async def test_selector_rejects_incomplete_persisted_dependency_document(
+    execution_fixture,
+):
+    await execution_fixture.approve_chain(["inspect", "verify"])
+    first = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert first is not None
+    document = PlanStepResultDocument(
+        plan_id=first.step_run.plan_id,
+        plan_version=first.step_run.plan_version,
+        run_id=first.step_run.run_id,
+        step_id=first.step_run.step_id,
+        step_run_id=first.step_run.step_run_id,
+        attempt=first.step_run.attempt,
+        status="succeeded",
+        summary="inspect complete",
+        evidence=[],
+        definition_digest=first.step.definition_digest,
+        dependency_result_digests={},
+        tool_catalog_digest="a" * 64,
+        policy_digest="b" * 64,
+        skill_set_digest="c" * 64,
+    )
+    incomplete_content = json.dumps(
+        document.model_dump(mode="json", exclude={"evidence"}),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    async with TenantUnitOfWork(
+        execution_fixture.database,
+        execution_fixture._context(),
+    ) as uow:
+        entry = await uow.memory.save(
+            MemoryEntry(
+                content=incomplete_content,
+                type="plan_step_result",
+                role="assistant",
+                session_id=execution_fixture._context().session_id,
+                metadata={
+                    "schema_version": 1,
+                    "plan_id": first.step_run.plan_id,
+                    "step_run_id": first.step_run.step_run_id,
+                },
+            )
+        )
+        await uow.conn.execute(
+            update(agent_plan_step_runs)
+            .where(
+                agent_plan_step_runs.c.tenant_id
+                == execution_fixture._context().tenant_id,
+                agent_plan_step_runs.c.workspace_id
+                == execution_fixture._context().workspace_id,
+                agent_plan_step_runs.c.session_id
+                == execution_fixture._context().session_id,
+                agent_plan_step_runs.c.run_id == first.step_run.run_id,
+                agent_plan_step_runs.c.step_run_id == first.step_run.step_run_id,
+            )
+            .values(
+                status=PlanStepRunStatus.SUCCEEDED.value,
+                result_summary=document.summary,
+                result_ref=f"memory:{entry.id}",
+                result_digest=document.digest(),
+                version=first.step_run.version + 1,
+                finished_at=first.step_run.started_at + 1,
+            )
+        )
+
+    with pytest.raises(PlanExecutionBlocked, match="document is invalid"):
+        await execution_fixture.coordinator.select_next(
+            context=execution_fixture._context(),
+        )
+
+
+@pytest.mark.asyncio
 async def test_all_succeeded_returns_no_next_step(execution_fixture):
     await execution_fixture.approve_and_succeed_all()
     assert (
@@ -696,6 +837,92 @@ async def test_attempt_rolls_back_when_checkpoint_insert_fails(execution_fixture
     assert await execution_fixture.count_step_runs() == 0
 
 
+@pytest.mark.asyncio
+async def test_mysql_plan_attempt_statements_compile_with_lock_fence_and_scope(
+    execution_fixture,
+):
+    await execution_fixture.approve()
+    context = execution_fixture._context()
+    async with TenantUnitOfWork(
+        execution_fixture.database,
+        context,
+        planning_settings=execution_fixture.settings.planning,
+    ) as uow:
+        recording = StatementRecordingConnection(uow.conn)
+        repository = PlanRepository(  # type: ignore[arg-type]
+            recording,
+            MySQLCompilationDialect(),  # type: ignore[arg-type]
+            context,
+            execution_fixture.settings.planning,
+        )
+        snapshot = await repository.get(execution_fixture.plan_id)
+        assert snapshot is not None
+        await repository.create_step_attempt(
+            execution_fixture.lease,
+            plan_id=snapshot.plan_id,
+            plan_version=snapshot.current_version,
+            step_id=snapshot.current.steps[0].step_id,
+        )
+
+    lock_statement = next(
+        statement
+        for statement in recording.statements
+        if getattr(statement, "is_select", False)
+        and getattr(statement, "_for_update_arg", None) is not None
+        and agent_runs in statement.get_final_froms()
+    )
+    fence_statement = next(
+        statement
+        for statement in recording.statements
+        if getattr(statement, "is_select", False)
+        and "lease_owner" in str(statement)
+        and "lease_expires_at" in str(statement)
+    )
+    insert_statement = next(
+        statement
+        for statement in recording.statements
+        if getattr(statement, "is_insert", False)
+        and statement.table is agent_plan_step_runs
+    )
+
+    mysql_dialect = mysql.dialect()
+    lock_sql = str(lock_statement.compile(dialect=mysql_dialect))
+    fence_sql = str(fence_statement.compile(dialect=mysql_dialect))
+    compiled_insert = insert_statement.compile(dialect=mysql_dialect)
+    insert_sql = str(compiled_insert)
+
+    assert lock_statement.get_final_froms() == [agent_runs]
+    assert lock_sql.endswith(" FOR UPDATE")
+    for column in ("tenant_id", "workspace_id", "session_id", "run_id"):
+        assert f"agent_runs.{column}" in lock_sql
+        assert f"agent_runs.{column}" in fence_sql
+    for column in ("lease_owner", "fencing_token", "version", "lease_expires_at"):
+        assert f"agent_runs.{column}" in fence_sql
+    assert insert_statement.table is agent_plan_step_runs
+    for column in (
+        "tenant_id",
+        "workspace_id",
+        "session_id",
+        "plan_id",
+        "plan_version",
+        "step_id",
+        "step_run_id",
+        "run_id",
+        "attempt",
+        "status",
+    ):
+        assert column in insert_sql
+        assert column in compiled_insert.params
+    assert compiled_insert.params["status"] == PlanStepRunStatus.RUNNING.value
+    assert compiled_insert.params["attempt"] == 1
+    assert compiled_insert.params["tenant_id"] == context.tenant_id
+    assert compiled_insert.params["workspace_id"] == context.workspace_id
+    assert compiled_insert.params["session_id"] == context.session_id
+    assert compiled_insert.params["run_id"] == context.run_id
+    assert compiled_insert.params["plan_id"] == snapshot.plan_id
+    assert compiled_insert.params["plan_version"] == snapshot.current_version
+
+
 @pytest.mark.skipif(not _MYSQL_URL, reason="MULTICLAW_TEST_MYSQL_URL is not configured")
 @pytest.mark.asyncio
 async def test_mysql_concurrent_attempt_contract():
@@ -734,7 +961,7 @@ async def test_mysql_concurrent_attempt_contract():
                     context=fixture._context(),
                     lease=fixture.lease,
                 )
-            except PlanStepAlreadyRunningError:
+            except (StaleFenceError, PlanStepAlreadyRunningError):
                 return None
 
         assert len([item for item in await asyncio.gather(start(), start()) if item]) == 1
