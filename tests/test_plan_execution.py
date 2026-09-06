@@ -345,6 +345,45 @@ class ExecutionFixture:
                         .values(status="approved", approved_version=2)
                     )
 
+    async def activate_second_version(self) -> None:
+        assert self.context is not None
+        assert self.plan_id is not None
+        assert self.aggregate_version is not None
+        async with TenantUnitOfWork(
+            self.database,
+            self.context,
+            planning_settings=self.settings.planning,
+        ) as uow:
+            revised = await uow.plans.for_context(self.context).append_version(
+                plan_id=self.plan_id,
+                expected_version=self.aggregate_version,
+                draft=_draft(("package", "publish")),
+                parent_version=1,
+                revision_feedback="Activate a second execution version.",
+                supersedes={},
+            )
+            await uow.conn.execute(
+                update(agent_plans)
+                .where(
+                    agent_plans.c.tenant_id == self.context.tenant_id,
+                    agent_plans.c.workspace_id == self.context.workspace_id,
+                    agent_plans.c.session_id == self.context.session_id,
+                    agent_plans.c.id == self.plan_id,
+                )
+                .values(status="approved", approved_version=2)
+            )
+            await uow.conn.execute(
+                update(agent_runs)
+                .where(
+                    agent_runs.c.tenant_id == self.context.tenant_id,
+                    agent_runs.c.workspace_id == self.context.workspace_id,
+                    agent_runs.c.session_id == self.context.session_id,
+                    agent_runs.c.run_id == self.context.run_id,
+                )
+                .values(active_plan_version=2)
+            )
+            self.aggregate_version = revised.aggregate_version
+
     async def update_run(self, **values: object) -> None:
         context = self._context()
         async with self.database.write_transaction() as conn:
@@ -825,6 +864,29 @@ async def test_concurrent_ready_nodes_still_create_one_running_attempt(execution
 
 
 @pytest.mark.asyncio
+async def test_running_attempt_from_prior_plan_version_blocks_dispatch(
+    execution_fixture,
+):
+    await execution_fixture.approve_with_two_roots()
+    first = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert first is not None
+    await execution_fixture.activate_second_version()
+    before_checkpoints = await execution_fixture.count_checkpoints()
+
+    with pytest.raises(PlanStepAlreadyRunningError):
+        await execution_fixture.coordinator.start_next_attempt(
+            context=execution_fixture._context(),
+            lease=execution_fixture.lease,
+        )
+
+    assert await execution_fixture.count_status(PlanStepRunStatus.RUNNING) == 1
+    assert await execution_fixture.count_checkpoints() == before_checkpoints
+
+
+@pytest.mark.asyncio
 async def test_run_lock_interleaving_reselects_after_prior_step_succeeds(
     execution_fixture,
     monkeypatch,
@@ -912,6 +974,66 @@ async def test_attempt_insert_rechecks_run_state_immediately_before_write(
         )
 
     assert await execution_fixture.count_step_runs() == 0
+    assert await execution_fixture.count_checkpoints() == before_checkpoints
+
+
+@pytest.mark.asyncio
+async def test_attempt_insert_rechecks_run_wide_running_gate(
+    execution_fixture,
+    monkeypatch,
+):
+    await execution_fixture.approve_with_two_roots()
+    first = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(),
+        lease=execution_fixture.lease,
+    )
+    assert first is not None
+    await execution_fixture.finish(
+        first.step_run,
+        PlanStepRunStatus.FAILED_RETRYABLE,
+    )
+    await execution_fixture.activate_second_version()
+    before_checkpoints = await execution_fixture.count_checkpoints()
+    original_require_ready = PlanRepository._require_step_ready
+    readiness_checks = 0
+
+    async def inject_prior_version_running(repository, **kwargs):
+        nonlocal readiness_checks
+        result = await original_require_ready(repository, **kwargs)
+        readiness_checks += 1
+        if readiness_checks == 2:
+            await repository.connection.execute(
+                update(agent_plan_step_runs)
+                .where(
+                    agent_plan_step_runs.c.tenant_id
+                    == execution_fixture._context().tenant_id,
+                    agent_plan_step_runs.c.workspace_id
+                    == execution_fixture._context().workspace_id,
+                    agent_plan_step_runs.c.session_id
+                    == execution_fixture._context().session_id,
+                    agent_plan_step_runs.c.run_id
+                    == execution_fixture._context().run_id,
+                    agent_plan_step_runs.c.step_run_id
+                    == first.step_run.step_run_id,
+                )
+                .values(status=PlanStepRunStatus.RUNNING.value)
+            )
+        return result
+
+    monkeypatch.setattr(
+        PlanRepository,
+        "_require_step_ready",
+        inject_prior_version_running,
+    )
+
+    with pytest.raises(PlanStepAlreadyRunningError):
+        await execution_fixture.coordinator.start_next_attempt(
+            context=execution_fixture._context(),
+            lease=execution_fixture.lease,
+        )
+
+    assert readiness_checks == 2
+    assert await execution_fixture.count_step_runs() == 1
     assert await execution_fixture.count_checkpoints() == before_checkpoints
 
 

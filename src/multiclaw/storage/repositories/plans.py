@@ -1235,6 +1235,7 @@ class PlanRepository:
             raise StaleFenceError("run lease scope is stale")
 
         run = await self.lock_run_for_execution(lease)
+        await self._require_no_running_attempt(str(lease.context.run_id))
         await self._require_active_plan_version(
             run,
             plan_id=plan_id,
@@ -1265,6 +1266,7 @@ class PlanRepository:
                 plan_id=plan_id,
                 plan_version=plan_version,
             )
+            await self._require_no_running_attempt(str(lease.context.run_id))
             await self._conn.execute(
                 insert(agent_plan_step_runs).values(
                     **self._scope_values(),
@@ -1478,8 +1480,13 @@ class PlanRepository:
         row = result.mappings().first()
         return None if row is None else self._hydrate_step_run(row)
 
-    async def _has_running_attempt(self, run_id: str) -> bool:
-        result = await self._conn.execute(
+    async def _has_running_attempt(
+        self,
+        run_id: str,
+        *,
+        for_update: bool = False,
+    ) -> bool:
+        statement = (
             select(agent_plan_step_runs.c.step_run_id)
             .where(
                 self._step_run_scope_predicate(run_id),
@@ -1487,7 +1494,16 @@ class PlanRepository:
             )
             .limit(1)
         )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self._conn.execute(statement)
         return result.scalar_one_or_none() is not None
+
+    async def _require_no_running_attempt(self, run_id: str) -> None:
+        if await self._has_running_attempt(run_id, for_update=True):
+            raise PlanStepAlreadyRunningError(
+                "Plan run already has a running step attempt"
+            )
 
     async def _latest_attempt_number(self, *, run_id: str, step_id: str) -> int:
         result = await self._conn.execute(
