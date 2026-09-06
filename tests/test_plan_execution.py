@@ -22,6 +22,7 @@ from multiclaw.agent.multiclaw import MultiClawAgent
 from multiclaw.agent.tool_batch import ToolCallOutcome
 from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings, Settings
+from multiclaw.events import EventRouter, EventScope
 from multiclaw.llm import LLMResponse, ToolCall
 from multiclaw.memory import MemoryEntry
 from multiclaw.planner.execution import (
@@ -1948,6 +1949,59 @@ async def test_persisted_cancellation_stops_before_retry_and_cancels_running_att
     assert run is not None and run.status is RunStatus.CANCELLED
     assert [attempt.status for attempt in attempts] == [PlanStepRunStatus.CANCELLED]
     assert len(runner.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_plan_emits_one_post_commit_status_event(execution_fixture):
+    await execution_fixture.materialize(_draft(("lint",)))
+    await execution_fixture.approve()
+    context = execution_fixture._context()
+    router = EventRouter()
+    observed = []
+
+    async def capture(event):
+        run = await execution_fixture.service.workflow.get_run(context)
+        checkpoint = await execution_fixture.latest_checkpoint()
+        assert run is not None and run.status is RunStatus.CANCELLED
+        assert checkpoint["phase"] == CheckpointPhase.RUN_TERMINAL.value
+        observed.append(event)
+
+    router.subscribe(EventScope.from_context(context), capture)
+    coordinator = PlanExecutionCoordinator(
+        execution_fixture.database,
+        settings=execution_fixture.settings,
+        event_router=router,
+    )
+    lease_handle = RunLeaseHandle(execution_fixture.lease)
+    runner = CancellingStepRunner(
+        execution_fixture.database, execution_fixture.settings
+    )
+
+    outcome = await coordinator.execute_to_boundary(
+        context=context,
+        run_lease_handle=lease_handle,
+        runner=runner,
+    )
+    replay = await coordinator.execute_to_boundary(
+        context=context,
+        run_lease_handle=lease_handle,
+        runner=runner,
+    )
+
+    assert outcome.state == replay.state == "cancelled"
+    assert len(observed) == 1
+    assert observed[0].event_type == "plan.run_status"
+    assert observed[0].data == {
+        "schema_version": 1,
+        "tenant_id": context.tenant_id,
+        "workspace_id": context.workspace_id,
+        "session_id": context.session_id,
+        "plan_id": execution_fixture.plan_id,
+        "plan_version": 1,
+        "run_id": context.run_id,
+        "aggregate_version": execution_fixture.aggregate_version,
+        "status": "cancelled",
+    }
 
 
 @pytest.mark.asyncio

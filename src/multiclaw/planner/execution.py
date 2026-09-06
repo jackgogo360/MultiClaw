@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 from multiclaw.config import Settings
+from multiclaw.events import EventRouter, ScopedEvent
 from multiclaw.planner.generator import PlanGenerationError
 from multiclaw.planner.models import (
     TERMINAL_PLAN_STEP_STATUSES,
@@ -16,6 +17,7 @@ from multiclaw.planner.models import (
     PlanCancellationRequested,
     PlanExecutionBlocked,
     PlanExecutionOutcome,
+    PlanReference,
     PlanRevisionContext,
     PlanRevisionLimitError,
     PlanSnapshot,
@@ -216,10 +218,12 @@ class PlanExecutionCoordinator:
         *,
         settings: Settings | None = None,
         planning_service: PlanningService | None = None,
+        event_router: EventRouter | None = None,
     ) -> None:
         self._database = database
         self._settings = settings or Settings(_config_file="/nonexistent")
         self._planning_service = planning_service
+        self._event_router = event_router
 
     async def select_next(
         self,
@@ -682,10 +686,30 @@ class PlanExecutionCoordinator:
             self._database, settings=self._settings
         ).finish_run_with_checkpoint(lease, RunStatus.CANCELLED)
         await run_lease_handle.replace(terminal)
+        plan = await self._load_active_plan(context)
+        final_run = await self._load_run(context)
+        if self._event_router is not None:
+            assert context.session_id is not None and context.run_id is not None
+            reference = PlanReference(
+                tenant_id=context.tenant_id,
+                workspace_id=context.workspace_id,
+                session_id=context.session_id,
+                run_id=context.run_id,
+                plan_id=plan.plan_id,
+                plan_version=plan.current_version,
+                aggregate_version=plan.aggregate_version,
+            ).model_dump(mode="json")
+            await self._event_router.publish(
+                ScopedEvent.from_context(
+                    context,
+                    "plan.run_status",
+                    {**reference, "status": RunStatus.CANCELLED.value},
+                )
+            )
         return PlanExecutionOutcome(
             state="cancelled",
-            plan=await self._load_active_plan(context),
-            run=await self._load_run(context),
+            plan=plan,
+            run=final_run,
         )
 
     async def _replan_terminal_failure(
