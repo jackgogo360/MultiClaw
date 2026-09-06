@@ -647,15 +647,11 @@ class PlanExecutionCoordinator:
         context: TenantContext,
         run_lease_handle: RunLeaseHandle,
     ) -> PlanExecutionOutcome:
-        run = await self._load_run(context)
-        if run.status is RunStatus.CANCELLED:
-            return PlanExecutionOutcome(
-                state="cancelled",
-                plan=await self._load_active_plan(context),
-                run=run,
-            )
-        if run.lease_owner is None or run.lease_expires_at is None:
-            raise PlanExecutionBlocked("cancelled Plan run has no current lease")
+        original_lease = await run_lease_handle.current()
+        if original_lease.context != context:
+            raise StaleFenceError("run lease scope is stale")
+        already_cancelled: RunRecord | None = None
+        terminal: RunLease | None = None
         async with TenantUnitOfWork(
             self._database,
             context,
@@ -666,33 +662,60 @@ class PlanExecutionCoordinator:
             workflow = WorkflowCoordinator(
                 self._database, settings=self._settings, connection=uow.conn
             )
+            await uow.workflow._dialect.lock_run(uow.conn, context)
             current = await workflow.get_run(context)
-            if (
-                current is None
-                or current.lease_owner is None
-                or current.lease_expires_at is None
-            ):
+            if current is None:
                 raise PlanExecutionBlocked("cancelled Plan run has no current lease")
-            lease = RunLease(
-                context=context,
-                lease_owner=current.lease_owner,
-                fencing_token=current.fencing_token,
-                version=current.version,
-                lease_expires_at=current.lease_expires_at,
-            )
-            running = await uow.plans.running_step_attempts(
-                run_id=str(context.run_id), for_update=True
-            )
-            if len(running) > 1:
-                raise PlanExecutionBlocked("Plan run has multiple running step attempts")
-            if running:
-                attempt = running[0]
-                await uow.plans.cancel_step_attempt(
-                    lease,
-                    step_run_id=attempt.step_run_id,
-                    expected_version=attempt.version,
+            if current.status is RunStatus.CANCELLED:
+                already_cancelled = current
+            else:
+                if current.lease_owner is None or current.lease_expires_at is None:
+                    raise PlanExecutionBlocked("cancelled Plan run has no current lease")
+                if (
+                    current.context != context
+                    or current.lease_owner != original_lease.lease_owner
+                    or current.fencing_token != original_lease.fencing_token
+                    or current.lease_expires_at != original_lease.lease_expires_at
+                    or current.version
+                    not in {original_lease.version, original_lease.version + 1}
+                ):
+                    raise StaleFenceError("cancellation run lease is stale")
+                if (
+                    current.cancel_requested_at is None
+                    or current.status not in {RunStatus.RUNNING, RunStatus.RESUMING}
+                ):
+                    raise PlanExecutionBlocked("Plan cancellation is no longer pending")
+                lease = RunLease(
+                    context=context,
+                    lease_owner=current.lease_owner,
+                    fencing_token=current.fencing_token,
+                    version=current.version,
+                    lease_expires_at=current.lease_expires_at,
                 )
-            terminal = await workflow.finish_run_with_checkpoint(lease, RunStatus.CANCELLED)
+                if not await uow.plans.has_current_lease(lease):
+                    raise StaleFenceError("cancellation run lease is stale")
+                running = await uow.plans.running_step_attempts(
+                    run_id=str(context.run_id), for_update=True
+                )
+                if len(running) > 1:
+                    raise PlanExecutionBlocked("Plan run has multiple running step attempts")
+                if running:
+                    attempt = running[0]
+                    await uow.plans.cancel_step_attempt(
+                        lease,
+                        step_run_id=attempt.step_run_id,
+                        expected_version=attempt.version,
+                    )
+                terminal = await workflow.finish_run_with_checkpoint(
+                    lease, RunStatus.CANCELLED
+                )
+        if already_cancelled is not None:
+            return PlanExecutionOutcome(
+                state="cancelled",
+                plan=await self._load_active_plan(context),
+                run=already_cancelled,
+            )
+        assert terminal is not None
         await run_lease_handle.replace(terminal)
         plan = await self._load_active_plan(context)
         final_run = await self._load_run(context)

@@ -289,6 +289,54 @@ async def test_cancel_after_non_idempotent_dispatch_persists_observed_result_onc
 
 
 @pytest.mark.asyncio
+async def test_cancel_after_prepare_stops_before_dispatch_and_closes_execution(
+    workflow_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-cancel-before-dispatch")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-cancel-before-dispatch")
+    scheduler = _scheduler(workflow_database)
+    dispatches = 0
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        nonlocal dispatches
+        dispatches += 1
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    original_publish = scheduler._publish_event
+
+    async def cancel_at_executing_boundary(event_type, data, *, context=None):
+        await original_publish(event_type, data, context=context)
+        if event_type == "tool.executing":
+            await coordinator.request_cancellation(context)
+
+    monkeypatch.setattr(scheduler, "_publish_event", cancel_at_executing_boundary)
+    result = await scheduler.run(
+        PersistedToolBuilder(
+            name="cancelled_before_dispatch",
+            runner=runner,
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        ),
+        {"label": "must not run"},
+        context=context,
+        call_id="call-cancel-before-dispatch",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+
+    row = await _latest_execution_row(workflow_database, context)
+    phases = await _checkpoint_phases(workflow_database, context)
+    run = await coordinator.get_run(context)
+    assert dispatches == 0
+    assert result.status is ToolStatus.CANCELLED
+    assert row["execution_status"] == ExecutionStatus.FAILED_RETRYABLE.value
+    assert row["external_request_id"] is None
+    assert row["result_ref"] is not None
+    assert phases[-1] == CheckpointPhase.EXECUTION_RESULT_OBSERVED.value
+    assert run is not None and run.cancel_requested_at is not None
+
+
+@pytest.mark.asyncio
 async def test_observed_result_rejects_foreign_prepared_lease_before_persistence(
     workflow_database: Database,
 ):

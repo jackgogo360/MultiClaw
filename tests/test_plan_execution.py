@@ -2031,6 +2031,110 @@ async def test_cancelled_attempt_rolls_back_when_terminal_checkpoint_fails(
 
 
 @pytest.mark.asyncio
+async def test_stale_executor_cannot_cancel_attempt_after_lease_takeover(
+    execution_fixture,
+):
+    await execution_fixture.materialize(_draft(("lint",)))
+    await execution_fixture.approve()
+    context = execution_fixture._context()
+    original_lease = execution_fixture.lease
+    started = await execution_fixture.coordinator.start_next_attempt(
+        context=context,
+        lease=original_lease,
+    )
+    assert started is not None
+    workflow = execution_fixture.service.workflow
+    await workflow.request_cancellation(context)
+    await execution_fixture.update_run(lease_expires_at=0)
+    takeover = await workflow.acquire_run(context, "runtime-b")
+    checkpoint_count = await execution_fixture.count_checkpoints()
+
+    with pytest.raises(StaleFenceError):
+        await execution_fixture.coordinator._cancel_at_boundary(
+            context,
+            RunLeaseHandle(original_lease),
+        )
+
+    run = await workflow.get_run(context)
+    attempt = await execution_fixture.latest_attempt()
+    assert run is not None and run.status is RunStatus.RESUMING
+    assert run.lease_owner == takeover.lease_owner
+    assert run.fencing_token == takeover.fencing_token
+    assert attempt.status is PlanStepRunStatus.RUNNING
+    assert await execution_fixture.count_checkpoints() == checkpoint_count
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_plan_cancellers_terminalize_once(
+    execution_fixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    await execution_fixture.materialize(_draft(("lint",)))
+    await execution_fixture.approve()
+    context = execution_fixture._context()
+    original_lease = execution_fixture.lease
+    started = await execution_fixture.coordinator.start_next_attempt(
+        context=context,
+        lease=original_lease,
+    )
+    assert started is not None
+    await execution_fixture.service.workflow.request_cancellation(context)
+    router = EventRouter()
+    observed = []
+
+    async def capture(event):
+        observed.append(event)
+
+    router.subscribe(EventScope.from_context(context), capture)
+    both_read_running = asyncio.Event()
+    arrivals = 0
+    original_load_run = PlanExecutionCoordinator._load_run
+
+    async def synchronized_load_run(self, requested_context):
+        nonlocal arrivals
+        run = await original_load_run(self, requested_context)
+        if run.status is RunStatus.RUNNING:
+            arrivals += 1
+            if arrivals == 2:
+                both_read_running.set()
+            await asyncio.wait_for(both_read_running.wait(), timeout=1)
+        return run
+
+    monkeypatch.setattr(PlanExecutionCoordinator, "_load_run", synchronized_load_run)
+    coordinators = (
+        PlanExecutionCoordinator(
+            execution_fixture.database,
+            settings=execution_fixture.settings,
+            event_router=router,
+        ),
+        PlanExecutionCoordinator(
+            execution_fixture.database,
+            settings=execution_fixture.settings,
+            event_router=router,
+        ),
+    )
+    outcomes = await asyncio.gather(
+        *(
+            coordinator._cancel_at_boundary(
+                context,
+                RunLeaseHandle(original_lease),
+            )
+            for coordinator in coordinators
+        )
+    )
+
+    assert [outcome.state for outcome in outcomes] == ["cancelled", "cancelled"]
+    assert len(observed) == 1
+    assert (await execution_fixture.latest_attempt()).status is PlanStepRunStatus.CANCELLED
+    terminal_checkpoints = [
+        checkpoint
+        for checkpoint in await execution_fixture.checkpoints()
+        if checkpoint["phase"] == CheckpointPhase.RUN_TERMINAL.value
+    ]
+    assert len(terminal_checkpoints) == 1
+
+
+@pytest.mark.asyncio
 async def test_cancellation_preserves_succeeded_attempts_and_plan_versions(
     execution_fixture,
 ):
