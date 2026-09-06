@@ -58,6 +58,7 @@ from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.repositories.plans import PlanRepository
 from multiclaw.storage.schema import (
     agent_plan_step_runs,
+    agent_plan_steps,
     agent_plans,
     agent_runs,
     execution_checkpoints,
@@ -3423,6 +3424,248 @@ async def test_mysql_plan_attempt_statements_compile_with_lock_fence_and_scope(
     assert compiled_insert.params["run_id"] == context.run_id
     assert compiled_insert.params["plan_id"] == snapshot.plan_id
     assert compiled_insert.params["plan_version"] == snapshot.current_version
+
+
+@pytest.mark.asyncio
+async def test_mysql_reused_attempt_statements_compile_with_lock_fence_and_scope(
+    execution_fixture,
+) -> None:
+    """Compile MySQL reuse locks against a real file-backed SQLite fixture."""
+    assert execution_fixture.database.engine.url.database != ":memory:"
+
+    draft = _draft(("collect",), max_attempts=2)
+    await execution_fixture.approve_chain(["collect"])
+    context = execution_fixture._context()
+    source_started = await execution_fixture.coordinator.start_next_attempt(
+        context=context,
+        lease=execution_fixture.lease,
+    )
+    assert source_started is not None
+    await execution_fixture.succeed(
+        source_started.step_run,
+        digest=hashlib.sha256(b"[]").hexdigest(),
+    )
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        original = await uow.plans.get(execution_fixture.plan_id)
+        assert original is not None
+        source_attempt = await uow.plans.step_run_by_id(
+            run_id=str(context.run_id),
+            step_run_id=source_started.step_run.step_run_id,
+        )
+        assert source_attempt is not None
+        revised = await uow.plans.append_version(
+            plan_id=original.plan_id,
+            expected_version=original.aggregate_version,
+            draft=draft,
+            parent_version=original.current_version,
+            revision_feedback="compile reused attempt locks",
+            supersedes={"collect": original.current.steps[0].step_id},
+        )
+        await uow.conn.execute(
+            update(agent_plans)
+            .where(agent_plans.c.id == revised.plan_id)
+            .values(status="approved", approved_version=revised.current_version)
+        )
+        await uow.conn.execute(
+            update(agent_runs)
+            .where(agent_runs.c.run_id == context.run_id)
+            .values(active_plan_version=revised.current_version)
+        )
+
+    async with TenantUnitOfWork(
+        execution_fixture.database,
+        context,
+        planning_settings=execution_fixture.settings.planning,
+    ) as uow:
+        recording = StatementRecordingConnection(
+            uow.conn,
+            mysql_run_id=str(context.run_id),
+        )
+        repository = PlanRepository(  # type: ignore[arg-type]
+            recording,
+            MySQLDialect(),
+            context,
+            execution_fixture.settings.planning,
+        )
+        snapshot = await repository.get(execution_fixture.plan_id)
+        assert snapshot is not None
+        reused = await repository.create_reused_step_attempt(
+            execution_fixture.lease,
+            plan_id=snapshot.plan_id,
+            plan_version=snapshot.current_version,
+            step_id=snapshot.current.steps[0].step_id,
+            source_step_run_id=source_attempt.step_run_id,
+        )
+
+    mysql_dialect = mysql.dialect()
+
+    def compiled_sql(statement: object) -> str:
+        return str(statement.compile(dialect=mysql_dialect))
+
+    def is_locked_select(statement: object, table: object) -> bool:
+        return (
+            getattr(statement, "is_select", False)
+            and getattr(statement, "_for_update_arg", None) is not None
+            and table in statement.get_final_froms()
+        )
+
+    run_lock = next(
+        statement
+        for statement in recording.statements
+        if is_locked_select(statement, agent_runs)
+        and "agent_runs.plan_id" not in compiled_sql(statement)
+    )
+    fence = next(
+        statement
+        for statement in recording.statements
+        if getattr(statement, "is_select", False)
+        and "lease_owner" in compiled_sql(statement)
+        and "lease_expires_at" in compiled_sql(statement)
+    )
+    executable_run_lock = next(
+        statement
+        for statement in recording.statements
+        if is_locked_select(statement, agent_runs)
+        and "agent_runs.plan_id" in compiled_sql(statement)
+    )
+    plan_lock = next(
+        statement
+        for statement in recording.statements
+        if is_locked_select(statement, agent_plans)
+    )
+    source_lock = next(
+        statement
+        for statement in recording.statements
+        if is_locked_select(statement, agent_plan_step_runs)
+        and source_attempt.step_run_id
+        in statement.compile(dialect=mysql_dialect).params.values()
+    )
+    readiness_lock = next(
+        statement
+        for statement in recording.statements
+        if is_locked_select(statement, agent_plan_steps)
+    )
+    target_attempts_lock = next(
+        statement
+        for statement in recording.statements
+        if is_locked_select(statement, agent_plan_step_runs)
+        and "agent_plan_step_runs.plan_version" in compiled_sql(statement)
+    )
+    insert_statement = next(
+        statement
+        for statement in recording.statements
+        if getattr(statement, "is_insert", False)
+        and statement.table is agent_plan_step_runs
+    )
+
+    run_lock_sql = compiled_sql(run_lock)
+    fence_sql = compiled_sql(fence)
+    executable_run_lock_sql = compiled_sql(executable_run_lock)
+    plan_lock_sql = compiled_sql(plan_lock)
+    source_lock_sql = compiled_sql(source_lock)
+    readiness_lock_sql = compiled_sql(readiness_lock)
+    target_attempts_lock_sql = compiled_sql(target_attempts_lock)
+    compiled_insert = insert_statement.compile(dialect=mysql_dialect)
+    insert_sql = str(compiled_insert)
+
+    assert run_lock_sql.endswith(" FOR UPDATE")
+    for column in ("tenant_id", "workspace_id", "session_id", "run_id"):
+        assert f"agent_runs.{column}" in run_lock_sql
+        assert f"agent_runs.{column}" in fence_sql
+        assert f"agent_runs.{column}" in executable_run_lock_sql
+    normalized_fence_sql = fence_sql.lower()
+    assert "unix_timestamp" in normalized_fence_sql
+    assert "current_timestamp" in normalized_fence_sql
+    assert "julianday" not in normalized_fence_sql
+    for column in ("lease_owner", "fencing_token", "version", "lease_expires_at"):
+        assert f"agent_runs.{column}" in fence_sql
+
+    assert executable_run_lock_sql.endswith(" FOR UPDATE")
+    for column in (
+        "tenant_id",
+        "workspace_id",
+        "session_id",
+        "run_id",
+        "plan_id",
+        "active_plan_version",
+        "run_status",
+    ):
+        assert f"agent_runs.{column}" in executable_run_lock_sql
+    assert plan_lock_sql.endswith(" FOR UPDATE")
+    for column in (
+        "tenant_id",
+        "workspace_id",
+        "session_id",
+        "id",
+        "status",
+        "current_version",
+        "approved_version",
+    ):
+        assert f"agent_plans.{column}" in plan_lock_sql
+
+    assert source_lock_sql.endswith(" FOR UPDATE")
+    for column in (
+        "tenant_id",
+        "workspace_id",
+        "session_id",
+        "run_id",
+        "step_run_id",
+    ):
+        assert f"agent_plan_step_runs.{column}" in source_lock_sql
+    assert readiness_lock_sql.endswith(" FOR UPDATE")
+    for column in (
+        "tenant_id",
+        "workspace_id",
+        "session_id",
+        "plan_id",
+        "plan_version",
+        "step_id",
+    ):
+        assert f"agent_plan_steps.{column}" in readiness_lock_sql
+    assert target_attempts_lock_sql.endswith(" FOR UPDATE")
+    for column in (
+        "tenant_id",
+        "workspace_id",
+        "session_id",
+        "plan_id",
+        "plan_version",
+        "run_id",
+    ):
+        assert f"agent_plan_step_runs.{column}" in target_attempts_lock_sql
+
+    assert reused.status is PlanStepRunStatus.SUCCEEDED
+    for column in (
+        "tenant_id",
+        "workspace_id",
+        "session_id",
+        "plan_id",
+        "plan_version",
+        "step_id",
+        "step_run_id",
+        "run_id",
+        "attempt",
+        "status",
+        "result_summary",
+        "result_ref",
+        "result_digest",
+        "reused_from_step_run_id",
+        "version",
+    ):
+        assert column in insert_sql
+        assert column in compiled_insert.params
+    assert compiled_insert.params["status"] == PlanStepRunStatus.SUCCEEDED.value
+    assert compiled_insert.params["attempt"] == 1
+    assert compiled_insert.params["version"] == 2
+    assert compiled_insert.params["tenant_id"] == context.tenant_id
+    assert compiled_insert.params["workspace_id"] == context.workspace_id
+    assert compiled_insert.params["session_id"] == context.session_id
+    assert compiled_insert.params["plan_id"] == snapshot.plan_id
+    assert compiled_insert.params["plan_version"] == snapshot.current_version
+    assert compiled_insert.params["run_id"] == context.run_id
+    assert compiled_insert.params["reused_from_step_run_id"] == source_attempt.step_run_id
+    assert compiled_insert.params["result_ref"] == source_attempt.result_ref
+    assert compiled_insert.params["result_digest"] == source_attempt.result_digest
+    assert compiled_insert.params["result_summary"] == source_attempt.result_summary
 
 
 @pytest.mark.skipif(not _MYSQL_URL, reason="MULTICLAW_TEST_MYSQL_URL is not configured")
