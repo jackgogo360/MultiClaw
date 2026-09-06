@@ -697,11 +697,11 @@ async def _approved_plan_tool_boundary(
     database: Database,
     *,
     approval_status: ApprovalStatus = ApprovalStatus.APPROVED,
-    result: ToolExecutionResult | None = None,
+    tool_result: ToolExecutionResult | None = None,
     builder_type: type[_ObservedToolBuilder] = _ApprovedPlanToolBuilder,
 ):
-    settings, context, service, result = await _materialized(database)
-    decision = await _approve(service, context, result)
+    settings, context, service, materialized = await _materialized(database)
+    decision = await _approve(service, context, materialized)
     assert decision.lease is not None
     running_lease = await service.workflow.transition_run(
         decision.lease,
@@ -714,7 +714,7 @@ async def _approved_plan_tool_boundary(
     )
     assert started is not None
     effects: dict[str, int] = {}
-    builder = builder_type(effects, result=result)
+    builder = builder_type(effects, result=tool_result)
     scheduler = _approval_scheduler(database, settings)
     approval = await scheduler.run(
         builder,
@@ -975,7 +975,11 @@ async def test_approved_plan_tool_resolution_resumes_plan_without_generic_recove
         assert len(runtime.agent.plan_calls) == 1
         assert run.status is RunStatus.COMPLETED
         assert await _execution_count(database, context) == 1
+        assert await _execution_status(database, context) is ExecutionStatus.SUCCEEDED
         assert await _step_attempt_count(database, context) == 1
+        recovered_result, _ = runtime.agent.plan_calls[0]
+        assert recovered_result is not None
+        assert recovered_result.content == "durable external result"
         async with TenantUnitOfWork(database, context) as uow:
             attempts = await uow.plans.running_step_attempts(run_id=str(context.run_id))
         assert attempts == ()
@@ -1042,7 +1046,7 @@ async def test_erroring_approved_plan_tool_resumes_plan_without_generic_recovery
     try:
         settings, context, service, effects, builder, scheduler = await _approved_plan_tool_boundary(
             database,
-            result=ToolExecutionResult(status=ToolStatus.ERROR, content="approved tool failed"),
+            tool_result=ToolExecutionResult(status=ToolStatus.ERROR, content="approved tool failed"),
             builder_type=_ErroringApprovedPlanToolBuilder,
         )
         runtime = _ObservedRuntime(
@@ -1068,7 +1072,7 @@ async def test_erroring_approved_plan_tool_resumes_plan_without_generic_recovery
             effects=effects,
             expected_effects={"observed-key": 1},
             expected_execution_status=ExecutionStatus.FAILED_TERMINAL,
-            expected_result_content="tool execution failed",
+            expected_result_content="approved tool failed",
         )
     finally:
         await database.dispose()
