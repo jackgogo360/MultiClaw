@@ -517,12 +517,35 @@ class _ErroringApprovedPlanToolBuilder(_ObservedToolBuilder):
     name = "approved_plan_effect"
 
 
+class _ObservedSummaryRouter:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def completion(self, **kwargs):
+        self.calls.append(kwargs)
+        assert kwargs["tools"] is None
+        messages = kwargs["messages"]
+        assert isinstance(messages, list) and len(messages) == 2
+        assert messages[0]["role"] == "system"
+        summary_input = json.loads(messages[1]["content"])
+        assert set(summary_input) == {"objective", "step_summaries"}
+        assert isinstance(summary_input["objective"], str)
+        assert isinstance(summary_input["step_summaries"], list)
+        assert len(summary_input["step_summaries"]) == 1
+        assert set(summary_input["step_summaries"][0]) == {
+            "logical_step_key",
+            "summary",
+        }
+        return SimpleNamespace(content="Observed durable Plan summary.")
+
+
 class _ObservedPlanAgent:
     def __init__(self, database: Database, settings: Settings) -> None:
         self.database = database
         self.settings = settings
         self.registry = ToolRegistry()
         self.skill_manager = SimpleNamespace(active_skills=())
+        self.router = _ObservedSummaryRouter()
         self.plan_calls: list[tuple[object, object]] = []
         self.generic_recovery_calls = 0
 
@@ -864,6 +887,17 @@ async def _terminal_checkpoint_count(database: Database, context: TenantContext)
     return int(result or 0)
 
 
+async def _final_summary_count(database: Database, context: TenantContext) -> int:
+    async with TenantUnitOfWork(database, context) as uow:
+        messages = await uow.memory.recent(limit=100, entry_type="chat_message")
+    return sum(
+        message.role == "assistant"
+        and message.metadata.get("kind") == "plan_final_summary"
+        and message.metadata.get("run_id") == context.run_id
+        for message in messages
+    )
+
+
 async def _execution_status(database: Database, context: TenantContext) -> ExecutionStatus:
     async with database.connect() as conn:
         status = await conn.scalar(
@@ -897,6 +931,8 @@ async def _assert_terminal_plan_recovery(
     assert await _execution_status(database, context) is expected_execution_status
     assert runtime.agent.generic_recovery_calls == 0
     assert len(runtime.agent.plan_calls) == 1
+    assert len(runtime.agent.router.calls) == 1
+    assert await _final_summary_count(database, context) == 1
     recovered_result, _ = runtime.agent.plan_calls[0]
     assert recovered_result is not None
     assert recovered_result.content == expected_result_content
@@ -908,6 +944,8 @@ async def _assert_terminal_plan_recovery(
 
     assert effects == expected_effects
     assert len(runtime.agent.plan_calls) == 1
+    assert len(runtime.agent.router.calls) == 1
+    assert await _final_summary_count(database, context) == 1
     assert runtime.begin_calls == runtime.closed_leases == pool.acquire_calls == 1
 
 
@@ -973,7 +1011,9 @@ async def test_approved_plan_tool_resolution_resumes_plan_without_generic_recove
         assert effects == {"observed-key": 1}
         assert runtime.agent.generic_recovery_calls == 0
         assert len(runtime.agent.plan_calls) == 1
+        assert len(runtime.agent.router.calls) == 1
         assert run.status is RunStatus.COMPLETED
+        assert await _final_summary_count(database, context) == 1
         assert await _execution_count(database, context) == 1
         assert await _execution_status(database, context) is ExecutionStatus.SUCCEEDED
         assert await _step_attempt_count(database, context) == 1
@@ -988,6 +1028,8 @@ async def test_approved_plan_tool_resolution_resumes_plan_without_generic_recove
 
         assert effects == {"observed-key": 1}
         assert len(runtime.agent.plan_calls) == 1
+        assert len(runtime.agent.router.calls) == 1
+        assert await _final_summary_count(database, context) == 1
     finally:
         await database.dispose()
 
