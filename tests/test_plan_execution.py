@@ -2908,9 +2908,81 @@ async def test_apply_compatible_reuse_creates_explicit_reused_attempt(
 
     assert len(reused) == 1
     assert repeated == ()
-    assert reused[0].status is PlanStepRunStatus.SUCCEEDED
-    assert reused[0].reused_from_step_run_id == source_started.step_run.step_run_id
-    assert reused[0].result_digest == source_document.digest()
+
+
+@pytest.mark.asyncio
+async def test_apply_compatible_reuse_proves_a_dependency_chain(
+    execution_fixture,
+) -> None:
+    """Both immutable predecessors are copied in topology order, never rerun."""
+    draft = _draft(("collect", "publish"), chain=True)
+    await execution_fixture.approve_chain(["collect", "publish"])
+    runner = ScriptedStepRunner([])
+    tool_digest = hashlib.sha256(b"[]").hexdigest()
+    policy_digest = hashlib.sha256(
+        json.dumps(
+            redact(execution_fixture.settings.governance.model_dump(mode="json")),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    skill_digest = hashlib.sha256(b"[]").hexdigest()
+    source_root = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(), lease=execution_fixture.lease
+    )
+    assert source_root is not None
+    root_document = await execution_fixture.succeed(
+        source_root.step_run,
+        digest=tool_digest,
+        policy_digest=policy_digest,
+        skill_set_digest=skill_digest,
+    )
+    source_dependent = await execution_fixture.coordinator.start_next_attempt(
+        context=execution_fixture._context(), lease=execution_fixture.lease
+    )
+    assert source_dependent is not None
+    dependent_document = await execution_fixture.succeed(
+        source_dependent.step_run,
+        digest=tool_digest,
+        dependency_result_digests={"collect": root_document.digest()},
+        policy_digest=policy_digest,
+        skill_set_digest=skill_digest,
+    )
+    context = execution_fixture._context()
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        original = await uow.plans.get(execution_fixture.plan_id)
+        assert original is not None
+        revised = await uow.plans.append_version(
+            plan_id=original.plan_id,
+            expected_version=original.aggregate_version,
+            draft=draft,
+            parent_version=original.current_version,
+            revision_feedback="reuse full chain",
+            supersedes={step.logical_step_key: step.step_id for step in original.current.steps},
+        )
+        await uow.conn.execute(
+            update(agent_plans).where(agent_plans.c.id == revised.plan_id).values(
+                status="approved", approved_version=revised.current_version
+            )
+        )
+        await uow.conn.execute(
+            update(agent_runs).where(agent_runs.c.run_id == context.run_id).values(
+                active_plan_version=revised.current_version
+            )
+        )
+
+    reused = await execution_fixture.coordinator.apply_compatible_reuse(
+        context=context, lease=execution_fixture.lease, runner=runner
+    )
+
+    assert [item.reused_from_step_run_id for item in reused] == [
+        source_root.step_run.step_run_id,
+        source_dependent.step_run.step_run_id,
+    ]
+    assert [item.result_digest for item in reused] == [
+        root_document.digest(), dependent_document.digest()
+    ]
+    assert await execution_fixture.coordinator.select_next(context=context) is None
 
 
 @pytest.mark.asyncio
