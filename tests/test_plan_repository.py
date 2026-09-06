@@ -3920,3 +3920,67 @@ async def test_create_reused_step_attempt_rejects_non_executable_run_without_wri
             await uow.plans.create_reused_step_attempt(lease, plan_id=snapshot.plan_id, plan_version=2, step_id=target.step_id, source_step_run_id=str(uuid4()))
         after = await uow.plans.step_attempts(plan_id=snapshot.plan_id, plan_version=2, run_id=run_id, step_id=target.step_id)
     assert before == after == ()
+
+
+@pytest.mark.asyncio
+async def test_create_reused_step_attempt_rejects_active_version_mismatch_before_source_lookup(
+    plan_database, seeded_revised_plan,
+):
+    context = seeded_revised_plan.context
+    async with TenantUnitOfWork(plan_database, context) as uow:
+        snapshot = await uow.plans.get(seeded_revised_plan.plan_id)
+        assert snapshot is not None
+        run_id = str(uuid4())
+        await uow.conn.execute(update(agent_plans).where(agent_plans.c.id == snapshot.plan_id).values(status="approved", approved_version=2))
+        await uow.conn.execute(insert(agent_runs).values(run_id=run_id, tenant_id=context.tenant_id, workspace_id=context.workspace_id, session_id=context.session_id, plan_id=snapshot.plan_id, initial_plan_version=1, active_plan_version=1, cancel_requested_at=None, run_status="running", runtime_instance_id="runtime-a", lease_owner="runtime-a", fencing_token=1, lease_expires_at=9_999_999_999_999, heartbeat_at=1, schema_version=1, version=1, created_at=1, updated_at=1, finished_at=None))
+        target = snapshot.current.steps[0]
+        before = await uow.plans.step_attempts(plan_id=snapshot.plan_id, plan_version=2, run_id=run_id, step_id=target.step_id)
+        lease = RunLease(context=context.for_run(context.session_id, run_id), lease_owner="runtime-a", fencing_token=1, version=1, lease_expires_at=9_999_999_999_999)
+        with pytest.raises(PlanExecutionBlocked, match="approved current active version"):
+            await uow.plans.create_reused_step_attempt(lease, plan_id=snapshot.plan_id, plan_version=2, step_id=target.step_id, source_step_run_id=str(uuid4()))
+        after = await uow.plans.step_attempts(plan_id=snapshot.plan_id, plan_version=2, run_id=run_id, step_id=target.step_id)
+    assert before == after == ()
+
+
+@pytest.mark.asyncio
+async def test_create_reused_step_attempt_rejects_requested_version_mismatch_without_writes(
+    plan_database, seeded_revised_plan,
+):
+    context = seeded_revised_plan.context
+    async with TenantUnitOfWork(plan_database, context) as uow:
+        snapshot = await uow.plans.get(seeded_revised_plan.plan_id)
+        assert snapshot is not None
+        run_id = str(uuid4())
+        await uow.conn.execute(update(agent_plans).where(agent_plans.c.id == snapshot.plan_id).values(status="approved", approved_version=2))
+        await uow.conn.execute(insert(agent_runs).values(run_id=run_id, tenant_id=context.tenant_id, workspace_id=context.workspace_id, session_id=context.session_id, plan_id=snapshot.plan_id, initial_plan_version=1, active_plan_version=2, cancel_requested_at=None, run_status="running", runtime_instance_id="runtime-a", lease_owner="runtime-a", fencing_token=1, lease_expires_at=9_999_999_999_999, heartbeat_at=1, schema_version=1, version=1, created_at=1, updated_at=1, finished_at=None))
+        v1_target, v2_target = snapshot.versions[0].steps[0], snapshot.current.steps[0]
+        before_v1 = await uow.plans.step_attempts(plan_id=snapshot.plan_id, plan_version=1, run_id=run_id, step_id=v1_target.step_id)
+        before_v2 = await uow.plans.step_attempts(plan_id=snapshot.plan_id, plan_version=2, run_id=run_id, step_id=v2_target.step_id)
+        lease = RunLease(context=context.for_run(context.session_id, run_id), lease_owner="runtime-a", fencing_token=1, version=1, lease_expires_at=9_999_999_999_999)
+        with pytest.raises(PlanExecutionBlocked, match="approved current active version"):
+            await uow.plans.create_reused_step_attempt(lease, plan_id=snapshot.plan_id, plan_version=1, step_id=v1_target.step_id, source_step_run_id=str(uuid4()))
+        after_v1 = await uow.plans.step_attempts(plan_id=snapshot.plan_id, plan_version=1, run_id=run_id, step_id=v1_target.step_id)
+        after_v2 = await uow.plans.step_attempts(plan_id=snapshot.plan_id, plan_version=2, run_id=run_id, step_id=v2_target.step_id)
+    assert before_v1 == after_v1 == () and before_v2 == after_v2 == ()
+
+
+@pytest.mark.asyncio
+async def test_create_reused_step_attempt_rejects_source_step_as_v2_target_without_writes(
+    plan_database, seeded_revised_plan,
+):
+    context = seeded_revised_plan.context
+    async with TenantUnitOfWork(plan_database, context) as uow:
+        snapshot = await uow.plans.get(seeded_revised_plan.plan_id)
+        assert snapshot is not None
+        run_id, source_id = str(uuid4()), str(uuid4())
+        source_step = snapshot.versions[0].steps[0]
+        await uow.conn.execute(update(agent_plans).where(agent_plans.c.id == snapshot.plan_id).values(status="approved", approved_version=2))
+        await uow.conn.execute(insert(agent_runs).values(run_id=run_id, tenant_id=context.tenant_id, workspace_id=context.workspace_id, session_id=context.session_id, plan_id=snapshot.plan_id, initial_plan_version=1, active_plan_version=2, cancel_requested_at=None, run_status="running", runtime_instance_id="runtime-a", lease_owner="runtime-a", fencing_token=1, lease_expires_at=9_999_999_999_999, heartbeat_at=1, schema_version=1, version=1, created_at=1, updated_at=1, finished_at=None))
+        await uow.conn.execute(insert(agent_plan_step_runs).values(tenant_id=context.tenant_id, workspace_id=context.workspace_id, session_id=context.session_id, plan_id=snapshot.plan_id, plan_version=1, step_id=source_step.step_id, step_run_id=source_id, run_id=run_id, attempt=1, status="succeeded", result_summary="source", result_ref="memory:source", result_digest="a" * 64, error_code=None, error_detail_redacted=None, reused_from_step_run_id=None, version=2, started_at=1, finished_at=2))
+        lease = RunLease(context=context.for_run(context.session_id, run_id), lease_owner="runtime-a", fencing_token=1, version=1, lease_expires_at=9_999_999_999_999)
+        source_before = await uow.plans.step_run_by_id(run_id=run_id, step_run_id=source_id)
+        with pytest.raises(PlanExecutionBlocked, match="active version"):
+            await uow.plans.create_reused_step_attempt(lease, plan_id=snapshot.plan_id, plan_version=2, step_id=source_step.step_id, source_step_run_id=source_id)
+        source_after = await uow.plans.step_run_by_id(run_id=run_id, step_run_id=source_id)
+        v2 = await uow.plans.latest_step_attempts(plan_id=snapshot.plan_id, plan_version=2, run_id=run_id)
+    assert source_after == source_before and v2 == {}
