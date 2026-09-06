@@ -131,9 +131,13 @@ def can_reuse_result(
     ):
         return False
     if (
-        source_result.run_id != current_run_id
+        source_result.plan_id != source_run.plan_id
+        or source_result.plan_version != source_run.plan_version
+        or source_result.run_id != current_run_id
         or source_result.step_id != source_step.step_id
         or source_result.step_run_id != source_run.step_run_id
+        or source_result.attempt != source_run.attempt
+        or source_result.status != "succeeded"
         or source_result.definition_digest != source_step.definition_digest
         or source_run.result_digest != source_result.digest()
         or source_run.result_summary != source_result.summary
@@ -160,15 +164,25 @@ def can_reuse_result(
             or proof.source_run.run_id != current_run_id
             or proof.source_run.status is not PlanStepRunStatus.SUCCEEDED
             or proof.source_run.reused_from_step_run_id is not None
+            or proof.source_result.plan_id != proof.source_run.plan_id
+            or proof.source_result.plan_version != proof.source_run.plan_version
             or proof.source_result.run_id != current_run_id
             or proof.source_result.step_id != proof.source_step.step_id
             or proof.source_result.step_run_id != proof.source_run.step_run_id
+            or proof.source_result.attempt != proof.source_run.attempt
+            or proof.source_result.status != "succeeded"
             or proof.source_result.definition_digest != proof.source_step.definition_digest
             or proof.source_run.result_digest != expected
+            or proof.source_run.result_summary != proof.source_result.summary
+            or proof.source_run.result_ref is None
             or proof.source_result.digest() != expected
+            or proof.reused_run.plan_id != proof.source_run.plan_id
+            or proof.reused_run.run_id != current_run_id
             or proof.reused_run.reused_from_step_run_id != proof.source_run.step_run_id
             or proof.reused_run.status is not PlanStepRunStatus.SUCCEEDED
+            or proof.reused_run.result_ref != proof.source_run.result_ref
             or proof.reused_run.result_digest != expected
+            or proof.reused_run.result_summary != proof.source_result.summary
         ):
             return False
     return True
@@ -342,7 +356,7 @@ class PlanExecutionCoordinator:
                 )
                 source_run = source_latest.get(source_step.step_id)
                 source_result = await self._reuse_document(
-                    uow.memory, context, source_run
+                    uow.memory, context, source_run, source_step
                 )
                 proofs: dict[str, DependencyReuseProof] = {}
                 valid_dependencies = True
@@ -366,7 +380,10 @@ class PlanExecutionCoordinator:
                         break
                     _, source_dependency_step = source_dependency_item
                     source_dependency_document = await self._reuse_document(
-                        uow.memory, context, source_dependency
+                        uow.memory,
+                        context,
+                        source_dependency,
+                        source_dependency_step,
                     )
                     if source_dependency_document is None:
                         valid_dependencies = False
@@ -412,19 +429,53 @@ class PlanExecutionCoordinator:
         memory: MemoryRepository,
         context: TenantContext,
         attempt: PlanStepRunRecord | None,
+        step: PlanStepRecord,
     ) -> PlanStepResultDocument | None:
-        if attempt is None or attempt.result_ref is None:
+        if (
+            attempt is None
+            or attempt.status is not PlanStepRunStatus.SUCCEEDED
+            or attempt.result_ref is None
+            or attempt.result_digest is None
+            or attempt.result_summary is None
+        ):
             return None
         match = _RESULT_REF.fullmatch(attempt.result_ref)
         if match is None:
             return None
         entry = await memory.get(match.group(1), context.session_id, for_update=True)
-        if entry is None:
+        if (
+            entry is None
+            or entry.type != "plan_step_result"
+            or entry.role != "assistant"
+            or entry.metadata.get("schema_version") != 1
+            or entry.metadata.get("plan_id") != attempt.plan_id
+            or entry.metadata.get("step_run_id") != attempt.step_run_id
+        ):
             return None
         try:
-            return PlanStepResultDocument.model_validate_json(entry.content)
+            content_bytes = entry.content.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        if len(content_bytes) > MAX_PLAN_STEP_RESULT_BYTES:
+            return None
+        try:
+            document = PlanStepResultDocument.model_validate_json(content_bytes)
         except ValidationError:
             return None
+        if (
+            document.plan_id != attempt.plan_id
+            or document.plan_version != attempt.plan_version
+            or document.run_id != attempt.run_id
+            or document.step_id != attempt.step_id
+            or document.step_run_id != attempt.step_run_id
+            or document.attempt != attempt.attempt
+            or document.status != "succeeded"
+            or document.definition_digest != step.definition_digest
+            or document.digest() != attempt.result_digest
+            or document.summary != attempt.result_summary
+        ):
+            return None
+        return document
 
     async def execute_to_boundary(
         self,

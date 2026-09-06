@@ -5,7 +5,7 @@ import hashlib
 import inspect
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import get_args
 from unittest.mock import AsyncMock
@@ -25,6 +25,7 @@ from multiclaw.config.settings import DatabaseSettings, Settings
 from multiclaw.llm import LLMResponse, ToolCall
 from multiclaw.memory import MemoryEntry
 from multiclaw.planner.execution import (
+    DependencyReuseProof,
     PlanExecutionCoordinator,
     can_reuse_result,
     choose_ready_step,
@@ -2544,6 +2545,203 @@ def test_reuse_requires_a_complete_source_proof() -> None:
     )
 
 
+def _complete_reuse_proof() -> dict[str, object]:
+    plan_id = str(uuid4())
+    run_id = str(uuid4())
+    source_step = PlanStepRecord(
+        step_id=str(uuid4()),
+        logical_step_key="collect",
+        supersedes_step_id=None,
+        ordinal=1,
+        title="Collect",
+        description="Collect immutable evidence.",
+        expected_outcome="Evidence is collected.",
+        assigned_agent_profile_id=None,
+        max_attempts=2,
+        definition_digest="a" * 64,
+    )
+    new_step = replace(source_step, step_id=str(uuid4()), supersedes_step_id=source_step.step_id)
+    source_run = PlanStepRunRecord(
+        step_run_id=str(uuid4()),
+        run_id=run_id,
+        plan_id=plan_id,
+        plan_version=1,
+        step_id=source_step.step_id,
+        attempt=1,
+        status=PlanStepRunStatus.SUCCEEDED,
+        result_summary="collect complete",
+        result_ref=f"memory:{uuid4()}",
+        result_digest=None,
+        error_code=None,
+        error_detail_redacted=None,
+        reused_from_step_run_id=None,
+        version=2,
+        started_at=1,
+        finished_at=1,
+    )
+    source_document = PlanStepResultDocument(
+        plan_id=plan_id,
+        plan_version=source_run.plan_version,
+        run_id=run_id,
+        step_id=source_step.step_id,
+        step_run_id=source_run.step_run_id,
+        attempt=source_run.attempt,
+        status="succeeded",
+        summary=source_run.result_summary,
+        evidence=[],
+        definition_digest=source_step.definition_digest,
+        dependency_result_digests={},
+        tool_catalog_digest="b" * 64,
+        policy_digest="c" * 64,
+        skill_set_digest="d" * 64,
+    )
+    return {
+        "current_run_id": run_id,
+        "new_step": new_step,
+        "source_step": source_step,
+        "source_run": replace(source_run, result_digest=source_document.digest()),
+        "source_result": source_document,
+        "new_dependency_ids": frozenset(),
+        "dependency_proofs": {},
+        "current_tool_catalog_digest": source_document.tool_catalog_digest,
+        "current_policy_digest": source_document.policy_digest,
+        "current_skill_set_digest": source_document.skill_set_digest,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("plan_id", str(uuid4())),
+        ("plan_version", 2),
+        ("attempt", 2),
+        ("status", "failed"),
+    ),
+)
+def test_reuse_rejects_source_document_identity_mismatch(
+    field: str,
+    value: str | int,
+) -> None:
+    inputs = _complete_reuse_proof()
+    assert can_reuse_result(**inputs)
+    source_document = inputs["source_result"]
+    assert isinstance(source_document, PlanStepResultDocument)
+    mutated_document = source_document.model_copy(update={field: value})
+    source_run = inputs["source_run"]
+    assert isinstance(source_run, PlanStepRunRecord)
+    inputs["source_result"] = mutated_document
+    inputs["source_run"] = replace(source_run, result_digest=mutated_document.digest())
+
+    assert not can_reuse_result(**inputs)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("plan_id", str(uuid4())),
+        ("plan_version", 2),
+        ("attempt", 2),
+        ("status", "failed"),
+    ),
+)
+def test_reuse_rejects_dependency_document_identity_mismatch(
+    field: str,
+    value: str | int,
+) -> None:
+    inputs = _complete_reuse_proof()
+    source_step = inputs["source_step"]
+    source_run = inputs["source_run"]
+    source_document = inputs["source_result"]
+    new_step = inputs["new_step"]
+    assert isinstance(source_step, PlanStepRecord)
+    assert isinstance(source_run, PlanStepRunRecord)
+    assert isinstance(source_document, PlanStepResultDocument)
+    assert isinstance(new_step, PlanStepRecord)
+    dependency_source_step = replace(
+        source_step,
+        step_id=str(uuid4()),
+        logical_step_key="prepare",
+    )
+    dependency_new_step = replace(
+        dependency_source_step,
+        step_id=str(uuid4()),
+        supersedes_step_id=dependency_source_step.step_id,
+    )
+    dependency_source_run = replace(
+        source_run,
+        step_run_id=str(uuid4()),
+        step_id=dependency_source_step.step_id,
+        result_summary="prepare complete",
+        result_ref=f"memory:{uuid4()}",
+    )
+    dependency_document = source_document.model_copy(
+        update={
+            "step_id": dependency_source_step.step_id,
+            "step_run_id": dependency_source_run.step_run_id,
+            "summary": dependency_source_run.result_summary,
+        }
+    )
+    dependency_source_run = replace(
+        dependency_source_run,
+        result_digest=dependency_document.digest(),
+    )
+    reused_dependency = replace(
+        dependency_source_run,
+        step_run_id=str(uuid4()),
+        plan_version=2,
+        step_id=dependency_new_step.step_id,
+        reused_from_step_run_id=dependency_source_run.step_run_id,
+    )
+    source_document = source_document.model_copy(
+        update={
+            "dependency_result_digests": {
+                dependency_new_step.logical_step_key: dependency_document.digest()
+            }
+        }
+    )
+    inputs["source_result"] = source_document
+    inputs["source_run"] = replace(source_run, result_digest=source_document.digest())
+    inputs["new_dependency_ids"] = frozenset({dependency_new_step.step_id})
+    inputs["dependency_proofs"] = {
+        dependency_new_step.logical_step_key: DependencyReuseProof(
+            new_step=dependency_new_step,
+            reused_run=reused_dependency,
+            source_step=dependency_source_step,
+            source_run=dependency_source_run,
+            source_result=dependency_document,
+        )
+    }
+    assert can_reuse_result(**inputs)
+
+    mutated_dependency = dependency_document.model_copy(update={field: value})
+    mutated_source = source_document.model_copy(
+        update={
+            "dependency_result_digests": {
+                dependency_new_step.logical_step_key: mutated_dependency.digest()
+            }
+        }
+    )
+    inputs["source_result"] = mutated_source
+    inputs["source_run"] = replace(source_run, result_digest=mutated_source.digest())
+    inputs["dependency_proofs"] = {
+        dependency_new_step.logical_step_key: DependencyReuseProof(
+            new_step=dependency_new_step,
+            reused_run=replace(
+                reused_dependency,
+                result_digest=mutated_dependency.digest(),
+            ),
+            source_step=dependency_source_step,
+            source_run=replace(
+                dependency_source_run,
+                result_digest=mutated_dependency.digest(),
+            ),
+            source_result=mutated_dependency,
+        )
+    }
+
+    assert not can_reuse_result(**inputs)
+
+
 @pytest.mark.asyncio
 async def test_copied_reuse_lineage_is_accepted_as_dependency_evidence(
     execution_fixture,
@@ -3036,6 +3234,189 @@ async def test_apply_compatible_reuse_concurrently_creates_one_durable_fact(
     assert await execution_fixture.load_result(source_attempt_after.result_ref) == (
         source_document_before
     )
+
+
+async def _prepare_compatible_single_step_reuse(execution_fixture):
+    draft = _draft(("collect",), max_attempts=2)
+    await execution_fixture.approve_chain(["collect"])
+    runner = ScriptedStepRunner([])
+    tool_digest = hashlib.sha256(b"[]").hexdigest()
+    policy_digest = hashlib.sha256(
+        json.dumps(
+            redact(execution_fixture.settings.governance.model_dump(mode="json")),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    skill_digest = hashlib.sha256(b"[]").hexdigest()
+    context = execution_fixture._context()
+    source_started = await execution_fixture.coordinator.start_next_attempt(
+        context=context,
+        lease=execution_fixture.lease,
+    )
+    assert source_started is not None
+    source_document = await execution_fixture.succeed(
+        source_started.step_run,
+        digest=tool_digest,
+        policy_digest=policy_digest,
+        skill_set_digest=skill_digest,
+    )
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        original = await uow.plans.get(execution_fixture.plan_id)
+        assert original is not None
+        source_attempt = await uow.plans.step_run_by_id(
+            run_id=str(context.run_id),
+            step_run_id=source_started.step_run.step_run_id,
+        )
+        assert source_attempt is not None
+        revised = await uow.plans.append_version(
+            plan_id=original.plan_id,
+            expected_version=original.aggregate_version,
+            draft=draft,
+            parent_version=original.current_version,
+            revision_feedback="compatible source result",
+            supersedes={"collect": original.current.steps[0].step_id},
+        )
+        await uow.conn.execute(
+            update(agent_plans)
+            .where(agent_plans.c.id == revised.plan_id)
+            .values(status="approved", approved_version=revised.current_version)
+        )
+        await uow.conn.execute(
+            update(agent_runs)
+            .where(agent_runs.c.run_id == context.run_id)
+            .values(active_plan_version=revised.current_version)
+        )
+    return context, source_attempt, source_document, runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("plan_id", str(uuid4())),
+        ("plan_version", 2),
+        ("attempt", 2),
+        ("status", "failed"),
+    ),
+)
+async def test_apply_compatible_reuse_rejects_forged_source_document_identity(
+    execution_fixture,
+    field: str,
+    value: str | int,
+) -> None:
+    context, source_attempt, source_document, runner = (
+        await _prepare_compatible_single_step_reuse(execution_fixture)
+    )
+    forged_document = source_document.model_copy(update={field: value})
+    assert source_attempt.result_ref is not None
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        await uow.conn.execute(
+            update(memory_entries)
+            .where(
+                memory_entries.c.tenant_id == context.tenant_id,
+                memory_entries.c.workspace_id == context.workspace_id,
+                memory_entries.c.session_id == context.session_id,
+                memory_entries.c.id == source_attempt.result_ref.removeprefix("memory:"),
+            )
+            .values(content=forged_document.canonical_json())
+        )
+        await uow.conn.execute(
+            update(agent_plan_step_runs)
+            .where(
+                agent_plan_step_runs.c.tenant_id == context.tenant_id,
+                agent_plan_step_runs.c.workspace_id == context.workspace_id,
+                agent_plan_step_runs.c.session_id == context.session_id,
+                agent_plan_step_runs.c.run_id == context.run_id,
+                agent_plan_step_runs.c.step_run_id == source_attempt.step_run_id,
+            )
+            .values(
+                result_digest=forged_document.digest(),
+                result_summary=forged_document.summary,
+            )
+        )
+
+    reused = await execution_fixture.coordinator.apply_compatible_reuse(
+        context=context,
+        lease=execution_fixture.lease,
+        runner=runner,
+    )
+    assert reused == ()
+    assert await execution_fixture.all_attempts() == ()
+    started = await execution_fixture.coordinator.start_next_attempt(
+        context=context,
+        lease=execution_fixture.lease,
+    )
+
+    assert started is not None
+    assert started.step.logical_step_key == "collect"
+    assert started.step_run.reused_from_step_run_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("schema_version", 2),
+        ("plan_id", str(uuid4())),
+        ("step_run_id", str(uuid4())),
+        ("type", "note"),
+        ("role", "user"),
+    ),
+)
+async def test_apply_compatible_reuse_rejects_untrusted_source_memory_entry(
+    execution_fixture,
+    field: str,
+    value: str | int,
+) -> None:
+    context, source_attempt, _, runner = await _prepare_compatible_single_step_reuse(
+        execution_fixture
+    )
+    assert source_attempt.result_ref is not None
+    entry_values: dict[str, object]
+    if field in {"schema_version", "plan_id", "step_run_id"}:
+        metadata = {
+            "schema_version": 1,
+            "plan_id": source_attempt.plan_id,
+            "step_run_id": source_attempt.step_run_id,
+        }
+        metadata[field] = value
+        entry_values = {
+            "metadata_json": json.dumps(
+                metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        }
+    else:
+        entry_values = {field: value}
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        await uow.conn.execute(
+            update(memory_entries)
+            .where(
+                memory_entries.c.tenant_id == context.tenant_id,
+                memory_entries.c.workspace_id == context.workspace_id,
+                memory_entries.c.session_id == context.session_id,
+                memory_entries.c.id == source_attempt.result_ref.removeprefix("memory:"),
+            )
+            .values(**entry_values)
+        )
+
+    reused = await execution_fixture.coordinator.apply_compatible_reuse(
+        context=context,
+        lease=execution_fixture.lease,
+        runner=runner,
+    )
+    assert reused == ()
+    assert await execution_fixture.all_attempts() == ()
+    started = await execution_fixture.coordinator.start_next_attempt(
+        context=context,
+        lease=execution_fixture.lease,
+    )
+
+    assert started is not None
+    assert started.step.logical_step_key == "collect"
+    assert started.step_run.reused_from_step_run_id is None
 
 
 @pytest.mark.asyncio
