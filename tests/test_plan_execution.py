@@ -2908,6 +2908,25 @@ async def test_apply_compatible_reuse_creates_explicit_reused_attempt(
 
     assert len(reused) == 1
     assert repeated == ()
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        current = await uow.plans.get(execution_fixture.plan_id)
+        assert current is not None
+        target_attempts = await uow.plans.step_attempts(
+            plan_id=current.plan_id,
+            plan_version=current.current_version,
+            run_id=str(context.run_id),
+            step_id=current.current.steps[0].step_id,
+        )
+        source_attempts = await uow.plans.step_attempts(
+            plan_id=current.plan_id,
+            plan_version=1,
+            run_id=str(context.run_id),
+            step_id=current.versions[0].steps[0].step_id,
+        )
+    assert len(target_attempts) == len(source_attempts) == 1
+    assert target_attempts[0] == reused[0]
+    assert target_attempts[0].reused_from_step_run_id == source_attempts[0].step_run_id
+    assert (target_attempts[0].result_ref, target_attempts[0].result_digest, target_attempts[0].result_summary) == (source_attempts[0].result_ref, source_attempts[0].result_digest, source_attempts[0].result_summary)
 
 
 @pytest.mark.asyncio
