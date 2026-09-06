@@ -898,6 +898,12 @@ class WorkflowRecoveryWorker:
                 status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
                 detail=content,
             )
+            if await self._consume_plan_terminal_result(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+            ):
+                return True
             await self._invoke_continuation(
                 runtime=runtime,
                 context=context,
@@ -922,6 +928,11 @@ class WorkflowRecoveryWorker:
                 status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
                 detail="missing builder during recovery",
             )
+            await self._consume_plan_terminal_result(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+            )
             return True
         await runtime.scheduler.recover_execution(
             builder=builder,
@@ -932,6 +943,20 @@ class WorkflowRecoveryWorker:
             force_execute=True,
         )
         refreshed = await coordinator.get_execution_recovery(context, execution.execution_id)
+        if refreshed is not None and refreshed.status in {
+            ExecutionStatus.SUCCEEDED,
+            ExecutionStatus.FAILED_TERMINAL,
+            ExecutionStatus.UNCERTAIN,
+            ExecutionStatus.BLOCKED_CORRUPT,
+            ExecutionStatus.BLOCKED_INCOMPATIBLE,
+        }:
+            plan_result_consumed = await self._consume_plan_terminal_result(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+            )
+            if plan_result_consumed:
+                return True
         if refreshed is not None and refreshed.status in {
             ExecutionStatus.BLOCKED_CORRUPT,
             ExecutionStatus.BLOCKED_INCOMPATIBLE,
@@ -956,6 +981,35 @@ class WorkflowRecoveryWorker:
                 run_lease_handle=run_lease_handle,
                 outcome=outcome,
             )
+        return True
+
+    async def _consume_plan_terminal_result(
+        self,
+        *,
+        runtime,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+    ) -> bool:
+        outcome = await self._recovery_service.validate_live_run(context)
+        if outcome.status in {
+            RunStatus.BLOCKED_CORRUPT,
+            RunStatus.BLOCKED_INCOMPATIBLE,
+        }:
+            await self._consume_outcome(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+                outcome=outcome,
+            )
+            return True
+        if outcome.plan_recovery_context is None:
+            return False
+        await self._consume_outcome(
+            runtime=runtime,
+            context=context,
+            run_lease_handle=run_lease_handle,
+            outcome=outcome,
+        )
         return True
 
     async def _consume_outcome(
@@ -1031,6 +1085,13 @@ class WorkflowRecoveryWorker:
                 action=outcome.action,
                 run_lease_handle=run_lease_handle,
             )
+            if outcome.plan_recovery_context is not None:
+                await self._consume_plan_terminal_result(
+                    runtime=runtime,
+                    context=context,
+                    run_lease_handle=run_lease_handle,
+                )
+                return
             if outcome.action is not RecoveryAction.MARK_MANUAL_UNCERTAIN:
                 await self._invoke_continuation(
                     runtime=runtime,

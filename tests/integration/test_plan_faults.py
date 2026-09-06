@@ -35,6 +35,7 @@ from multiclaw.storage.schema import (
     agent_plan_step_runs,
     agent_plans,
     agent_runs,
+    approval_requests,
     execution_checkpoints,
     tool_executions,
 )
@@ -48,7 +49,9 @@ from multiclaw.tools.base import (
     ToolStatus,
 )
 from multiclaw.workflow.models import (
+    ApprovalStatus,
     CheckpointPhase,
+    ExecutionStatus,
     InvalidTransitionError,
     RecoveryAction,
     RecoveryOutcome,
@@ -435,14 +438,27 @@ class _ObservedToolParams(BaseModel):
 
 
 class _ObservedToolInvocation(ToolInvocation[_ObservedToolParams]):
-    def __init__(self, params: _ObservedToolParams, effect_counts: dict[str, int]) -> None:
+    def __init__(
+        self,
+        params: _ObservedToolParams,
+        effect_counts: dict[str, int],
+        *,
+        result: ToolExecutionResult | None = None,
+        cancel_after_effect: bool = False,
+    ) -> None:
         super().__init__(name="observed_plan_effect", params=params)
         self._effect_counts = effect_counts
+        self._result = result
+        self._cancel_after_effect = cancel_after_effect
 
     async def execute(self) -> ToolExecutionResult:
         self._effect_counts[self.params.idempotency_key] = (
             self._effect_counts.get(self.params.idempotency_key, 0) + 1
         )
+        if self._cancel_after_effect:
+            raise asyncio.CancelledError
+        if self._result is not None:
+            return self._result
         return ToolExecutionResult(
             status=ToolStatus.SUCCESS,
             content="durable external result",
@@ -457,14 +473,27 @@ class _ObservedToolBuilder(ToolBuilder[_ObservedToolParams]):
     recovery_strategy = RecoveryStrategy.IDEMPOTENT_RETRY
     idempotency_key_field = "idempotency_key"
 
-    def __init__(self, effect_counts: dict[str, int]) -> None:
+    def __init__(
+        self,
+        effect_counts: dict[str, int],
+        *,
+        result: ToolExecutionResult | None = None,
+        cancel_after_effect: bool = False,
+    ) -> None:
         self._effect_counts = effect_counts
+        self._result = result
+        self._cancel_after_effect = cancel_after_effect
 
     def validate(self, params: dict[str, object]) -> _ObservedToolParams:
         return _ObservedToolParams.model_validate(params)
 
     def build(self, params: _ObservedToolParams) -> ToolInvocation[_ObservedToolParams]:
-        return _ObservedToolInvocation(params, self._effect_counts)
+        return _ObservedToolInvocation(
+            params,
+            self._effect_counts,
+            result=self._result,
+            cancel_after_effect=self._cancel_after_effect,
+        )
 
 
 class _ApprovedPlanToolBuilder(_ObservedToolBuilder):
@@ -473,9 +502,19 @@ class _ApprovedPlanToolBuilder(_ObservedToolBuilder):
     idempotency_key_field = None
 
     def build(self, params: _ObservedToolParams) -> ToolInvocation[_ObservedToolParams]:
-        invocation = _ObservedToolInvocation(params, self._effect_counts)
+        invocation = super().build(params)
         invocation.name = self.name
         return invocation
+
+
+class _ManualPlanToolBuilder(_ObservedToolBuilder):
+    name = "manual_plan_effect"
+    recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
+    idempotency_key_field = None
+
+
+class _ErroringApprovedPlanToolBuilder(_ObservedToolBuilder):
+    name = "approved_plan_effect"
 
 
 class _ObservedPlanAgent:
@@ -497,7 +536,6 @@ class _ObservedPlanAgent:
     ) -> PlanStepCompletion:
         self.plan_calls.append((recovered_tool_result, recovered_tool_input_json))
         assert recovered_tool_result is not None
-        assert recovered_tool_result.content == "durable external result"
         assert recovered_tool_input_json == '{"idempotency_key":"observed-key"}'
         return PlanStepCompletion(status="succeeded", summary="observed", evidence=[])
 
@@ -507,8 +545,11 @@ class _ObservedPlanAgent:
 
 
 class _ObservedRuntimeLease:
+    def __init__(self, runtime: _ObservedRuntime) -> None:
+        self._runtime = runtime
+
     def close(self) -> None:
-        return None
+        self._runtime.closed_leases += 1
 
 
 class _ObservedRuntime:
@@ -527,16 +568,21 @@ class _ObservedRuntime:
         self.registry.register(builder)
         self.recovery_continuation = RuntimeRecoveryContinuationService()
         self.plan_execution = PlanExecutionCoordinator(database, settings=settings)
+        self.begin_calls = 0
+        self.closed_leases = 0
 
     def begin_run(self) -> _ObservedRuntimeLease:
-        return _ObservedRuntimeLease()
+        self.begin_calls += 1
+        return _ObservedRuntimeLease(self)
 
 
 class _ObservedRuntimePool:
     def __init__(self, runtime: _ObservedRuntime) -> None:
         self._runtime = runtime
+        self.acquire_calls = 0
 
     async def acquire(self, _context: TenantContext) -> _ObservedRuntime:
+        self.acquire_calls += 1
         return self._runtime
 
 
@@ -647,7 +693,13 @@ async def _observed_result_boundary(database: Database):
     return settings, context, service, effects, builder, scheduler, checkpoint
 
 
-async def _approved_plan_tool_boundary(database: Database):
+async def _approved_plan_tool_boundary(
+    database: Database,
+    *,
+    approval_status: ApprovalStatus = ApprovalStatus.APPROVED,
+    result: ToolExecutionResult | None = None,
+    builder_type: type[_ObservedToolBuilder] = _ApprovedPlanToolBuilder,
+):
     settings, context, service, result = await _materialized(database)
     decision = await _approve(service, context, result)
     assert decision.lease is not None
@@ -662,7 +714,7 @@ async def _approved_plan_tool_boundary(database: Database):
     )
     assert started is not None
     effects: dict[str, int] = {}
-    builder = _ApprovedPlanToolBuilder(effects)
+    builder = builder_type(effects, result=result)
     scheduler = _approval_scheduler(database, settings)
     approval = await scheduler.run(
         builder,
@@ -673,12 +725,63 @@ async def _approved_plan_tool_boundary(database: Database):
     )
     assert approval.status is ToolStatus.AWAITING_APPROVAL
     approval_id = str(approval.data["approval_id"])
-    await service.workflow.decide_approval(
-        context,
-        approval_id,
-        approved=True,
-        version=1,
+    if approval_status is ApprovalStatus.APPROVED:
+        await service.workflow.decide_approval(
+            context,
+            approval_id,
+            approved=True,
+            version=1,
+        )
+    elif approval_status is ApprovalStatus.REJECTED:
+        await service.workflow.decide_approval(
+            context,
+            approval_id,
+            approved=False,
+            version=1,
+        )
+    else:
+        assert approval_status is ApprovalStatus.EXPIRED
+        async with database.write_transaction() as conn:
+            await conn.execute(
+                update(approval_requests)
+                .where(approval_requests.c.approval_id == approval_id)
+                .values(expires_at=database.dialect.db_now_ms() - 1)
+            )
+        with pytest.raises(InvalidTransitionError, match="approval expired"):
+            await service.workflow.decide_approval(
+                context,
+                approval_id,
+                approved=True,
+                version=1,
+            )
+    return settings, context, service, effects, builder, scheduler
+
+
+async def _manual_uncertain_plan_boundary(database: Database):
+    settings, context, service, result = await _materialized(database)
+    decision = await _approve(service, context, result)
+    assert decision.lease is not None
+    running_lease = await service.workflow.transition_run(
+        decision.lease,
+        RunStatus.RUNNING,
     )
+    plan_execution = PlanExecutionCoordinator(database, settings=settings)
+    started = await plan_execution.start_next_attempt(
+        context=context,
+        lease=running_lease,
+    )
+    assert started is not None
+    effects: dict[str, int] = {}
+    builder = _ManualPlanToolBuilder(effects, cancel_after_effect=True)
+    scheduler = _durable_scheduler(database, settings)
+    with pytest.raises(asyncio.CancelledError):
+        await scheduler.run(
+            builder,
+            {"idempotency_key": "observed-key"},
+            context=context,
+            call_id="manual-call",
+            run_lease_handle=RunLeaseHandle(running_lease),
+        )
     return settings, context, service, effects, builder, scheduler
 
 
@@ -761,6 +864,53 @@ async def _terminal_checkpoint_count(database: Database, context: TenantContext)
     return int(result or 0)
 
 
+async def _execution_status(database: Database, context: TenantContext) -> ExecutionStatus:
+    async with database.connect() as conn:
+        status = await conn.scalar(
+            select(tool_executions.c.execution_status).where(
+                tool_executions.c.run_id == context.run_id
+            )
+        )
+    assert status is not None
+    return ExecutionStatus(status)
+
+
+async def _assert_terminal_plan_recovery(
+    *,
+    database: Database,
+    context: TenantContext,
+    service: PlanningService,
+    worker: WorkflowRecoveryWorker,
+    runtime: _ObservedRuntime,
+    pool: _ObservedRuntimePool,
+    effects: dict[str, int],
+    expected_effects: dict[str, int],
+    expected_execution_status: ExecutionStatus,
+    expected_result_content: str,
+) -> None:
+    await worker.run_once()
+
+    run = await service.workflow.get_run(context)
+    assert run is not None
+    assert run.status is RunStatus.COMPLETED
+    assert effects == expected_effects
+    assert await _execution_status(database, context) is expected_execution_status
+    assert runtime.agent.generic_recovery_calls == 0
+    assert len(runtime.agent.plan_calls) == 1
+    recovered_result, _ = runtime.agent.plan_calls[0]
+    assert recovered_result is not None
+    assert recovered_result.content == expected_result_content
+    assert runtime.begin_calls == runtime.closed_leases == pool.acquire_calls == 1
+    async with TenantUnitOfWork(database, context) as uow:
+        assert await uow.plans.running_step_attempts(run_id=str(context.run_id)) == ()
+
+    await worker.run_once()
+
+    assert effects == expected_effects
+    assert len(runtime.agent.plan_calls) == 1
+    assert runtime.begin_calls == runtime.closed_leases == pool.acquire_calls == 1
+
+
 @pytest.mark.asyncio
 async def test_real_observed_tool_result_resumes_plan_without_redispatch(tmp_path: Path):
     database = await _database(tmp_path)
@@ -786,6 +936,7 @@ async def test_real_observed_tool_result_resumes_plan_without_redispatch(tmp_pat
         recovered_result, recovered_input = runtime.agent.plan_calls[0]
         assert recovered_result is not None
         assert recovered_result.result_ref.startswith("memory://")
+        assert recovered_result.content == "durable external result"
         assert recovered_input == '{"idempotency_key":"observed-key"}'
         assert await _execution_count(database, context) == 1
         assert await _step_attempt_count(database, context) == 1
@@ -802,9 +953,7 @@ async def test_approved_plan_tool_resolution_resumes_plan_without_generic_recove
 ):
     database = await _database(tmp_path)
     try:
-        settings, context, service, effects, builder, scheduler = await _approved_plan_tool_boundary(
-            database
-        )
+        settings, context, service, effects, builder, scheduler = await _approved_plan_tool_boundary(database)
         runtime = _ObservedRuntime(
             database=database,
             settings=settings,
@@ -835,6 +984,129 @@ async def test_approved_plan_tool_resolution_resumes_plan_without_generic_recove
 
         assert effects == {"observed-key": 1}
         assert len(runtime.agent.plan_calls) == 1
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("approval_status", "expected_result_content"),
+    (
+        (ApprovalStatus.REJECTED, "rejected by user"),
+        (ApprovalStatus.EXPIRED, "approval expired"),
+    ),
+)
+async def test_terminal_plan_approval_resolution_resumes_plan_without_generic_recovery(
+    tmp_path: Path,
+    approval_status: ApprovalStatus,
+    expected_result_content: str,
+):
+    database = await _database(tmp_path)
+    try:
+        settings, context, service, effects, builder, scheduler = await _approved_plan_tool_boundary(
+            database,
+            approval_status=approval_status,
+        )
+        runtime = _ObservedRuntime(
+            database=database,
+            settings=settings,
+            scheduler=scheduler,
+            builder=builder,
+        )
+        pool = _ObservedRuntimePool(runtime)
+        worker = WorkflowRecoveryWorker(
+            database=database,
+            settings=settings,
+            runtime_pool=pool,
+        )
+
+        await _assert_terminal_plan_recovery(
+            database=database,
+            context=context,
+            service=service,
+            worker=worker,
+            runtime=runtime,
+            pool=pool,
+            effects=effects,
+            expected_effects={},
+            expected_execution_status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
+            expected_result_content=expected_result_content,
+        )
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_erroring_approved_plan_tool_resumes_plan_without_generic_recovery(tmp_path: Path):
+    database = await _database(tmp_path)
+    try:
+        settings, context, service, effects, builder, scheduler = await _approved_plan_tool_boundary(
+            database,
+            result=ToolExecutionResult(status=ToolStatus.ERROR, content="approved tool failed"),
+            builder_type=_ErroringApprovedPlanToolBuilder,
+        )
+        runtime = _ObservedRuntime(
+            database=database,
+            settings=settings,
+            scheduler=scheduler,
+            builder=builder,
+        )
+        pool = _ObservedRuntimePool(runtime)
+        worker = WorkflowRecoveryWorker(
+            database=database,
+            settings=settings,
+            runtime_pool=pool,
+        )
+
+        await _assert_terminal_plan_recovery(
+            database=database,
+            context=context,
+            service=service,
+            worker=worker,
+            runtime=runtime,
+            pool=pool,
+            effects=effects,
+            expected_effects={"observed-key": 1},
+            expected_execution_status=ExecutionStatus.FAILED_TERMINAL,
+            expected_result_content="tool execution failed",
+        )
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_manual_uncertain_plan_recovery_resumes_plan_without_redispatch(tmp_path: Path):
+    database = await _database(tmp_path)
+    try:
+        settings, context, service, effects, builder, scheduler = await _manual_uncertain_plan_boundary(
+            database
+        )
+        runtime = _ObservedRuntime(
+            database=database,
+            settings=settings,
+            scheduler=scheduler,
+            builder=builder,
+        )
+        pool = _ObservedRuntimePool(runtime)
+        await _expire(database, context)
+        worker = WorkflowRecoveryWorker(
+            database=database,
+            settings=settings,
+            runtime_pool=pool,
+        )
+
+        await _assert_terminal_plan_recovery(
+            database=database,
+            context=context,
+            service=service,
+            worker=worker,
+            runtime=runtime,
+            pool=pool,
+            effects=effects,
+            expected_effects={"observed-key": 1},
+            expected_execution_status=ExecutionStatus.UNCERTAIN,
+            expected_result_content="tool execution failed",
+        )
     finally:
         await database.dispose()
 
