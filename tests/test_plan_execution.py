@@ -3151,6 +3151,50 @@ async def test_failed_revision_generation_terminates_without_extra_version(
 
 
 @pytest.mark.asyncio
+async def test_unexpected_revision_generator_failure_terminalizes_without_dispatch(
+    execution_fixture,
+) -> None:
+    draft = _draft(("lint",), max_attempts=1)
+
+    async def observe_checkpoint() -> None:
+        return None
+
+    generator = ObservingFailureGenerator(draft, observe_checkpoint)
+    generator.error = RuntimeError("unexpected generator failure")
+    execution_fixture.service._generator = generator
+    coordinator = PlanExecutionCoordinator(
+        execution_fixture.database,
+        settings=execution_fixture.settings,
+        planning_service=execution_fixture.service,
+    )
+    await execution_fixture.materialize(draft)
+    await execution_fixture.approve()
+    runner = ScriptedStepRunner(
+        [PlanStepCompletion(status="failed", summary="no repair", evidence=[])]
+    )
+
+    outcome = await coordinator.execute_to_boundary(
+        context=execution_fixture._context(),
+        run_lease_handle=RunLeaseHandle(execution_fixture.lease),
+        runner=runner,
+    )
+
+    snapshot = await coordinator._load_active_plan(execution_fixture._context())
+    durable_run = await execution_fixture.service.workflow.get_run(
+        execution_fixture._context()
+    )
+    phases = [item["phase"] for item in await execution_fixture.checkpoints()]
+    assert outcome.state == "failed_terminal"
+    assert outcome.run.status is RunStatus.FAILED_TERMINAL
+    assert durable_run is not None and durable_run.status is RunStatus.FAILED_TERMINAL
+    assert snapshot.current_version == 1
+    assert len(snapshot.versions) == 1
+    assert len(runner.calls) == 1
+    assert CheckpointPhase.PLAN_REPLAN_REQUIRED.value in phases
+    assert phases[-1] == CheckpointPhase.RUN_TERMINAL.value
+
+
+@pytest.mark.asyncio
 async def test_revision_quota_fails_closed_before_generator_call(execution_fixture) -> None:
     draft = _draft(("lint",), max_attempts=1)
 

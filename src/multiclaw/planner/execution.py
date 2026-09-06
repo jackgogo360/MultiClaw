@@ -653,7 +653,7 @@ class PlanExecutionCoordinator:
                 max_depth=self._settings.planning.max_dependency_depth,
                 max_attempts=self._settings.planning.max_step_attempts,
             )
-        except PlanGenerationError:
+        except Exception:  # noqa: BLE001 - generator faults terminate this boundary
             return await self._fail_replan_terminal(run_lease_handle, plan)
         draft = PlanningService._draft(generated)
         if failed_step.logical_step_key not in {
