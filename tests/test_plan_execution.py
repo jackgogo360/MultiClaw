@@ -7,6 +7,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import get_args
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -237,7 +238,11 @@ def test_plan_step_runner_protocol_has_the_durable_resume_signature():
     assert signature.parameters["recovered_tool_result"].default is None
     assert signature.parameters["recovered_tool_input_json"].annotation == "str | None"
     assert signature.parameters["recovered_tool_input_json"].default is None
-    assert signature.return_annotation == "PlanStepCompletion"
+    assert signature.return_annotation == "PlanStepCompletion | ContinuationOutcome"
+    agent_return = inspect.signature(MultiClawAgent.run_plan_step).return_annotation
+    assert {annotation.__name__ for annotation in get_args(agent_return)} == set(
+        signature.return_annotation.split(" | ")
+    )
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ from multiclaw.workflow.models import RunLease, RunRecord, RunStatus
 
 if TYPE_CHECKING:
     from multiclaw.workflow.continuation import (
+        ContinuationOutcome,
         PersistedToolResult,
         WorkflowContinuationService,
     )
@@ -444,7 +445,7 @@ class PlanStepRunner(Protocol):
         workflow_continuation: WorkflowContinuationService,
         recovered_tool_result: PersistedToolResult | None = None,
         recovered_tool_input_json: str | None = None,
-    ) -> PlanStepCompletion: ...
+    ) -> PlanStepCompletion | ContinuationOutcome: ...
 
 
 @dataclass(frozen=True, slots=True)
