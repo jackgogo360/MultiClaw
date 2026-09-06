@@ -450,6 +450,7 @@ class RecoveryService:
                 and plan.status is PlanStatus.AWAITING_APPROVAL
                 and run.status is RunStatus.AWAITING_USER
                 and run.active_plan_version == plan_version
+                and plan.approved_version == plan_version
                 and plan.current_version == plan_version + 1
                 and plan.current.parent_version == plan_version
             )
@@ -632,6 +633,18 @@ def _decode_json_object(payload_json: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise CorruptCheckpointError("checkpoint payload_json must decode to an object")
     return value
+
+
+def _validated_execution_input(input_payload_json: str, expected_hash: str) -> str:
+    value = _decode_json_object(input_payload_json)
+    reject_secret_fields(value)
+    encoded = canonical_json(value)
+    if hashlib.sha256(encoded).hexdigest() != expected_hash:
+        raise ValueError("persisted tool input hash mismatch")
+    canonical = encoded.decode("utf-8")
+    if input_payload_json != canonical:
+        raise ValueError("persisted tool input is not canonical")
+    return canonical
 
 
 def _validate_checkpoint_scope(checkpoint: CheckpointRecord, payload: CheckpointPayload) -> None:
@@ -1083,8 +1096,11 @@ class RuntimeRecoveryContinuationService:
                 assert result_payload is not None
                 execution = await workflow.get_execution_recovery(context, result_payload.execution_id)
                 if execution is not None:
-                    recovered_tool_input_json = execution.input_payload_json
                     try:
+                        recovered_tool_input_json = _validated_execution_input(
+                            execution.input_payload_json,
+                            execution.input_hash,
+                        )
                         recovered_tool_result = await continuation.load_tool_result(
                             context=context,
                             result_ref=result_payload.result_ref,

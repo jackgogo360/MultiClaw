@@ -671,13 +671,21 @@ class PlanExecutionCoordinator:
                 failed_step_run_id=failed.step_run_id,
             )
         if recovery.cursor == "final_summary" and recovery.running_step is None:
-            lease = await run_lease_handle.current()
-            terminal = await WorkflowCoordinator(
-                self._database, settings=self._settings
-            ).finish_run_with_checkpoint(lease, RunStatus.COMPLETED)
-            await run_lease_handle.replace(terminal)
+            # Recovery must not invent a final response; Task 14 owns that producer.
+            current_run = await self._load_run(context)
+            if current_run is not None and current_run.status is RunStatus.RESUMING:
+                await run_lease_handle.refresh(
+                    lambda lease: WorkflowCoordinator(
+                        self._database, settings=self._settings
+                    ).transition_run(lease, RunStatus.RUNNING)
+                )
+            await run_lease_handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    self._database, settings=self._settings
+                ).transition_run(lease, RunStatus.AWAITING_USER)
+            )
             return PlanExecutionOutcome(
-                state="completed",
+                state="awaiting_user",
                 plan=recovery.plan,
                 run=await self._load_run(context),
             )

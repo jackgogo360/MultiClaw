@@ -2,24 +2,53 @@ import asyncio
 import base64
 import json
 from pathlib import Path
-
-import pytest
-from alembic import command
-from sqlalchemy import insert, text
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+from sandbox_fakes import ReadyRecordingSandboxController
+from sqlalchemy import func, insert, select, text, update
+
+from alembic import command
 from multiclaw.cli import alembic_config
-from multiclaw.config.settings import DatabaseSettings, LLMSettings, McpSettings, SecretSettings, Settings, SkillSettings
+from multiclaw.config.settings import (
+    DatabaseSettings,
+    LLMSettings,
+    McpSettings,
+    SecretSettings,
+    Settings,
+    SkillSettings,
+)
+from multiclaw.memory import MemoryEntry
+from multiclaw.planner.models import (
+    MaterializeInitialPlan,
+    PlanDecisionAction,
+    PlanDecisionRequest,
+    PlanDraft,
+    PlanDraftStep,
+    PlanStepRunStatus,
+    PlanTriggerMode,
+)
 from multiclaw.secrets.envelope import EnvelopeFields, SecretEnvelopeService
 from multiclaw.secrets.keyring import DeploymentKeyring
 from multiclaw.secrets.resolver import SecretResolver
 from multiclaw.storage import Database
-from multiclaw.storage.schema import agent_runs, chat_sessions, execution_checkpoints, workspaces
+from multiclaw.storage.schema import (
+    agent_plan_step_runs,
+    agent_runs,
+    chat_sessions,
+    execution_checkpoints,
+    tool_executions,
+    workspaces,
+)
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
-from multiclaw.workflow.models import RunStatus
-
-from sandbox_fakes import ReadyRecordingSandboxController
+from multiclaw.workflow.models import (
+    CheckpointPhase,
+    RecoveryAction,
+    RunLeaseHandle,
+    RunStatus,
+)
+from multiclaw.workflow.recovery import RecoveryService
 
 
 def _settings_for_runtime(root: Path) -> Settings:
@@ -151,6 +180,156 @@ async def test_runtime_factory_builds_distinct_mutable_components_per_tenant(tmp
     assert runtime_a.registry is not runtime_b.registry
     assert runtime_a.skill_manager is not runtime_b.skill_manager
     assert runtime_a.sandbox_controller is not runtime_b.sandbox_controller
+    assert runtime_a.plan_execution._planning_service is not None
+    assert runtime_a.plan_execution._planning_service._generator is not None
+    assert runtime_a.plan_execution._planning_service._generator._router is runtime_a.agent.router
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_recovery_replans_without_tool_dispatch(tmp_path: Path):
+    from multiclaw.runtime.factory import RuntimeFactory
+
+    instances = []
+
+    class SpyPlanGenerator:
+        def __init__(self, router, **_kwargs) -> None:
+            self.router = router
+            self.calls: list[object] = []
+            instances.append(self)
+
+        async def generate(self, _objective: str, *, revision, **_limits) -> PlanDraft:
+            self.calls.append(revision)
+            return _draft("factory recovery revision")
+
+    def _draft(reason: str) -> PlanDraft:
+        return PlanDraft(
+            objective="Recover a durable Plan.",
+            constraints=[],
+            generation_reason=reason,
+            steps=[
+                PlanDraftStep(
+                    logical_step_key="execute",
+                    title="Execute",
+                    description="Keep the failed step in the revision.",
+                    expected_outcome="a durable result",
+                    max_attempts=1,
+                    depends_on=[],
+                )
+            ],
+        )
+
+    settings = _settings_for_runtime(tmp_path)
+    database = await _create_migrated_runtime_database(tmp_path)
+    root = TenantContext("tenant-a", "workspace-a")
+    await _seed_runtime_scope(database, root.tenant_id, root.workspace_id)
+    factory = RuntimeFactory(
+        settings=settings,
+        database=database,
+        workspace_resolver=WorkspaceResolver(tmp_path),
+        sandbox_controller_factory=lambda workspace_root, event_bus: ReadyRecordingSandboxController(
+            workspace_root=workspace_root
+        ),
+    )
+    runtime = None
+    try:
+        async with TenantUnitOfWork(database, root) as uow:
+            session = await uow.sessions.create(title="Factory Plan recovery")
+        session_context = root.for_session(session.id)
+        async with TenantUnitOfWork(database, session_context) as uow:
+            source = await uow.memory.save(
+                MemoryEntry(
+                    content="Recover a durable Plan.",
+                    type="chat_message",
+                    role="user",
+                    session_id=session.id,
+                )
+            )
+        context = root.for_run(session.id, "00000000-0000-0000-0000-000000000013")
+        with patch("multiclaw.runtime.factory.PlanGenerator", SpyPlanGenerator):
+            runtime = await factory.create(root)
+        planning = runtime.plan_execution._planning_service
+        assert planning is not None
+        materialized = await planning.materialize_initial(
+            MaterializeInitialPlan(
+                context=context,
+                runtime_instance_id=runtime.runtime_instance_id,
+                source_message_id=source.id,
+                assistant_turn_index=1,
+                trigger_mode=PlanTriggerMode.EXPLICIT,
+                draft=_draft("factory recovery test"),
+            )
+        )
+        decision = await planning.decide(
+            PlanDecisionRequest(
+                decision_id="factory-recovery-decision",
+                plan_id=materialized.plan.plan_id,
+                plan_version=1,
+                expected_version=materialized.plan.aggregate_version,
+                action=PlanDecisionAction.APPROVE,
+            ),
+            decided_by=context.tenant_id,
+            runtime_instance_id=runtime.runtime_instance_id,
+        )
+        assert decision.lease is not None
+        started = await runtime.plan_execution.start_next_attempt(context=context, lease=decision.lease)
+        assert started is not None
+        async with database.write_transaction() as conn:
+            await conn.execute(
+                update(agent_plan_step_runs)
+                .where(agent_plan_step_runs.c.step_run_id == started.step_run.step_run_id)
+                .values(status=PlanStepRunStatus.FAILED_TERMINAL.value)
+            )
+        await planning.workflow.checkpoint(
+            decision.lease,
+            CheckpointPhase.PLAN_REPLAN_REQUIRED,
+            {
+                "run_id": context.run_id,
+                "plan_id": materialized.plan.plan_id,
+                "plan_version": 1,
+                "plan_digest": materialized.plan.current.content_digest,
+                "failed_step_run_id": started.step_run.step_run_id,
+                "failure_digest": "a" * 64,
+                "revision_cursor": "generate_revision",
+                "cursor": "generate_revision",
+            },
+        )
+        async with database.write_transaction() as conn:
+            await conn.execute(
+                update(agent_runs)
+                .where(agent_runs.c.run_id == context.run_id)
+                .values(lease_expires_at=database.dialect.db_now_ms() - 1)
+            )
+
+        outcome = await RecoveryService(database, settings=settings).recover(
+            context, runtime.runtime_instance_id
+        )
+
+        assert outcome.action is RecoveryAction.RESUME_PLAN_REVISION
+        assert outcome.lease is not None
+        await runtime.recovery_continuation.resume(
+            runtime=runtime,
+            context=context,
+            run_lease_handle=RunLeaseHandle(outcome.lease),
+            recovery_outcome=outcome,
+        )
+
+        run = await planning.workflow.get_run(context)
+        assert run is not None
+        assert run.status is RunStatus.AWAITING_USER
+        assert len(instances) == 1
+        assert instances[0].router is runtime.agent.router
+        assert len(instances[0].calls) == 1
+        async with database.connect() as conn:
+            tool_execution_count = await conn.scalar(
+                select(func.count())
+                .select_from(tool_executions)
+                .where(tool_executions.c.run_id == context.run_id)
+            )
+        assert tool_execution_count == 0
+    finally:
+        if runtime is not None:
+            await runtime.close()
+        await database.dispose()
 
 
 @pytest.mark.asyncio
@@ -294,8 +473,8 @@ async def test_runtime_factory_closes_partial_runtime_resources_when_create_fail
             captured["manager"] = manager
             return manager
 
-        def _build_agent(self, context, registry, scheduler, event_bus, skill_manager):
-            del context, registry, scheduler, event_bus, skill_manager
+        def _build_agent(self, registry, scheduler, event_bus, skill_manager, *, router, planner):
+            del registry, scheduler, event_bus, skill_manager, router, planner
             raise RuntimeError("agent assembly failed")
 
     settings = _settings_for_runtime(tmp_path).model_copy(update={"mcp": McpSettings(enabled=True)})
@@ -373,8 +552,8 @@ async def test_runtime_factory_preserves_primary_create_failure_and_notes_cleanu
             captured["manager"] = manager
             return manager
 
-        def _build_agent(self, context, registry, scheduler, event_bus, skill_manager):
-            del context, registry, scheduler, event_bus, skill_manager
+        def _build_agent(self, registry, scheduler, event_bus, skill_manager, *, router, planner):
+            del registry, scheduler, event_bus, skill_manager, router, planner
             raise RuntimeError("agent assembly failed")
 
     settings = _settings_for_runtime(tmp_path).model_copy(update={"mcp": McpSettings(enabled=True)})
@@ -474,9 +653,11 @@ async def test_runtime_factory_closes_built_runtime_when_counter_load_fails(
             captured["manager"] = manager
             return manager
 
-        def _build_agent(self, context, registry, scheduler, event_bus, skill_manager):
+        def _build_agent(self, registry, scheduler, event_bus, skill_manager, *, router, planner):
             captured["skill_manager"] = skill_manager
-            return super()._build_agent(context, registry, scheduler, event_bus, skill_manager)
+            return super()._build_agent(
+                registry, scheduler, event_bus, skill_manager, router=router, planner=planner
+            )
 
         async def _load_workflow_counters(self, context):
             del context
@@ -519,7 +700,6 @@ async def test_runtime_factory_preserves_counter_load_failure_and_notes_runtime_
     monkeypatch: pytest.MonkeyPatch,
 ):
     from multiclaw.runtime.factory import RuntimeFactory
-    from multiclaw.runtime.models import TenantRuntime
 
     class TrackingController(ReadyRecordingSandboxController):
         def __init__(self, *, workspace_root: Path) -> None:
@@ -580,9 +760,11 @@ async def test_runtime_factory_preserves_counter_load_failure_and_notes_runtime_
             captured["manager"] = manager
             return manager
 
-        def _build_agent(self, context, registry, scheduler, event_bus, skill_manager):
+        def _build_agent(self, registry, scheduler, event_bus, skill_manager, *, router, planner):
             captured["skill_manager"] = skill_manager
-            return super()._build_agent(context, registry, scheduler, event_bus, skill_manager)
+            return super()._build_agent(
+                registry, scheduler, event_bus, skill_manager, router=router, planner=planner
+            )
 
         async def _load_workflow_counters(self, context):
             del context
