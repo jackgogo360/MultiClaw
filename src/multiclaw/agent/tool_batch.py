@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 from multiclaw.agent.models import Observation, ObservationType
 from multiclaw.tenancy import TenantContext
@@ -47,6 +48,7 @@ class ToolBatchExecutor:
         *,
         context: TenantContext | None = None,
         run_lease_handle: RunLeaseHandle | None = None,
+        before_dispatch: Callable[[], Awaitable[None]] | None = None,
     ) -> list[ToolCallOutcome]:
         outcomes: list[ToolCallOutcome] = []
         for call in calls:
@@ -54,6 +56,7 @@ class ToolBatchExecutor:
                 call,
                 context=context,
                 run_lease_handle=run_lease_handle,
+                before_dispatch=before_dispatch,
             )
             outcomes.append(outcome)
             if outcome.result.status is ToolStatus.AWAITING_APPROVAL:
@@ -66,6 +69,7 @@ class ToolBatchExecutor:
         *,
         context: TenantContext | None,
         run_lease_handle: RunLeaseHandle | None,
+        before_dispatch: Callable[[], Awaitable[None]] | None,
     ) -> ToolCallOutcome:
         builder = self.registry.get(call.name)
         if builder is None:
@@ -82,6 +86,8 @@ class ToolBatchExecutor:
                 ),
             )
 
+        if before_dispatch is not None:
+            await before_dispatch()
         result = await self.scheduler.run(
             builder,
             call.arguments,

@@ -517,6 +517,52 @@ class WorkflowRepository:
             current.version + 1,
         )
 
+    async def _request_cancellation(self, context: TenantContext) -> RunRecord | None:
+        """Durably record a cancellation request without touching Plan state."""
+        await self._dialect.lock_run(self._conn, context)
+        current = await self.get_run(context)
+        if current is None:
+            return None
+        if current.status in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED_TERMINAL,
+            RunStatus.CANCELLED,
+            RunStatus.BLOCKED_CORRUPT,
+            RunStatus.BLOCKED_INCOMPATIBLE,
+        }:
+            return current
+        if current.cancel_requested_at is not None:
+            return current
+
+        now_ms = self._dialect.db_now_ms()
+        values: dict[str, object] = {
+            "cancel_requested_at": func.coalesce(
+                agent_runs.c.cancel_requested_at,
+                now_ms,
+            ),
+            "updated_at": now_ms,
+            "version": agent_runs.c.version + 1,
+        }
+        if current.status is RunStatus.AWAITING_USER:
+            values.update(
+                run_status=RunStatus.CANCELLED.value,
+                heartbeat_at=now_ms,
+                lease_expires_at=now_ms + self._lease_ttl_ms,
+                finished_at=now_ms,
+            )
+        result = await self._conn.execute(
+            update(agent_runs)
+            .where(
+                _context_predicate(context),
+                agent_runs.c.version == current.version,
+                agent_runs.c.run_status == current.status.value,
+            )
+            .values(**values)
+        )
+        if result.rowcount != 1:
+            return await self.get_run(context)
+        return await self.get_run(context)
+
     async def _plan_version_exists(
         self,
         context: TenantContext,

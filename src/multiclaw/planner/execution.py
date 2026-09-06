@@ -13,6 +13,7 @@ from multiclaw.planner.generator import PlanGenerationError
 from multiclaw.planner.models import (
     TERMINAL_PLAN_STEP_STATUSES,
     CompletedStepContext,
+    PlanCancellationRequested,
     PlanExecutionBlocked,
     PlanExecutionOutcome,
     PlanRevisionContext,
@@ -494,12 +495,33 @@ class PlanExecutionCoordinator:
         recovered_tool_result: PersistedToolResult | None = None,
         recovered_tool_input_json: str | None = None,
     ) -> PlanExecutionOutcome:
+        try:
+            return await self._execute_to_boundary(
+                context=context,
+                run_lease_handle=run_lease_handle,
+                runner=runner,
+                recovered_tool_result=recovered_tool_result,
+                recovered_tool_input_json=recovered_tool_input_json,
+            )
+        except PlanCancellationRequested:
+            return await self._cancel_at_boundary(context, run_lease_handle)
+
+    async def _execute_to_boundary(
+        self,
+        *,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        runner: PlanStepRunner,
+        recovered_tool_result: PersistedToolResult | None = None,
+        recovered_tool_input_json: str | None = None,
+    ) -> PlanExecutionOutcome:
         if (recovered_tool_result is None) != (recovered_tool_input_json is None):
             raise ValueError("recovered tool result and input must be provided together")
         resume_running_attempt = recovered_tool_result is not None
         last_plan: PlanSnapshot | None = None
         started: StartedPlanStep | None
         while True:
+            await self._raise_if_cancel_requested(context)
             lease = await run_lease_handle.current()
             run = await self._load_run(context)
             if run.status is RunStatus.RESUMING:
@@ -516,11 +538,13 @@ class PlanExecutionCoordinator:
                     lease=lease,
                     runner=runner,
                 )
+                await self._raise_if_cancel_requested(context)
                 started = await self.start_next_attempt(context=context, lease=lease)
             if started is None:
                 if last_plan is None:
                     last_plan = await self._load_active_plan(context)
                 run = await self._load_run(context)
+                await self._raise_if_cancel_requested(context)
                 return PlanExecutionOutcome(
                     state="completed",
                     plan=last_plan,
@@ -535,6 +559,7 @@ class PlanExecutionCoordinator:
                 step_run=started.step_run,
                 dependency_results=started.dependency_results,
             )
+            await self._raise_if_cancel_requested(context)
             completion = await runner.run_plan_step(
                 request,
                 run_lease_handle=run_lease_handle,
@@ -564,6 +589,7 @@ class PlanExecutionCoordinator:
                     "Plan step runner returned an invalid completion"
                 )
 
+            await self._raise_if_cancel_requested(context)
             if completion.status == "succeeded":
                 target_status = PlanStepRunStatus.SUCCEEDED
             elif completion.retryable and started.step_run.attempt < min(
@@ -607,6 +633,61 @@ class PlanExecutionCoordinator:
                     run=await self._load_run(context),
                 )
 
+    async def _raise_if_cancel_requested(self, context: TenantContext) -> None:
+        await WorkflowCoordinator(
+            self._database, settings=self._settings
+        ).raise_if_cancel_requested(context)
+
+    async def _cancel_at_boundary(
+        self,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+    ) -> PlanExecutionOutcome:
+        run = await self._load_run(context)
+        if run.status is RunStatus.CANCELLED:
+            return PlanExecutionOutcome(
+                state="cancelled",
+                plan=await self._load_active_plan(context),
+                run=run,
+            )
+        if run.lease_owner is None or run.lease_expires_at is None:
+            raise PlanExecutionBlocked("cancelled Plan run has no current lease")
+        lease = RunLease(
+            context=context,
+            lease_owner=run.lease_owner,
+            fencing_token=run.fencing_token,
+            version=run.version,
+            lease_expires_at=run.lease_expires_at,
+        )
+        await run_lease_handle.replace(lease)
+        async with TenantUnitOfWork(
+            self._database,
+            context,
+            planning_settings=self._settings.planning,
+            workflow_settings=self._settings.workflow,
+        ) as uow:
+            running = await uow.plans.running_step_attempts(
+                run_id=str(context.run_id), for_update=True
+            )
+            if len(running) > 1:
+                raise PlanExecutionBlocked("Plan run has multiple running step attempts")
+            if running:
+                attempt = running[0]
+                await uow.plans.cancel_step_attempt(
+                    lease,
+                    step_run_id=attempt.step_run_id,
+                    expected_version=attempt.version,
+                )
+        terminal = await WorkflowCoordinator(
+            self._database, settings=self._settings
+        ).finish_run_with_checkpoint(lease, RunStatus.CANCELLED)
+        await run_lease_handle.replace(terminal)
+        return PlanExecutionOutcome(
+            state="cancelled",
+            plan=await self._load_active_plan(context),
+            run=await self._load_run(context),
+        )
+
     async def _replan_terminal_failure(
         self,
         *,
@@ -617,6 +698,7 @@ class PlanExecutionCoordinator:
         failed_step_run_id: str,
     ) -> PlanExecutionOutcome:
         """Durably mark failure before the no-tools revision generation boundary."""
+        await self._raise_if_cancel_requested(context)
         failed = await self._step_attempt(context, failed_step_run_id)
         if failed.status is not PlanStepRunStatus.FAILED_TERMINAL:
             raise PlanExecutionBlocked("Plan replan requires a terminal failed attempt")
@@ -659,6 +741,7 @@ class PlanExecutionCoordinator:
             failure_digest=failure_digest,
         )
         try:
+            await self._raise_if_cancel_requested(context)
             generated = await generator.generate(
                 plan.current.objective,
                 revision=revision,
@@ -666,6 +749,9 @@ class PlanExecutionCoordinator:
                 max_depth=self._settings.planning.max_dependency_depth,
                 max_attempts=self._settings.planning.max_step_attempts,
             )
+            await self._raise_if_cancel_requested(context)
+        except PlanCancellationRequested:
+            raise
         except Exception:  # noqa: BLE001 - generator faults terminate this boundary
             return await self._fail_replan_terminal(run_lease_handle, plan)
         draft = PlanningService._draft(generated)

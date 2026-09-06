@@ -1633,6 +1633,59 @@ class PlanRepository:
             raise RuntimeError("Plan step attempt missing after finish")
         return finished
 
+    async def cancel_step_attempt(
+        self,
+        lease: RunLease,
+        *,
+        step_run_id: str,
+        expected_version: int,
+    ) -> PlanStepRunRecord | None:
+        """Cancel the in-flight attempt while retaining its fence and immutable results."""
+        if not self._lease_matches_context(lease):
+            raise StaleFenceError("run lease scope is stale")
+        await self._dialect.lock_run(self._conn, lease.context)
+        if not await self.has_current_lease(lease):
+            raise StaleFenceError("run lease is stale")
+        current_result = await self._conn.execute(
+            select(agent_plan_step_runs)
+            .where(
+                self._step_run_scope_predicate(str(lease.context.run_id)),
+                agent_plan_step_runs.c.step_run_id == step_run_id,
+            )
+            .with_for_update()
+        )
+        row = current_result.mappings().first()
+        if row is None:
+            return None
+        current = self._hydrate_step_run(row)
+        if current.status is PlanStepRunStatus.CANCELLED:
+            return current
+        if (
+            current.status is not PlanStepRunStatus.RUNNING
+            or current.version != expected_version
+        ):
+            raise PlanExecutionBlocked("Plan step attempt is no longer running")
+        finished_at = await self._db_now_ms()
+        updated = await self._conn.execute(
+            update(agent_plan_step_runs)
+            .where(
+                self._step_run_scope_predicate(str(lease.context.run_id)),
+                agent_plan_step_runs.c.step_run_id == step_run_id,
+                agent_plan_step_runs.c.status == PlanStepRunStatus.RUNNING.value,
+                agent_plan_step_runs.c.version == expected_version,
+            )
+            .values(
+                status=PlanStepRunStatus.CANCELLED.value,
+                version=expected_version + 1,
+                finished_at=finished_at,
+            )
+        )
+        if int(updated.rowcount or 0) != 1:
+            raise VersionConflictError("Plan step attempt version conflict")
+        return await self._get_step_run(
+            run_id=str(lease.context.run_id), step_run_id=step_run_id
+        )
+
     async def _insert_version(
         self,
         *,

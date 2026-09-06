@@ -276,6 +276,57 @@ class WorkflowCoordinator:
             )
             return lease
 
+    async def request_cancellation(self, context: TenantContext) -> RunRecord:
+        """Persist a cancellation request, terminalizing waiting runs atomically."""
+        run_id = cast(str, context.run_id)
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            record = await repository._request_cancellation(context)
+            if record is None:
+                raise RuntimeError("run record missing for cancellation")
+            if record.status is not RunStatus.CANCELLED or record.finished_at is None:
+                return record
+
+            latest = await repository.get_latest_checkpoint(context)
+            if latest is not None:
+                phase = CheckpointPhase(latest.phase)
+                if phase is CheckpointPhase.RUN_TERMINAL:
+                    return record
+            lease = RunLease(
+                context=context,
+                lease_owner=record.lease_owner or "",
+                fencing_token=record.fencing_token,
+                version=record.version,
+                lease_expires_at=record.lease_expires_at or 0,
+            )
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.RUN_TERMINAL,
+                {
+                    "run_id": run_id,
+                    "terminal_status": RunStatus.CANCELLED.value,
+                    "finished_at_ms": record.finished_at,
+                    "final_digest": self._terminal_digest(
+                        run_id,
+                        RunStatus.CANCELLED,
+                        record.finished_at,
+                    ),
+                },
+                checkpoint_seq=await repository.get_next_checkpoint_seq(context),
+            )
+            return record
+
+    async def raise_if_cancel_requested(self, context: TenantContext) -> None:
+        run = await self.get_run(context)
+        if run is None:
+            from multiclaw.planner.models import PlanExecutionBlocked
+
+            raise PlanExecutionBlocked("run is missing")
+        if run.cancel_requested_at is not None or run.status is RunStatus.CANCELLED:
+            from multiclaw.planner.models import PlanCancellationRequested
+
+            raise PlanCancellationRequested
+
     async def heartbeat(self, lease: RunLease) -> RunLease:
         async with self._write_connection() as conn:
             repository = self._repository(conn)

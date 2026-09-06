@@ -21,7 +21,6 @@ from multiclaw.tools import (
     ToolRegistry,
     ToolStatus,
 )
-from multiclaw.workflow.models import RecoveryStrategy
 from multiclaw.tools.find_dir import FindDirToolBuilder
 from multiclaw.tools.glob import GlobToolBuilder
 from multiclaw.tools.grep import GrepToolBuilder
@@ -30,6 +29,7 @@ from multiclaw.tools.read_file import ReadFileToolBuilder
 from multiclaw.tools.web_fetch import WebFetchToolBuilder
 from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
+from multiclaw.workflow.models import RecoveryStrategy
 
 
 class ScriptedParams(BaseModel):
@@ -206,6 +206,33 @@ async def test_read_only_calls_run_strictly_in_input_order(
         ObservationType.TOOL_RESULT,
         ObservationType.TOOL_RESULT,
     ]
+
+
+@pytest.mark.asyncio
+async def test_before_dispatch_can_cancel_without_running_a_tool(
+    tmp_path: Path,
+    registry: ToolRegistry,
+    scheduler: CoreToolScheduler,
+) -> None:
+    executions = 0
+
+    async def runner(params: ScriptedParams) -> ToolExecutionResult:
+        nonlocal executions
+        executions += 1
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    async def cancel_before_dispatch() -> None:
+        raise RuntimeError("cancel requested")
+
+    registry.register(ScriptedToolBuilder("probe", runner, tmp_path, read_only=False))
+
+    with pytest.raises(RuntimeError, match="cancel requested"):
+        await _executor(registry, scheduler).execute(
+            [ToolCallSpec(call_id="call-1", name="probe", arguments={"label": "one"})],
+            before_dispatch=cancel_before_dispatch,
+        )
+
+    assert executions == 0
 
 
 @pytest.mark.asyncio

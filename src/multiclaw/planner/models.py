@@ -369,6 +369,10 @@ class PlanExecutionBlocked(RuntimeError):
     pass
 
 
+class PlanCancellationRequested(PlanExecutionBlocked):
+    pass
+
+
 class PlanStepAlreadyRunningError(PlanExecutionBlocked):
     pass
 

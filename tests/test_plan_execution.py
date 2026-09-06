@@ -124,6 +124,32 @@ class ScriptedStepRunner:
         return self.completions.pop(0)
 
 
+class CancellingStepRunner(ScriptedStepRunner):
+    def __init__(self, database: Database, settings: Settings) -> None:
+        super().__init__([PlanStepCompletion(status="failed", summary="retry", evidence=[], retryable=True)])
+        self.workflow = WorkflowCoordinator(database, settings=settings)
+
+    async def run_plan_step(self, request, **kwargs):
+        await self.workflow.request_cancellation(request.context)
+        return await super().run_plan_step(request, **kwargs)
+
+
+class CancelAfterSuccessStepRunner(ScriptedStepRunner):
+    def __init__(self, database: Database, settings: Settings) -> None:
+        super().__init__(
+            [
+                PlanStepCompletion(status="succeeded", summary="first", evidence=[]),
+                PlanStepCompletion(status="failed", summary="retry", evidence=[], retryable=True),
+            ]
+        )
+        self.workflow = WorkflowCoordinator(database, settings=settings)
+
+    async def run_plan_step(self, request, **kwargs):
+        if self.calls:
+            await self.workflow.request_cancellation(request.context)
+        return await super().run_plan_step(request, **kwargs)
+
+
 class HeartbeatStepRunner:
     def __init__(
         self,
@@ -1906,6 +1932,46 @@ async def test_cancel_requested_run_blocks_pure_selection_and_mutation(
 
     assert await execution_fixture.count_step_runs() == 0
     assert await execution_fixture.count_checkpoints() == before_checkpoints
+
+
+@pytest.mark.asyncio
+async def test_persisted_cancellation_stops_before_retry_and_cancels_running_attempt(
+    execution_fixture,
+):
+    runner = CancellingStepRunner(execution_fixture.database, execution_fixture.settings)
+
+    outcome = await execution_fixture.execute(runner, draft=_draft(("lint",)))
+    attempts = await execution_fixture.all_attempts()
+    run = await execution_fixture.service.workflow.get_run(execution_fixture._context())
+
+    assert outcome.state == "cancelled"
+    assert run is not None and run.status is RunStatus.CANCELLED
+    assert [attempt.status for attempt in attempts] == [PlanStepRunStatus.CANCELLED]
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_preserves_succeeded_attempts_and_plan_versions(
+    execution_fixture,
+):
+    runner = CancelAfterSuccessStepRunner(
+        execution_fixture.database, execution_fixture.settings
+    )
+
+    outcome = await execution_fixture.execute(
+        runner,
+        draft=_draft(("lint", "test"), chain=True),
+    )
+    snapshot = await execution_fixture.coordinator._load_active_plan(
+        execution_fixture._context()
+    )
+    attempts = await execution_fixture.all_attempts()
+
+    assert outcome.state == "cancelled"
+    assert snapshot.current_version == 1
+    assert [attempt.status for attempt in attempts] == [PlanStepRunStatus.SUCCEEDED]
+    assert await execution_fixture.count_status(PlanStepRunStatus.CANCELLED) == 1
+    assert len(runner.calls) == 2
 
 
 @pytest.mark.asyncio

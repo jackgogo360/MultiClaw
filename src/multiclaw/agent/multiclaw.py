@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import re
@@ -18,7 +17,7 @@ from multiclaw.events import AgentState, EventBus, EventRouter
 from multiclaw.llm import LLMResponse, ModelRouter
 from multiclaw.memory import MemoryEntry, MemoryProtocol
 from multiclaw.planner import Planner, PlanStepCompletion
-from multiclaw.planner.models import PlanStepExecutionRequest
+from multiclaw.planner.models import PlanCancellationRequested, PlanStepExecutionRequest
 from multiclaw.skills import SkillManager
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.tools import CoreToolScheduler, ToolRegistry
@@ -29,6 +28,7 @@ from multiclaw.workflow.continuation import (
     PersistedToolResult,
     WorkflowContinuationService,
 )
+from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import RunLease, RunLeaseHandle
 
 logger = logging.getLogger(__name__)
@@ -219,11 +219,23 @@ class MultiClawAgent(ToolCallAgent):
         if not calls:
             return []
         await self.transition(AgentState.ACTING, context=context)
+        before_dispatch = None
+        if context is not None and context.run_id is not None:
+            before_dispatch = lambda: self._raise_if_cancel_requested(context)
         return await self._require_tool_batch_executor().execute(
             self._build_tool_call_specs(calls),
             context=context,
             run_lease_handle=run_lease_handle,
+            before_dispatch=before_dispatch,
         )
+
+    async def _raise_if_cancel_requested(self, context: TenantContext) -> None:
+        database = getattr(getattr(self, "scheduler", None), "database", None)
+        if context.run_id is None or database is None:
+            return
+        await WorkflowCoordinator(
+            database, settings=self.settings
+        ).raise_if_cancel_requested(context)
 
     async def run_plan_step(
         self,
@@ -312,6 +324,7 @@ class MultiClawAgent(ToolCallAgent):
         invalid_terminal_limit = self.settings.agent.reflection_max_attempts + 1
 
         for _ in range(self.settings.agent.max_tool_rounds):
+            await self._raise_if_cancel_requested(request.context)
             response: LLMResponse = await self.router.completion(
                 model=self.settings.llm.default_model,
                 messages=messages,
@@ -429,6 +442,7 @@ class MultiClawAgent(ToolCallAgent):
             controller = self._build_resilience_controller()
 
             for _ in range(max_rounds):
+                await self._raise_if_cancel_requested(context)
                 response: LLMResponse = await self.router.completion(
                     model=self.settings.llm.default_model,
                     messages=messages,
@@ -502,12 +516,15 @@ class MultiClawAgent(ToolCallAgent):
                 full_text = await self._generate_final_summary(
                     messages,
                     self._collect_completion_text_response,
+                    before_model=lambda: self._raise_if_cancel_requested(context),
                 )
                 await self._save_chat_msg(context, "assistant", full_text, next_turn_index + 1)
                 return Observation(
                     type=ObservationType.USER_RESPONSE,
                     content=full_text,
                 )
+            except PlanCancellationRequested:
+                raise
             except Exception:
                 logger.exception("final summary failed")
                 return Observation(
@@ -570,7 +587,11 @@ class MultiClawAgent(ToolCallAgent):
             [list[dict[str, Any]]],
             Awaitable[str],
         ],
+        *,
+        before_model: Callable[[], Awaitable[None]] | None = None,
     ) -> str:
+        if before_model is not None:
+            await before_model()
         full_text = await collect_response(messages)
         if self._contains_dsml_tool_markup(full_text):
             logger.warning(
@@ -580,6 +601,8 @@ class MultiClawAgent(ToolCallAgent):
                 {"role": "system", "content": FINAL_SUMMARY_PLAIN_TEXT_PROMPT},
                 *messages,
             ]
+            if before_model is not None:
+                await before_model()
             retry_text = await collect_response(retry_messages)
             full_text = retry_text or full_text
         return self._strip_dsml_tool_markup(full_text)
@@ -662,6 +685,7 @@ class MultiClawAgent(ToolCallAgent):
                 terminate_requested = False
 
                 try:
+                    await self._raise_if_cancel_requested(context)
                     async for event in self.router.stream_completion(
                         model=self.settings.llm.default_model,
                         messages=messages,
@@ -799,7 +823,7 @@ class MultiClawAgent(ToolCallAgent):
                         yield {"type": "done", "content": full_text, "data": {}}
                         return
 
-                except (httpx.ReadTimeout, asyncio.TimeoutError) as exc:
+                except (TimeoutError, httpx.ReadTimeout) as exc:
                     logger.error(
                         "stream timeout round=%d/%d session=%s input=%r",
                         round_num + 1, max_rounds, context.session_id, user_input[:200],
@@ -824,7 +848,10 @@ class MultiClawAgent(ToolCallAgent):
                 full_text = await self._generate_final_summary(
                     messages,
                     self._collect_plain_text_response,
+                    before_model=lambda: self._raise_if_cancel_requested(context),
                 )
+            except PlanCancellationRequested:
+                raise
             except Exception:
                 logger.exception("final summary failed")
                 yield {
@@ -967,6 +994,7 @@ class MultiClawAgent(ToolCallAgent):
         max_rounds = self.settings.agent.max_tool_rounds
 
         for _ in range(max_rounds):
+            await self._raise_if_cancel_requested(context)
             response: LLMResponse = await self.router.completion(
                 model=self.settings.llm.default_model,
                 messages=messages,
@@ -1020,6 +1048,7 @@ class MultiClawAgent(ToolCallAgent):
         full_text = await self._generate_final_summary(
             messages,
             self._collect_completion_text_response,
+            before_model=lambda: self._raise_if_cancel_requested(context),
         )
         await self._persist_stream_assistant_output(
             context=context,

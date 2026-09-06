@@ -1438,6 +1438,87 @@ async def test_cancel_waiting_plan_writes_terminal_checkpoint(
     assert payload["terminal_status"] == RunStatus.CANCELLED.value
 
 
+@pytest.mark.asyncio
+async def test_request_cancellation_is_idempotent_and_immediately_finishes_waiting_plan(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-request-cancel")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+
+    first = await coordinator.request_cancellation(context)
+    second = await coordinator.request_cancellation(context)
+    checkpoint = (await _checkpoint_rows(workflow_database, context))[-1]
+
+    assert first.status is RunStatus.CANCELLED
+    assert first.finished_at is not None
+    assert second == first
+    assert checkpoint["phase"] == CheckpointPhase.RUN_TERMINAL.value
+
+
+@pytest.mark.asyncio
+async def test_request_cancellation_persists_one_timestamp_for_running_plan(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-running-request-cancel")
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_run_with_checkpoint(context, "runtime-plan")
+    before = await coordinator.get_run(context)
+    assert before is not None
+
+    first = await coordinator.request_cancellation(context)
+    second = await coordinator.request_cancellation(context)
+
+    assert first.status is RunStatus.RUNNING
+    assert first.cancel_requested_at is not None
+    assert first.version == before.version + 1
+    assert second.cancel_requested_at == first.cancel_requested_at
+    assert second.version == first.version
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cancellation_requests_change_running_run_once(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-concurrent-cancel")
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_run_with_checkpoint(context, "runtime-plan")
+    before = await coordinator.get_run(context)
+    assert before is not None
+
+    first, second = await asyncio.gather(
+        coordinator.request_cancellation(context),
+        coordinator.request_cancellation(context),
+    )
+
+    assert first.cancel_requested_at is not None
+    assert second.cancel_requested_at == first.cancel_requested_at
+    assert first.version == second.version == before.version + 1
+
+
+@pytest.mark.asyncio
+async def test_request_cancellation_keeps_terminal_run_unchanged(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-terminal-cancel")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-plan")
+    await coordinator.finish_run_with_checkpoint(lease, RunStatus.COMPLETED)
+    before = await coordinator.get_run(context)
+    assert before is not None
+
+    after = await coordinator.request_cancellation(context)
+
+    assert after == before
+
+
 def test_run_hydration_rejects_partial_plan_binding():
     row = {
         "tenant_id": str(uuid4()),
