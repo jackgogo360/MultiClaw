@@ -288,61 +288,18 @@ class PlanExecutionCoordinator:
                 runner=runner,
             )
 
-            async with TenantUnitOfWork(
-                self._database,
-                context,
-                planning_settings=self._settings.planning,
-                workflow_settings=self._settings.workflow,
-            ) as uow:
-                await uow.plans.lock_run_for_execution(lease)
-                assert uow.conn is not None
-                continuation = WorkflowContinuationService(
-                    self._database,
-                    settings=self._settings,
-                    connection=uow.conn,
-                )
-                persisted = await continuation.persist_plan_step_result(
+            await run_lease_handle.use_current(
+                lambda current_lease,
+                started=started,
+                target_status=target_status,
+                document=document: self._finalize_step_attempt(
                     context=context,
+                    lease=current_lease,
+                    started=started,
+                    target_status=target_status,
                     document=document,
                 )
-                finished = await uow.plans.finish_step_attempt(
-                    lease,
-                    step_run_id=started.step_run.step_run_id,
-                    expected_version=started.step_run.version,
-                    status=target_status,
-                    result=document,
-                    result_ref=persisted.result_ref,
-                    error_code=(
-                        None
-                        if target_status is PlanStepRunStatus.SUCCEEDED
-                        else str(redact("plan_step_failed"))
-                    ),
-                    error_detail_redacted=(
-                        None
-                        if target_status is PlanStepRunStatus.SUCCEEDED
-                        else str(redact(document.summary))
-                    ),
-                )
-                workflow = WorkflowCoordinator(
-                    self._database,
-                    settings=self._settings,
-                    connection=uow.conn,
-                )
-                await workflow.checkpoint(
-                    lease,
-                    CheckpointPhase.PLAN_STEP_READY,
-                    {
-                        "run_id": context.run_id,
-                        "plan_id": started.plan.plan_id,
-                        "plan_version": started.plan.current_version,
-                        "plan_digest": started.plan.current.content_digest,
-                        "step_id": started.step.step_id,
-                        "step_run_id": finished.step_run_id,
-                        "attempt": finished.attempt,
-                        "execution_cursor": "select_next",
-                        "cursor": "select_next",
-                    },
-                )
+            )
 
             if target_status is PlanStepRunStatus.FAILED_TERMINAL:
                 return PlanExecutionOutcome(
@@ -350,6 +307,71 @@ class PlanExecutionCoordinator:
                     plan=started.plan,
                     run=await self._load_run(context),
                 )
+
+    async def _finalize_step_attempt(
+        self,
+        *,
+        context: TenantContext,
+        lease: RunLease,
+        started: StartedPlanStep,
+        target_status: PlanStepRunStatus,
+        document: PlanStepResultDocument,
+    ) -> None:
+        async with TenantUnitOfWork(
+            self._database,
+            context,
+            planning_settings=self._settings.planning,
+            workflow_settings=self._settings.workflow,
+        ) as uow:
+            await uow.plans.lock_run_for_execution(lease)
+            assert uow.conn is not None
+            continuation = WorkflowContinuationService(
+                self._database,
+                settings=self._settings,
+                connection=uow.conn,
+            )
+            persisted = await continuation.persist_plan_step_result(
+                context=context,
+                document=document,
+            )
+            finished = await uow.plans.finish_step_attempt(
+                lease,
+                step_run_id=started.step_run.step_run_id,
+                expected_version=started.step_run.version,
+                status=target_status,
+                result=document,
+                result_ref=persisted.result_ref,
+                error_code=(
+                    None
+                    if target_status is PlanStepRunStatus.SUCCEEDED
+                    else str(redact("plan_step_failed"))
+                ),
+                error_detail_redacted=(
+                    None
+                    if target_status is PlanStepRunStatus.SUCCEEDED
+                    else str(redact(document.summary))
+                ),
+            )
+            workflow = WorkflowCoordinator(
+                self._database,
+                settings=self._settings,
+                connection=uow.conn,
+            )
+            await workflow.checkpoint(
+                lease,
+                CheckpointPhase.PLAN_STEP_READY,
+                {
+                    "run_id": context.run_id,
+                    "plan_id": started.plan.plan_id,
+                    "plan_version": started.plan.current_version,
+                    "plan_digest": started.plan.current.content_digest,
+                    "step_id": started.step.step_id,
+                    "step_run_id": finished.step_run_id,
+                    "attempt": finished.attempt,
+                    "execution_cursor": "select_next",
+                    "cursor": "select_next",
+                },
+            )
 
     async def _resume_running_attempt(
         self,

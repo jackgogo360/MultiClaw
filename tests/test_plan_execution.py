@@ -101,6 +101,28 @@ class ScriptedStepRunner:
         return self.completions.pop(0)
 
 
+class HeartbeatStepRunner:
+    def __init__(
+        self,
+        database: Database,
+        settings: Settings,
+        delegate,
+    ) -> None:
+        self.workflow = WorkflowCoordinator(database, settings=settings)
+        self.delegate = delegate
+        self.registry = delegate.registry
+        self.skill_manager = delegate.skill_manager
+
+    async def run_plan_step(self, request, *, run_lease_handle, **kwargs):
+        refreshed = await self.workflow.heartbeat(await run_lease_handle.current())
+        await run_lease_handle.replace(refreshed)
+        return await self.delegate.run_plan_step(
+            request,
+            run_lease_handle=run_lease_handle,
+            **kwargs,
+        )
+
+
 class ApprovalStepRunner:
     def __init__(self, database: Database, settings: Settings) -> None:
         self.database = database
@@ -1387,6 +1409,38 @@ async def test_valid_completion_is_persisted_before_step_success(
 
 
 @pytest.mark.asyncio
+async def test_success_finalization_uses_lease_refreshed_during_runner(
+    execution_fixture,
+):
+    scripted = ScriptedStepRunner(
+        [
+            PlanStepCompletion(
+                status="succeeded",
+                summary="Heartbeat-safe success.",
+                evidence=["runner refreshed the lease"],
+            )
+        ]
+    )
+    runner = HeartbeatStepRunner(
+        execution_fixture.database,
+        execution_fixture.settings,
+        scripted,
+    )
+
+    outcome = await execution_fixture.execute(
+        runner,
+        draft=_draft(("lint",)),
+    )
+
+    attempt = await execution_fixture.latest_attempt()
+    assert outcome.state == "completed"
+    assert attempt.status is PlanStepRunStatus.SUCCEEDED
+    assert attempt.result_ref is not None
+    assert await execution_fixture.count_results() == 1
+    assert (await execution_fixture.load_result(attempt.result_ref)).status == "succeeded"
+
+
+@pytest.mark.asyncio
 async def test_result_and_attempt_finish_roll_back_when_checkpoint_fails(
     execution_fixture,
     monkeypatch,
@@ -1476,6 +1530,47 @@ async def test_retryable_completion_creates_only_bounded_attempts(execution_fixt
 
 
 @pytest.mark.asyncio
+async def test_retryable_finalization_uses_lease_refreshed_during_runner(
+    execution_fixture,
+):
+    scripted = ScriptedStepRunner(
+        [
+            PlanStepCompletion(
+                status="failed",
+                summary="Retry after heartbeat.",
+                evidence=[],
+                retryable=True,
+            ),
+            PlanStepCompletion(
+                status="succeeded",
+                summary="Second attempt succeeds.",
+                evidence=["bounded retry"],
+            ),
+        ]
+    )
+    runner = HeartbeatStepRunner(
+        execution_fixture.database,
+        execution_fixture.settings,
+        scripted,
+    )
+
+    outcome = await execution_fixture.execute(
+        runner,
+        draft=_draft(("lint",), max_attempts=2),
+    )
+
+    attempts = await execution_fixture.all_attempts()
+    assert outcome.state == "completed"
+    assert [attempt.status for attempt in attempts] == [
+        PlanStepRunStatus.FAILED_RETRYABLE,
+        PlanStepRunStatus.SUCCEEDED,
+    ]
+    assert [attempt.attempt for attempt in attempts] == [1, 2]
+    assert len(scripted.calls) == 2
+    assert await execution_fixture.count_results() == 2
+
+
+@pytest.mark.asyncio
 async def test_tool_approval_keeps_run_and_attempt_resumable(execution_fixture):
     outcome = await execution_fixture.execute(
         ApprovalStepRunner(
@@ -1547,7 +1642,11 @@ async def test_recovered_approval_reuses_running_attempt_without_redispatch(
     outcome = await execution_fixture.coordinator.execute_to_boundary(
         context=execution_fixture._context(),
         run_lease_handle=lease_handle,
-        runner=agent,
+        runner=HeartbeatStepRunner(
+            execution_fixture.database,
+            execution_fixture.settings,
+            agent,
+        ),
         recovered_tool_result=recovered,
         recovered_tool_input_json=recovered_input_json,
     )
