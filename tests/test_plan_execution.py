@@ -3038,6 +3038,42 @@ async def test_incomplete_reuse_proof_forces_the_changed_or_unproven_step(
 
 
 @pytest.mark.asyncio
+async def test_partial_reuse_keeps_unproven_dependent_for_real_execution(
+    execution_fixture,
+) -> None:
+    """A valid root fact never grants its dependent a shortcut by implication."""
+    await execution_fixture.approve_chain(["collect", "publish"])
+    runner = ScriptedStepRunner([])
+    digest = hashlib.sha256(b"[]").hexdigest()
+    policy = hashlib.sha256(json.dumps(redact(execution_fixture.settings.governance.model_dump(mode="json")), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    source_root = await execution_fixture.coordinator.start_next_attempt(context=execution_fixture._context(), lease=execution_fixture.lease)
+    assert source_root is not None
+    root_document = await execution_fixture.succeed(source_root.step_run, digest=digest, policy_digest=policy, skill_set_digest=digest)
+    source_dependent = await execution_fixture.coordinator.start_next_attempt(context=execution_fixture._context(), lease=execution_fixture.lease)
+    assert source_dependent is not None
+    dependent_document = await execution_fixture.succeed(source_dependent.step_run, digest=digest, dependency_result_digests={"collect": "e" * 64}, policy_digest=policy, skill_set_digest=digest)
+    context = execution_fixture._context()
+    async with TenantUnitOfWork(execution_fixture.database, context) as uow:
+        original = await uow.plans.get(execution_fixture.plan_id)
+        assert original is not None
+        source_root_row = await uow.plans.step_run_by_id(run_id=str(context.run_id), step_run_id=source_root.step_run.step_run_id)
+        source_dependent_row = await uow.plans.step_run_by_id(run_id=str(context.run_id), step_run_id=source_dependent.step_run.step_run_id)
+        assert source_root_row is not None and source_dependent_row is not None
+        revised = await uow.plans.append_version(plan_id=original.plan_id, expected_version=original.aggregate_version, draft=_draft(("collect", "publish"), chain=True), parent_version=1, revision_feedback="dependent proof changed", supersedes={step.logical_step_key: step.step_id for step in original.current.steps})
+        await uow.conn.execute(update(agent_plans).where(agent_plans.c.id == revised.plan_id).values(status="approved", approved_version=2))
+        await uow.conn.execute(update(agent_runs).where(agent_runs.c.run_id == context.run_id).values(active_plan_version=2))
+    reused = await execution_fixture.coordinator.apply_compatible_reuse(context=context, lease=execution_fixture.lease, runner=runner)
+    started = await execution_fixture.coordinator.start_next_attempt(context=context, lease=execution_fixture.lease)
+    assert [item.reused_from_step_run_id for item in reused] == [source_root.step_run.step_run_id]
+    assert reused[0].result_ref == source_root_row.result_ref
+    assert reused[0].result_digest == source_root_row.result_digest == root_document.digest()
+    assert reused[0].result_summary == source_root_row.result_summary
+    assert source_dependent_row.result_digest == dependent_document.digest()
+    assert started is not None and started.step.logical_step_key == "publish"
+    assert started.step_run.reused_from_step_run_id is None
+
+
+@pytest.mark.asyncio
 async def test_attempt_and_plan_step_ready_checkpoint_commit_together(execution_fixture):
     await execution_fixture.approve()
     before_checkpoints = 0
