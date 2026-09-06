@@ -15,15 +15,17 @@ from multiclaw.events import EventBus, EventRouter
 from multiclaw.governance import (
     ExecutionGuard,
     PermissionChecker,
-    ScopedAuditLogger,
     SandboxController,
     SandboxProcessRunner,
     SandboxReadiness,
+    ScopedAuditLogger,
 )
 from multiclaw.governance.sandbox.manager import SandboxManager
 from multiclaw.llm import ModelRouter
+from multiclaw.mcp import MCPClientManager
 from multiclaw.memory import MemoryEntry, MemoryProtocol
 from multiclaw.planner import Planner
+from multiclaw.planner.execution import PlanExecutionCoordinator
 from multiclaw.runtime.models import RuntimeClock, TenantRuntime
 from multiclaw.secrets.resolver import ResolvedCredentials
 from multiclaw.skills import SkillManager
@@ -43,10 +45,7 @@ from multiclaw.tools.shell import ShellToolBuilder
 from multiclaw.tools.web_fetch import WebFetchToolBuilder
 from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
-
-from multiclaw.mcp import MCPClientManager
 from multiclaw.workflow.recovery import RuntimeRecoveryContinuationService
-
 
 _SQLITE_MISSING_TABLE_RE = re.compile(r"no such table:\s*(?P<table>[^\s]+)", re.IGNORECASE)
 _MYSQL_MISSING_TABLE_RE = re.compile(
@@ -205,6 +204,11 @@ class RuntimeFactory:
             sandbox_controller=sandbox_controller,
             sandbox_readiness=readiness,
             recovery_continuation=RuntimeRecoveryContinuationService(),
+            plan_execution=PlanExecutionCoordinator(
+                self.database,
+                settings=self.settings,
+                event_router=event_router,
+            ),
             last_used_at_ms=self.clock.now_ms(),
             clock=self.clock,
         )

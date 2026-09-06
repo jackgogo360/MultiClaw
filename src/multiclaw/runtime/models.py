@@ -116,6 +116,7 @@ class TenantRuntime:
     sandbox_readiness: SandboxReadiness | None
     last_used_at_ms: int
     recovery_continuation: Any | None = None
+    plan_execution: Any | None = None
     secret_handles: list[SecretHandle] = field(default_factory=list)
     clock: RuntimeClock | None = None
     active_run_count: int = 0

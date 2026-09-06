@@ -498,6 +498,7 @@ class PlanExecutionCoordinator:
         runner: PlanStepRunner,
         recovered_tool_result: PersistedToolResult | None = None,
         recovered_tool_input_json: str | None = None,
+        resume_running_attempt: bool = False,
     ) -> PlanExecutionOutcome:
         try:
             return await self._execute_to_boundary(
@@ -506,6 +507,7 @@ class PlanExecutionCoordinator:
                 runner=runner,
                 recovered_tool_result=recovered_tool_result,
                 recovered_tool_input_json=recovered_tool_input_json,
+                resume_running_attempt=resume_running_attempt,
             )
         except PlanCancellationRequested:
             return await self._cancel_at_boundary(context, run_lease_handle)
@@ -518,10 +520,11 @@ class PlanExecutionCoordinator:
         runner: PlanStepRunner,
         recovered_tool_result: PersistedToolResult | None = None,
         recovered_tool_input_json: str | None = None,
+        resume_running_attempt: bool = False,
     ) -> PlanExecutionOutcome:
         if (recovered_tool_result is None) != (recovered_tool_input_json is None):
             raise ValueError("recovered tool result and input must be provided together")
-        resume_running_attempt = recovered_tool_result is not None
+        resume_running_attempt = resume_running_attempt or recovered_tool_result is not None
         last_plan: PlanSnapshot | None = None
         started: StartedPlanStep | None
         while True:
@@ -636,6 +639,63 @@ class PlanExecutionCoordinator:
                     plan=started.plan,
                     run=await self._load_run(context),
                 )
+
+    async def resume(
+        self,
+        *,
+        runtime,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        recovery_outcome,
+        recovered_tool_result: PersistedToolResult | None = None,
+        recovered_tool_input_json: str | None = None,
+    ) -> PlanExecutionOutcome:
+        """Continue only from a previously validated durable Plan boundary."""
+        recovery = recovery_outcome.plan_recovery_context
+        if recovery is None:
+            raise PlanExecutionBlocked("Plan recovery context is unavailable")
+        action = recovery_outcome.action
+        if action is not None and action.value == "resume_plan_revision":
+            failed = recovery.failed_step
+            failed_step = next(
+                (step for step in recovery.plan.current.steps if failed is not None and step.step_id == failed.step_id),
+                None,
+            )
+            if failed is None or failed_step is None:
+                raise PlanExecutionBlocked("Plan revision recovery facts are inconsistent")
+            return await self._replan_terminal_failure(
+                context=context,
+                run_lease_handle=run_lease_handle,
+                plan=recovery.plan,
+                failed_step=failed_step,
+                failed_step_run_id=failed.step_run_id,
+            )
+        if recovery.cursor == "final_summary" and recovery.running_step is None:
+            lease = await run_lease_handle.current()
+            terminal = await WorkflowCoordinator(
+                self._database, settings=self._settings
+            ).finish_run_with_checkpoint(lease, RunStatus.COMPLETED)
+            await run_lease_handle.replace(terminal)
+            return PlanExecutionOutcome(
+                state="completed",
+                plan=recovery.plan,
+                run=await self._load_run(context),
+            )
+        result = await self.execute_to_boundary(
+            context=context,
+            run_lease_handle=run_lease_handle,
+            runner=runtime.agent,
+            recovered_tool_result=recovered_tool_result,
+            recovered_tool_input_json=recovered_tool_input_json,
+            resume_running_attempt=recovery.running_step is not None,
+        )
+        if result.state == "completed":
+            await run_lease_handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    self._database, settings=self._settings
+                ).finish_run_with_checkpoint(lease, RunStatus.COMPLETED)
+            )
+        return result
 
     async def _raise_if_cancel_requested(self, context: TenantContext) -> None:
         await WorkflowCoordinator(

@@ -9,10 +9,9 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from alembic import command
-from pydantic import ValidationError
 from sqlalchemy import insert, select, text, update
 
+from alembic import command
 from multiclaw.cli import alembic_config
 from multiclaw.config.settings import DatabaseSettings, Settings
 from multiclaw.storage import Database
@@ -489,6 +488,59 @@ async def test_raw_plan_phase_or_cursor_mismatch_blocks_recovery_without_lease(
         run_context,
         "runtime-2",
     )
+
+    assert outcome.status is RunStatus.BLOCKED_CORRUPT
+    assert outcome.action is None
+    assert outcome.lease is None
+    assert outcome.executions_started == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_checkpoint_with_missing_plan_blocks_before_recovery_lease(
+    workflow_database: Database,
+):
+    """Plan checkpoints are never recoverable from an unscoped payload alone."""
+    run_context = await _create_run_context(workflow_database, suffix="-missing-plan")
+    await _coordinator(workflow_database).start_run(run_context, "runtime-1")
+    plan_id = str(uuid4())
+    payload = {
+        "schema_version": 1,
+        "run_id": run_context.run_id,
+        "plan_id": plan_id,
+        "plan_version": 1,
+        "plan_digest": "a" * 64,
+        "decision_cursor": f"plan:{plan_id}:v1:decision",
+        "next_step": "plan_decision",
+        "cursor": f"plan:{plan_id}:v1:decision",
+    }
+    payload_json = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    async with workflow_database.write_transaction() as conn:
+        await conn.execute(
+            insert(execution_checkpoints).values(
+                checkpoint_id=str(uuid4()),
+                tenant_id=run_context.tenant_id,
+                workspace_id=run_context.workspace_id,
+                session_id=run_context.session_id,
+                run_id=run_context.run_id,
+                approval_id=None,
+                execution_id=None,
+                phase=CheckpointPhase.PLAN_AWAITING_APPROVAL.value,
+                checkpoint_seq=1,
+                payload_json=payload_json,
+                payload_hash=hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                schema_version=1,
+                created_at=workflow_database.dialect.db_now_ms(),
+            )
+        )
+    await _expire_run_lease_with_db_clock(workflow_database, run_context)
+
+    outcome = await RecoveryService(workflow_database).recover(run_context, "runtime-2")
 
     assert outcome.status is RunStatus.BLOCKED_CORRUPT
     assert outcome.action is None

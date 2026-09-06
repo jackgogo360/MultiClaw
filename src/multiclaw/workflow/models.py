@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from enum import Enum, StrEnum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from multiclaw.tenancy.context import TenantContext
+
+if TYPE_CHECKING:
+    from multiclaw.workflow.recovery import PlanRecoveryContext
 
 
 class RunStatus(str, Enum):
@@ -519,6 +522,7 @@ class RecoveryOutcome:
     status: RunStatus | None = None
     lease: RunLease | None = None
     execution_id: str | None = None
+    plan_recovery_context: PlanRecoveryContext | None = None
     executions_started: int = 0
     reason: str = ""
 
