@@ -49,7 +49,9 @@ from multiclaw.tools.base import (
 )
 from multiclaw.workflow.models import (
     CheckpointPhase,
+    InvalidTransitionError,
     RecoveryAction,
+    RecoveryOutcome,
     RecoveryStrategy,
     RunLeaseHandle,
     RunStatus,
@@ -335,6 +337,99 @@ async def test_corrupt_plan_recovery_fails_closed_before_effects(
         await database.dispose()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("corruption", "terminal_status"),
+    (
+        ("plan_binding", RunStatus.BLOCKED_CORRUPT),
+        ("checkpoint_schema", RunStatus.BLOCKED_INCOMPATIBLE),
+    ),
+)
+async def test_worker_terminalizes_plan_only_recovery_failures_once(
+    tmp_path: Path,
+    corruption: str,
+    terminal_status: RunStatus,
+):
+    database = await _database(tmp_path)
+    try:
+        settings, context, service, _result = await _materialized(database)
+        checkpoint = await service.workflow.get_latest_checkpoint(context)
+        assert checkpoint is not None
+        async with database.write_transaction() as conn:
+            if corruption == "plan_binding":
+                await conn.execute(
+                    update(agent_runs)
+                    .where(agent_runs.c.run_id == context.run_id)
+                    .values(
+                        plan_id=None,
+                        initial_plan_version=None,
+                        active_plan_version=None,
+                    )
+                )
+            else:
+                await conn.execute(
+                    update(execution_checkpoints)
+                    .where(execution_checkpoints.c.checkpoint_id == checkpoint.checkpoint_id)
+                    .values(schema_version=2)
+                )
+        await _expire(database, context)
+        runtime = _BlockedPlanRuntime(database, settings)
+        pool = _BlockedPlanRuntimePool(runtime)
+        worker = WorkflowRecoveryWorker(
+            database=database,
+            settings=settings,
+            runtime_pool=pool,
+        )
+
+        await worker.run_once()
+
+        run = await service.workflow.get_run(context)
+        assert run is not None
+        assert run.status is terminal_status
+        assert await _terminal_checkpoint_count(database, context) == 1
+        assert runtime.agent.generic_recovery_calls == 0
+        assert runtime.begin_calls == runtime.closed_leases == pool.acquire_calls == 1
+
+        await worker.run_once()
+
+        assert await _terminal_checkpoint_count(database, context) == 1
+        assert runtime.begin_calls == runtime.closed_leases == pool.acquire_calls == 1
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_cannot_terminalize_new_plan_lease(tmp_path: Path):
+    database = await _database(tmp_path)
+    try:
+        settings, context, service, _result = await _materialized(database)
+        stale_lease = await service.workflow.resume_waiting_run(context, "runtime-old")
+        await _expire(database, context)
+        current_lease = await service.workflow.acquire_run(context, "runtime-new")
+        runtime = _BlockedPlanRuntime(database, settings)
+        worker = WorkflowRecoveryWorker(
+            database=database,
+            settings=settings,
+            runtime_pool=_BlockedPlanRuntimePool(runtime),
+        )
+
+        with pytest.raises(InvalidTransitionError):
+            await worker._consume_outcome(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=RunLeaseHandle(stale_lease),
+                outcome=RecoveryOutcome(status=RunStatus.BLOCKED_CORRUPT),
+            )
+
+        run = await service.workflow.get_run(context)
+        assert run is not None
+        assert run.status is RunStatus.RESUMING
+        assert run.lease_owner == current_lease.lease_owner
+        assert await _terminal_checkpoint_count(database, context) == 0
+    finally:
+        await database.dispose()
+
+
 class _ObservedToolParams(BaseModel):
     idempotency_key: str
 
@@ -370,6 +465,17 @@ class _ObservedToolBuilder(ToolBuilder[_ObservedToolParams]):
 
     def build(self, params: _ObservedToolParams) -> ToolInvocation[_ObservedToolParams]:
         return _ObservedToolInvocation(params, self._effect_counts)
+
+
+class _ApprovedPlanToolBuilder(_ObservedToolBuilder):
+    name = "approved_plan_effect"
+    recovery_strategy = RecoveryStrategy.MANUAL_UNCERTAIN
+    idempotency_key_field = None
+
+    def build(self, params: _ObservedToolParams) -> ToolInvocation[_ObservedToolParams]:
+        invocation = _ObservedToolInvocation(params, self._effect_counts)
+        invocation.name = self.name
+        return invocation
 
 
 class _ObservedPlanAgent:
@@ -451,9 +557,61 @@ class _FinalSummaryRuntime:
         self.plan_execution = PlanExecutionCoordinator(database, settings=settings)
 
 
+class _BlockedPlanRuntimeLease:
+    def __init__(self, runtime) -> None:
+        self._runtime = runtime
+
+    def close(self) -> None:
+        self._runtime.closed_leases += 1
+
+
+class _BlockedPlanAgent:
+    def __init__(self, database: Database, settings: Settings) -> None:
+        self.database = database
+        self.settings = settings
+        self.generic_recovery_calls = 0
+
+    async def resume_recovery(self, **_kwargs) -> None:
+        self.generic_recovery_calls += 1
+        raise AssertionError("corrupt Plan recovery must not invoke generic continuation")
+
+
+class _BlockedPlanRuntime:
+    def __init__(self, database: Database, settings: Settings) -> None:
+        self.runtime_instance_id = "blocked-plan-runtime"
+        self.agent = _BlockedPlanAgent(database, settings)
+        self.begin_calls = 0
+        self.closed_leases = 0
+
+    def begin_run(self) -> _BlockedPlanRuntimeLease:
+        self.begin_calls += 1
+        return _BlockedPlanRuntimeLease(self)
+
+
+class _BlockedPlanRuntimePool:
+    def __init__(self, runtime: _BlockedPlanRuntime) -> None:
+        self._runtime = runtime
+        self.acquire_calls = 0
+
+    async def acquire(self, _context: TenantContext) -> _BlockedPlanRuntime:
+        self.acquire_calls += 1
+        return self._runtime
+
+
 def _durable_scheduler(database: Database, settings: Settings) -> CoreToolScheduler:
     return CoreToolScheduler(
         permission_checker=PermissionChecker(),
+        execution_guard=ExecutionGuard(timeout=1.0),
+        audit_logger=InMemoryAuditLogger(),
+        event_bus=EventBus(),
+        database=database,
+        settings=settings,
+    )
+
+
+def _approval_scheduler(database: Database, settings: Settings) -> CoreToolScheduler:
+    return CoreToolScheduler(
+        permission_checker=PermissionChecker(guarded_tools={"approved_plan_effect"}),
         execution_guard=ExecutionGuard(timeout=1.0),
         audit_logger=InMemoryAuditLogger(),
         event_bus=EventBus(),
@@ -487,6 +645,41 @@ async def _observed_result_boundary(database: Database):
     assert checkpoint is not None
     assert checkpoint.phase == "execution_result_observed"
     return settings, context, service, effects, builder, scheduler, checkpoint
+
+
+async def _approved_plan_tool_boundary(database: Database):
+    settings, context, service, result = await _materialized(database)
+    decision = await _approve(service, context, result)
+    assert decision.lease is not None
+    running_lease = await service.workflow.transition_run(
+        decision.lease,
+        RunStatus.RUNNING,
+    )
+    plan_execution = PlanExecutionCoordinator(database, settings=settings)
+    started = await plan_execution.start_next_attempt(
+        context=context,
+        lease=running_lease,
+    )
+    assert started is not None
+    effects: dict[str, int] = {}
+    builder = _ApprovedPlanToolBuilder(effects)
+    scheduler = _approval_scheduler(database, settings)
+    approval = await scheduler.run(
+        builder,
+        {"idempotency_key": "observed-key"},
+        context=context,
+        call_id="approved-call",
+        run_lease_handle=RunLeaseHandle(running_lease),
+    )
+    assert approval.status is ToolStatus.AWAITING_APPROVAL
+    approval_id = str(approval.data["approval_id"])
+    await service.workflow.decide_approval(
+        context,
+        approval_id,
+        approved=True,
+        version=1,
+    )
+    return settings, context, service, effects, builder, scheduler
 
 
 async def _final_summary_boundary(
@@ -555,6 +748,19 @@ async def _step_attempt_count(database: Database, context: TenantContext) -> int
     return int(result or 0)
 
 
+async def _terminal_checkpoint_count(database: Database, context: TenantContext) -> int:
+    async with database.connect() as conn:
+        result = await conn.scalar(
+            select(func.count())
+            .select_from(execution_checkpoints)
+            .where(
+                execution_checkpoints.c.run_id == context.run_id,
+                execution_checkpoints.c.phase == CheckpointPhase.RUN_TERMINAL.value,
+            )
+        )
+    return int(result or 0)
+
+
 @pytest.mark.asyncio
 async def test_real_observed_tool_result_resumes_plan_without_redispatch(tmp_path: Path):
     database = await _database(tmp_path)
@@ -586,6 +792,49 @@ async def test_real_observed_tool_result_resumes_plan_without_redispatch(tmp_pat
         async with TenantUnitOfWork(database, context) as uow:
             attempts = await uow.plans.running_step_attempts(run_id=str(context.run_id))
         assert attempts == ()
+    finally:
+        await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_approved_plan_tool_resolution_resumes_plan_without_generic_recovery(
+    tmp_path: Path,
+):
+    database = await _database(tmp_path)
+    try:
+        settings, context, service, effects, builder, scheduler = await _approved_plan_tool_boundary(
+            database
+        )
+        runtime = _ObservedRuntime(
+            database=database,
+            settings=settings,
+            scheduler=scheduler,
+            builder=builder,
+        )
+        worker = WorkflowRecoveryWorker(
+            database=database,
+            settings=settings,
+            runtime_pool=_ObservedRuntimePool(runtime),
+        )
+
+        await worker.run_once()
+
+        run = await service.workflow.get_run(context)
+        assert run is not None
+        assert effects == {"observed-key": 1}
+        assert runtime.agent.generic_recovery_calls == 0
+        assert len(runtime.agent.plan_calls) == 1
+        assert run.status is RunStatus.COMPLETED
+        assert await _execution_count(database, context) == 1
+        assert await _step_attempt_count(database, context) == 1
+        async with TenantUnitOfWork(database, context) as uow:
+            attempts = await uow.plans.running_step_attempts(run_id=str(context.run_id))
+        assert attempts == ()
+
+        await worker.run_once()
+
+        assert effects == {"observed-key": 1}
+        assert len(runtime.agent.plan_calls) == 1
     finally:
         await database.dispose()
 

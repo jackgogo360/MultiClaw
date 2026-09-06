@@ -827,13 +827,32 @@ class WorkflowRecoveryWorker:
                 }:
                     return
 
-                if candidate.awaiting_resolution and run.status is RunStatus.AWAITING_USER:
+                if (
+                    run.status is RunStatus.AWAITING_USER
+                    and (
+                        candidate.awaiting_resolution
+                        or preflight.status
+                        in {RunStatus.BLOCKED_CORRUPT, RunStatus.BLOCKED_INCOMPATIBLE}
+                    )
+                ):
                     lease = await coordinator.resume_waiting_run(candidate.context, runtime_instance_id)
                 else:
                     lease = await coordinator.acquire_run(candidate.context, runtime_instance_id)
             except LeaseConflictError:
                 return
             run_lease_handle = RunLeaseHandle(lease)
+
+            if preflight.status in {
+                RunStatus.BLOCKED_CORRUPT,
+                RunStatus.BLOCKED_INCOMPATIBLE,
+            }:
+                await self._consume_outcome(
+                    runtime=runtime,
+                    context=candidate.context,
+                    run_lease_handle=run_lease_handle,
+                    outcome=preflight,
+                )
+                return
 
             if candidate.awaiting_resolution and await self._resume_resolved_approval_if_present(
                 runtime=runtime,
@@ -842,7 +861,7 @@ class WorkflowRecoveryWorker:
             ):
                 return
 
-            outcome = await self._recovery_service.recover(candidate.context, runtime_instance_id)
+            outcome = await self._recovery_service.validate_live_run(candidate.context)
             await self._consume_outcome(
                 runtime=runtime,
                 context=candidate.context,
@@ -930,7 +949,13 @@ class WorkflowRecoveryWorker:
             )
             return True
         if refreshed is not None and refreshed.status is ExecutionStatus.SUCCEEDED:
-            await self._invoke_continuation(runtime=runtime, context=context, run_lease_handle=run_lease_handle)
+            outcome = await self._recovery_service.validate_live_run(context)
+            await self._consume_outcome(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+                outcome=outcome,
+            )
         return True
 
     async def _consume_outcome(
@@ -963,6 +988,12 @@ class WorkflowRecoveryWorker:
                         ),
                         detail=outcome.reason or "recovery blocked",
                     )
+            await run_lease_handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    self._database,
+                    settings=self._settings,
+                ).finish_run_with_checkpoint(lease, outcome.status)
+            )
             return
         if outcome.action is None or outcome.action is RecoveryAction.TERMINAL_NOOP:
             return
