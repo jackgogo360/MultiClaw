@@ -248,6 +248,499 @@ def _metric_count_for(metrics, name: str) -> int:
     return sum(value for (metric_name, _labels), value in metrics.counters.items() if metric_name == name)
 
 
+def test_plan_api_request_body_rejects_forged_decider(migrated_database):
+    """Decision identity is derived from auth, never accepted from a client."""
+    from multiclaw import server
+
+    with TestClient(server.app) as client:
+        client.cookies = _make_auth_cookie(server.app, migrated_database)
+        response = client.post(
+            f"/api/plans/{uuid4()}/decision",
+            json={
+                "session_id": str(uuid4()),
+                "decision_id": "decision-1",
+                "plan_version": 1,
+                "expected_version": 1,
+                "action": "approve",
+                "decided_by": "forged-user",
+            },
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "extra_forbidden"
+    assert response.json()["detail"][0]["loc"] == ["body", "decided_by"]
+
+
+def test_plan_api_routes_are_registered():
+    """The authenticated Plan/Run control plane is a first-class API surface."""
+    from multiclaw import server as server_module
+
+    routes = {route.path for route in server_module.app.routes if hasattr(route, "path")}
+    assert {
+        "/api/sessions/{session_id}/plans",
+        "/api/plans/{plan_id}",
+        "/api/plans/{plan_id}/decision",
+        "/api/plans/{plan_id}/runs",
+        "/api/runs/{run_id}",
+        "/api/runs/{run_id}/cancel",
+        "/api/runs/{run_id}/summary/retry",
+    } <= routes
+
+
+def test_plan_api_scopes_reads_and_streams_approved_execution(migrated_database, monkeypatch):
+    """GET is scoped/authoritative and approval streams durable Plan mutations."""
+    from multiclaw import server
+    from multiclaw.memory import MemoryEntry
+    from multiclaw.planner.models import (
+        MaterializeInitialPlan,
+        PlanDraft,
+        PlanDraftStep,
+        PlanStepCompletion,
+        PlanTriggerMode,
+    )
+    from multiclaw.planner.service import PlanningService
+    from multiclaw.storage.repositories.memory import MemoryRepository
+
+    class FakeRouter:
+        async def completion(self, **_kwargs):
+            return SimpleNamespace(content="All durable Plan steps completed.")
+
+    class FakeRunner:
+        def __init__(self):
+            self.settings = server.app.state.settings
+            self.router = FakeRouter()
+            self.registry = SimpleNamespace(to_openai_schemas=list)
+            self.skill_manager = SimpleNamespace(active_skills=[])
+            self.calls = 0
+            self.step_started = threading.Event()
+            self.step_release = threading.Event()
+            self.block_steps = False
+
+        async def run_plan_step(self, _request, **_kwargs):
+            self.calls += 1
+            if self.block_steps:
+                self.step_started.set()
+                assert self.step_release.wait(timeout=5)
+            return PlanStepCompletion(
+                status="succeeded",
+                summary="The scoped step succeeded.",
+                evidence=["persisted"],
+            )
+
+    async def seed_plan(user_id: str) -> tuple[TenantContext, str, str, int]:
+        async with AuthUnitOfWork(migrated_database) as auth_uow:
+            user = await auth_uow.users.get_by_id(user_id)
+            assert user is not None and user.default_workspace_id is not None
+        root = TenantContext(user_id, user.default_workspace_id)
+        source_message_id = str(uuid4())
+        async with TenantUnitOfWork(
+            migrated_database,
+            root,
+            planning_settings=server.app.state.settings.planning,
+            workflow_settings=server.app.state.settings.workflow,
+        ) as uow:
+            session = await uow.sessions.create()
+            await MemoryRepository(
+                uow.conn, root.for_session(session.id), migrated_database.dialect
+            ).save(
+                MemoryEntry(
+                    id=source_message_id,
+                    content="Plan this request.",
+                    type="chat_message",
+                    role="user",
+                    session_id=session.id,
+                    turn_index=1,
+                )
+            )
+        run_context = root.for_run(session.id, str(uuid4()))
+        materialized = await PlanningService(
+            migrated_database, settings=server.app.state.settings
+        ).materialize_initial(
+            MaterializeInitialPlan(
+                context=run_context,
+                runtime_instance_id="seed-runtime",
+                source_message_id=source_message_id,
+                assistant_turn_index=1,
+                trigger_mode=PlanTriggerMode.EXPLICIT,
+                draft=PlanDraft(
+                    objective="Validate the API boundary.",
+                    constraints=[],
+                    generation_reason="test",
+                    steps=[
+                        PlanDraftStep(
+                            logical_step_key="verify",
+                            title="Verify",
+                            description="Run one durable scoped step.",
+                            expected_outcome="A persisted result.",
+                        )
+                    ],
+                ),
+            )
+        )
+        return root, session.id, materialized.plan.plan_id, materialized.plan.aggregate_version
+
+    with TestClient(server.app) as client:
+        owner_cookie = _make_auth_cookie(server.app, migrated_database, email="plans-owner@example.com")
+        owner_id = jwt.decode(
+            owner_cookie["token"], TEST_JWT_SIGNING_KEY, algorithms=["HS256"], audience="multiclaw-api"
+        )["sub"]
+        root, session_id, plan_id, aggregate_version = asyncio.run(seed_plan(owner_id))
+        client.cookies = owner_cookie
+
+        foreign_cookie = _make_auth_cookie(server.app, migrated_database, email="plans-foreign@example.com")
+        client.cookies = foreign_cookie
+        unknown = client.get(f"/api/plans/{uuid4()}?session_id={session_id}")
+        foreign = client.get(f"/api/plans/{plan_id}?session_id={session_id}")
+        client.cookies = owner_cookie
+        assert unknown.status_code == foreign.status_code == 404
+        assert unknown.json() == foreign.json() == {"detail": "resource not found"}
+
+        listed = client.get(f"/api/sessions/{session_id}/plans")
+        assert listed.status_code == 200
+        assert listed.json()[0]["plan_id"] == plan_id
+
+        original_acquire = server.app.state.runtime_pool.acquire
+        runner = FakeRunner()
+
+        async def acquire_and_patch(context):
+            runtime = await original_acquire(context)
+            runtime.agent = runner
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_and_patch)
+        streamed = client.post(
+            f"/api/plans/{plan_id}/decision",
+            json={
+                "session_id": session_id,
+                "decision_id": "approve-api-test",
+                "plan_version": 1,
+                "expected_version": aggregate_version,
+                "action": "approve",
+            },
+        )
+        assert streamed.status_code == 200
+        parts = _decode_sse_messages(streamed.text)
+        assert parts[0]["type"] == "data-run"
+        assert [part["type"] for part in parts][-1] == "finish"
+        assert "data-plan-decision" in {part["type"] for part in parts}
+        assert "data-plan-step-status" in {part["type"] for part in parts}
+        assert runner.calls == 1
+
+        authoritative = client.get(f"/api/plans/{plan_id}?session_id={session_id}")
+        assert authoritative.status_code == 200
+        run_id = authoritative.json()["runs"][0]["run_id"]
+        persisted = client.get(f"/api/runs/{run_id}?session_id={session_id}")
+        assert persisted.status_code == 200
+        assert persisted.json()["status"] == "completed"
+        assert persisted.json()["final_summary_available"] is True
+
+        stale = client.post(
+            f"/api/plans/{plan_id}/decision",
+            json={
+                "session_id": session_id,
+                "decision_id": "stale-api-test",
+                "plan_version": 1,
+                "expected_version": aggregate_version,
+                "action": "approve",
+            },
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["code"] == "plan_version_conflict"
+        assert stale.json()["detail"]["latest"]["current_version"] == 1
+
+        _, revise_session_id, revise_plan_id, revise_version = asyncio.run(seed_plan(owner_id))
+
+        async def generate_revision(_objective, *, revision, **_limits):
+            assert revision.feedback == "Tighten the durable result."
+            return PlanDraft(
+                objective="Validate the API boundary.",
+                constraints=[],
+                generation_reason="revision-test",
+                steps=[
+                    PlanDraftStep(
+                        logical_step_key="verify",
+                        title="Verify revised",
+                        description="Re-run the durable scoped step.",
+                        expected_outcome="A revised persisted result.",
+                    )
+                ],
+            )
+
+        async def acquire_with_revision(context):
+            runtime = await original_acquire(context)
+            runtime.agent = runner
+            runtime.plan_execution.planning_service._generator = SimpleNamespace(
+                generate=generate_revision
+            )
+            return runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", acquire_with_revision)
+        revised = client.post(
+            f"/api/plans/{revise_plan_id}/decision",
+            json={
+                "session_id": revise_session_id,
+                "decision_id": "revise-api-test",
+                "plan_version": 1,
+                "expected_version": revise_version,
+                "action": "revise",
+                "feedback": "Tighten the durable result.",
+            },
+        )
+        assert revised.status_code == 200
+        revised_types = [part["type"] for part in _decode_sse_messages(revised.text)]
+        assert revised_types == ["data-run", "data-plan-revised", "data-plan-decision", "finish"]
+        revised_get = client.get(
+            f"/api/plans/{revise_plan_id}?session_id={revise_session_id}"
+        )
+        assert revised_get.status_code == 200
+        assert revised_get.json()["current_version"] == 2
+        assert revised_get.json()["versions"][1]["revision_feedback"] == "Tighten the durable result."
+
+        _, reject_session_id, reject_plan_id, reject_version = asyncio.run(seed_plan(owner_id))
+        calls_before_reject = runner.calls
+        rejected = client.post(
+            f"/api/plans/{reject_plan_id}/decision",
+            json={
+                "session_id": reject_session_id,
+                "decision_id": "reject-api-test",
+                "plan_version": 1,
+                "expected_version": reject_version,
+                "action": "reject",
+            },
+        )
+        assert rejected.status_code == 200
+        rejected_parts = _decode_sse_messages(rejected.text)
+        assert [part["type"] for part in rejected_parts] == [
+            "data-run",
+            "data-plan-decision",
+            "finish",
+        ]
+        rejected_run_id = rejected_parts[0]["data"]["run_id"]
+        rejected_get = client.get(
+            f"/api/runs/{rejected_run_id}?session_id={reject_session_id}"
+        )
+        assert rejected_get.json()["status"] == "cancelled"
+        assert runner.calls == calls_before_reject
+
+        rerun = client.post(
+            f"/api/plans/{plan_id}/runs", json={"session_id": session_id}
+        )
+        assert rerun.status_code == 200
+        rerun_parts = _decode_sse_messages(rerun.text)
+        assert rerun_parts[0]["type"] == "data-run"
+        rerun_id = rerun_parts[0]["data"]["run_id"]
+        rerun_get = client.get(f"/api/runs/{rerun_id}?session_id={session_id}")
+        assert rerun_get.json()["initial_plan_version"] == 1
+        assert rerun_get.json()["active_plan_version"] == 1
+
+        before_concurrent = client.get(
+            f"/api/plans/{plan_id}?session_id={session_id}"
+        ).json()
+        runner.block_steps = True
+        runner.step_started.clear()
+        runner.step_release.clear()
+        shared_runtime = None
+
+        async def acquire_same_runtime(_context):
+            assert shared_runtime is not None
+            return shared_runtime
+
+        async def capture_runtime(context):
+            nonlocal shared_runtime
+            shared_runtime = await original_acquire(context)
+            shared_runtime.agent = runner
+            return shared_runtime
+
+        monkeypatch.setattr(server.app.state.runtime_pool, "acquire", capture_runtime)
+        asyncio.run(capture_runtime(root.for_session(session_id)))
+        monkeypatch.setattr(
+            server.app.state.runtime_pool, "acquire", acquire_same_runtime
+        )
+        request_barrier = threading.Barrier(2)
+        concurrent_responses: list[object] = []
+        thread_errors: list[Exception] = []
+        rejection_observed = threading.Event()
+        first_client = TestClient(server.app)
+        second_client = TestClient(server.app)
+        first_client.cookies.update(owner_cookie)
+        second_client.cookies.update(owner_cookie)
+
+        def post_rerun(target_client):
+            try:
+                request_barrier.wait(timeout=3)
+                response = target_client.post(
+                    f"/api/plans/{plan_id}/runs", json={"session_id": session_id}
+                )
+                concurrent_responses.append(response)
+                if response.status_code == 409:
+                    rejection_observed.set()
+            except Exception as error:  # noqa: BLE001 - surface concurrent request errors.
+                thread_errors.append(error)
+
+        first_thread = threading.Thread(target=post_rerun, args=(first_client,))
+        second_thread = threading.Thread(target=post_rerun, args=(second_client,))
+        try:
+            first_thread.start()
+            second_thread.start()
+            assert runner.step_started.wait(timeout=3)
+            assert rejection_observed.wait(timeout=3)
+        finally:
+            runner.step_release.set()
+            first_thread.join(timeout=5)
+            second_thread.join(timeout=5)
+            first_client.close()
+            second_client.close()
+
+        assert thread_errors == []
+        assert first_thread.is_alive() is False
+        assert second_thread.is_alive() is False
+        assert sorted(response.status_code for response in concurrent_responses) == [200, 409]
+        after_concurrent = client.get(
+            f"/api/plans/{plan_id}?session_id={session_id}"
+        ).json()
+        assert len(after_concurrent["runs"]) == len(before_concurrent["runs"]) + 1
+        async def persisted_run_ids() -> set[str]:
+            async with TenantUnitOfWork(
+                migrated_database,
+                root.for_session(session_id),
+                planning_settings=server.app.state.settings.planning,
+                workflow_settings=server.app.state.settings.workflow,
+            ) as uow:
+                runs = await uow.workflow.list_plan_runs(
+                    root.for_session(session_id), plan_id
+                )
+            return {str(run.context.run_id) for run in runs}
+
+        assert len(asyncio.run(persisted_run_ids())) == len(before_concurrent["runs"]) + 1
+        runner.block_steps = False
+
+        _, cancel_session_id, cancel_plan_id, _ = asyncio.run(seed_plan(owner_id))
+        cancel_plan = client.get(
+            f"/api/plans/{cancel_plan_id}?session_id={cancel_session_id}"
+        )
+        cancel_run_id = cancel_plan.json()["runs"][0]["run_id"]
+        cancelled_once = client.post(
+            f"/api/runs/{cancel_run_id}/cancel",
+            json={"session_id": cancel_session_id},
+        )
+        cancelled_twice = client.post(
+            f"/api/runs/{cancel_run_id}/cancel",
+            json={"session_id": cancel_session_id},
+        )
+        assert cancelled_once.status_code == cancelled_twice.status_code == 200
+        first_cancel_at = _decode_sse_messages(cancelled_once.text)[1]["data"]["cancel_requested_at"]
+        second_cancel_at = _decode_sse_messages(cancelled_twice.text)[1]["data"]["cancel_requested_at"]
+        assert first_cancel_at == second_cancel_at
+        cancel_after = client.get(
+            f"/api/runs/{cancel_run_id}?session_id={cancel_session_id}"
+        ).json()
+        assert cancel_after["status"] == "cancelled"
+        assert cancel_after["cancel_requested_at"] is not None
+        async def persisted_cancel_attempts() -> list[dict[str, object]]:
+            async with TenantUnitOfWork(
+                migrated_database,
+                root.for_session(cancel_session_id),
+                planning_settings=server.app.state.settings.planning,
+                workflow_settings=server.app.state.settings.workflow,
+            ) as uow:
+                attempts = await uow.plans.latest_step_attempts(
+                    plan_id=cancel_plan_id,
+                    plan_version=1,
+                    run_id=cancel_run_id,
+                )
+            return [
+                {
+                    "step_run_id": attempt.step_run_id,
+                    "plan_version": attempt.plan_version,
+                    "step_id": attempt.step_id,
+                    "attempt": attempt.attempt,
+                    "status": attempt.status.value,
+                    "result_summary": attempt.result_summary,
+                    "result_digest": attempt.result_digest,
+                    "error_code": attempt.error_code,
+                    "error_detail_redacted": attempt.error_detail_redacted,
+                    "reused_from_step_run_id": attempt.reused_from_step_run_id,
+                    "version": attempt.version,
+                    "started_at": attempt.started_at,
+                    "finished_at": attempt.finished_at,
+                }
+                for attempt in sorted(
+                    attempts.values(), key=lambda item: (item.step_id, item.attempt)
+                )
+            ]
+
+        assert cancel_after["latest_attempts"] == asyncio.run(persisted_cancel_attempts())
+
+        _, summary_session_id, summary_plan_id, summary_version = asyncio.run(
+            seed_plan(owner_id)
+        )
+
+        class FailingSummaryRouter:
+            async def completion(self, **_kwargs):
+                raise RuntimeError("summary model temporarily unavailable")
+
+        runner.router = FailingSummaryRouter()
+        calls_before_summary = runner.calls
+        summary_wait = client.post(
+            f"/api/plans/{summary_plan_id}/decision",
+            json={
+                "session_id": summary_session_id,
+                "decision_id": "summary-wait-api-test",
+                "plan_version": 1,
+                "expected_version": summary_version,
+                "action": "approve",
+            },
+        )
+        assert summary_wait.status_code == 200
+        summary_run_id = _decode_sse_messages(summary_wait.text)[0]["data"]["run_id"]
+        waiting_get = client.get(
+            f"/api/runs/{summary_run_id}?session_id={summary_session_id}"
+        ).json()
+        assert waiting_get["status"] == "awaiting_user"
+        assert len(waiting_get["latest_attempts"]) == 1
+
+        from multiclaw.workflow.models import StaleFenceError
+
+        assert shared_runtime is not None
+        coordinator_type = type(shared_runtime.plan_execution)
+        original_resume_waiting_summary_run = coordinator_type.resume_waiting_summary_run
+
+        async def reject_stale_summary_retry(_coordinator, **_kwargs):
+            raise StaleFenceError("summary retry lease is stale")
+
+        monkeypatch.setattr(
+            coordinator_type,
+            "resume_waiting_summary_run",
+            reject_stale_summary_retry,
+        )
+        try:
+            stale_summary_retry = client.post(
+                f"/api/runs/{summary_run_id}/summary/retry",
+                json={"session_id": summary_session_id},
+            )
+        finally:
+            monkeypatch.setattr(
+                coordinator_type,
+                "resume_waiting_summary_run",
+                original_resume_waiting_summary_run,
+            )
+        assert stale_summary_retry.status_code == 409
+        assert stale_summary_retry.json()["detail"] == "summary retry is unavailable"
+
+        runner.router = FakeRouter()
+        summary_retry = client.post(
+            f"/api/runs/{summary_run_id}/summary/retry",
+            json={"session_id": summary_session_id},
+        )
+        assert summary_retry.status_code == 200
+        assert [part["type"] for part in _decode_sse_messages(summary_retry.text)][-1] == "finish"
+        completed_get = client.get(
+            f"/api/runs/{summary_run_id}?session_id={summary_session_id}"
+        ).json()
+        assert completed_get["status"] == "completed"
+        assert len(completed_get["latest_attempts"]) == 1
+        assert runner.calls == calls_before_summary + 1
+
+
 @pytest.fixture
 def migrated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MULTICLAW_DATABASE__DRIVER", "sqlite")

@@ -131,6 +131,22 @@ class DataStreamEncoder:
         )
 
     @classmethod
+    def plan_decision(cls, data: dict[str, Any]) -> str:
+        return cls.data_part("data-plan-decision", data, transient=True)
+
+    @classmethod
+    def plan_revised(cls, data: dict[str, Any]) -> str:
+        return cls.data_part("data-plan-revised", data, transient=True)
+
+    @classmethod
+    def plan_step_status(cls, data: dict[str, Any]) -> str:
+        return cls.data_part("data-plan-step-status", data, transient=True)
+
+    @classmethod
+    def run_status(cls, data: dict[str, Any]) -> str:
+        return cls.data_part("data-run-status", data, transient=True)
+
+    @classmethod
     def scoped_event(cls, event: ScopedEvent) -> str:
         return cls.data_part(
             "data-event",

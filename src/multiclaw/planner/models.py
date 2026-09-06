@@ -16,6 +16,8 @@ from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import RunLease, RunRecord, RunStatus
 
 if TYPE_CHECKING:
+    from multiclaw.config.settings import Settings
+    from multiclaw.llm.router import CompletionRouter
     from multiclaw.skills import SkillManager
     from multiclaw.tools import ToolRegistry
     from multiclaw.workflow.continuation import (
@@ -236,6 +238,150 @@ class PlanSummary:
     aggregate_version: int
     latest_run_id: str | None
     latest_run_status: RunStatus | None
+
+
+SessionId = Annotated[str, Field(min_length=36, max_length=36)]
+
+
+class SessionScopedRequest(BaseModel):
+    """Authenticated session scope supplied by API mutation callers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: SessionId
+
+
+class PlanDecisionBody(SessionScopedRequest):
+    """Untrusted Plan decision fields; actor identity comes from auth only."""
+
+    decision_id: str = Field(min_length=1, max_length=128)
+    plan_version: int = Field(ge=1)
+    expected_version: int = Field(ge=1)
+    action: PlanDecisionAction
+    feedback: str | None = Field(default=None, max_length=8_000)
+
+    @model_validator(mode="after")
+    def validate_feedback(self) -> PlanDecisionBody:
+        if self.action is PlanDecisionAction.REVISE:
+            if self.feedback is None or not self.feedback.strip():
+                raise ValueError("revision feedback is required")
+        elif self.feedback is not None:
+            raise ValueError("feedback is valid only for revise")
+        return self
+
+
+class PlanStepResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    step_id: str
+    logical_step_key: str
+    supersedes_step_id: str | None
+    ordinal: int
+    title: str
+    description: str
+    expected_outcome: str
+    assigned_agent_profile_id: str | None
+    max_attempts: int
+    definition_digest: str
+    dependency_ids: tuple[str, ...]
+
+
+class PlanVersionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    plan_version: int
+    objective: str
+    constraints: tuple[str, ...]
+    generation_reason: str
+    parent_version: int | None
+    revision_feedback: str | None
+    schema_version: int
+    content_digest: str
+    created_at: int
+    steps: tuple[PlanStepResponse, ...]
+
+
+class PlanDecisionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    decision_id: str
+    plan_version: int
+    expected_plan_cas_version: int
+    action: PlanDecisionAction
+    feedback: str | None
+    decided_by: str
+    resulting_plan_version: int | None
+    created_at: int
+
+
+class PlanStepAttemptResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    step_run_id: str
+    plan_version: int
+    step_id: str
+    attempt: int
+    status: PlanStepRunStatus
+    result_summary: str | None
+    result_digest: str | None
+    error_code: str | None
+    error_detail_redacted: str | None
+    reused_from_step_run_id: str | None
+    version: int
+    started_at: int
+    finished_at: int | None
+
+
+class RunSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: str
+    status: RunStatus
+    initial_plan_version: int | None
+    active_plan_version: int | None
+    cancel_requested_at: int | None
+    final_summary_available: bool
+
+
+class PlanResponse(BaseModel):
+    """Redacted immutable Plan aggregate view; GET is the authority."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    plan_id: str
+    session_id: str
+    source_message_id: str
+    trigger_mode: PlanTriggerMode
+    status: PlanStatus
+    current_version: int
+    approved_version: int | None
+    aggregate_version: int
+    created_at: int
+    updated_at: int
+    versions: tuple[PlanVersionResponse, ...]
+    decisions: tuple[PlanDecisionResponse, ...]
+    runs: tuple[RunSummaryResponse, ...]
+    latest_attempts: tuple[PlanStepAttemptResponse, ...]
+
+
+class RunResponse(BaseModel):
+    """Redacted Plan-bound run state; no raw tool payload reaches the API."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: str
+    session_id: str
+    plan_id: str | None
+    initial_plan_version: int | None
+    active_plan_version: int | None
+    status: RunStatus
+    cancel_requested_at: int | None
+    version: int
+    created_at: int
+    updated_at: int
+    finished_at: int | None
+    final_summary_available: bool
+    latest_attempts: tuple[PlanStepAttemptResponse, ...]
 
 
 class PlanningDecision(BaseModel):
@@ -520,6 +666,12 @@ class PlanStepExecutionRequest:
 
 
 class PlanStepRunner(Protocol):
+    @property
+    def router(self) -> CompletionRouter: ...
+
+    @property
+    def settings(self) -> Settings: ...
+
     @property
     def registry(self) -> ToolRegistry: ...
 

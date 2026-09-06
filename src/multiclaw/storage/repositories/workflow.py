@@ -151,6 +151,31 @@ class WorkflowRepository:
         row = result.mappings().first()
         return None if row is None else self._run_from_row(row)
 
+    async def list_plan_runs(
+        self,
+        context: TenantContext,
+        plan_id: str,
+        *,
+        for_update: bool = False,
+    ) -> tuple[RunRecord, ...]:
+        """Return all Plan-bound runs inside the caller's tenant/session scope."""
+        if context.session_id is None:
+            raise ValueError("session_id is required for Plan run lookup")
+        statement = (
+            select(agent_runs)
+            .where(
+                agent_runs.c.tenant_id == context.tenant_id,
+                agent_runs.c.workspace_id == context.workspace_id,
+                agent_runs.c.session_id == context.session_id,
+                agent_runs.c.plan_id == plan_id,
+            )
+            .order_by(agent_runs.c.created_at.desc(), agent_runs.c.run_id.desc())
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self._conn.execute(statement)
+        return tuple(self._run_from_row(row) for row in result.mappings())
+
     async def count_active_runs(self, tenant_id: str) -> int:
         result = await self._conn.execute(
             select(func.count())

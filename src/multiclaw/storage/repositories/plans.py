@@ -697,6 +697,14 @@ class PlanRepository:
             raise PlanNotFoundError("Plan not found")
         return latest
 
+    async def lock_aggregate(self, plan_id: str) -> PlanSnapshot:
+        """Lock one already-scoped Plan aggregate for a compound mutation.
+
+        Callers own the surrounding TenantUnitOfWork; this keeps Plan/run
+        admission checks and their durable writes in the same transaction.
+        """
+        return await self._lock_plan(plan_id)
+
     @staticmethod
     def _require_current_decision_target(
         request: PlanDecisionRequest,

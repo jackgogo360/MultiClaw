@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from multiclaw.config import Settings
 from multiclaw.events import EventRouter, ScopedEvent
+from multiclaw.memory import MemoryEntry
 from multiclaw.planner.generator import PlanGenerationError
 from multiclaw.planner.models import (
     TERMINAL_PLAN_STEP_STATUSES,
@@ -224,6 +225,11 @@ class PlanExecutionCoordinator:
         self._settings = settings or Settings(_config_file="/nonexistent")
         self._planning_service = planning_service
         self._event_router = event_router
+
+    @property
+    def planning_service(self) -> PlanningService | None:
+        """The runtime-bound PlanningService used by authenticated mutations."""
+        return self._planning_service
 
     async def select_next(
         self,
@@ -512,6 +518,263 @@ class PlanExecutionCoordinator:
         except PlanCancellationRequested:
             return await self._cancel_at_boundary(context, run_lease_handle)
 
+    async def execute_with_final_summary(
+        self,
+        *,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        runner: PlanStepRunner,
+    ) -> PlanExecutionOutcome:
+        """Execute Plan steps, then produce the durable no-tools final summary."""
+        outcome = await self.execute_to_boundary(
+            context=context,
+            run_lease_handle=run_lease_handle,
+            runner=runner,
+        )
+        if outcome.state != "completed":
+            return outcome
+        return await self.complete_final_summary(
+            context=context,
+            run_lease_handle=run_lease_handle,
+            runner=runner,
+        )
+
+    async def resume_waiting_summary_run(
+        self,
+        *,
+        context: TenantContext,
+        runtime_instance_id: str,
+    ) -> RunLease:
+        """CAS-resume only a verified final-summary boundary, never Plan steps."""
+        self._require_run_context(context)
+        async with TenantUnitOfWork(
+            self._database,
+            context,
+            planning_settings=self._settings.planning,
+            workflow_settings=self._settings.workflow,
+        ) as uow:
+            run = await uow.workflow.get_run(context)
+            if (
+                run is None
+                or run.status is not RunStatus.AWAITING_USER
+                or run.plan_id is None
+                or run.active_plan_version is None
+            ):
+                raise StaleFenceError("waiting final-summary run is stale")
+            checkpoint = await uow.workflow.get_latest_checkpoint(context)
+            if checkpoint is None:
+                raise PlanExecutionBlocked("final-summary checkpoint is unavailable")
+            try:
+                payload = json.loads(checkpoint.payload_json)
+            except (TypeError, ValueError) as error:
+                raise PlanExecutionBlocked("final-summary checkpoint is invalid") from error
+            if (
+                str(checkpoint.phase) != CheckpointPhase.PLAN_STEP_READY.value
+                or payload.get("execution_cursor") != "final_summary"
+            ):
+                raise PlanExecutionBlocked("run is not waiting for final summary")
+            plan = await uow.plans.lock_aggregate(run.plan_id)
+            if (
+                plan.status is not PlanStatus.APPROVED
+                or plan.current_version != run.active_plan_version
+                or plan.approved_version != run.active_plan_version
+            ):
+                raise PlanExecutionBlocked("final-summary Plan version is stale")
+            latest = await uow.plans.latest_step_attempts(
+                plan_id=plan.plan_id,
+                plan_version=plan.current_version,
+                run_id=str(context.run_id),
+                for_update=True,
+            )
+            if not self._all_steps_succeeded(plan, latest):
+                raise PlanExecutionBlocked("final-summary requires completed Plan steps")
+            workflow = WorkflowCoordinator(
+                self._database, settings=self._settings, connection=uow.conn
+            )
+            return await workflow.resume_waiting_plan_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                plan_id=plan.plan_id,
+                plan_version=plan.current_version,
+                expected_run_version=run.version,
+            )
+
+    async def complete_final_summary(
+        self,
+        *,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+        runner: PlanStepRunner,
+    ) -> PlanExecutionOutcome:
+        """Checkpoint, generate and persist a no-tools summary from durable facts."""
+        current_run = await self._load_run(context)
+        if current_run.status is RunStatus.RESUMING:
+            await run_lease_handle.refresh(
+                lambda current: WorkflowCoordinator(
+                    self._database, settings=self._settings
+                ).transition_run(current, RunStatus.RUNNING)
+            )
+        lease = await run_lease_handle.current()
+        plan, summaries = await self._prepare_final_summary(context=context, lease=lease)
+        try:
+            response = await runner.router.completion(
+                model=runner.settings.llm.default_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Write a concise final summary of the completed Plan. "
+                            "Do not call tools and do not add facts beyond the objective "
+                            "and persisted step summaries."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "objective": plan.current.objective,
+                                "step_summaries": summaries,
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    },
+                ],
+                tools=None,
+            )
+            content = str(redact(response.content)).strip()
+            if not content:
+                raise PlanExecutionBlocked("final summary is empty")
+        except PlanCancellationRequested:
+            raise
+        except Exception:  # noqa: BLE001 - preserve steps and offer a retryable summary boundary.
+            await run_lease_handle.refresh(
+                lambda current: WorkflowCoordinator(
+                    self._database, settings=self._settings
+                ).transition_run(current, RunStatus.AWAITING_USER)
+            )
+            return PlanExecutionOutcome(
+                state="awaiting_user",
+                plan=plan,
+                run=await self._load_run(context),
+            )
+
+        async with TenantUnitOfWork(
+            self._database,
+            context,
+            planning_settings=self._settings.planning,
+            workflow_settings=self._settings.workflow,
+        ) as uow:
+            current_lease = await run_lease_handle.current()
+            await uow.plans.lock_run_for_execution(current_lease)
+            current_plan = await self._load_executable_plan(
+                context=context, plans=uow.plans, workflow=uow.workflow
+            )
+            latest = await uow.plans.latest_step_attempts(
+                plan_id=current_plan.plan_id,
+                plan_version=current_plan.current_version,
+                run_id=str(context.run_id),
+                for_update=True,
+            )
+            if not self._all_steps_succeeded(current_plan, latest):
+                raise PlanExecutionBlocked("final-summary Plan changed before persistence")
+            recent = await uow.memory.recent(limit=1, entry_type="chat_message")
+            turn_index = recent[0].turn_index + 1 if recent else 1
+            await uow.memory.save(
+                MemoryEntry(
+                    content=content,
+                    type="chat_message",
+                    role="assistant",
+                    session_id=context.session_id,
+                    turn_index=turn_index,
+                    metadata={
+                        "kind": "plan_final_summary",
+                        "plan_id": current_plan.plan_id,
+                        "run_id": str(context.run_id),
+                    },
+                )
+            )
+            workflow = WorkflowCoordinator(
+                self._database, settings=self._settings, connection=uow.conn
+            )
+            terminal = await workflow.finish_run_with_checkpoint(
+                current_lease, RunStatus.COMPLETED
+            )
+        await run_lease_handle.replace(terminal)
+        return PlanExecutionOutcome(
+            state="completed",
+            plan=current_plan,
+            run=await self._load_run(context),
+            assistant_content=content,
+        )
+
+    async def _prepare_final_summary(
+        self,
+        *,
+        context: TenantContext,
+        lease: RunLease,
+    ) -> tuple[PlanSnapshot, list[dict[str, str]]]:
+        async with TenantUnitOfWork(
+            self._database,
+            context,
+            planning_settings=self._settings.planning,
+            workflow_settings=self._settings.workflow,
+        ) as uow:
+            await uow.plans.lock_run_for_execution(lease)
+            plan = await self._load_executable_plan(
+                context=context, plans=uow.plans, workflow=uow.workflow
+            )
+            latest = await uow.plans.latest_step_attempts(
+                plan_id=plan.plan_id,
+                plan_version=plan.current_version,
+                run_id=str(context.run_id),
+                for_update=True,
+            )
+            if not self._all_steps_succeeded(plan, latest):
+                raise PlanExecutionBlocked("final-summary requires completed Plan steps")
+            ordered = sorted(
+                plan.current.steps,
+                key=lambda item: (item.ordinal, item.step_id),
+            )
+            final_attempt = latest[ordered[-1].step_id]
+            workflow = WorkflowCoordinator(
+                self._database, settings=self._settings, connection=uow.conn
+            )
+            await workflow.checkpoint(
+                lease,
+                CheckpointPhase.PLAN_STEP_READY,
+                {
+                    "run_id": str(context.run_id),
+                    "plan_id": plan.plan_id,
+                    "plan_version": plan.current_version,
+                    "plan_digest": plan.current.content_digest,
+                    "step_id": final_attempt.step_id,
+                    "step_run_id": final_attempt.step_run_id,
+                    "attempt": final_attempt.attempt,
+                    "execution_cursor": "final_summary",
+                    "cursor": "final_summary",
+                },
+            )
+            summaries = [
+                {
+                    "logical_step_key": step.logical_step_key,
+                    "summary": latest[step.step_id].result_summary or "",
+                }
+                for step in ordered
+            ]
+        return plan, summaries
+
+    @staticmethod
+    def _all_steps_succeeded(
+        plan: PlanSnapshot,
+        latest: Mapping[str, PlanStepRunRecord],
+    ) -> bool:
+        return all(
+            (attempt := latest.get(step.step_id)) is not None
+            and attempt.status is PlanStepRunStatus.SUCCEEDED
+            for step in plan.current.steps
+        )
+
     async def _execute_to_boundary(
         self,
         *,
@@ -671,7 +934,8 @@ class PlanExecutionCoordinator:
                 failed_step_run_id=failed.step_run_id,
             )
         if recovery.cursor == "final_summary" and recovery.running_step is None:
-            # Recovery must not invent a final response; Task 14 owns that producer.
+            # A recovered final-summary boundary must use the same producer as
+            # live API execution; it must never silently terminalize a run.
             current_run = await self._load_run(context)
             if current_run is not None and current_run.status is RunStatus.RESUMING:
                 await run_lease_handle.refresh(
@@ -679,15 +943,10 @@ class PlanExecutionCoordinator:
                         self._database, settings=self._settings
                     ).transition_run(lease, RunStatus.RUNNING)
                 )
-            await run_lease_handle.refresh(
-                lambda lease: WorkflowCoordinator(
-                    self._database, settings=self._settings
-                ).transition_run(lease, RunStatus.AWAITING_USER)
-            )
-            return PlanExecutionOutcome(
-                state="awaiting_user",
-                plan=recovery.plan,
-                run=await self._load_run(context),
+            return await self.complete_final_summary(
+                context=context,
+                run_lease_handle=run_lease_handle,
+                runner=runtime.agent,
             )
         result = await self.execute_to_boundary(
             context=context,
@@ -698,10 +957,10 @@ class PlanExecutionCoordinator:
             resume_running_attempt=recovery.running_step is not None,
         )
         if result.state == "completed":
-            await run_lease_handle.refresh(
-                lambda lease: WorkflowCoordinator(
-                    self._database, settings=self._settings
-                ).finish_run_with_checkpoint(lease, RunStatus.COMPLETED)
+            return await self.complete_final_summary(
+                context=context,
+                run_lease_handle=run_lease_handle,
+                runner=runtime.agent,
             )
         return result
 

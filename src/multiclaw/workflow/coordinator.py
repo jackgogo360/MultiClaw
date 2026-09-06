@@ -206,6 +206,60 @@ class WorkflowCoordinator:
             )
             return lease
 
+    async def start_approved_plan_run_with_checkpoint(
+        self,
+        context: TenantContext,
+        runtime_instance_id: str,
+        *,
+        plan_id: str,
+        plan_version: int,
+        plan_digest: str,
+    ) -> RunLease:
+        """Atomically start an already-approved Plan rerun at RUN_STARTED.
+
+        The caller holds the scoped Plan aggregate lock in the same UoW.  This
+        method retains workflow quota, binding and checkpoint invariants rather
+        than letting an HTTP route create a run row directly.
+        """
+        run_id = cast(str, context.run_id)
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            await repository._lock_tenant(context.tenant_id)
+            if not await repository._plan_version_exists(
+                context,
+                plan_id,
+                plan_version,
+                content_digest=plan_digest,
+            ):
+                raise StaleFenceError("Plan version or digest is stale")
+            await self._enforce_run_quota(repository, context.tenant_id)
+            lease = await repository._create_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                status=RunStatus.RUNNING,
+                plan_id=plan_id,
+                initial_plan_version=plan_version,
+                active_plan_version=plan_version,
+            )
+            record = await repository.get_run(context)
+            if record is None:
+                raise RuntimeError("Plan rerun record missing after creation")
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.RUN_STARTED,
+                {
+                    "tenant_id": context.tenant_id,
+                    "workspace_id": context.workspace_id,
+                    "session_id": context.session_id,
+                    "run_id": run_id,
+                    "started_at_ms": record.created_at,
+                    "model_cursor": self._run_started_cursor(context),
+                    "cursor": self._run_started_cursor(context),
+                },
+                checkpoint_seq=1,
+            )
+            return lease
+
     async def acquire_run(self, context: TenantContext, runtime_instance_id: str) -> RunLease:
         async with self._write_connection() as conn:
             repository = self._repository(conn)

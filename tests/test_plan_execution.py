@@ -7,6 +7,7 @@ import json
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import get_args
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -84,6 +85,7 @@ from multiclaw.workflow.models import (
     RunStatus,
     StaleFenceError,
 )
+from multiclaw.workflow.recovery import RecoveryService
 
 _MYSQL_URL = os.getenv("MULTICLAW_TEST_MYSQL_URL")
 
@@ -1494,6 +1496,76 @@ async def test_success_finalization_uses_lease_refreshed_during_runner(
     assert attempt.result_ref is not None
     assert await execution_fixture.count_results() == 1
     assert (await execution_fixture.load_result(attempt.result_ref)).status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_final_summary_is_checkpointed_and_retry_uses_only_persisted_steps(
+    execution_fixture,
+):
+    runner = ScriptedStepRunner(
+        [PlanStepCompletion(status="succeeded", summary="durable result", evidence=[])]
+    )
+    runner.settings = execution_fixture.settings
+    failing_router = ScriptedPlanRouter([RuntimeError("summary unavailable")])
+    runner.router = failing_router
+    await execution_fixture.materialize(_draft(("lint",)))
+    await execution_fixture.approve()
+    handle = RunLeaseHandle(execution_fixture.lease)
+
+    paused = await execution_fixture.coordinator.execute_with_final_summary(
+        context=execution_fixture._context(),
+        run_lease_handle=handle,
+        runner=runner,
+    )
+    assert paused.state == "awaiting_user"
+    assert len(runner.calls) == 1
+    checkpoint = await execution_fixture.latest_checkpoint()
+    assert checkpoint["phase"] == CheckpointPhase.PLAN_STEP_READY.value
+    assert json.loads(str(checkpoint["payload_json"]))["execution_cursor"] == "final_summary"
+
+    retried_lease = await execution_fixture.coordinator.resume_waiting_summary_run(
+        context=execution_fixture._context(), runtime_instance_id="summary-retry"
+    )
+    runner.router = ScriptedPlanRouter([LLMResponse(content="final durable summary")])
+    completed = await execution_fixture.coordinator.complete_final_summary(
+        context=execution_fixture._context(),
+        run_lease_handle=RunLeaseHandle(retried_lease),
+        runner=runner,
+    )
+    assert completed.state == "completed"
+    assert len(runner.calls) == 1
+    assert await execution_fixture.count_step_runs() == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_after_all_steps_uses_final_summary_producer(execution_fixture):
+    runner = ScriptedStepRunner(
+        [PlanStepCompletion(status="succeeded", summary="recovered fact", evidence=[])]
+    )
+    runner.settings = execution_fixture.settings
+    runner.router = ScriptedPlanRouter([LLMResponse(content="recovered final summary")])
+    await execution_fixture.materialize(_draft(("lint",)))
+    await execution_fixture.approve()
+    context = execution_fixture._context()
+    await execution_fixture.coordinator.execute_to_boundary(
+        context=context,
+        run_lease_handle=RunLeaseHandle(execution_fixture.lease),
+        runner=runner,
+    )
+    await execution_fixture.update_run(lease_expires_at=0)
+    recovery = await RecoveryService(
+        execution_fixture.database, settings=execution_fixture.settings
+    ).recover(context, "recovery-summary")
+    assert recovery.lease is not None
+    outcome = await execution_fixture.coordinator.resume(
+        runtime=SimpleNamespace(agent=runner),
+        context=context,
+        run_lease_handle=RunLeaseHandle(recovery.lease),
+        recovery_outcome=recovery,
+    )
+    assert outcome.state == "completed"
+    assert len(runner.calls) == 1
+    assert runner.router.calls[0]["tools"] is None
 
 
 @pytest.mark.asyncio

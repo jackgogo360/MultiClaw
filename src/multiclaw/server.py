@@ -3,8 +3,8 @@ import hashlib
 import inspect
 import logging
 import re
-import threading
 import tempfile
+import threading
 from contextlib import asynccontextmanager
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -90,18 +90,25 @@ def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException
     primary.add_note(f"{phase} failed: {type(error).__name__}: {error}")
 
 
+from multiclaw.api.account import router as account_router
+from multiclaw.api.approvals import router as approvals_router
+from multiclaw.api.chat import router as chat_router
+from multiclaw.api.health import router as health_router
+from multiclaw.api.plans import router as plans_router
+from multiclaw.api.runs import router as runs_router
+from multiclaw.api.secrets import router as secrets_router
+from multiclaw.api.sessions import router as sessions_router
+from multiclaw.auth.cleanup import AuthCleanupWorker
+from multiclaw.auth.middleware import AuthMiddleware
+from multiclaw.auth.models import build_auth_runtime
+from multiclaw.auth.router import router as auth_router
 from multiclaw.config import Settings
+from multiclaw.deletion.service import DeletionService
+from multiclaw.deletion.worker import DeletionWorker
 from multiclaw.events import EventBus
 from multiclaw.governance import (
     SandboxController,
     SandboxReadiness,
-)
-from multiclaw.runtime import RuntimeFactory, RuntimePool
-from multiclaw.runtime.pool import RuntimeCapacityError, RuntimeUnavailableError
-from multiclaw.storage import Database
-from multiclaw.tenancy import WorkspaceResolver
-from multiclaw.tools import (
-    ToolRegistry,
 )
 from multiclaw.mcp import (
     MCPClientManager,
@@ -117,17 +124,6 @@ from multiclaw.mcp.types import (
     StdioServerConfig,
     WebSocketServerConfig,
 )
-
-from multiclaw.auth.cleanup import AuthCleanupWorker
-from multiclaw.auth.middleware import AuthMiddleware
-from multiclaw.auth.models import build_auth_runtime
-from multiclaw.auth.router import router as auth_router
-from multiclaw.api.account import router as account_router
-from multiclaw.api.approvals import router as approvals_router
-from multiclaw.api.chat import router as chat_router
-from multiclaw.api.health import router as health_router
-from multiclaw.api.secrets import router as secrets_router
-from multiclaw.api.sessions import router as sessions_router
 from multiclaw.observability import (
     OperationalMetrics,
     TraceEventSink,
@@ -136,13 +132,17 @@ from multiclaw.observability import (
     observe_database_error,
     record_trace_event,
 )
-from multiclaw.workflow.recovery import WorkflowRecoveryWorker
-from multiclaw.deletion.service import DeletionService
-from multiclaw.deletion.worker import DeletionWorker
+from multiclaw.runtime import RuntimeFactory, RuntimePool
+from multiclaw.runtime.pool import RuntimeCapacityError, RuntimeUnavailableError
 from multiclaw.secrets.keyring import DeploymentKeyring, SecretKeyringError
 from multiclaw.secrets.resolver import SecretResolver
 from multiclaw.secrets.validation import SecretCredentialTester
-
+from multiclaw.storage import Database
+from multiclaw.tenancy import WorkspaceResolver
+from multiclaw.tools import (
+    ToolRegistry,
+)
+from multiclaw.workflow.recovery import WorkflowRecoveryWorker
 
 # ---------------------------------------------------------------------------
 # Agent factory
@@ -737,6 +737,8 @@ app.include_router(approvals_router)
 app.include_router(sessions_router)
 app.include_router(chat_router)
 app.include_router(secrets_router)
+app.include_router(plans_router)
+app.include_router(runs_router)
 
 
 def _runtime_error_response(retry_after_seconds: int) -> JSONResponse:
