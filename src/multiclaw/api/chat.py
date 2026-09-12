@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from multiclaw.api.dependencies import tenant_context, tenant_uow
 from multiclaw.events import EventScope, ScopedEvent
 from multiclaw.memory import MemoryEntry
-from multiclaw.observability import increment_metric, record_trace_event
+from multiclaw.observability import increment_metric, record_plan_operation, record_trace_event
 from multiclaw.observability import observability_scope
 from multiclaw.planner.models import (
     MaterializeInitialPlan,
@@ -256,7 +256,19 @@ async def chat(
         try:
             planning_decision = await planning_policy.decide(objective, planning_mode)
         except PlanningUnavailableError as error:
+            record_plan_operation(
+                "classification",
+                status="failed",
+                error_class="planning_unavailable",
+                attributes={"error": str(error)},
+            )
             raise HTTPException(status_code=503, detail="planning is unavailable") from error
+
+    record_plan_operation(
+        "classification",
+        status="succeeded",
+        attributes={"route": planning_decision.mode.value},
+    )
 
     if planning_decision.mode is PlanningRoute.PLAN:
         generator = getattr(runtime, "plan_generator", None)
@@ -287,6 +299,12 @@ async def chat(
                 max_attempts=request.app.state.settings.planning.max_step_attempts,
             )
         except PlanGenerationError as error:
+            record_plan_operation(
+                "generation",
+                status="failed",
+                error_class="generation_error",
+                attributes={"error": str(error), "run_id": run_id},
+            )
             # A Plan route that cannot produce a valid draft is terminal. It
             # must not be disguised as direct execution, including auto mode.
             await _persist_unbound_failure_run(
@@ -301,6 +319,12 @@ async def chat(
                 headers={"X-Vercel-AI-Data-Stream": "v1"},
             )
         except Exception as error:
+            record_plan_operation(
+                "generation",
+                status="failed",
+                error_class=type(error).__name__,
+                attributes={"error": str(error), "run_id": run_id},
+            )
             # Unexpected generator failures are still a failed Plan request,
             # but only the generator's explicit terminal error gets an
             # unbound run/checkpoint (the durable contract).
@@ -323,6 +347,12 @@ async def chat(
                 )
             )
         except Exception as error:
+            record_plan_operation(
+                "materialization",
+                status="failed",
+                error_class=type(error).__name__,
+                attributes={"error": str(error), "run_id": run_id},
+            )
             # materialize_initial owns one transaction; on failure its UoW
             # rolls back Plan/version/steps/run/checkpoint/reference rows. Do
             # not add an unrelated unbound run here.
@@ -331,6 +361,15 @@ async def chat(
                 media_type="text/event-stream",
                 headers={"X-Vercel-AI-Data-Stream": "v1"},
             )
+
+        record_plan_operation(
+            "materialization",
+            status="succeeded",
+            attributes={
+                "plan_id": materialized.plan.plan_id,
+                "run_id": run_id,
+            },
+        )
 
         async def plan_stream():
             enc = DataStreamEncoder()

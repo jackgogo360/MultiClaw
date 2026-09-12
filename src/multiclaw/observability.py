@@ -105,6 +105,36 @@ def record_trace_event(name: str, *, attributes: Mapping[str, object]) -> None:
     current_trace_sink().record(name, attributes)
 
 
+def record_plan_operation(
+    operation: str,
+    *,
+    status: str = "succeeded",
+    error_class: str = "none",
+    attributes: Mapping[str, object] | None = None,
+) -> None:
+    """Record a Plan lifecycle operation using bounded metric dimensions.
+
+    Plan and run identifiers are deliberately accepted only as trace
+    attributes; ``OperationalMetrics`` rejects them as labels.  Callers may
+    include provider/error details in ``attributes`` because the trace sink
+    applies the shared redaction policy before retaining them.
+    """
+
+    increment_metric(
+        "multiclaw_plan_operations_total",
+        labels={
+            "operation": str(operation)[:64],
+            "status": str(status)[:32],
+            "error_class": str(error_class)[:64],
+        },
+    )
+    trace_attributes = dict(attributes or {})
+    trace_attributes.setdefault("status", status)
+    if error_class != "none":
+        trace_attributes.setdefault("error_class", error_class)
+    record_trace_event(f"plan_{str(operation)[:64]}", attributes=trace_attributes)
+
+
 def observe_database_error(error: BaseException, *, backend: str, operation: str) -> None:
     message = str(error).lower()
     if "database is locked" in message:
