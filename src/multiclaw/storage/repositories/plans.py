@@ -67,6 +67,9 @@ from multiclaw.workflow.models import (
 )
 
 Dialect = SQLiteDialect | MySQLDialect
+_PLAN_ROUND_KINDS = frozenset(
+    {"revision_generation", "step_model", "reflection", "final_summary"}
+)
 
 
 def _note_cleanup_error(primary: BaseException, phase: str, error: BaseException) -> None:
@@ -144,6 +147,10 @@ class PlanRepository:
         """
         from multiclaw.planner.models import PlanRoundBudgetExceeded
 
+        if round_kind not in _PLAN_ROUND_KINDS:
+            raise ValueError("unsupported Plan round kind")
+        if total_budget < 1:
+            raise ValueError("Plan round budget must be positive")
         consumed = await self.count_round_units(run_id=run_id, plan_id=plan_id)
         if consumed >= total_budget:
             raise PlanRoundBudgetExceeded("Plan round budget exceeded")
