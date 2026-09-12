@@ -55,6 +55,8 @@ from multiclaw.storage.schema import (
     agent_plan_versions,
     agent_plans,
     agent_runs,
+    memory_entries,
+    tool_executions,
 )
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import (
@@ -91,6 +93,82 @@ class PlanRepository:
     @property
     def connection(self) -> AsyncConnection:
         return self._conn
+
+    async def count_round_units(self, *, run_id: str, plan_id: str) -> int:
+        """Recompute consumed Plan work units from durable rows.
+
+        The ledger is session-scoped and keyed by run/Plan in metadata. Tool
+        execution rows count once each; replaying an existing tool call does
+        not create a row and therefore does not consume another unit.
+        """
+        if self._context.session_id is None:
+            raise ValueError("session_id is required for Plan round accounting")
+        ledger = await self._conn.scalar(
+            select(func.count())
+            .select_from(memory_entries)
+            .where(
+                memory_entries.c.tenant_id == self._context.tenant_id,
+                memory_entries.c.workspace_id == self._context.workspace_id,
+                memory_entries.c.session_id == self._context.session_id,
+                memory_entries.c.type == "plan_round_counter",
+                memory_entries.c.metadata_json.like(f'%"run_id":"{run_id}"%'),
+                memory_entries.c.metadata_json.like(f'%"plan_id":"{plan_id}"%'),
+            )
+        )
+        executions = await self._conn.scalar(
+            select(func.count())
+            .select_from(tool_executions)
+            .where(
+                tool_executions.c.tenant_id == self._context.tenant_id,
+                tool_executions.c.workspace_id == self._context.workspace_id,
+                tool_executions.c.session_id == self._context.session_id,
+                tool_executions.c.run_id == run_id,
+            )
+        )
+        return int(ledger or 0) + int(executions or 0)
+
+    async def reserve_round_unit(
+        self,
+        *,
+        run_id: str,
+        plan_id: str,
+        round_kind: str,
+        total_budget: int,
+        step_run_id: str | None = None,
+    ) -> int:
+        """Reserve one model round in the current transaction.
+
+        Callers must commit this short transaction before invoking inference.
+        The run/Plan rows are locked by the caller when a dialect supports
+        row locks; the durable count remains authoritative during recovery.
+        """
+        from multiclaw.planner.models import PlanRoundBudgetExceeded
+
+        consumed = await self.count_round_units(run_id=run_id, plan_id=plan_id)
+        if consumed >= total_budget:
+            raise PlanRoundBudgetExceeded("Plan round budget exceeded")
+        metadata = {
+            "schema_version": 1,
+            "plan_id": plan_id,
+            "run_id": run_id,
+            "step_run_id": step_run_id,
+            "round_kind": round_kind,
+        }
+        await self._conn.execute(
+            insert(memory_entries).values(
+                id=str(uuid4()),
+                tenant_id=self._context.tenant_id,
+                workspace_id=self._context.workspace_id,
+                session_id=self._context.session_id,
+                content="model",
+                type="plan_round_counter",
+                role="system",
+                turn_index=0,
+                created_at=self._dialect.db_now_ms(),
+                metadata_json=json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            )
+        )
+        return consumed + 1
 
     @staticmethod
     async def locate_context(

@@ -362,12 +362,38 @@ class PlanningService:
             completed=[],
             current_plan=revision_current_plan_context(snapshot.current),
         )
+
+        async def reserve_revision_round(_attempt: int) -> None:
+            # Reserve in a short transaction before inference. A crashed
+            # process therefore consumes budget conservatively, and recovery
+            # can recompute from the persisted ledger/tool rows.
+            if context.session_id is None or context.run_id is None:
+                raise ValueError("revision requires session and run scope")
+            async with TenantUnitOfWork(
+                self._database,
+                context,
+                planning_settings=self._settings.planning,
+                workflow_settings=self._settings.workflow,
+            ) as reservation_uow:
+                total_budget = (
+                    self._settings.planning.max_steps
+                    * self._settings.planning.max_step_attempts
+                    * self._settings.agent.max_tool_rounds
+                )
+                await reservation_uow.plans.reserve_round_unit(
+                    run_id=str(context.run_id),
+                    plan_id=snapshot.plan_id,
+                    round_kind="revision_generation",
+                    total_budget=total_budget,
+                )
+
         generated = await self._generator.generate(
             snapshot.current.objective,
             revision=revision_context,
             max_steps=self._settings.planning.max_steps,
             max_depth=self._settings.planning.max_dependency_depth,
             max_attempts=self._settings.planning.max_step_attempts,
+            reserve_round=reserve_revision_round,
         )
         draft = self._draft(generated)
         validate_plan_draft(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pydantic import ValidationError
@@ -163,6 +164,7 @@ class PlanGenerator:
         max_steps: int = 20,
         max_depth: int = 10,
         max_attempts: int = 2,
+        reserve_round: Callable[[int], Awaitable[None]] | None = None,
     ) -> ValidatedPlanDraft:
         if self._router is None:
             raise PlanGenerationError("plan generation unavailable")
@@ -172,6 +174,8 @@ class PlanGenerator:
         messages = _initial_messages(safe_objective, revision)
 
         for attempt in range(2):
+            if reserve_round is not None:
+                await reserve_round(attempt)
             provider_unavailable = False
             response_invalid = False
             try:

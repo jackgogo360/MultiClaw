@@ -16,6 +16,7 @@ from multiclaw.storage.schema import (
     execution_checkpoints,
     tool_executions,
     users,
+    memory_entries,
 )
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import (
@@ -94,6 +95,7 @@ class WorkflowRepository:
     _dialect: Dialect
     _heartbeat_ms: int
     _lease_ttl_ms: int
+    plan_round_budget: int | None = None
 
     async def _lock_tenant(self, tenant_id: str) -> None:
         if self._dialect.name != "mysql":
@@ -1046,6 +1048,38 @@ class WorkflowRepository:
         await self._dialect.lock_run(self._conn, lease.context)
         if not await self._has_current_lease(lease):
             return None
+
+        if self.plan_round_budget is not None:
+            plan_row = await self._conn.execute(
+                select(agent_runs.c.plan_id).where(_context_predicate(lease.context))
+            )
+            plan_id = plan_row.scalar_one_or_none()
+            if plan_id is not None:
+                ledger_count = await self._conn.scalar(
+                    select(func.count())
+                    .select_from(memory_entries)
+                    .where(
+                        memory_entries.c.tenant_id == lease.context.tenant_id,
+                        memory_entries.c.workspace_id == lease.context.workspace_id,
+                        memory_entries.c.session_id == lease.context.session_id,
+                        memory_entries.c.type == "plan_round_counter",
+                        memory_entries.c.metadata_json.like(f'%"run_id":"{lease.context.run_id}"%'),
+                    )
+                )
+                execution_count = await self._conn.scalar(
+                    select(func.count())
+                    .select_from(tool_executions)
+                    .where(
+                        tool_executions.c.tenant_id == lease.context.tenant_id,
+                        tool_executions.c.workspace_id == lease.context.workspace_id,
+                        tool_executions.c.session_id == lease.context.session_id,
+                        tool_executions.c.run_id == lease.context.run_id,
+                    )
+                )
+                if int(ledger_count or 0) + int(execution_count or 0) >= self.plan_round_budget:
+                    from multiclaw.planner.models import PlanRoundBudgetExceeded
+
+                    raise PlanRoundBudgetExceeded("Plan round budget exceeded")
 
         now_ms = self._dialect.db_now_ms()
         selectable = select(

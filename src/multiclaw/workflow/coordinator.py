@@ -853,6 +853,11 @@ class WorkflowCoordinator:
             self._database.dialect,
             self._settings.workflow.heartbeat_ms,
             self._settings.workflow.lease_ttl_ms,
+            plan_round_budget=(
+                self._settings.planning.max_steps
+                * self._settings.planning.max_step_attempts
+                * self._settings.agent.max_tool_rounds
+            ),
         )
 
     async def _enforce_run_quota(

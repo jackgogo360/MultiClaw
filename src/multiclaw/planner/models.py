@@ -527,6 +527,12 @@ class PlanAttemptLimitError(PlanExecutionBlocked):
     pass
 
 
+class PlanRoundBudgetExceeded(PlanExecutionBlocked):
+    """The durable Plan/run round budget has been exhausted."""
+
+    pass
+
+
 class CompletedStepContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
