@@ -96,6 +96,23 @@ mock 邮件模式只跳过 provider 调用，不返回验证码，因此适合�
 | `POST /api/approvals/{approval_id}/decision` | 会话 + CSRF | body 为 `approved` 与当前 `version`；以 CAS 决策 |
 | `POST /api/approve` | 会话 + CSRF | 兼容别名，body 还包含 `approval_id`；不进入 OpenAPI，新集成不要使用 |
 
+## Durable Plan 与 runs：`/api/plans`、`/api/runs`
+
+所有 Plan/run 请求都必须携带已认证的 tenant、workspace 和 `session_id`
+作用域。Plan 响应包含 `plan_id`、`current_version`、不可变 `versions`、
+`decisions` 与关联 `run_id`；run 响应包含 `run_id`、`run_status`、当前
+`plan_version` 和 checkpoint 摘要。典型操作如下：
+
+| 方法 | 作用 |
+|---|---|
+| `GET /api/plans/{plan_id}?session_id=...` | 读取当前作用域 Plan 及版本历史 |
+| `POST /api/plans/{plan_id}/decisions` | 以 `decision_id`、`action`、`expected_version` 提交 approve/reject/revise |
+| `GET /api/runs/{run_id}?session_id=...` | 读取当前作用域 run 与恢复状态 |
+| `POST /api/runs/{run_id}/cancel` | 持久化取消请求并返回新的 run 状态 |
+
+未知或跨作用域资源统一返回 `404`。版本、CAS 或重复决策冲突返回
+`409`；SSE 事件只作通知，客户端应在刷新或切换会话时重新 GET hydration。
+
 外租户/不存在返回 `404`，已解决或 version 冲突返回 `409`，过期返回 `410`。客户端必须使用最近读取的 version，不能在冲突后盲目重试旧决策。
 
 ## Secret：`/api/secrets`

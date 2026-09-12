@@ -14,6 +14,7 @@
 - [配置参考](configuration.md)：TOML、环境变量、默认值和安全属性。
 - [API 概览](api.md)：认证、会话、聊天、审批、Secret、删除和健康接口。
 - [测试指南](testing.md)：后端、前端、文档、MySQL 和原生沙箱门禁。
+- [Durable Plans](durable-plans.md)：Plan 审核、版本、恢复、配额和发布检查。
 - [贡献指南](../CONTRIBUTING.md)：提交、测试、Lore trailer 和 Pull Request 规范。
 
 ## 安全

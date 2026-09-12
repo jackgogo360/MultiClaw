@@ -71,6 +71,21 @@ driver 与 URL scheme 必须匹配：SQLite 使用 `sqlite+aiosqlite://`，MySQL
 
 修改 heartbeat/lease 需要同时考虑数据库延迟、最长调度停顿和恢复扫描间隔。租约不是任务超时；过小值会制造错误 fence 丢失。
 
+## Durable Plan：`planning`
+
+| TOML key | 环境变量 | 类型 / 默认值 / 约束 | 分类与说明 |
+|---|---|---|---|
+| `planning.enabled` | `MULTICLAW_PLANNING__ENABLED` | bool / `true` | 功能开关；关闭时显式 Plan 请求安全失败 |
+| `planning.default_mode` | `MULTICLAW_PLANNING__DEFAULT_MODE` | `auto`、`always` 或 `never` / `auto` | 发布策略；示例部署保持 `never` 直到双后端门禁完成 |
+| `planning.classification_model` | `MULTICLAW_PLANNING__CLASSIFICATION_MODEL` | string / 空 / 最长 255 | 模型路由；空值使用默认模型 |
+| `planning.generation_model` | `MULTICLAW_PLANNING__GENERATION_MODEL` | string / 空 / 最长 255 | 模型路由；空值使用默认模型 |
+| `planning.max_steps` | `MULTICLAW_PLANNING__MAX_STEPS` | strict int / `20` / `1..20` | 单个 Plan 的步骤上限 |
+| `planning.max_dependency_depth` | `MULTICLAW_PLANNING__MAX_DEPENDENCY_DEPTH` | strict int / `10` / `1..10` | DAG 深度上限 |
+| `planning.max_revisions` | `MULTICLAW_PLANNING__MAX_REVISIONS` | strict int / `5` / `0..20` | 不可变版本历史上限 |
+| `planning.max_step_attempts` | `MULTICLAW_PLANNING__MAX_STEP_ATTEMPTS` | strict int / `2` / `1..20` | 每个步骤的尝试上限 |
+
+Plan 的总 round 预算按 `max_steps * max_step_attempts * agent.max_tool_rounds` 计算；模型请求和新工具执行行在持久化边界预留预算，恢复时从数据库重算。Plan 运行同时计入 `runtime.max_concurrent_runs_per_tenant`，不会引入第二套并发配额。
+
 ## Secret 与删除：`secrets`、`deletion`
 
 | TOML key | 环境变量 | 类型 / 默认值 / 约束 | 分类与说明 |
