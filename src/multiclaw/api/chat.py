@@ -22,6 +22,7 @@ from multiclaw.planner.models import (
     PlanningMode,
     PlanningRoute,
 )
+from multiclaw.planner.generator import PlanGenerationError
 from multiclaw.planner.policy import PlanningPolicy, PlanningUnavailableError
 from multiclaw.planner.service import PlanningService
 from multiclaw.runtime.pool import RuntimeUnavailableError
@@ -254,6 +255,14 @@ async def chat(
                 settings=request.app.state.settings,
                 generator=generator,
             )
+        async def failed_plan_stream(error: BaseException):
+            enc = DataStreamEncoder()
+            yield enc.start()
+            yield encode_session_metadata(session.model_dump(mode="json"))
+            yield encode_run_metadata(session.id, run_id)
+            yield enc.error(public_error_message(error))
+            yield enc.finish("stop")
+
         try:
             generated = await generator.generate(
                 objective,
@@ -261,6 +270,31 @@ async def chat(
                 max_depth=request.app.state.settings.planning.max_dependency_depth,
                 max_attempts=request.app.state.settings.planning.max_step_attempts,
             )
+        except PlanGenerationError as error:
+            # A Plan route that cannot produce a valid draft is terminal. It
+            # must not be disguised as direct execution, including auto mode.
+            await _persist_unbound_failure_run(
+                request.app.state.database,
+                request.app.state.settings,
+                run_context,
+                runtime.runtime_instance_id,
+            )
+            return StreamingResponse(
+                failed_plan_stream(error),
+                media_type="text/event-stream",
+                headers={"X-Vercel-AI-Data-Stream": "v1"},
+            )
+        except Exception as error:
+            # Unexpected generator failures are still a failed Plan request,
+            # but only the generator's explicit terminal error gets an
+            # unbound run/checkpoint (the durable contract).
+            return StreamingResponse(
+                failed_plan_stream(error),
+                media_type="text/event-stream",
+                headers={"X-Vercel-AI-Data-Stream": "v1"},
+            )
+
+        try:
             draft = service.draft_from_generated(generated)
             materialized = await service.materialize_initial(
                 MaterializeInitialPlan(
@@ -273,41 +307,31 @@ async def chat(
                 )
             )
         except Exception as error:
-            if planning_mode is PlanningMode.ALWAYS or trigger_mode is PlanTriggerMode.EXPLICIT:
-                await _persist_unbound_failure_run(
-                    request.app.state.database,
-                    request.app.state.settings,
-                    run_context,
-                    runtime.runtime_instance_id,
-                )
-
-                async def failed_plan_stream():
-                    enc = DataStreamEncoder()
-                    yield enc.start()
-                    yield encode_session_metadata(session.model_dump(mode="json"))
-                    yield encode_run_metadata(session.id, run_id)
-                    yield enc.error(public_error_message(error))
-                    yield enc.finish("stop")
-
-                return StreamingResponse(
-                    failed_plan_stream(),
-                    media_type="text/event-stream",
-                    headers={"X-Vercel-AI-Data-Stream": "v1"},
-                )
-            planning_decision = planning_decision.model_copy(update={"mode": PlanningRoute.DIRECT})
-        else:
-            async def plan_stream():
-                enc = DataStreamEncoder()
-                yield enc.start()
-                yield encode_session_metadata(session.model_dump(mode="json"))
-                yield encode_run_metadata(session.id, run_id)
-                yield enc.plan_created(materialized.reference.model_dump(mode="json"))
-                yield enc.finish("tool-calls")
+            # materialize_initial owns one transaction; on failure its UoW
+            # rolls back Plan/version/steps/run/checkpoint/reference rows. Do
+            # not add an unrelated unbound run here.
             return StreamingResponse(
-                plan_stream(),
+                failed_plan_stream(error),
                 media_type="text/event-stream",
                 headers={"X-Vercel-AI-Data-Stream": "v1"},
             )
+
+        async def plan_stream():
+            enc = DataStreamEncoder()
+            yield enc.start()
+            yield encode_session_metadata(session.model_dump(mode="json"))
+            yield encode_run_metadata(session.id, run_id)
+            yield enc.plan_created(materialized.reference.model_dump(mode="json"))
+            yield enc.finish("tool-calls")
+        # ``materialize_initial`` has committed and closed its transaction by
+        # this point. Publish the lifecycle event only after that commit so
+        # subscribers never observe a Plan that can still roll back.
+        await runtime.event_router.publish(materialized.event)
+        return StreamingResponse(
+            plan_stream(),
+            media_type="text/event-stream",
+            headers={"X-Vercel-AI-Data-Stream": "v1"},
+        )
 
     # Direct route continues through the existing workflow/agent stream using
     # the original user message (the normalized objective is only for policy).
