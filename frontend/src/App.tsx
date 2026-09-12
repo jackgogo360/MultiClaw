@@ -25,6 +25,8 @@ import { extractLatestUserText } from "@/lib/chat-request";
 import { sessionStore } from "@/lib/session-store";
 import { chatStore } from "@/lib/chat-store";
 import { ensureCsrfToken } from "@/lib/security";
+import { planStore } from "@/lib/plan-store";
+import type { PlanDataPart } from "@/lib/api";
 
 type ChatRequestState = "idle" | "sending" | "streaming";
 type ActiveRun = {
@@ -248,6 +250,10 @@ function ChatApp() {
   const runtime = useChatRuntimeWithStore({
     transport,
     onData: (part: DataPart) => {
+      if (part.type.startsWith("data-plan-")) {
+        planStore.acceptDataPart(part as PlanDataPart);
+        return;
+      }
       if (part.type === "data-run") {
         const scope = readRunScope(part.data);
         if (scope) {
