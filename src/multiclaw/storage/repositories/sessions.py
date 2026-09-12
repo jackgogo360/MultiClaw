@@ -226,16 +226,20 @@ class SessionRepository:
         )
         rows = list(result.mappings().all())
         rows.reverse()
-        return [
-            {
+        messages: list[dict[str, object]] = []
+        for row in rows:
+            payload = {
                 "id": str(row["id"]),
                 "role": str(row["role"]),
                 "content": str(row["content"]),
                 "created_at": int(row["created_at"]),
                 "parts": _message_parts(row["metadata_json"]),
             }
-            for row in rows
-        ]
+            safe_payload = redact(payload)
+            messages.append(
+                safe_payload if isinstance(safe_payload, dict) else payload
+            )
+        return messages
 
     async def list_pending_approvals(self, session_id: str) -> list[dict[str, object]]:
         result = await self._conn.execute(
