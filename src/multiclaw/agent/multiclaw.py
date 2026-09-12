@@ -16,7 +16,7 @@ from multiclaw.config import Settings
 from multiclaw.events import AgentState, EventBus, EventRouter
 from multiclaw.llm import LLMResponse, ModelRouter
 from multiclaw.memory import MemoryEntry, MemoryProtocol
-from multiclaw.planner import Planner, PlanStepCompletion
+from multiclaw.planner import PlanStepCompletion
 from multiclaw.planner.models import PlanCancellationRequested, PlanStepExecutionRequest
 from multiclaw.skills import SkillManager
 from multiclaw.tenancy.context import TenantContext
@@ -87,8 +87,8 @@ class MultiClawAgent(ToolCallAgent):
         registry: ToolRegistry,
         scheduler: CoreToolScheduler,
         memory: MemoryProtocol,
-        planner: Planner,
         event_bus: EventBus,
+        planner=None,
         event_router: EventRouter | None = None,
         skill_manager: SkillManager | None = None,
     ) -> None:
@@ -101,7 +101,9 @@ class MultiClawAgent(ToolCallAgent):
             event_bus=event_bus,
             event_router=event_router,
         )
-        self.planner = planner
+        # ``planner`` is retained as a deprecated constructor argument for
+        # callers that still build agents directly; planning is routed by the
+        # API/runtime policy and never by this execution agent.
         self.context_builder = ContextBuilder(
             memory=memory,
             recent_turns=settings.memory.recent_turns,
@@ -413,15 +415,6 @@ class MultiClawAgent(ToolCallAgent):
         *,
         context: TenantContext,
     ) -> Observation:
-        if user_input.startswith("plan:"):
-            next_turn_index = await self._next_turn_index(context)
-            await self._save_chat_msg(context, "user", user_input, next_turn_index)
-            request = user_input[len("plan:") :].strip()
-            plan = self.planner.create_plan(request)
-            return Observation(
-                type=ObservationType.USER_RESPONSE,
-                content=self.planner.summary(plan),
-            )
         try:
             # --- Skill handling ---
             user_msg = user_input
@@ -634,19 +627,6 @@ class MultiClawAgent(ToolCallAgent):
     ) -> AsyncIterator[dict[str, Any]]:
         del run_lease, workflow_recovery
         logger.info("handle_message_stream: %r", user_input[:80])
-
-        if user_input.startswith("plan:"):
-            next_turn_index = await self._next_turn_index(context)
-            await self._save_chat_msg(context, "user", user_input, next_turn_index)
-            logger.info("-> plan mode")
-            request = user_input[len("plan:") :].strip()
-            plan = self.planner.create_plan(request)
-            yield {
-                "type": "done",
-                "content": self.planner.summary(plan),
-                "data": {},
-            }
-            return
 
         try:
             await self.transition(AgentState.THINKING, context=context)

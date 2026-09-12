@@ -124,6 +124,11 @@ class PlanningService:
             ),
         )
 
+    @staticmethod
+    def draft_from_generated(generated: PlanDraft | ValidatedPlanDraft) -> PlanDraft:
+        """Convert a validated generator result to the materialization draft shape."""
+        return PlanningService._draft(generated)
+
     async def materialize_failure_revision(
         self,
         request: FailureRevisionRequest,

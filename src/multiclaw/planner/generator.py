@@ -147,10 +147,10 @@ def _validate_response(
 class PlanGenerator:
     def __init__(
         self,
-        router: CompletionRouter,
+        router: CompletionRouter | None = None,
         *,
-        default_model: str,
-        generation_model: str,
+        default_model: str = "",
+        generation_model: str = "",
     ) -> None:
         self._router = router
         self._default_model = default_model
@@ -164,6 +164,8 @@ class PlanGenerator:
         max_depth: int = 10,
         max_attempts: int = 2,
     ) -> ValidatedPlanDraft:
+        if self._router is None:
+            raise PlanGenerationError("plan generation unavailable")
         safe_objective = sanitize_plan_text(objective)
         if not safe_objective.strip() or len(safe_objective) > 16_000:
             raise PlanGenerationError("invalid planning objective")

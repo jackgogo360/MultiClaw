@@ -27,6 +27,7 @@ from multiclaw.memory import MemoryEntry, MemoryProtocol
 from multiclaw.planner.execution import PlanExecutionCoordinator
 from multiclaw.planner.generator import PlanGenerator
 from multiclaw.planner.service import PlanningService
+from multiclaw.planner.policy import PlanningPolicy
 from multiclaw.runtime.models import RuntimeClock, TenantRuntime
 from multiclaw.secrets.resolver import ResolvedCredentials
 from multiclaw.skills import SkillManager
@@ -171,6 +172,12 @@ class RuntimeFactory:
                 default_model=self.settings.llm.default_model,
                 generation_model=self.settings.planning.generation_model,
             )
+            planning_policy = PlanningPolicy(
+                router,
+                default_model=self.settings.llm.default_model,
+                classification_model=self.settings.planning.classification_model,
+                enabled=self.settings.planning.enabled,
+            )
             planning_service = PlanningService(
                 self.database,
                 settings=self.settings,
@@ -217,6 +224,8 @@ class RuntimeFactory:
             sandbox_controller=sandbox_controller,
             sandbox_readiness=readiness,
             recovery_continuation=RuntimeRecoveryContinuationService(),
+            planning_policy=planning_policy,
+            plan_generator=plan_generator,
             plan_execution=PlanExecutionCoordinator(
                 self.database,
                 settings=self.settings,

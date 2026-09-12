@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from multiclaw.events import ScopedEvent
+from multiclaw.security.redaction import redact
 
 
 class DataStreamEncoder:
@@ -145,6 +146,43 @@ class DataStreamEncoder:
     @classmethod
     def run_status(cls, data: dict[str, Any]) -> str:
         return cls.data_part("data-run-status", data, transient=True)
+
+    @classmethod
+    def plan_part(
+        cls,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        durable: bool = False,
+    ) -> str:
+        """Encode a scoped Plan lifecycle event.
+
+        ``plan-created`` is durable when persisted as an assistant message; all
+        other events remain transient stream metadata.
+        """
+        allowed = {
+            "plan-created",
+            "plan-revised",
+            "plan-decision",
+            "plan-step-status",
+            "plan-run-status",
+        }
+        if event_type not in allowed:
+            raise ValueError("unsupported Plan event")
+        safe = redact(data)
+        part_id = None
+        if durable:
+            part_id = f"plan:{safe['plan_id']}:v{safe['plan_version']}"
+        return cls.data_part(
+            f"data-{event_type}",
+            safe,
+            transient=not durable,
+            part_id=part_id,
+        )
+
+    @classmethod
+    def plan_created(cls, data: dict[str, Any]) -> str:
+        return cls.plan_part("plan-created", data, durable=True)
 
     @classmethod
     def scoped_event(cls, event: ScopedEvent) -> str:

@@ -33,6 +33,7 @@ from multiclaw.planner import (
 from multiclaw.planner import validation as planner_validation
 from multiclaw.planner.generator import PlanGenerationError, PlanGenerator
 from multiclaw.planner.policy import PlanningPolicy, PlanningUnavailableError
+from multiclaw.stream import DataStreamEncoder
 from multiclaw.planner.validation import (
     PlanValidationError,
     canonical_plan_bytes,
@@ -307,6 +308,29 @@ def test_planner_package_exports():
     assert planner.PlanStep is PlanStep
     assert planner.Planner is Planner
     assert Planner is PlanGenerator
+
+
+def test_plan_created_part_is_durable_and_scoped() -> None:
+    payload = {
+        "schema_version": 1,
+        "tenant_id": "tenant",
+        "workspace_id": "workspace",
+        "session_id": "session",
+        "run_id": "run",
+        "plan_id": "a" * 36,
+        "plan_version": 1,
+        "aggregate_version": 1,
+    }
+    encoded = DataStreamEncoder.plan_part("plan-created", payload, durable=True)
+    assert '"type":"data-plan-created"' in encoded
+    assert '"transient":true' not in encoded
+    assert '"id":"plan:' in encoded
+
+
+@pytest.mark.asyncio
+async def test_legacy_planner_without_router_fails_closed() -> None:
+    with pytest.raises(PlanGenerationError, match="plan generation unavailable"):
+        await PlanGenerator().generate("objective")
 
 
 def _validation_step(
