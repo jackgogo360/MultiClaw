@@ -10,6 +10,12 @@ from sqlalchemy.sql.elements import ColumnElement
 from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
 from multiclaw.storage.repositories.auth import _ConnectionBoundRepository
 from multiclaw.storage.schema import (
+    agent_plan_decisions,
+    agent_plan_step_dependencies,
+    agent_plan_step_runs,
+    agent_plan_steps,
+    agent_plan_versions,
+    agent_plans,
     agent_runs,
     approval_requests,
     audit_logs,
@@ -647,6 +653,8 @@ class DeletionJobRepository(_ScopedDeletionRepository):
             .where(users.c.id == scoped_tenant_id)
             .values(default_workspace_id=None, updated_at=now_ms)
         )
+        for table in (agent_plan_step_runs,):
+            await self._conn.execute(delete(table).where(table.c.tenant_id == scoped_tenant_id))
         await self._conn.execute(
             delete(execution_checkpoints).where(execution_checkpoints.c.tenant_id == scoped_tenant_id)
         )
@@ -654,6 +662,8 @@ class DeletionJobRepository(_ScopedDeletionRepository):
         await self._conn.execute(delete(tool_executions).where(tool_executions.c.tenant_id == scoped_tenant_id))
         await self._conn.execute(delete(approval_requests).where(approval_requests.c.tenant_id == scoped_tenant_id))
         await self._conn.execute(delete(agent_runs).where(agent_runs.c.tenant_id == scoped_tenant_id))
+        for table in (agent_plan_decisions, agent_plan_step_dependencies, agent_plan_steps, agent_plan_versions, agent_plans):
+            await self._conn.execute(delete(table).where(table.c.tenant_id == scoped_tenant_id))
         await self._conn.execute(delete(memory_entries).where(memory_entries.c.tenant_id == scoped_tenant_id))
         await self._conn.execute(delete(chat_sessions).where(chat_sessions.c.tenant_id == scoped_tenant_id))
         await self._conn.execute(delete(user_secrets).where(user_secrets.c.tenant_id == scoped_tenant_id))

@@ -1,21 +1,56 @@
 from __future__ import annotations
+import json
 from dataclasses import dataclass
+
+from pydantic import ValidationError
 
 from sqlalchemy import and_, delete, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from multiclaw.session.models import ChatSession, InvalidSessionTitleError, SessionStatus
+from multiclaw.planner.models import PlanReference
+from multiclaw.security.redaction import redact
 from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
 from multiclaw.storage.schema import (
+    agent_plan_decisions,
+    agent_plan_step_dependencies,
+    agent_plan_step_runs,
+    agent_plan_steps,
+    agent_plan_versions,
+    agent_plans,
     approval_requests,
+    audit_logs,
     chat_sessions,
+    execution_checkpoints,
     memory_entries,
+    agent_runs,
     tool_executions,
 )
 from multiclaw.tenancy.context import TenantContext
 
 
 Dialect = SQLiteDialect | MySQLDialect
+
+
+def _message_parts(metadata_json: object) -> list[dict[str, object]]:
+    try:
+        metadata = metadata_json if isinstance(metadata_json, dict) else json.loads(str(metadata_json))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    parts = metadata.get("parts", []) if isinstance(metadata, dict) else []
+    if not isinstance(parts, list):
+        return []
+    accepted: list[dict[str, object]] = []
+    for part in parts:
+        if not isinstance(part, dict) or part.get("type") != "data-plan-created":
+            continue
+        try:
+            reference = PlanReference.model_validate(part.get("data"))
+        except ValidationError:
+            continue
+        accepted.append({"type": "data-plan-created", "data": reference.model_dump(mode="json")})
+    safe = redact({"parts": accepted})
+    return safe.get("parts", []) if isinstance(safe, dict) else []
 
 
 def _validate_title(title: str) -> str:
@@ -135,6 +170,21 @@ class SessionRepository:
         return await self._set_status(session_id, SessionStatus.ACTIVE)
 
     async def delete(self, session_id: str) -> None:
+        def scoped(table):
+            return (
+                table.c.tenant_id == self._context.tenant_id,
+                table.c.workspace_id == self._context.workspace_id,
+                table.c.session_id == session_id,
+            )
+
+        for table in (agent_plan_step_runs,):
+            await self._conn.execute(delete(table).where(*scoped(table)))
+        for table in (execution_checkpoints, audit_logs, tool_executions, approval_requests):
+            await self._conn.execute(delete(table).where(*scoped(table)))
+        await self._conn.execute(delete(agent_runs).where(*scoped(agent_runs)))
+        for table in (agent_plan_decisions, agent_plan_step_dependencies, agent_plan_steps, agent_plan_versions):
+            await self._conn.execute(delete(table).where(*scoped(table)))
+        await self._conn.execute(delete(agent_plans).where(*scoped(agent_plans)))
         await self._conn.execute(
             delete(memory_entries).where(
                 memory_entries.c.tenant_id == self._context.tenant_id,
@@ -153,10 +203,12 @@ class SessionRepository:
     async def get_messages(self, session_id: str, limit: int = 50) -> list[dict[str, object]]:
         result = await self._conn.execute(
             select(
+                memory_entries.c.id,
                 memory_entries.c.role,
                 memory_entries.c.content,
                 memory_entries.c.created_at,
                 memory_entries.c.turn_index,
+                memory_entries.c.metadata_json,
             )
             .where(
                 memory_entries.c.tenant_id == self._context.tenant_id,
@@ -176,9 +228,11 @@ class SessionRepository:
         rows.reverse()
         return [
             {
+                "id": str(row["id"]),
                 "role": str(row["role"]),
                 "content": str(row["content"]),
                 "created_at": int(row["created_at"]),
+                "parts": _message_parts(row["metadata_json"]),
             }
             for row in rows
         ]
