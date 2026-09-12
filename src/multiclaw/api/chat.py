@@ -239,6 +239,8 @@ async def chat(
         # during policy bootstrap.
         agent_router = getattr(runtime.agent, "router", None)
         if agent_router is None:
+            if planning_mode is PlanningMode.ALWAYS:
+                raise HTTPException(status_code=503, detail="planning is unavailable")
             planning_decision = PlanningDecision(
                 mode=PlanningRoute.DIRECT,
                 reason="planning components unavailable",
