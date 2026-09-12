@@ -12,7 +12,7 @@ function readPlanReference(value: unknown): PlanReference | null {
   if (!value || typeof value !== "object") return null;
   const item = value as Record<string, unknown>;
   if (item.schema_version !== 1 || Object.keys(item).some((key) => key === "schema_version" ? false : item[key] == null)) return null;
-  if (!["tenant_id", "workspace_id", "session_id", "run_id", "plan_id"].every((key) => typeof item[key] === "string")) return null;
+  if (!["tenant_id", "workspace_id", "session_id", "run_id", "plan_id"].every((key) => typeof item[key] === "string" && (item[key] as string).length > 0)) return null;
   if (!["plan_version", "aggregate_version"].every((key) => typeof item[key] === "number" && Number.isInteger(item[key]) && (item[key] as number) >= 1)) return null;
   return item as unknown as PlanReference;
 }
