@@ -19,6 +19,7 @@ from multiclaw.observability import observability_scope
 from multiclaw.planner.models import (
     MaterializeInitialPlan,
     PlanTriggerMode,
+    PlanningDecision,
     PlanningMode,
     PlanningRoute,
 )
@@ -232,16 +233,28 @@ async def chat(
     )
     planning_policy = getattr(runtime, "planning_policy", None)
     if planning_policy is None:
-        planning_policy = PlanningPolicy(
-            runtime.agent.router,
-            default_model=request.app.state.settings.llm.default_model,
-            classification_model=request.app.state.settings.planning.classification_model,
-            enabled=request.app.state.settings.planning.enabled,
-        )
-    try:
-        planning_decision = await planning_policy.decide(objective, planning_mode)
-    except PlanningUnavailableError as error:
-        raise HTTPException(status_code=503, detail="planning is unavailable") from error
+        # Test doubles and legacy runtimes may expose only the execution
+        # agent, without a model router or planning components. Preserve the
+        # existing direct-chat path for those runtimes instead of failing
+        # during policy bootstrap.
+        agent_router = getattr(runtime.agent, "router", None)
+        if agent_router is None:
+            planning_decision = PlanningDecision(
+                mode=PlanningRoute.DIRECT,
+                reason="planning components unavailable",
+            )
+        else:
+            planning_policy = PlanningPolicy(
+                agent_router,
+                default_model=request.app.state.settings.llm.default_model,
+                classification_model=request.app.state.settings.planning.classification_model,
+                enabled=request.app.state.settings.planning.enabled,
+            )
+    if planning_policy is not None:
+        try:
+            planning_decision = await planning_policy.decide(objective, planning_mode)
+        except PlanningUnavailableError as error:
+            raise HTTPException(status_code=503, detail="planning is unavailable") from error
 
     if planning_decision.mode is PlanningRoute.PLAN:
         generator = getattr(runtime, "plan_generator", None)
@@ -255,6 +268,7 @@ async def chat(
                 settings=request.app.state.settings,
                 generator=generator,
             )
+
         async def failed_plan_stream(error: BaseException):
             enc = DataStreamEncoder()
             yield enc.start()
