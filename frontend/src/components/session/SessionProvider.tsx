@@ -49,6 +49,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     }
     lastResetVersion.current = state.resetVersion;
     chatStore.resetServerState();
+    planStore.reset(null);
   }, [state.resetVersion]);
 
   useEffect(() => {
@@ -56,6 +57,11 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     if (!sessionId) {
       return;
     }
+
+    // Clear the previous session's Plan snapshot immediately on switch. The
+    // network hydration may take a moment (or fail), but stale Plan cards must
+    // never remain visible under the newly selected session.
+    planStore.reset(sessionId);
 
     let cancelled = false;
 
