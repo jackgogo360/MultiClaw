@@ -617,6 +617,25 @@ class PlanExecutionCoordinator:
         lease = await run_lease_handle.current()
         plan, summaries = await self._prepare_final_summary(context=context, lease=lease)
         try:
+            # Reserve the final-summary model round in a short transaction;
+            # inference runs after commit so recovery can recompute consumed
+            # units from durable ledger rows.
+            async with TenantUnitOfWork(
+                self._database,
+                context,
+                planning_settings=self._settings.planning,
+                workflow_settings=self._settings.workflow,
+            ) as reservation_uow:
+                await reservation_uow.plans.reserve_round_unit(
+                    run_id=str(context.run_id),
+                    plan_id=plan.plan_id,
+                    round_kind="final_summary",
+                    total_budget=(
+                        self._settings.planning.max_steps
+                        * self._settings.planning.max_step_attempts
+                        * self._settings.agent.max_tool_rounds
+                    ),
+                )
             response = await runner.router.completion(
                 model=runner.settings.llm.default_model,
                 messages=[
