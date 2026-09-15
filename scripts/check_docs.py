@@ -26,6 +26,7 @@ REQUIRED_FILES = (
     "docs/troubleshooting.md",
     "docs/multi-tenant-operations.md",
     "docs/sandbox-deployment.md",
+    "docs/durable-plans.md",
     "frontend/README.md",
 )
 
@@ -195,6 +196,7 @@ def check_required_content(root: Path) -> list[str]:
             "workflow",
             "secrets",
             "deletion",
+            "planning",
             "llm",
             "memory",
             "governance",
@@ -221,6 +223,8 @@ def check_required_content(root: Path) -> list[str]:
             "/api/secrets",
             "/api/account",
             "/api/health",
+            "/api/plans",
+            "/api/runs",
         ):
             if route_group not in api:
                 issues.append(f"docs/api.md: missing public route group: {route_group}")

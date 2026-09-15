@@ -1,18 +1,27 @@
 from multiclaw.llm.providers import (
-    ProviderAdapter,
-    OpenAIAdapter,
     AnthropicAdapter,
     LLMResponse,
+    OpenAIAdapter,
+    ProviderAdapter,
     ToolCall,
 )
-from multiclaw.llm.router import ModelRouter, CapabilityTag
+from multiclaw.llm.router import (
+    CapabilityTag,
+    CompletionRouter,
+    LLMProviderError,
+    LLMResponseParseError,
+    ModelRouter,
+)
 
 __all__ = [
-    "ProviderAdapter",
-    "OpenAIAdapter",
     "AnthropicAdapter",
-    "LLMResponse",
-    "ToolCall",
-    "ModelRouter",
     "CapabilityTag",
+    "CompletionRouter",
+    "LLMProviderError",
+    "LLMResponse",
+    "LLMResponseParseError",
+    "ModelRouter",
+    "OpenAIAdapter",
+    "ProviderAdapter",
+    "ToolCall",
 ]

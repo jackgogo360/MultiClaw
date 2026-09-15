@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import re
@@ -6,6 +5,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal
 
 import httpx
+from pydantic import ValidationError
 
 from multiclaw.agent.context import ContextBuilder, ContextRequest
 from multiclaw.agent.models import Observation, ObservationType
@@ -16,16 +16,19 @@ from multiclaw.config import Settings
 from multiclaw.events import AgentState, EventBus, EventRouter
 from multiclaw.llm import LLMResponse, ModelRouter
 from multiclaw.memory import MemoryEntry, MemoryProtocol
-from multiclaw.planner import Planner
+from multiclaw.planner import PlanStepCompletion
+from multiclaw.planner.models import PlanCancellationRequested, PlanStepExecutionRequest
 from multiclaw.skills import SkillManager
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.tools import CoreToolScheduler, ToolRegistry
+from multiclaw.tools.base import ToolStatus
 from multiclaw.workflow.continuation import (
     ContinuationOutcome,
     ContinuationState,
     PersistedToolResult,
+    WorkflowContinuationService,
 )
-from multiclaw.tools.base import ToolStatus
+from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import RunLease, RunLeaseHandle
 
 logger = logging.getLogger(__name__)
@@ -84,8 +87,8 @@ class MultiClawAgent(ToolCallAgent):
         registry: ToolRegistry,
         scheduler: CoreToolScheduler,
         memory: MemoryProtocol,
-        planner: Planner,
         event_bus: EventBus,
+        planner=None,
         event_router: EventRouter | None = None,
         skill_manager: SkillManager | None = None,
     ) -> None:
@@ -98,7 +101,9 @@ class MultiClawAgent(ToolCallAgent):
             event_bus=event_bus,
             event_router=event_router,
         )
-        self.planner = planner
+        # ``planner`` is retained as a deprecated constructor argument for
+        # callers that still build agents directly; planning is routed by the
+        # API/runtime policy and never by this execution agent.
         self.context_builder = ContextBuilder(
             memory=memory,
             recent_turns=settings.memory.recent_turns,
@@ -128,7 +133,11 @@ class MultiClawAgent(ToolCallAgent):
         self,
         messages: list[dict[str, Any]],
         reason: str,
+        *,
+        before_model: Callable[[], Awaitable[None]] | None = None,
     ) -> str:
+        if before_model is not None:
+            await before_model()
         prompt = REFLECTION_PROMPT.format(reason=reason)
         response = await self.router.completion(
             model=self.settings.llm.default_model,
@@ -142,9 +151,15 @@ class MultiClawAgent(ToolCallAgent):
         self,
         messages: list[dict[str, Any]],
         reason: str,
+        *,
+        before_model: Callable[[], Awaitable[None]] | None = None,
     ) -> str | None:
         try:
-            reflection = await self._generate_reflection(messages, reason)
+            reflection = await self._generate_reflection(
+                messages, reason, before_model=before_model
+            )
+        except PlanCancellationRequested:
+            raise
         except Exception:
             logger.exception("reflection generation failed")
             return None
@@ -216,10 +231,178 @@ class MultiClawAgent(ToolCallAgent):
         if not calls:
             return []
         await self.transition(AgentState.ACTING, context=context)
+        before_dispatch = None
+        if context is not None and context.run_id is not None:
+            before_dispatch = lambda: self._raise_if_cancel_requested(context)
         return await self._require_tool_batch_executor().execute(
             self._build_tool_call_specs(calls),
             context=context,
             run_lease_handle=run_lease_handle,
+            before_dispatch=before_dispatch,
+        )
+
+    async def _raise_if_cancel_requested(self, context: TenantContext) -> None:
+        database = getattr(getattr(self, "scheduler", None), "database", None)
+        if context.run_id is None or database is None:
+            return
+        await WorkflowCoordinator(
+            database, settings=self.settings
+        ).raise_if_cancel_requested(context)
+
+    async def run_plan_step(
+        self,
+        request: PlanStepExecutionRequest,
+        *,
+        run_lease_handle: RunLeaseHandle,
+        workflow_continuation: WorkflowContinuationService,
+        recovered_tool_result: PersistedToolResult | None = None,
+        recovered_tool_input_json: str | None = None,
+    ) -> PlanStepCompletion | ContinuationOutcome:
+        del workflow_continuation
+        step_context = {
+            "objective": request.plan.current.objective,
+            "constraints": list(request.plan.current.constraints),
+            "step": {
+                "logical_step_key": request.step.logical_step_key,
+                "title": request.step.title,
+                "description": request.step.description,
+                "expected_outcome": request.step.expected_outcome,
+            },
+            "dependencies": [
+                result.public_context() for result in request.dependency_results
+            ],
+            "attempt": request.step_run.attempt,
+            "remaining_attempts": request.step.max_attempts - request.step_run.attempt,
+        }
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.settings.agent.system_prompt},
+            {
+                "role": "system",
+                "content": (
+                    "Execute exactly one Plan step and finish with complete_plan_step."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    step_context,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        messages.extend(
+            {"role": "system", "content": prompt}
+            for _, prompt in self.skill_manager.get_active_skill_prompts()
+        )
+        if (recovered_tool_result is None) != (recovered_tool_input_json is None):
+            raise ValueError("recovered tool result and input must be provided together")
+        if recovered_tool_result is not None and recovered_tool_input_json is not None:
+            try:
+                recovered_arguments = json.loads(recovered_tool_input_json)
+            except json.JSONDecodeError as error:
+                raise ValueError("persisted tool input is not valid JSON") from error
+            if not isinstance(recovered_arguments, dict):
+                raise ValueError("persisted tool input must be a JSON object")
+            messages.append(
+                _build_assistant_tool_calls_msg(
+                    [
+                        {
+                            "id": recovered_tool_result.tool_call_id,
+                            "name": recovered_tool_result.tool_name,
+                            "arguments": recovered_arguments,
+                        }
+                    ]
+                )
+            )
+            messages.append(
+                _build_tool_result_msg(
+                    recovered_tool_result.tool_call_id,
+                    recovered_tool_result.content,
+                )
+            )
+        tools = [
+            *self.registry.to_openai_schemas(),
+            {
+                "type": "function",
+                "function": {
+                    "name": "complete_plan_step",
+                    "description": "Finish the current Plan step with structured evidence.",
+                    "parameters": PlanStepCompletion.model_json_schema(),
+                },
+            },
+        ]
+        invalid_terminal_responses = 0
+        invalid_terminal_limit = self.settings.agent.reflection_max_attempts + 1
+
+        for _ in range(self.settings.agent.max_tool_rounds):
+            await self._raise_if_cancel_requested(request.context)
+            response: LLMResponse = await self.router.completion(
+                model=self.settings.llm.default_model,
+                messages=messages,
+                tools=tools,
+            )
+            if response.tool_calls:
+                normalized_calls = self._normalize_tool_calls(response.tool_calls)
+                if (
+                    len(normalized_calls) == 1
+                    and normalized_calls[0]["name"] == "complete_plan_step"
+                ):
+                    try:
+                        return PlanStepCompletion.model_validate(
+                            normalized_calls[0]["arguments"]
+                        )
+                    except ValidationError:
+                        pass
+                elif not any(
+                    call["name"] == "complete_plan_step"
+                    for call in normalized_calls
+                ):
+                    messages.append(
+                        _build_assistant_tool_calls_msg(
+                            normalized_calls,
+                            response.reasoning_content,
+                        )
+                    )
+                    outcomes = await self._execute_tool_batch(
+                        normalized_calls,
+                        context=request.context,
+                        run_lease_handle=run_lease_handle,
+                    )
+                    if any(
+                        outcome.result.status is ToolStatus.AWAITING_APPROVAL
+                        for outcome in outcomes
+                    ):
+                        return ContinuationOutcome(
+                            state=ContinuationState.AWAITING_USER,
+                            detail="tool awaiting approval",
+                        )
+                    messages.extend(
+                        _build_tool_result_msg(
+                            outcome.call_id,
+                            outcome.observation.content,
+                        )
+                        for outcome in outcomes
+                    )
+                    continue
+            invalid_terminal_responses += 1
+            if invalid_terminal_responses >= invalid_terminal_limit:
+                break
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "The previous response did not call complete_plan_step. "
+                        "Call it exactly once with valid arguments."
+                    ),
+                }
+            )
+
+        return PlanStepCompletion(
+            status="failed",
+            summary="Step completion protocol was not satisfied",
+            evidence=[],
+            retryable=False,
         )
 
     # ------------------------------------------------------------------
@@ -232,15 +415,6 @@ class MultiClawAgent(ToolCallAgent):
         *,
         context: TenantContext,
     ) -> Observation:
-        if user_input.startswith("plan:"):
-            next_turn_index = await self._next_turn_index(context)
-            await self._save_chat_msg(context, "user", user_input, next_turn_index)
-            request = user_input[len("plan:") :].strip()
-            plan = self.planner.create_plan(request)
-            return Observation(
-                type=ObservationType.USER_RESPONSE,
-                content=self.planner.summary(plan),
-            )
         try:
             # --- Skill handling ---
             user_msg = user_input
@@ -271,6 +445,7 @@ class MultiClawAgent(ToolCallAgent):
             controller = self._build_resilience_controller()
 
             for _ in range(max_rounds):
+                await self._raise_if_cancel_requested(context)
                 response: LLMResponse = await self.router.completion(
                     model=self.settings.llm.default_model,
                     messages=messages,
@@ -294,7 +469,9 @@ class MultiClawAgent(ToolCallAgent):
                     call_decision = controller.observe_calls(normalized_calls)
                     if call_decision.action == ResilienceAction.REFLECT:
                         reflection = await self._attempt_reflection(
-                            messages, call_decision.reason
+                            messages,
+                            call_decision.reason,
+                            before_model=lambda: self._raise_if_cancel_requested(context),
                         )
                         if reflection is None:
                             break
@@ -325,7 +502,9 @@ class MultiClawAgent(ToolCallAgent):
                     result_decision = controller.observe_results(result_contents)
                     if result_decision.action == ResilienceAction.REFLECT:
                         reflection = await self._attempt_reflection(
-                            messages, result_decision.reason
+                            messages,
+                            result_decision.reason,
+                            before_model=lambda: self._raise_if_cancel_requested(context),
                         )
                         if reflection is None:
                             break
@@ -344,12 +523,15 @@ class MultiClawAgent(ToolCallAgent):
                 full_text = await self._generate_final_summary(
                     messages,
                     self._collect_completion_text_response,
+                    before_model=lambda: self._raise_if_cancel_requested(context),
                 )
                 await self._save_chat_msg(context, "assistant", full_text, next_turn_index + 1)
                 return Observation(
                     type=ObservationType.USER_RESPONSE,
                     content=full_text,
                 )
+            except PlanCancellationRequested:
+                raise
             except Exception:
                 logger.exception("final summary failed")
                 return Observation(
@@ -412,7 +594,11 @@ class MultiClawAgent(ToolCallAgent):
             [list[dict[str, Any]]],
             Awaitable[str],
         ],
+        *,
+        before_model: Callable[[], Awaitable[None]] | None = None,
     ) -> str:
+        if before_model is not None:
+            await before_model()
         full_text = await collect_response(messages)
         if self._contains_dsml_tool_markup(full_text):
             logger.warning(
@@ -422,6 +608,8 @@ class MultiClawAgent(ToolCallAgent):
                 {"role": "system", "content": FINAL_SUMMARY_PLAIN_TEXT_PROMPT},
                 *messages,
             ]
+            if before_model is not None:
+                await before_model()
             retry_text = await collect_response(retry_messages)
             full_text = retry_text or full_text
         return self._strip_dsml_tool_markup(full_text)
@@ -439,19 +627,6 @@ class MultiClawAgent(ToolCallAgent):
     ) -> AsyncIterator[dict[str, Any]]:
         del run_lease, workflow_recovery
         logger.info("handle_message_stream: %r", user_input[:80])
-
-        if user_input.startswith("plan:"):
-            next_turn_index = await self._next_turn_index(context)
-            await self._save_chat_msg(context, "user", user_input, next_turn_index)
-            logger.info("-> plan mode")
-            request = user_input[len("plan:") :].strip()
-            plan = self.planner.create_plan(request)
-            yield {
-                "type": "done",
-                "content": self.planner.summary(plan),
-                "data": {},
-            }
-            return
 
         try:
             await self.transition(AgentState.THINKING, context=context)
@@ -504,6 +679,7 @@ class MultiClawAgent(ToolCallAgent):
                 terminate_requested = False
 
                 try:
+                    await self._raise_if_cancel_requested(context)
                     async for event in self.router.stream_completion(
                         model=self.settings.llm.default_model,
                         messages=messages,
@@ -530,7 +706,9 @@ class MultiClawAgent(ToolCallAgent):
                                 call_decision = controller.observe_calls(normalized_calls)
                                 if call_decision.action == ResilienceAction.REFLECT:
                                     reflection = await self._attempt_reflection(
-                                        messages, call_decision.reason
+                                        messages,
+                                        call_decision.reason,
+                                        before_model=lambda: self._raise_if_cancel_requested(context),
                                     )
                                     if reflection is None:
                                         terminate_requested = True
@@ -601,7 +779,9 @@ class MultiClawAgent(ToolCallAgent):
                                 result_decision = controller.observe_results(result_contents)
                                 if result_decision.action == ResilienceAction.REFLECT:
                                     reflection = await self._attempt_reflection(
-                                        messages, result_decision.reason
+                                        messages,
+                                        result_decision.reason,
+                                        before_model=lambda: self._raise_if_cancel_requested(context),
                                     )
                                     if reflection is None:
                                         terminate_requested = True
@@ -641,7 +821,7 @@ class MultiClawAgent(ToolCallAgent):
                         yield {"type": "done", "content": full_text, "data": {}}
                         return
 
-                except (httpx.ReadTimeout, asyncio.TimeoutError) as exc:
+                except (TimeoutError, httpx.ReadTimeout) as exc:
                     logger.error(
                         "stream timeout round=%d/%d session=%s input=%r",
                         round_num + 1, max_rounds, context.session_id, user_input[:200],
@@ -666,7 +846,10 @@ class MultiClawAgent(ToolCallAgent):
                 full_text = await self._generate_final_summary(
                     messages,
                     self._collect_plain_text_response,
+                    before_model=lambda: self._raise_if_cancel_requested(context),
                 )
+            except PlanCancellationRequested:
+                raise
             except Exception:
                 logger.exception("final summary failed")
                 yield {
@@ -809,6 +992,7 @@ class MultiClawAgent(ToolCallAgent):
         max_rounds = self.settings.agent.max_tool_rounds
 
         for _ in range(max_rounds):
+            await self._raise_if_cancel_requested(context)
             response: LLMResponse = await self.router.completion(
                 model=self.settings.llm.default_model,
                 messages=messages,
@@ -862,6 +1046,7 @@ class MultiClawAgent(ToolCallAgent):
         full_text = await self._generate_final_summary(
             messages,
             self._collect_completion_text_response,
+            before_model=lambda: self._raise_if_cancel_requested(context),
         )
         await self._persist_stream_assistant_output(
             context=context,

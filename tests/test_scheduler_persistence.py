@@ -251,6 +251,142 @@ async def _checkpoint_phases(database: Database, context: TenantContext) -> list
     return [str(row) for row in rows]
 
 
+@pytest.mark.asyncio
+async def test_cancel_after_non_idempotent_dispatch_persists_observed_result_once(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-cancel-observed")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-cancel-observed")
+    calls = 0
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        nonlocal calls
+        calls += 1
+        await coordinator.request_cancellation(context)
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    result = await _scheduler(workflow_database).run(
+        PersistedToolBuilder(
+            name="post_dispatch_mutation",
+            runner=runner,
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        ),
+        {"label": "observed"},
+        context=context,
+        call_id="call-cancel-observed",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+
+    row = await _latest_execution_row(workflow_database, context)
+    assert result.status is ToolStatus.SUCCESS
+    assert calls == 1
+    assert row["execution_status"] == ExecutionStatus.SUCCEEDED.value
+    assert row["result_ref"] is not None
+    assert CheckpointPhase.EXECUTION_RESULT_OBSERVED.value in await _checkpoint_phases(
+        workflow_database, context
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_prepare_stops_before_dispatch_and_closes_execution(
+    workflow_database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    context = await _create_run_context(workflow_database, email_suffix="-cancel-before-dispatch")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-cancel-before-dispatch")
+    scheduler = _scheduler(workflow_database)
+    dispatches = 0
+
+    async def runner(params: PersistedParams) -> ToolExecutionResult:
+        nonlocal dispatches
+        dispatches += 1
+        return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
+
+    original_publish = scheduler._publish_event
+
+    async def cancel_at_executing_boundary(event_type, data, *, context=None):
+        await original_publish(event_type, data, context=context)
+        if event_type == "tool.executing":
+            await coordinator.request_cancellation(context)
+
+    monkeypatch.setattr(scheduler, "_publish_event", cancel_at_executing_boundary)
+    result = await scheduler.run(
+        PersistedToolBuilder(
+            name="cancelled_before_dispatch",
+            runner=runner,
+            recovery_strategy=RecoveryStrategy.MANUAL_UNCERTAIN,
+        ),
+        {"label": "must not run"},
+        context=context,
+        call_id="call-cancel-before-dispatch",
+        run_lease_handle=RunLeaseHandle(lease),
+    )
+
+    row = await _latest_execution_row(workflow_database, context)
+    phases = await _checkpoint_phases(workflow_database, context)
+    run = await coordinator.get_run(context)
+    assert dispatches == 0
+    assert result.status is ToolStatus.CANCELLED
+    assert row["execution_status"] == ExecutionStatus.FAILED_RETRYABLE.value
+    assert row["external_request_id"] is None
+    assert row["result_ref"] is not None
+    assert phases[-1] == CheckpointPhase.EXECUTION_RESULT_OBSERVED.value
+    assert run is not None and run.cancel_requested_at is not None
+
+
+@pytest.mark.asyncio
+async def test_observed_result_rejects_foreign_prepared_lease_before_persistence(
+    workflow_database: Database,
+):
+    foreign_context = await _create_run_context(workflow_database, email_suffix="-foreign-lease")
+    target_context = await _create_run_context(
+        workflow_database,
+        email_suffix="-target-lease",
+        tenant_id=foreign_context.tenant_id,
+        workspace_id=foreign_context.workspace_id,
+    )
+    coordinator = _coordinator(workflow_database)
+    foreign_lease = await coordinator.start_run_with_checkpoint(foreign_context, "same-owner")
+    target_lease = await coordinator.start_run_with_checkpoint(target_context, "same-owner")
+    assert foreign_lease.lease_owner == target_lease.lease_owner
+    assert foreign_lease.fencing_token == target_lease.fencing_token
+
+    scheduler = _scheduler(workflow_database)
+    builder = PersistedToolBuilder(
+        name="foreign_prepared_result",
+        runner=lambda _params: None,
+        recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+    )
+    invocation = builder.build(PersistedParams(label="foreign"))
+    canonical_input = scheduler._canonicalize_input({"label": "foreign"})
+    prepared = await scheduler._prepare_execution(
+        builder=builder,
+        context=foreign_context,
+        call_id="foreign-prepared-result",
+        run_lease_handle=RunLeaseHandle(foreign_lease),
+        invocation=invocation,
+        canonical_input=canonical_input,
+        recovery_strategy=RecoveryStrategy.READ_ONLY_REPLAY,
+        idempotency_key=None,
+    )
+
+    with pytest.raises(StaleFenceError, match="context"):
+        await scheduler._persist_execution_result(
+            prepared,
+            tool_name=builder.name,
+            context=target_context,
+            call_id="foreign-prepared-result",
+            result=ToolExecutionResult(status=ToolStatus.SUCCESS, content="must not persist"),
+        )
+
+    execution = await coordinator.get_execution(foreign_context, prepared.execution_id)
+    assert execution is not None
+    assert execution.status is ExecutionStatus.EXECUTING
+    assert await coordinator.get_execution(target_context, prepared.execution_id) is None
+
+
 class PersistedParams(BaseModel):
     label: str
     delay: float = 0.0

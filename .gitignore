@@ -49,3 +49,4 @@ frontend/dist/
 .omx/
 .superpowers/
 .claude/worktrees/
+.worktrees/

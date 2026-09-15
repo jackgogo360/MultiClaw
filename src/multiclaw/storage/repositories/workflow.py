@@ -9,34 +9,34 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from multiclaw.storage.dialect import MySQLDialect, SQLiteDialect
 from multiclaw.storage.schema import (
+    agent_plan_versions,
     agent_runs,
     approval_requests,
     audit_logs,
     execution_checkpoints,
     tool_executions,
     users,
+    memory_entries,
 )
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import (
+    LEGAL_EXECUTION_TRANSITIONS,
+    LEGAL_RUN_TRANSITIONS,
+    TERMINAL_EXECUTION_STATUSES,
     ApprovalRecord,
     ApprovalStatus,
-    CheckpointPhase,
     CheckpointRecord,
     ExecutionRecord,
     ExecutionRecoveryRecord,
     ExecutionStatus,
     InvalidTransitionError,
-    LEGAL_EXECUTION_TRANSITIONS,
-    LEGAL_RUN_TRANSITIONS,
     RecoveryStrategy,
-    TERMINAL_EXECUTION_STATUSES,
     RunLease,
     RunRecord,
     RunStatus,
     VersionConflictError,
     WorkflowRuntimeCounters,
 )
-
 
 Dialect = SQLiteDialect | MySQLDialect
 ACTIVE_RUN_STATUSES = (RunStatus.RUNNING.value, RunStatus.AWAITING_USER.value, RunStatus.RESUMING.value)
@@ -95,6 +95,7 @@ class WorkflowRepository:
     _dialect: Dialect
     _heartbeat_ms: int
     _lease_ttl_ms: int
+    plan_round_budget: int | None = None
 
     async def _lock_tenant(self, tenant_id: str) -> None:
         if self._dialect.name != "mysql":
@@ -110,6 +111,10 @@ class WorkflowRepository:
                 agent_runs.c.workspace_id,
                 agent_runs.c.session_id,
                 agent_runs.c.run_id,
+                agent_runs.c.plan_id,
+                agent_runs.c.initial_plan_version,
+                agent_runs.c.active_plan_version,
+                agent_runs.c.cancel_requested_at,
                 agent_runs.c.run_status,
                 agent_runs.c.runtime_instance_id,
                 agent_runs.c.lease_owner,
@@ -126,6 +131,52 @@ class WorkflowRepository:
         )
         row = result.mappings().first()
         return None if row is None else self._run_from_row(row)
+
+    async def get_plan_run(
+        self,
+        context: TenantContext,
+        plan_id: str,
+    ) -> RunRecord | None:
+        if context.session_id is None:
+            raise ValueError("session_id is required for Plan run lookup")
+        result = await self._conn.execute(
+            select(agent_runs)
+            .where(
+                agent_runs.c.tenant_id == context.tenant_id,
+                agent_runs.c.workspace_id == context.workspace_id,
+                agent_runs.c.session_id == context.session_id,
+                agent_runs.c.plan_id == plan_id,
+            )
+            .order_by(agent_runs.c.created_at.desc(), agent_runs.c.run_id.desc())
+            .limit(1)
+        )
+        row = result.mappings().first()
+        return None if row is None else self._run_from_row(row)
+
+    async def list_plan_runs(
+        self,
+        context: TenantContext,
+        plan_id: str,
+        *,
+        for_update: bool = False,
+    ) -> tuple[RunRecord, ...]:
+        """Return all Plan-bound runs inside the caller's tenant/session scope."""
+        if context.session_id is None:
+            raise ValueError("session_id is required for Plan run lookup")
+        statement = (
+            select(agent_runs)
+            .where(
+                agent_runs.c.tenant_id == context.tenant_id,
+                agent_runs.c.workspace_id == context.workspace_id,
+                agent_runs.c.session_id == context.session_id,
+                agent_runs.c.plan_id == plan_id,
+            )
+            .order_by(agent_runs.c.created_at.desc(), agent_runs.c.run_id.desc())
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self._conn.execute(statement)
+        return tuple(self._run_from_row(row) for row in result.mappings())
 
     async def count_active_runs(self, tenant_id: str) -> int:
         result = await self._conn.execute(
@@ -191,7 +242,16 @@ class WorkflowRepository:
         context: TenantContext,
         *,
         runtime_instance_id: str,
+        status: RunStatus = RunStatus.RUNNING,
+        plan_id: str | None = None,
+        initial_plan_version: int | None = None,
+        active_plan_version: int | None = None,
     ) -> RunLease:
+        binding = (plan_id, initial_plan_version, active_plan_version)
+        if any(value is None for value in binding) and any(
+            value is not None for value in binding
+        ):
+            raise ValueError("Plan run binding must be complete")
         now_ms = self._dialect.db_now_ms()
         await self._conn.execute(
             insert(agent_runs).values(
@@ -199,7 +259,11 @@ class WorkflowRepository:
                 tenant_id=context.tenant_id,
                 workspace_id=context.workspace_id,
                 session_id=context.session_id,
-                run_status=RunStatus.RUNNING.value,
+                plan_id=plan_id,
+                initial_plan_version=initial_plan_version,
+                active_plan_version=active_plan_version,
+                cancel_requested_at=None,
+                run_status=status.value,
                 runtime_instance_id=runtime_instance_id,
                 lease_owner=runtime_instance_id,
                 fencing_token=1,
@@ -325,6 +389,228 @@ class WorkflowRepository:
             current.fencing_token + 1,
             current.version + 1,
         )
+
+    async def _resume_waiting_plan_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+        plan_id: str,
+        plan_version: int,
+        expected_run_version: int,
+    ) -> RunLease | None:
+        await self._dialect.lock_run(self._conn, context)
+        current = await self.get_run(context)
+        if (
+            current is None
+            or current.status is not RunStatus.AWAITING_USER
+            or current.plan_id != plan_id
+            or current.version != expected_run_version
+            or not await self._plan_version_exists(context, plan_id, plan_version)
+        ):
+            return None
+
+        now_ms = self._dialect.db_now_ms()
+        result = await self._conn.execute(
+            update(agent_runs)
+            .where(
+                _context_predicate(context),
+                agent_runs.c.run_status == RunStatus.AWAITING_USER.value,
+                agent_runs.c.plan_id == plan_id,
+                agent_runs.c.version == expected_run_version,
+            )
+            .values(
+                run_status=RunStatus.RESUMING.value,
+                active_plan_version=plan_version,
+                runtime_instance_id=runtime_instance_id,
+                lease_owner=runtime_instance_id,
+                fencing_token=agent_runs.c.fencing_token + 1,
+                lease_expires_at=now_ms + self._lease_ttl_ms,
+                heartbeat_at=now_ms,
+                version=agent_runs.c.version + 1,
+                updated_at=now_ms,
+            )
+        )
+        if result.rowcount != 1:
+            return None
+        return await self.require_lease(
+            context,
+            runtime_instance_id,
+            current.fencing_token + 1,
+            current.version + 1,
+        )
+
+    async def _fence_waiting_plan_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+        plan_id: str,
+        plan_version: int,
+        plan_digest: str,
+        expected_run_version: int,
+    ) -> RunLease | None:
+        await self._dialect.lock_run(self._conn, context)
+        current = await self.get_run(context)
+        if (
+            current is None
+            or current.status is not RunStatus.AWAITING_USER
+            or current.plan_id != plan_id
+            or current.version != expected_run_version
+            or not await self._plan_version_exists(
+                context,
+                plan_id,
+                plan_version,
+                content_digest=plan_digest,
+            )
+        ):
+            return None
+
+        now_ms = self._dialect.db_now_ms()
+        result = await self._conn.execute(
+            update(agent_runs)
+            .where(
+                _context_predicate(context),
+                agent_runs.c.run_status == RunStatus.AWAITING_USER.value,
+                agent_runs.c.plan_id == plan_id,
+                agent_runs.c.version == expected_run_version,
+            )
+            .values(
+                runtime_instance_id=runtime_instance_id,
+                lease_owner=runtime_instance_id,
+                fencing_token=agent_runs.c.fencing_token + 1,
+                lease_expires_at=now_ms + self._lease_ttl_ms,
+                heartbeat_at=now_ms,
+                version=agent_runs.c.version + 1,
+                updated_at=now_ms,
+            )
+        )
+        if result.rowcount != 1:
+            return None
+        return await self.require_lease(
+            context,
+            runtime_instance_id,
+            current.fencing_token + 1,
+            current.version + 1,
+        )
+
+    async def _cancel_waiting_plan_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+        plan_id: str,
+        plan_version: int,
+        expected_run_version: int,
+    ) -> RunLease | None:
+        await self._dialect.lock_run(self._conn, context)
+        current = await self.get_run(context)
+        if (
+            current is None
+            or current.status is not RunStatus.AWAITING_USER
+            or current.plan_id != plan_id
+            or current.version != expected_run_version
+            or not await self._plan_version_exists(context, plan_id, plan_version)
+        ):
+            return None
+
+        now_ms = self._dialect.db_now_ms()
+        result = await self._conn.execute(
+            update(agent_runs)
+            .where(
+                _context_predicate(context),
+                agent_runs.c.run_status == RunStatus.AWAITING_USER.value,
+                agent_runs.c.plan_id == plan_id,
+                agent_runs.c.version == expected_run_version,
+            )
+            .values(
+                run_status=RunStatus.CANCELLED.value,
+                runtime_instance_id=runtime_instance_id,
+                lease_owner=runtime_instance_id,
+                fencing_token=agent_runs.c.fencing_token + 1,
+                lease_expires_at=now_ms + self._lease_ttl_ms,
+                heartbeat_at=now_ms,
+                version=agent_runs.c.version + 1,
+                updated_at=now_ms,
+                finished_at=now_ms,
+            )
+        )
+        if result.rowcount != 1:
+            return None
+        return await self.require_lease(
+            context,
+            runtime_instance_id,
+            current.fencing_token + 1,
+            current.version + 1,
+        )
+
+    async def _request_cancellation(self, context: TenantContext) -> RunRecord | None:
+        """Durably record a cancellation request without touching Plan state."""
+        await self._dialect.lock_run(self._conn, context)
+        current = await self.get_run(context)
+        if current is None:
+            return None
+        if current.status in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED_TERMINAL,
+            RunStatus.CANCELLED,
+            RunStatus.BLOCKED_CORRUPT,
+            RunStatus.BLOCKED_INCOMPATIBLE,
+        }:
+            return current
+        if current.cancel_requested_at is not None:
+            return current
+
+        now_ms = self._dialect.db_now_ms()
+        values: dict[str, object] = {
+            "cancel_requested_at": func.coalesce(
+                agent_runs.c.cancel_requested_at,
+                now_ms,
+            ),
+            "updated_at": now_ms,
+            "version": agent_runs.c.version + 1,
+        }
+        if current.status is RunStatus.AWAITING_USER:
+            values.update(
+                run_status=RunStatus.CANCELLED.value,
+                heartbeat_at=now_ms,
+                lease_expires_at=now_ms + self._lease_ttl_ms,
+                finished_at=now_ms,
+            )
+        result = await self._conn.execute(
+            update(agent_runs)
+            .where(
+                _context_predicate(context),
+                agent_runs.c.version == current.version,
+                agent_runs.c.run_status == current.status.value,
+            )
+            .values(**values)
+        )
+        if result.rowcount != 1:
+            return await self.get_run(context)
+        return await self.get_run(context)
+
+    async def _plan_version_exists(
+        self,
+        context: TenantContext,
+        plan_id: str,
+        plan_version: int,
+        *,
+        content_digest: str | None = None,
+    ) -> bool:
+        predicates = [
+            agent_plan_versions.c.tenant_id == context.tenant_id,
+            agent_plan_versions.c.workspace_id == context.workspace_id,
+            agent_plan_versions.c.session_id == context.session_id,
+            agent_plan_versions.c.plan_id == plan_id,
+            agent_plan_versions.c.plan_version == plan_version,
+        ]
+        if content_digest is not None:
+            predicates.append(agent_plan_versions.c.content_digest == content_digest)
+        result = await self._conn.execute(
+            select(agent_plan_versions.c.plan_id).where(*predicates).limit(1)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def _refresh_lease(self, lease: RunLease) -> RunLease | None:
         now_ms = self._dialect.db_now_ms()
@@ -763,6 +1049,38 @@ class WorkflowRepository:
         if not await self._has_current_lease(lease):
             return None
 
+        if self.plan_round_budget is not None:
+            plan_row = await self._conn.execute(
+                select(agent_runs.c.plan_id).where(_context_predicate(lease.context))
+            )
+            plan_id = plan_row.scalar_one_or_none()
+            if plan_id is not None:
+                ledger_count = await self._conn.scalar(
+                    select(func.count())
+                    .select_from(memory_entries)
+                    .where(
+                        memory_entries.c.tenant_id == lease.context.tenant_id,
+                        memory_entries.c.workspace_id == lease.context.workspace_id,
+                        memory_entries.c.session_id == lease.context.session_id,
+                        memory_entries.c.type == "plan_round_counter",
+                        memory_entries.c.metadata_json.like(f'%"run_id":"{lease.context.run_id}"%'),
+                    )
+                )
+                execution_count = await self._conn.scalar(
+                    select(func.count())
+                    .select_from(tool_executions)
+                    .where(
+                        tool_executions.c.tenant_id == lease.context.tenant_id,
+                        tool_executions.c.workspace_id == lease.context.workspace_id,
+                        tool_executions.c.session_id == lease.context.session_id,
+                        tool_executions.c.run_id == lease.context.run_id,
+                    )
+                )
+                if int(ledger_count or 0) + int(execution_count or 0) >= self.plan_round_budget:
+                    from multiclaw.planner.models import PlanRoundBudgetExceeded
+
+                    raise PlanRoundBudgetExceeded("Plan round budget exceeded")
+
         now_ms = self._dialect.db_now_ms()
         selectable = select(
             literal(execution_id),
@@ -1019,6 +1337,15 @@ class WorkflowRepository:
 
     @staticmethod
     def _run_from_row(row) -> RunRecord:
+        plan_binding = (
+            row["plan_id"],
+            row["initial_plan_version"],
+            row["active_plan_version"],
+        )
+        if any(value is None for value in plan_binding) and any(
+            value is not None for value in plan_binding
+        ):
+            raise ValueError("run has an incomplete Plan binding")
         context = TenantContext(
             tenant_id=str(row["tenant_id"]),
             workspace_id=str(row["workspace_id"]),
@@ -1028,6 +1355,22 @@ class WorkflowRepository:
         return RunRecord(
             context=context,
             status=RunStatus(str(row["run_status"])),
+            plan_id=None if row["plan_id"] is None else str(row["plan_id"]),
+            initial_plan_version=(
+                None
+                if row["initial_plan_version"] is None
+                else int(row["initial_plan_version"])
+            ),
+            active_plan_version=(
+                None
+                if row["active_plan_version"] is None
+                else int(row["active_plan_version"])
+            ),
+            cancel_requested_at=(
+                None
+                if row["cancel_requested_at"] is None
+                else int(row["cancel_requested_at"])
+            ),
             runtime_instance_id=None if row["runtime_instance_id"] is None else str(row["runtime_instance_id"]),
             lease_owner=None if row["lease_owner"] is None else str(row["lease_owner"]),
             fencing_token=int(row["fencing_token"]),

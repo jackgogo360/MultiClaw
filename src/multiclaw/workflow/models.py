@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from enum import Enum, StrEnum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from multiclaw.tenancy.context import TenantContext
+
+if TYPE_CHECKING:
+    from multiclaw.workflow.recovery import PlanRecoveryContext
 
 
 class RunStatus(str, Enum):
@@ -48,6 +51,9 @@ class RecoveryStrategy(str, Enum):
 
 class CheckpointPhase(StrEnum):
     RUN_STARTED = "run_started"
+    PLAN_AWAITING_APPROVAL = "plan_awaiting_approval"
+    PLAN_STEP_READY = "plan_step_ready"
+    PLAN_REPLAN_REQUIRED = "plan_replan_required"
     MODEL_OUTPUT_COMMITTED = "model_output_committed"
     AWAITING_APPROVAL = "awaiting_approval"
     EXECUTION_DISPATCHING = "execution_dispatching"
@@ -58,6 +64,9 @@ class CheckpointPhase(StrEnum):
 class RecoveryAction(StrEnum):
     RESUME_MODEL = "resume_model"
     AWAIT_USER = "await_user"
+    AWAIT_PLAN_DECISION = "await_plan_decision"
+    RESUME_PLAN_STEP = "resume_plan_step"
+    RESUME_PLAN_REVISION = "resume_plan_revision"
     REPLAY_READ_ONLY = "replay_read_only"
     RETRY_IDEMPOTENT = "retry_idempotent"
     MARK_MANUAL_UNCERTAIN = "mark_manual_uncertain"
@@ -71,6 +80,11 @@ CURSOR_FIELD = Field(min_length=1, max_length=255)
 REF_FIELD = Field(min_length=1, max_length=255)
 OPTIONAL_REQUEST_ID_FIELD = Field(default=None, min_length=1, max_length=255)
 DIGEST_FIELD = Field(min_length=64, max_length=64)
+UUID_PATTERN = (
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+SHA256_PATTERN = r"^[0-9a-f]{64}$"
 OPTIONAL_IDEMPOTENCY_KEY_FIELD = Field(default=None, min_length=1, max_length=128)
 
 
@@ -91,9 +105,75 @@ class RunStartedPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_cursor(self) -> "RunStartedPayload":
+    def validate_cursor(self) -> RunStartedPayload:
         if self.cursor != self.model_cursor:
             raise ValueError("cursor must match model_cursor")
+        return self
+
+
+class PlanAwaitingApprovalPayload(CheckpointPayload):
+    run_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_version: StrictInt = Field(ge=1)
+    plan_digest: str = Field(min_length=64, max_length=64, pattern=SHA256_PATTERN)
+    decision_cursor: str = CURSOR_FIELD
+    next_step: Literal["plan_decision"] = "plan_decision"
+    cursor: str = CURSOR_FIELD
+
+    @model_validator(mode="after")
+    def validate_cursor(self) -> PlanAwaitingApprovalPayload:
+        if self.cursor != self.decision_cursor:
+            raise ValueError("cursor must match decision_cursor")
+        return self
+
+
+class PlanStepReadyPayload(CheckpointPayload):
+    run_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_version: StrictInt = Field(ge=1)
+    plan_digest: str = Field(min_length=64, max_length=64, pattern=SHA256_PATTERN)
+    step_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    step_run_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    attempt: StrictInt = Field(ge=1, le=20)
+    execution_cursor: Literal[
+        "dispatch_step",
+        "continue_step",
+        "select_next",
+        "final_summary",
+    ]
+    next_step: Literal["plan_step_execution"] = "plan_step_execution"
+    cursor: str = CURSOR_FIELD
+
+    @model_validator(mode="after")
+    def validate_cursor(self) -> PlanStepReadyPayload:
+        if self.cursor != self.execution_cursor:
+            raise ValueError("cursor must match execution_cursor")
+        return self
+
+
+class PlanReplanRequiredPayload(CheckpointPayload):
+    run_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_id: str = Field(min_length=36, max_length=36, pattern=UUID_PATTERN)
+    plan_version: StrictInt = Field(ge=1)
+    plan_digest: str = Field(min_length=64, max_length=64, pattern=SHA256_PATTERN)
+    failed_step_run_id: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=UUID_PATTERN,
+    )
+    failure_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=SHA256_PATTERN,
+    )
+    revision_cursor: Literal["generate_revision"] = "generate_revision"
+    next_step: Literal["plan_revision"] = "plan_revision"
+    cursor: str = CURSOR_FIELD
+
+    @model_validator(mode="after")
+    def validate_cursor(self) -> PlanReplanRequiredPayload:
+        if self.cursor != self.revision_cursor:
+            raise ValueError("cursor must match revision_cursor")
         return self
 
 
@@ -106,7 +186,7 @@ class ModelOutputPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_cursor(self) -> "ModelOutputPayload":
+    def validate_cursor(self) -> ModelOutputPayload:
         if self.cursor != self.model_cursor:
             raise ValueError("cursor must match model_cursor")
         return self
@@ -122,7 +202,7 @@ class AwaitingApprovalPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_cursor(self) -> "AwaitingApprovalPayload":
+    def validate_cursor(self) -> AwaitingApprovalPayload:
         if self.cursor != self.resume_cursor:
             raise ValueError("cursor must match resume_cursor")
         return self
@@ -141,7 +221,7 @@ class ExecutionDispatchingPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_dispatch(self) -> "ExecutionDispatchingPayload":
+    def validate_dispatch(self) -> ExecutionDispatchingPayload:
         if self.cursor != self.dispatch_cursor:
             raise ValueError("cursor must match dispatch_cursor")
         if self.recovery_strategy is RecoveryStrategy.IDEMPOTENT_RETRY and not self.idempotency_key:
@@ -161,7 +241,7 @@ class ExecutionResultObservedPayload(CheckpointPayload):
     cursor: str = CURSOR_FIELD
 
     @model_validator(mode="after")
-    def validate_cursor(self) -> "ExecutionResultObservedPayload":
+    def validate_cursor(self) -> ExecutionResultObservedPayload:
         if self.cursor != self.resume_cursor:
             raise ValueError("cursor must match resume_cursor")
         return self
@@ -176,7 +256,7 @@ class RunTerminalPayload(CheckpointPayload):
     cursor: None = None
 
     @model_validator(mode="after")
-    def validate_terminal_status(self) -> "RunTerminalPayload":
+    def validate_terminal_status(self) -> RunTerminalPayload:
         if self.terminal_status not in TERMINAL_RUN_STATUSES:
             raise ValueError("terminal_status must be terminal")
         return self
@@ -184,6 +264,9 @@ class RunTerminalPayload(CheckpointPayload):
 
 PHASE_PAYLOADS: dict[CheckpointPhase, type[CheckpointPayload]] = {
     CheckpointPhase.RUN_STARTED: RunStartedPayload,
+    CheckpointPhase.PLAN_AWAITING_APPROVAL: PlanAwaitingApprovalPayload,
+    CheckpointPhase.PLAN_STEP_READY: PlanStepReadyPayload,
+    CheckpointPhase.PLAN_REPLAN_REQUIRED: PlanReplanRequiredPayload,
     CheckpointPhase.MODEL_OUTPUT_COMMITTED: ModelOutputPayload,
     CheckpointPhase.AWAITING_APPROVAL: AwaitingApprovalPayload,
     CheckpointPhase.EXECUTION_DISPATCHING: ExecutionDispatchingPayload,
@@ -223,10 +306,11 @@ LEGAL_RUN_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
             RunStatus.CANCELLED,
         }
     ),
-    RunStatus.AWAITING_USER: frozenset({RunStatus.RESUMING}),
+    RunStatus.AWAITING_USER: frozenset({RunStatus.RESUMING, RunStatus.CANCELLED}),
     RunStatus.RESUMING: frozenset(
         {
             RunStatus.RUNNING,
+            RunStatus.AWAITING_USER,
             RunStatus.FAILED_TERMINAL,
             RunStatus.BLOCKED_INCOMPATIBLE,
             RunStatus.BLOCKED_CORRUPT,
@@ -355,6 +439,10 @@ class RunLeaseHandle:
 class RunRecord:
     context: TenantContext
     status: RunStatus
+    plan_id: str | None
+    initial_plan_version: int | None
+    active_plan_version: int | None
+    cancel_requested_at: int | None
     runtime_instance_id: str | None
     lease_owner: str | None
     fencing_token: int
@@ -435,6 +523,7 @@ class RecoveryOutcome:
     status: RunStatus | None = None
     lease: RunLease | None = None
     execution_id: str | None = None
+    plan_recovery_context: PlanRecoveryContext | None = None
     executions_started: int = 0
     reason: str = ""
 

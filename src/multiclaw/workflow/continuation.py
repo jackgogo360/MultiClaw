@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from enum import StrEnum
 
-from multiclaw.memory import MemoryEntry
+from sqlalchemy.ext.asyncio import AsyncConnection
+
 from multiclaw.config import Settings
+from multiclaw.memory import MemoryEntry
+from multiclaw.planner.models import PlanStepResultDocument
 from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.memory import MemoryRepository
 from multiclaw.storage.uow import TenantUnitOfWork
@@ -33,6 +35,13 @@ class PersistedToolResult:
     tool_name: str
 
 
+@dataclass(frozen=True, slots=True)
+class PersistedPlanStepResult:
+    entry_id: str
+    result_ref: str
+    result_digest: str
+
+
 class ContinuationState(StrEnum):
     COMPLETED = "completed"
     AWAITING_USER = "awaiting_user"
@@ -47,9 +56,53 @@ class ContinuationOutcome:
 
 
 class WorkflowContinuationService:
-    def __init__(self, database: Database, *, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        settings: Settings | None = None,
+        connection: AsyncConnection | None = None,
+    ) -> None:
         self._database = database
         self._settings = settings or Settings(_config_file="/nonexistent")
+        self._connection = connection
+
+    async def persist_plan_step_result(
+        self,
+        *,
+        context: TenantContext,
+        document: PlanStepResultDocument,
+    ) -> PersistedPlanStepResult:
+        if self._connection is None:
+            raise RuntimeError("Plan step result persistence requires a bound connection")
+        if context.session_id is None:
+            raise ValueError("session_id is required for Plan step result persistence")
+        content = document.canonical_json()
+        if len(content.encode("utf-8")) > 262_144:
+            raise ValueError("Plan step result document exceeds 262144 bytes")
+        repository = MemoryRepository(
+            self._connection,
+            context,
+            self._database.dialect,
+        )
+        entry = await repository.save(
+            MemoryEntry(
+                content=content,
+                type="plan_step_result",
+                role="assistant",
+                session_id=context.session_id,
+                metadata={
+                    "schema_version": 1,
+                    "plan_id": document.plan_id,
+                    "step_run_id": document.step_run_id,
+                },
+            )
+        )
+        return PersistedPlanStepResult(
+            entry_id=entry.id,
+            result_ref=f"memory:{entry.id}",
+            result_digest=document.digest(),
+        )
 
     async def persist_assistant_output(
         self,

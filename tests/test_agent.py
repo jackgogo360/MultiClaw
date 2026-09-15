@@ -246,6 +246,30 @@ def agent(test_config_path):
 
 class TestMultiClawAgent:
     @pytest.mark.asyncio
+    async def test_reflection_cancellation_skips_model_and_propagates(self):
+        from multiclaw.planner.models import PlanCancellationRequested
+
+        agent = _build_stub_agent(
+            completion_responses=[LLMResponse(content="must not run")],
+            act_results=[],
+            resilience_enabled=True,
+            repeat_limit=1,
+            max_reflections=1,
+        )
+
+        async def cancelled() -> None:
+            raise PlanCancellationRequested
+
+        with pytest.raises(PlanCancellationRequested):
+            await agent._attempt_reflection(
+                [{"role": "user", "content": "hello"}],
+                "repeat",
+                before_model=cancelled,
+            )
+
+        assert agent.router.completion.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_llm_calls_echo_tool(self, agent):
         from multiclaw.agent import ObservationType
 
@@ -297,7 +321,7 @@ class TestMultiClawAgent:
         assert tool_results[0].content == "hello"
 
     @pytest.mark.asyncio
-    async def test_uses_planner_for_plan_mode(self, agent):
+    async def test_plan_prefix_is_not_interpreted_by_execution_agent(self, agent):
         from multiclaw.agent import ObservationType
 
         observation = await agent.handle_message(
@@ -306,7 +330,9 @@ class TestMultiClawAgent:
         )
 
         assert observation.type == ObservationType.USER_RESPONSE
-        assert observation.content == "1. collect facts | 2. summarize findings"
+        # Planning is an API/runtime concern; the execution agent treats the
+        # normalized input as ordinary user text and does not create Plans.
+        assert "mock_response" in observation.content
 
     @pytest.mark.asyncio
     async def test_plain_message_returns_llm_text(self, agent):

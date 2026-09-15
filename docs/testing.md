@@ -16,6 +16,7 @@ uv run pytest -q
 uv run pytest tests/test_server.py -k health -q
 uv run pytest tests/integration/test_tenant_e2e.py -q
 uv run pytest tests/integration/test_workflow_faults.py -q
+uv run pytest tests/test_plan_repository.py tests/test_plan_execution.py tests/test_secret_redaction.py tests/test_deletion_worker.py -q
 ```
 
 不要用无条件 skip 掩盖 SQLite 或普通平台失败。新增行为测试应命名为 `test_<behavior>`，优先验证真实边界和结果，而不是只断言 mock 调用次数。
@@ -28,6 +29,11 @@ uv run pytest tests/test_documentation.py -q
 ```
 
 检查器不访问网络、不写文件，验证正式文档清单、相对链接/标题锚点、关键 README 命令、Settings/API 覆盖、旧接口、未决标记和疑似凭据。修改路由、配置或开发命令时必须同步修改对应文档。
+
+Durable Plan 发布前还需运行 `uv run python -m compileall -q src tests` 与
+`git diff --check`，并手工覆盖创建/审核、拒绝、修订冲突、刷新与会话切换、
+重试/恢复、取消、摘要重跑及删除场景。若环境未提供 MySQL URL，只能报告
+SQLite 证据和明确的 MySQL skip。
 
 ## 前端门禁
 

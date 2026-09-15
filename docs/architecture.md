@@ -22,6 +22,7 @@ MultiClaw `0.1.0` 是单进程、单机 `standalone` Agent 运行时。它在一
 | 工具治理 | [`tools/scheduler.py`](../src/multiclaw/tools/scheduler.py) · [`governance/`](../src/multiclaw/governance/) | 工具调度、审批、审计与原生沙箱 |
 | 删除生命周期 | [`deletion/service.py`](../src/multiclaw/deletion/service.py) · [`deletion/worker.py`](../src/multiclaw/deletion/worker.py) | 延迟删除、恢复窗口和最终清除 |
 | Web 界面 | [`frontend/src/`](../frontend/src/) | 认证、会话、聊天流、审批、Secret 与删除恢复 |
+| Durable Plan | [`planner/`](../src/multiclaw/planner/) · [`workflow/`](../src/multiclaw/workflow/) | 版本化 Plan、DAG 步骤、审批、租约、检查点和恢复 |
 
 ## 组件关系
 
@@ -93,6 +94,12 @@ sequenceDiagram
 - 服务关闭时 pool 拒绝新 acquire，逐租户关闭 runtime，并保留第一个关闭错误及后续错误注释。
 
 运行时是可重建缓存，不是持久状态的事实源。恢复所需的 run、execution、checkpoint 和 approval 均存入数据库。
+
+Durable Plan 以 session 作为最小公开作用域：Plan 版本和决定由规划仓储持久化，
+WorkflowCoordinator 负责 run/lease/checkpoint/tool execution 的可变状态。Plan
+审核与工具审核是两个边界；SSE 仅发送提交后的通知，刷新时始终从作用域 API
+重建状态。所有计划增长限制（步骤、深度、版本、尝试和总 round）在验证层与
+事务写入层重复检查。
 
 ## 事件与 SSE
 

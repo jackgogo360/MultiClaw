@@ -15,15 +15,19 @@ from multiclaw.events import EventBus, EventRouter
 from multiclaw.governance import (
     ExecutionGuard,
     PermissionChecker,
-    ScopedAuditLogger,
     SandboxController,
     SandboxProcessRunner,
     SandboxReadiness,
+    ScopedAuditLogger,
 )
 from multiclaw.governance.sandbox.manager import SandboxManager
 from multiclaw.llm import ModelRouter
+from multiclaw.mcp import MCPClientManager
 from multiclaw.memory import MemoryEntry, MemoryProtocol
-from multiclaw.planner import Planner
+from multiclaw.planner.execution import PlanExecutionCoordinator
+from multiclaw.planner.generator import PlanGenerator
+from multiclaw.planner.service import PlanningService
+from multiclaw.planner.policy import PlanningPolicy
 from multiclaw.runtime.models import RuntimeClock, TenantRuntime
 from multiclaw.secrets.resolver import ResolvedCredentials
 from multiclaw.skills import SkillManager
@@ -43,10 +47,7 @@ from multiclaw.tools.shell import ShellToolBuilder
 from multiclaw.tools.web_fetch import WebFetchToolBuilder
 from multiclaw.tools.web_search import WebSearchToolBuilder
 from multiclaw.tools.write_file import WriteFileToolBuilder
-
-from multiclaw.mcp import MCPClientManager
 from multiclaw.workflow.recovery import RuntimeRecoveryContinuationService
-
 
 _SQLITE_MISSING_TABLE_RE = re.compile(r"no such table:\s*(?P<table>[^\s]+)", re.IGNORECASE)
 _MYSQL_MISSING_TABLE_RE = re.compile(
@@ -165,12 +166,30 @@ class RuntimeFactory:
             readiness = sandbox_controller.finalize_readiness()
             scheduler = self._build_scheduler(event_bus)
             scheduler.event_router = event_router
+            router = self._build_router(context)
+            plan_generator = PlanGenerator(
+                router,
+                default_model=self.settings.llm.default_model,
+                generation_model=self.settings.planning.generation_model,
+            )
+            planning_policy = PlanningPolicy(
+                router,
+                default_model=self.settings.llm.default_model,
+                classification_model=self.settings.planning.classification_model,
+                enabled=self.settings.planning.enabled,
+            )
+            planning_service = PlanningService(
+                self.database,
+                settings=self.settings,
+                generator=plan_generator,
+            )
             agent = self._build_agent(
-                context,
                 registry,
                 scheduler,
                 event_bus,
                 skill_manager,
+                router=router,
+                planner=plan_generator,
             )
         except BaseException as primary:
             self._cleanup_create_failure(
@@ -205,6 +224,14 @@ class RuntimeFactory:
             sandbox_controller=sandbox_controller,
             sandbox_readiness=readiness,
             recovery_continuation=RuntimeRecoveryContinuationService(),
+            planning_policy=planning_policy,
+            plan_generator=plan_generator,
+            plan_execution=PlanExecutionCoordinator(
+                self.database,
+                settings=self.settings,
+                planning_service=planning_service,
+                event_router=event_router,
+            ),
             last_used_at_ms=self.clock.now_ms(),
             clock=self.clock,
         )
@@ -243,19 +270,21 @@ class RuntimeFactory:
 
     def _build_agent(
         self,
-        context: TenantContext,
         registry: ToolRegistry,
         scheduler: CoreToolScheduler,
         event_bus: EventBus,
         skill_manager: SkillManager,
+        *,
+        router: ModelRouter,
+        planner: PlanGenerator,
     ) -> MultiClawAgent:
         return MultiClawAgent(
             settings=self.settings,
-            router=self._build_router(context),
+            router=router,
             registry=registry,
             scheduler=scheduler,
             memory=_DatabaseBackedMemory(self.database),
-            planner=Planner(),
+            planner=planner,
             event_bus=event_bus,
             skill_manager=skill_manager,
         )

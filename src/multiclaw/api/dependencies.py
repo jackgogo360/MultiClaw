@@ -37,6 +37,7 @@ async def tenant_uow(
     async with TenantUnitOfWork(
         request.app.state.database,
         context,
+        planning_settings=request.app.state.settings.planning,
         workflow_settings=request.app.state.settings.workflow,
     ) as uow:
         try:

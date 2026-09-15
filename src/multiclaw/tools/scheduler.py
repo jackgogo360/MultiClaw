@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 import re
 import uuid
@@ -276,8 +277,36 @@ class CoreToolScheduler:
                 self._event_data(builder.name, call_id),
                 context=context,
             )
+            cancelled_before_dispatch = False
+            dispatch_started = False
+
+            async def check_cancellation() -> ToolExecutionResult | None:
+                nonlocal cancelled_before_dispatch
+                cancelled = await self._check_pre_dispatch_cancellation(
+                    prepared,
+                    tool_name=builder.name,
+                    context=context,
+                    call_id=call_id,
+                    run_lease_handle=run_lease_handle,
+                )
+                cancelled_before_dispatch = cancelled is not None
+                return cancelled
+
+            async def execute_invocation() -> ToolExecutionResult:
+                nonlocal dispatch_started
+                dispatch_started = True
+                return await invocation.execute()
+
+            async def dispatch() -> ToolExecutionResult:
+                return await self._dispatch_after_check(
+                    execute_invocation,
+                    check_cancellation,
+                )
+
             try:
-                result = await self.execution_guard.run(invocation.execute)
+                result = await self.execution_guard.run(dispatch)
+            except (StaleFenceError, VersionConflictError, LeaseConflictError):
+                raise
             except Exception:
                 result = ToolExecutionResult(
                     status=ToolStatus.ERROR,
@@ -285,8 +314,13 @@ class CoreToolScheduler:
                 )
                 terminal_status = (
                     ExecutionStatus.UNCERTAIN
-                    if prepared.recovery_strategy is RecoveryStrategy.MANUAL_UNCERTAIN
-                    else ExecutionStatus.FAILED_TERMINAL
+                    if dispatch_started
+                    and prepared.recovery_strategy is RecoveryStrategy.MANUAL_UNCERTAIN
+                    else (
+                        ExecutionStatus.FAILED_TERMINAL
+                        if dispatch_started
+                        else ExecutionStatus.FAILED_RETRYABLE
+                    )
                 )
                 await self._persist_execution_result(
                     prepared,
@@ -297,6 +331,8 @@ class CoreToolScheduler:
                     terminal_status=terminal_status,
                     run_lease_handle=run_lease_handle,
                 )
+                return result
+            if cancelled_before_dispatch:
                 return result
         except (ExecutionConflictError, StaleFenceError, VersionConflictError, LeaseConflictError):
             raise
@@ -569,6 +605,79 @@ class CoreToolScheduler:
             idempotency_key=idempotency_key,
         )
 
+    @staticmethod
+    async def _dispatch_after_check(
+        operation: Callable[[], Awaitable[ToolExecutionResult]],
+        before_dispatch: Callable[[], Awaitable[ToolExecutionResult | None]],
+    ) -> ToolExecutionResult:
+        cancelled = await before_dispatch()
+        if cancelled is not None:
+            return cancelled
+        return await operation()
+
+    async def _check_pre_dispatch_cancellation(
+        self,
+        prepared: _PreparedExecution,
+        *,
+        tool_name: str,
+        context: TenantContext,
+        call_id: str | None,
+        run_lease_handle: RunLeaseHandle,
+    ) -> ToolExecutionResult | None:
+        """Close a prepared execution when cancellation wins before dispatch."""
+        lease = await run_lease_handle.current()
+        if prepared.lease.context != context or lease.context != context:
+            raise StaleFenceError("pre-dispatch run lease context is stale")
+        if (
+            prepared.lease.lease_owner != lease.lease_owner
+            or prepared.lease.fencing_token != lease.fencing_token
+        ):
+            raise StaleFenceError("pre-dispatch run lease is stale")
+
+        async with self.database.write_transaction() as conn:
+            repository = self._workflow_repository(conn)
+            await repository._dialect.lock_run(conn, context)
+            current = await repository.get_run(context)
+            if (
+                current is None
+                or current.lease_owner != lease.lease_owner
+                or current.fencing_token != lease.fencing_token
+                or current.lease_expires_at != lease.lease_expires_at
+                or current.version not in {lease.version, lease.version + 1}
+                or current.lease_expires_at is None
+            ):
+                raise StaleFenceError("pre-dispatch run lease is stale")
+            durable_lease = RunLease(
+                context=context,
+                lease_owner=current.lease_owner,
+                fencing_token=current.fencing_token,
+                version=current.version,
+                lease_expires_at=current.lease_expires_at,
+            )
+            if not await repository._has_current_lease(durable_lease):
+                raise StaleFenceError("pre-dispatch run lease is stale")
+            if current.cancel_requested_at is None:
+                if current.version != lease.version:
+                    raise StaleFenceError("pre-dispatch run lease is stale")
+                return None
+            if current.status not in {RunStatus.RUNNING, RunStatus.RESUMING}:
+                raise StaleFenceError("pre-dispatch cancellation lease is stale")
+
+        result = ToolExecutionResult(
+            status=ToolStatus.CANCELLED,
+            content="run cancellation requested before tool dispatch",
+        )
+        await self._persist_execution_result(
+            prepared,
+            tool_name=tool_name,
+            context=context,
+            call_id=call_id,
+            result=result,
+            terminal_status=ExecutionStatus.FAILED_RETRYABLE,
+            run_lease_handle=run_lease_handle,
+        )
+        return result
+
     async def _persist_execution_result(
         self,
         prepared: _PreparedExecution,
@@ -592,6 +701,10 @@ class CoreToolScheduler:
         async with self.database.write_transaction() as conn:
             workflow = WorkflowCoordinator(self.database, settings=self.settings, connection=conn)
             repository = self._workflow_repository(conn)
+            await repository._dialect.lock_run(conn, context)
+            lease = await self._lease_for_observed_result(
+                workflow, prepared.lease, context
+            )
             continuation = WorkflowContinuationService(self.database, settings=self.settings)
             persisted_result = await continuation.persist_tool_result(
                 repository=MemoryRepository(conn, context, self.database.dialect),
@@ -603,7 +716,7 @@ class CoreToolScheduler:
                 result_status=resolved_status.value,
             )
             updated = await workflow.complete_execution(
-                prepared.lease,
+                lease,
                 prepared.execution_id,
                 expected_status=ExecutionStatus.EXECUTING,
                 expected_version=prepared.progress_state.execution_version,
@@ -616,7 +729,7 @@ class CoreToolScheduler:
             prepared.progress_state.external_request_id = updated.external_request_id
             resume_cursor = self._result_cursor(context.run_id, call_id or prepared.execution_id)
             await workflow.checkpoint(
-                prepared.lease,
+                lease,
                 CheckpointPhase.EXECUTION_RESULT_OBSERVED,
                 {
                     "run_id": context.run_id,
@@ -644,7 +757,7 @@ class CoreToolScheduler:
                 execution_id=prepared.execution_id,
             )
         if run_lease_handle is not None:
-            await run_lease_handle.replace(prepared.lease)
+            await run_lease_handle.replace(lease)
         await self._publish_result_event(
             tool_name,
             result,
@@ -652,6 +765,35 @@ class CoreToolScheduler:
             call_id=call_id,
             error_label="tool execution failed" if result.status is ToolStatus.ERROR else None,
         )
+
+    @staticmethod
+    async def _lease_for_observed_result(
+        workflow: WorkflowCoordinator,
+        lease: RunLease,
+        context: TenantContext,
+    ) -> RunLease:
+        if lease.context != context:
+            raise StaleFenceError("observed result lease context is stale")
+        current = await workflow.get_run(context)
+        if current is None:
+            return lease
+        if current.version == lease.version:
+            return lease
+        if (
+            current.cancel_requested_at is not None
+            and current.status in {RunStatus.RUNNING, RunStatus.RESUMING}
+            and current.lease_owner == lease.lease_owner
+            and current.fencing_token == lease.fencing_token
+            and current.lease_expires_at is not None
+        ):
+            return RunLease(
+                context=context,
+                lease_owner=lease.lease_owner,
+                fencing_token=lease.fencing_token,
+                version=current.version,
+                lease_expires_at=current.lease_expires_at,
+            )
+        return lease
 
     async def recover_execution(
         self,

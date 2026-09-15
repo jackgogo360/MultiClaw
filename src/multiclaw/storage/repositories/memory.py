@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import json
 import re
 from dataclasses import dataclass
 
@@ -111,6 +113,43 @@ class MemoryRepository:
             visible_scope="session_only",
         )
 
+    async def has_final_summary(self, run_id: str) -> bool:
+        if self._context.session_id is None:
+            return False
+        like_escape = "^"
+        escaped_run_id = (
+            run_id.replace(like_escape, like_escape * 2)
+            .replace("%", f"{like_escape}%")
+            .replace("_", f"{like_escape}_")
+        )
+        result = await self._conn.execute(
+            select(memory_entries.c.metadata_json).where(
+                memory_entries.c.tenant_id == self._context.tenant_id,
+                memory_entries.c.workspace_id == self._context.workspace_id,
+                memory_entries.c.session_id == self._context.session_id,
+                memory_entries.c.type == "chat_message",
+                memory_entries.c.role == "assistant",
+                memory_entries.c.metadata_json.like(
+                    '%"kind":"plan_final_summary"%', escape=like_escape
+                ),
+                memory_entries.c.metadata_json.like(
+                    f'%"run_id":"{escaped_run_id}"%', escape=like_escape
+                ),
+            )
+        )
+        for metadata_json in result.scalars():
+            try:
+                metadata = json.loads(str(metadata_json))
+            except (TypeError, ValueError):
+                continue
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("kind") == "plan_final_summary"
+                and metadata.get("run_id") == run_id
+            ):
+                return True
+        return False
+
     async def context(
         self,
         max_chars: int,
@@ -180,8 +219,14 @@ class MemoryRepository:
         result = await self._conn.execute(query)
         return [MemoryEntry.from_row(row) for row in result.mappings().all()]
 
-    async def _get_row(self, entry_id: str, target_session_id: str | None) -> MemoryEntry | None:
-        result = await self._conn.execute(
+    async def _get_row(
+        self,
+        entry_id: str,
+        target_session_id: str | None,
+        *,
+        for_update: bool = False,
+    ) -> MemoryEntry | None:
+        statement = (
             select(
                 memory_entries.c.id,
                 memory_entries.c.content,
@@ -200,11 +245,24 @@ class MemoryRepository:
             )
             .limit(1)
         )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self._conn.execute(statement)
         row = result.mappings().first()
         return None if row is None else MemoryEntry.from_row(row)
 
-    async def get(self, entry_id: str, target_session_id: str | None = None) -> MemoryEntry | None:
-        return await self._get_row(entry_id, target_session_id)
+    async def get(
+        self,
+        entry_id: str,
+        target_session_id: str | None = None,
+        *,
+        for_update: bool = False,
+    ) -> MemoryEntry | None:
+        return await self._get_row(
+            entry_id,
+            target_session_id,
+            for_update=for_update,
+        )
 
     def _prepare_entry(self, entry: MemoryEntry) -> MemoryEntry:
         if entry.type == "chat_message":

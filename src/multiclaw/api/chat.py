@@ -14,8 +14,18 @@ from pydantic import BaseModel
 from multiclaw.api.dependencies import tenant_context, tenant_uow
 from multiclaw.events import EventScope, ScopedEvent
 from multiclaw.memory import MemoryEntry
-from multiclaw.observability import increment_metric, record_trace_event
+from multiclaw.observability import increment_metric, record_plan_operation, record_trace_event
 from multiclaw.observability import observability_scope
+from multiclaw.planner.models import (
+    MaterializeInitialPlan,
+    PlanTriggerMode,
+    PlanningDecision,
+    PlanningMode,
+    PlanningRoute,
+)
+from multiclaw.planner.generator import PlanGenerationError
+from multiclaw.planner.policy import PlanningPolicy, PlanningUnavailableError
+from multiclaw.planner.service import PlanningService
 from multiclaw.runtime.pool import RuntimeUnavailableError
 from multiclaw.security.redaction import public_error_message, redact
 from multiclaw.session import SessionStatus
@@ -46,6 +56,27 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     id: str | None = None
     messages: list[dict[str, Any]] | None = None
+    planning_mode: PlanningMode | None = None
+
+
+def normalize_planning_request(
+    message: str,
+    requested: PlanningMode | None,
+    default: PlanningMode,
+) -> tuple[str, PlanningMode, PlanTriggerMode]:
+    stripped = message.lstrip()
+    if stripped.lower().startswith("plan:"):
+        objective = stripped[5:].strip()
+        if not objective:
+            raise HTTPException(status_code=422, detail="Plan objective is empty")
+        return objective, PlanningMode.ALWAYS, PlanTriggerMode.EXPLICIT
+    mode = requested or default
+    trigger = (
+        PlanTriggerMode.EXPLICIT
+        if requested is PlanningMode.ALWAYS
+        else PlanTriggerMode.AUTOMATIC
+    )
+    return message, mode, trigger
 
 
 def encode_session_metadata(session_payload: dict[str, Any]) -> str:
@@ -75,6 +106,23 @@ def build_workflow_recovery_service(database, settings) -> RecoveryService:
 
 def build_workflow_continuation_service(database, settings) -> WorkflowContinuationService:
     return WorkflowContinuationService(database, settings=settings)
+
+
+async def _persist_unbound_failure_run(database, settings, context, runtime_instance_id: str) -> None:
+    """Persist a terminal run/checkpoint without creating a partial Plan."""
+    async with TenantUnitOfWork(
+        database,
+        context,
+        planning_settings=settings.planning,
+        workflow_settings=settings.workflow,
+    ) as failure_uow:
+        coordinator = WorkflowCoordinator(
+            database,
+            settings=settings,
+            connection=failure_uow.conn,
+        )
+        lease = await coordinator.start_run_with_checkpoint(context, runtime_instance_id)
+        await coordinator.finish_run_with_checkpoint(lease, RunStatus.FAILED_TERMINAL)
 
 
 def stream_accepts_run_lease(handler) -> bool:
@@ -165,7 +213,7 @@ async def chat(
     )
     recent_messages = await session_memory.recent(limit=1, entry_type="chat_message")
     user_turn_index = (recent_messages[0].turn_index + 1) if recent_messages else 1
-    await session_memory.save(
+    saved_user = await session_memory.save(
         MemoryEntry(
             content=message,
             type="chat_message",
@@ -174,10 +222,179 @@ async def chat(
             turn_index=user_turn_index,
         )
     )
+    # Source user turn is committed before any model call. This ID is used as
+    # the durable Plan provenance reference.
+    await uow.commit()
+
+    objective, planning_mode, trigger_mode = normalize_planning_request(
+        message,
+        req.planning_mode,
+        request.app.state.settings.planning.default_mode,
+    )
+    planning_policy = getattr(runtime, "planning_policy", None)
+    if planning_policy is None:
+        # Test doubles and legacy runtimes may expose only the execution
+        # agent, without a model router or planning components. Preserve the
+        # existing direct-chat path for those runtimes instead of failing
+        # during policy bootstrap.
+        agent_router = getattr(runtime.agent, "router", None)
+        if agent_router is None:
+            if planning_mode is PlanningMode.ALWAYS:
+                raise HTTPException(status_code=503, detail="planning is unavailable")
+            planning_decision = PlanningDecision(
+                mode=PlanningRoute.DIRECT,
+                reason="planning components unavailable",
+            )
+        else:
+            planning_policy = PlanningPolicy(
+                agent_router,
+                default_model=request.app.state.settings.llm.default_model,
+                classification_model=request.app.state.settings.planning.classification_model,
+                enabled=request.app.state.settings.planning.enabled,
+            )
+    if planning_policy is not None:
+        try:
+            planning_decision = await planning_policy.decide(objective, planning_mode)
+        except PlanningUnavailableError as error:
+            record_plan_operation(
+                "classification",
+                status="failed",
+                error_class="planning_unavailable",
+                attributes={"error": str(error)},
+            )
+            raise HTTPException(status_code=503, detail="planning is unavailable") from error
+
+    record_plan_operation(
+        "classification",
+        status="succeeded",
+        attributes={"route": planning_decision.mode.value},
+    )
+
+    if planning_decision.mode is PlanningRoute.PLAN:
+        generator = getattr(runtime, "plan_generator", None)
+        if generator is None:
+            generator = getattr(getattr(runtime, "plan_execution", None), "planning_service", None)
+            generator = getattr(generator, "_generator", None)
+        service = getattr(getattr(runtime, "plan_execution", None), "planning_service", None)
+        if service is None:
+            service = PlanningService(
+                request.app.state.database,
+                settings=request.app.state.settings,
+                generator=generator,
+            )
+
+        async def failed_plan_stream(error: BaseException):
+            enc = DataStreamEncoder()
+            yield enc.start()
+            yield encode_session_metadata(session.model_dump(mode="json"))
+            yield encode_run_metadata(session.id, run_id)
+            yield enc.error(public_error_message(error))
+            yield enc.finish("stop")
+
+        try:
+            generated = await generator.generate(
+                objective,
+                max_steps=request.app.state.settings.planning.max_steps,
+                max_depth=request.app.state.settings.planning.max_dependency_depth,
+                max_attempts=request.app.state.settings.planning.max_step_attempts,
+            )
+        except PlanGenerationError as error:
+            record_plan_operation(
+                "generation",
+                status="failed",
+                error_class="generation_error",
+                attributes={"error": str(error), "run_id": run_id},
+            )
+            # A Plan route that cannot produce a valid draft is terminal. It
+            # must not be disguised as direct execution, including auto mode.
+            await _persist_unbound_failure_run(
+                request.app.state.database,
+                request.app.state.settings,
+                run_context,
+                runtime.runtime_instance_id,
+            )
+            return StreamingResponse(
+                failed_plan_stream(error),
+                media_type="text/event-stream",
+                headers={"X-Vercel-AI-Data-Stream": "v1"},
+            )
+        except Exception as error:
+            record_plan_operation(
+                "generation",
+                status="failed",
+                error_class=type(error).__name__,
+                attributes={"error": str(error), "run_id": run_id},
+            )
+            # Unexpected generator failures are still a failed Plan request,
+            # but only the generator's explicit terminal error gets an
+            # unbound run/checkpoint (the durable contract).
+            return StreamingResponse(
+                failed_plan_stream(error),
+                media_type="text/event-stream",
+                headers={"X-Vercel-AI-Data-Stream": "v1"},
+            )
+
+        try:
+            draft = service.draft_from_generated(generated)
+            materialized = await service.materialize_initial(
+                MaterializeInitialPlan(
+                    context=run_context,
+                    runtime_instance_id=runtime.runtime_instance_id,
+                    source_message_id=saved_user.id,
+                    assistant_turn_index=user_turn_index + 1,
+                    trigger_mode=trigger_mode,
+                    draft=draft,
+                )
+            )
+        except Exception as error:
+            record_plan_operation(
+                "materialization",
+                status="failed",
+                error_class=type(error).__name__,
+                attributes={"error": str(error), "run_id": run_id},
+            )
+            # materialize_initial owns one transaction; on failure its UoW
+            # rolls back Plan/version/steps/run/checkpoint/reference rows. Do
+            # not add an unrelated unbound run here.
+            return StreamingResponse(
+                failed_plan_stream(error),
+                media_type="text/event-stream",
+                headers={"X-Vercel-AI-Data-Stream": "v1"},
+            )
+
+        record_plan_operation(
+            "materialization",
+            status="succeeded",
+            attributes={
+                "plan_id": materialized.plan.plan_id,
+                "run_id": run_id,
+            },
+        )
+
+        async def plan_stream():
+            enc = DataStreamEncoder()
+            yield enc.start()
+            yield encode_session_metadata(session.model_dump(mode="json"))
+            yield encode_run_metadata(session.id, run_id)
+            yield enc.plan_created(materialized.reference.model_dump(mode="json"))
+            yield enc.finish("tool-calls")
+        # ``materialize_initial`` has committed and closed its transaction by
+        # this point. Publish the lifecycle event only after that commit so
+        # subscribers never observe a Plan that can still roll back.
+        await runtime.event_router.publish(materialized.event)
+        return StreamingResponse(
+            plan_stream(),
+            media_type="text/event-stream",
+            headers={"X-Vercel-AI-Data-Stream": "v1"},
+        )
+
+    # Direct route continues through the existing workflow/agent stream using
+    # the original user message (the normalized objective is only for policy).
+    # The source-message transaction is already committed. Use a fresh
+    # coordinator/transaction for the direct run boundary.
     workflow = build_workflow_coordinator(
         request.app.state.database,
         request.app.state.settings,
-        connection=uow.conn,
     )
     workflow_continuation = build_workflow_continuation_service(
         request.app.state.database,

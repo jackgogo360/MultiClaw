@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 from contextlib import asynccontextmanager
+from typing import cast
 from uuid import uuid4
 
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from multiclaw.config import Settings
+from multiclaw.events import EventRouter, ScopedEvent
+from multiclaw.planner.models import PlanReference
 from multiclaw.storage.engine import Database
+from multiclaw.storage.repositories.plans import PlanRepository
 from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.models import (
@@ -15,18 +21,20 @@ from multiclaw.workflow.models import (
     AwaitingApprovalPayload,
     CheckpointPayload,
     CheckpointPhase,
+    CheckpointRecord,
     CheckpointWrite,
     ExecutionDispatchingPayload,
-    ExecutionResultObservedPayload,
     ExecutionRecord,
-    CheckpointRecord,
+    ExecutionResultObservedPayload,
     ExecutionStatus,
     InvalidTransitionError,
     LeaseConflictError,
+    PlanAwaitingApprovalPayload,
+    RecoveryStrategy,
     RunLease,
     RunRecord,
+    RunStartedPayload,
     RunStatus,
-    RecoveryStrategy,
     StaleFenceError,
     TenantRunQuotaError,
     VersionConflictError,
@@ -53,6 +61,49 @@ PHASE_ALLOWED_EXECUTION_STATUSES: dict[CheckpointPhase, frozenset[ExecutionStatu
 }
 
 
+class PostCommitEventQueue:
+    """Explicit post-commit event handoff for callers that own a transaction.
+
+    The transaction owner must call ``publish`` only after its transaction has
+    committed, or ``discard`` after rollback. Draining before publication makes
+    repeated post-commit handling idempotent.
+    """
+
+    def __init__(self) -> None:
+        self._events: list[ScopedEvent] = []
+        self._connection: AsyncConnection | None = None
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._events)
+
+    def defer(self, event: ScopedEvent) -> None:
+        self._events.append(event)
+
+    def bind(self, connection: AsyncConnection) -> None:
+        if self._connection is not None and self._connection is not connection:
+            raise ValueError("PostCommitEventQueue is already bound to another transaction")
+        if self._connection is connection:
+            return
+
+        self._connection = connection
+
+        def discard_on_rollback(_connection) -> None:
+            self.discard()
+
+        sqlalchemy_event.listen(connection.sync_connection, "rollback", discard_on_rollback)
+
+    def discard(self) -> None:
+        self._events.clear()
+
+    async def publish(self, event_router: EventRouter) -> None:
+        if self._connection is not None and self._connection.in_transaction():
+            raise RuntimeError("post-commit events cannot publish before the transaction is committed")
+        events, self._events = self._events, []
+        for event in events:
+            await event_router.publish(event)
+
+
 class WorkflowCoordinator:
     def __init__(
         self,
@@ -60,18 +111,22 @@ class WorkflowCoordinator:
         *,
         settings: Settings | None = None,
         connection: AsyncConnection | None = None,
+        event_router: EventRouter | None = None,
+        post_commit_events: PostCommitEventQueue | None = None,
     ) -> None:
         self._database = database
         self._settings = settings or Settings(_config_file="/nonexistent")
         self._connection = connection
+        self._event_router = event_router
+        self._post_commit_events = post_commit_events
+        if connection is not None and post_commit_events is not None:
+            post_commit_events.bind(connection)
 
     async def start_run(self, context: TenantContext, runtime_instance_id: str) -> RunLease:
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             await repository._lock_tenant(context.tenant_id)
-            active_runs = await repository.count_active_runs(context.tenant_id)
-            if active_runs >= self._settings.runtime.max_concurrent_runs_per_tenant:
-                raise TenantRunQuotaError("tenant run quota exceeded")
+            await self._enforce_run_quota(repository, context.tenant_id)
             return await repository._create_run(
                 context,
                 runtime_instance_id=runtime_instance_id,
@@ -81,9 +136,7 @@ class WorkflowCoordinator:
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             await repository._lock_tenant(context.tenant_id)
-            active_runs = await repository.count_active_runs(context.tenant_id)
-            if active_runs >= self._settings.runtime.max_concurrent_runs_per_tenant:
-                raise TenantRunQuotaError("tenant run quota exceeded")
+            await self._enforce_run_quota(repository, context.tenant_id)
 
             lease = await repository._create_run(
                 context,
@@ -100,6 +153,105 @@ class WorkflowCoordinator:
                     "workspace_id": context.workspace_id,
                     "session_id": context.session_id,
                     "run_id": context.run_id,
+                    "started_at_ms": record.created_at,
+                    "model_cursor": self._run_started_cursor(context),
+                    "cursor": self._run_started_cursor(context),
+                },
+                checkpoint_seq=1,
+            )
+            return lease
+
+    async def start_plan_run_with_checkpoint(
+        self,
+        context: TenantContext,
+        runtime_instance_id: str,
+        *,
+        plan_id: str,
+        plan_version: int,
+        plan_digest: str,
+    ) -> RunLease:
+        run_id = cast(str, context.run_id)
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            await repository._lock_tenant(context.tenant_id)
+            if not await repository._plan_version_exists(
+                context,
+                plan_id,
+                plan_version,
+                content_digest=plan_digest,
+            ):
+                raise StaleFenceError("Plan version or digest is stale")
+            await self._enforce_run_quota(repository, context.tenant_id)
+            lease = await repository._create_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                status=RunStatus.AWAITING_USER,
+                plan_id=plan_id,
+                initial_plan_version=plan_version,
+                active_plan_version=plan_version,
+            )
+            cursor = f"plan:{plan_id}:v{plan_version}:decision"
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.PLAN_AWAITING_APPROVAL,
+                PlanAwaitingApprovalPayload(
+                    run_id=run_id,
+                    plan_id=plan_id,
+                    plan_version=plan_version,
+                    plan_digest=plan_digest,
+                    decision_cursor=cursor,
+                    cursor=cursor,
+                ),
+                checkpoint_seq=1,
+            )
+            return lease
+
+    async def start_approved_plan_run_with_checkpoint(
+        self,
+        context: TenantContext,
+        runtime_instance_id: str,
+        *,
+        plan_id: str,
+        plan_version: int,
+        plan_digest: str,
+    ) -> RunLease:
+        """Atomically start an already-approved Plan rerun at RUN_STARTED.
+
+        The caller holds the scoped Plan aggregate lock in the same UoW.  This
+        method retains workflow quota, binding and checkpoint invariants rather
+        than letting an HTTP route create a run row directly.
+        """
+        run_id = cast(str, context.run_id)
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            await repository._lock_tenant(context.tenant_id)
+            if not await repository._plan_version_exists(
+                context,
+                plan_id,
+                plan_version,
+                content_digest=plan_digest,
+            ):
+                raise StaleFenceError("Plan version or digest is stale")
+            await self._enforce_run_quota(repository, context.tenant_id)
+            lease = await repository._create_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                status=RunStatus.RUNNING,
+                plan_id=plan_id,
+                initial_plan_version=plan_version,
+                active_plan_version=plan_version,
+            )
+            record = await repository.get_run(context)
+            if record is None:
+                raise RuntimeError("Plan rerun record missing after creation")
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.RUN_STARTED,
+                {
+                    "tenant_id": context.tenant_id,
+                    "workspace_id": context.workspace_id,
+                    "session_id": context.session_id,
+                    "run_id": run_id,
                     "started_at_ms": record.created_at,
                     "model_cursor": self._run_started_cursor(context),
                     "cursor": self._run_started_cursor(context),
@@ -129,6 +281,201 @@ class WorkflowCoordinator:
             if lease is None:
                 raise LeaseConflictError("awaiting_user run could not be resumed")
             return lease
+
+    async def resume_waiting_plan_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+        plan_id: str,
+        plan_version: int,
+        expected_run_version: int,
+    ) -> RunLease:
+        async with self._write_connection() as conn:
+            lease = await self._repository(conn)._resume_waiting_plan_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                plan_id=plan_id,
+                plan_version=plan_version,
+                expected_run_version=expected_run_version,
+            )
+            if lease is None:
+                raise StaleFenceError("waiting Plan run fence is stale")
+            return lease
+
+    async def fence_waiting_plan_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+        plan_id: str,
+        plan_version: int,
+        expected_run_version: int,
+        plan_digest: str,
+    ) -> RunLease:
+        run_id = cast(str, context.run_id)
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            lease = await repository._fence_waiting_plan_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                plan_id=plan_id,
+                plan_version=plan_version,
+                plan_digest=plan_digest,
+                expected_run_version=expected_run_version,
+            )
+            if lease is None:
+                raise StaleFenceError("waiting Plan run fence is stale")
+            cursor = f"plan:{plan_id}:v{plan_version}:decision"
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.PLAN_AWAITING_APPROVAL,
+                PlanAwaitingApprovalPayload(
+                    run_id=run_id,
+                    plan_id=plan_id,
+                    plan_version=plan_version,
+                    plan_digest=plan_digest,
+                    decision_cursor=cursor,
+                    cursor=cursor,
+                ),
+                checkpoint_seq=await repository.get_next_checkpoint_seq(context),
+            )
+            return lease
+
+    async def cancel_waiting_plan_run(
+        self,
+        context: TenantContext,
+        *,
+        runtime_instance_id: str,
+        plan_id: str,
+        plan_version: int,
+        expected_run_version: int,
+    ) -> RunLease:
+        run_id = cast(str, context.run_id)
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            lease = await repository._cancel_waiting_plan_run(
+                context,
+                runtime_instance_id=runtime_instance_id,
+                plan_id=plan_id,
+                plan_version=plan_version,
+                expected_run_version=expected_run_version,
+            )
+            if lease is None:
+                raise StaleFenceError("waiting Plan run fence is stale")
+            record = await repository.get_run(context)
+            if record is None or record.finished_at is None:
+                raise RuntimeError("cancelled Plan run missing finished_at")
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.RUN_TERMINAL,
+                {
+                    "run_id": run_id,
+                    "terminal_status": RunStatus.CANCELLED.value,
+                    "finished_at_ms": record.finished_at,
+                    "final_digest": self._terminal_digest(
+                        run_id,
+                        RunStatus.CANCELLED,
+                        record.finished_at,
+                    ),
+                },
+                checkpoint_seq=await repository.get_next_checkpoint_seq(context),
+            )
+            return lease
+
+    async def request_cancellation(self, context: TenantContext) -> RunRecord:
+        """Persist a cancellation request, terminalizing waiting runs atomically."""
+        if (
+            self._connection is not None
+            and self._event_router is not None
+            and self._post_commit_events is None
+        ):
+            raise ValueError(
+                "externally owned cancellation transactions require a PostCommitEventQueue"
+            )
+        run_id = cast(str, context.run_id)
+        post_commit_event: ScopedEvent | None = None
+        async with self._write_connection() as conn:
+            repository = self._repository(conn)
+            before = await repository.get_run(context)
+            record = await repository._request_cancellation(context)
+            if record is None:
+                raise RuntimeError("run record missing for cancellation")
+            if record.status is not RunStatus.CANCELLED or record.finished_at is None:
+                return record
+
+            latest = await repository.get_latest_checkpoint(context)
+            if latest is not None:
+                phase = CheckpointPhase(latest.phase)
+                if phase is CheckpointPhase.RUN_TERMINAL:
+                    return record
+            lease = RunLease(
+                context=context,
+                lease_owner=record.lease_owner or "",
+                fencing_token=record.fencing_token,
+                version=record.version,
+                lease_expires_at=record.lease_expires_at or 0,
+            )
+            await self._scoped(conn).checkpoint(
+                lease,
+                CheckpointPhase.RUN_TERMINAL,
+                {
+                    "run_id": run_id,
+                    "terminal_status": RunStatus.CANCELLED.value,
+                    "finished_at_ms": record.finished_at,
+                    "final_digest": self._terminal_digest(
+                        run_id,
+                        RunStatus.CANCELLED,
+                        record.finished_at,
+                    ),
+                },
+                checkpoint_seq=await repository.get_next_checkpoint_seq(context),
+            )
+            if (
+                before is not None
+                and before.status is RunStatus.AWAITING_USER
+                and record.plan_id is not None
+            ):
+                plan = await PlanRepository(
+                    conn,
+                    self._database.dialect,
+                    context,
+                    self._settings.planning,
+                ).get(record.plan_id)
+                if plan is not None:
+                    assert context.session_id is not None and context.run_id is not None
+                    data = PlanReference(
+                        tenant_id=context.tenant_id,
+                        workspace_id=context.workspace_id,
+                        session_id=context.session_id,
+                        run_id=context.run_id,
+                        plan_id=plan.plan_id,
+                        plan_version=plan.current_version,
+                        aggregate_version=plan.aggregate_version,
+                    ).model_dump(mode="json")
+                    post_commit_event = ScopedEvent.from_context(
+                        context,
+                        "plan.run_status",
+                        {**data, "status": RunStatus.CANCELLED.value},
+                    )
+        if post_commit_event is not None and self._event_router is not None:
+            if self._connection is None:
+                await self._event_router.publish(post_commit_event)
+            else:
+                assert self._post_commit_events is not None
+                self._post_commit_events.defer(post_commit_event)
+        return record
+
+    async def raise_if_cancel_requested(self, context: TenantContext) -> None:
+        run = await self.get_run(context)
+        if run is None:
+            from multiclaw.planner.models import PlanExecutionBlocked
+
+            raise PlanExecutionBlocked("run is missing")
+        if run.cancel_requested_at is not None or run.status is RunStatus.CANCELLED:
+            from multiclaw.planner.models import PlanCancellationRequested
+
+            raise PlanCancellationRequested
 
     async def heartbeat(self, lease: RunLease) -> RunLease:
         async with self._write_connection() as conn:
@@ -175,6 +522,7 @@ class WorkflowCoordinator:
         }:
             raise InvalidTransitionError(f"{target.value} is not a terminal run status")
 
+        run_id = cast(str, lease.context.run_id)
         async with self._write_connection() as conn:
             repository = self._repository(conn)
             if target is RunStatus.COMPLETED and await repository.has_nonterminal_execution(lease.context):
@@ -192,10 +540,10 @@ class WorkflowCoordinator:
                 transitioned,
                 CheckpointPhase.RUN_TERMINAL,
                 {
-                    "run_id": lease.context.run_id,
+                    "run_id": run_id,
                     "terminal_status": target.value,
                     "finished_at_ms": record.finished_at,
-                    "final_digest": self._terminal_digest(lease.context.run_id, target, record.finished_at),
+                    "final_digest": self._terminal_digest(run_id, target, record.finished_at),
                 },
                 checkpoint_seq=next_seq,
             )
@@ -358,7 +706,10 @@ class WorkflowCoordinator:
         execution_expected_status: ExecutionStatus | None = None,
         execution_expected_version: int | None = None,
     ) -> CheckpointWrite:
-        from multiclaw.workflow.recovery import encode_checkpoint_payload, validate_phase_payload
+        from multiclaw.workflow.recovery import (
+            encode_checkpoint_payload,
+            validate_phase_payload,
+        )
 
         normalized_phase, validated_payload = validate_phase_payload(phase, payload)
         resolved_approval_id, resolved_execution_id = self._validate_checkpoint_scope(
@@ -401,6 +752,14 @@ class WorkflowCoordinator:
     async def get_run(self, context: TenantContext) -> RunRecord | None:
         async with self._write_connection() as conn:
             return await self._repository(conn).get_run(context)
+
+    async def get_plan_run(
+        self,
+        context: TenantContext,
+        plan_id: str,
+    ) -> RunRecord | None:
+        async with self._write_connection() as conn:
+            return await self._repository(conn).get_plan_run(context, plan_id)
 
     async def get_execution(self, context: TenantContext, execution_id: str) -> ExecutionRecord | None:
         async with self._write_connection() as conn:
@@ -494,10 +853,26 @@ class WorkflowCoordinator:
             self._database.dialect,
             self._settings.workflow.heartbeat_ms,
             self._settings.workflow.lease_ttl_ms,
+            plan_round_budget=(
+                self._settings.planning.max_steps
+                * self._settings.planning.max_step_attempts
+                * self._settings.agent.max_tool_rounds
+            ),
         )
 
-    def _scoped(self, conn) -> "WorkflowCoordinator":
-        return WorkflowCoordinator(self._database, settings=self._settings, connection=conn)
+    async def _enforce_run_quota(
+        self,
+        repository: WorkflowRepository,
+        tenant_id: str,
+    ) -> None:
+        active_runs = await repository.count_active_runs(tenant_id)
+        if active_runs >= self._settings.runtime.max_concurrent_runs_per_tenant:
+            raise TenantRunQuotaError("tenant run quota exceeded")
+
+    def _scoped(self, conn) -> WorkflowCoordinator:
+        scoped = copy.copy(self)
+        scoped._connection = conn
+        return scoped
 
     @staticmethod
     def _validate_checkpoint_scope(
@@ -510,11 +885,11 @@ class WorkflowCoordinator:
         execution_expected_status: ExecutionStatus | None,
         execution_expected_version: int | None,
     ) -> tuple[str | None, str | None]:
-        if payload.run_id != lease.context.run_id:
+        if cast(RunStartedPayload, payload).run_id != lease.context.run_id:
             raise InvalidTransitionError("checkpoint payload run_id does not match active run")
 
         if phase is CheckpointPhase.RUN_STARTED:
-            run_started = payload
+            run_started = cast(RunStartedPayload, payload)
             assert hasattr(run_started, "tenant_id")
             if run_started.tenant_id != lease.context.tenant_id:
                 raise InvalidTransitionError("checkpoint payload tenant_id does not match active run")
@@ -566,5 +941,5 @@ class WorkflowCoordinator:
 
     @staticmethod
     def _terminal_digest(run_id: str, target: RunStatus, finished_at_ms: int) -> str:
-        payload = f"{run_id}:{target.value}:{finished_at_ms}".encode("utf-8")
+        payload = f"{run_id}:{target.value}:{finished_at_ms}".encode()
         return hashlib.sha256(payload).hexdigest()

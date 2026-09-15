@@ -194,6 +194,11 @@ class _BrokenBindUnitOfWork(AuthUnitOfWork):
         raise self._bind_error
 
 
+class _RejectingPrecommitUnitOfWork(AuthUnitOfWork):
+    async def _validate_precommit(self) -> None:
+        raise RuntimeError("precommit rejected")
+
+
 @pytest.fixture
 async def migrated_sqlite_database(tmp_path: Path):
     database = await _create_database(driver="sqlite", database_url=_sqlite_url(tmp_path, "tenant-uow.db"))
@@ -458,6 +463,32 @@ async def test_send_code_lock_releases_after_commit_failure_before_close() -> No
     assert events[1] == "commit"
     assert events[2].startswith("release:lock-token")
     assert events[3] == "close"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_commit", (False, True))
+async def test_precommit_rejection_rolls_back_without_committing(
+    explicit_commit: bool,
+) -> None:
+    tx = _FakeTransaction()
+    conn = _FakeConnection()
+    database = _FakeDatabase(conn, tx)
+    uow = _RejectingPrecommitUnitOfWork(database)  # type: ignore[arg-type]
+    await uow.__aenter__()
+
+    if explicit_commit:
+        try:
+            with pytest.raises(RuntimeError, match="precommit rejected"):
+                await uow.commit()
+        finally:
+            await uow.__aexit__(None, None, None)
+    else:
+        with pytest.raises(RuntimeError, match="precommit rejected"):
+            await uow.__aexit__(None, None, None)
+
+    assert tx.commit_calls == 0
+    assert tx.rollback_calls == 1
+    assert conn.close_calls == 1
 
 
 @pytest.mark.asyncio

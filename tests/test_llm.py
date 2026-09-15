@@ -1,13 +1,46 @@
-import pytest
+import json
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
+import pytest
+
+import multiclaw.llm.router as router_module
 from multiclaw.config.settings import Settings
-from multiclaw.llm.providers import ProviderAdapter, OpenAIAdapter, AnthropicAdapter
-from multiclaw.llm.router import ModelRouter, CapabilityTag
-from multiclaw.secrets.resolver import ResolvedCredentials, SecretBytes
+from multiclaw.llm import (
+    CompletionRouter,
+    LLMProviderError,
+    LLMResponse,
+    LLMResponseParseError,
+)
+from multiclaw.llm.providers import AnthropicAdapter, OpenAIAdapter, ProviderAdapter
+from multiclaw.llm.router import CapabilityTag, ModelRouter
+from multiclaw.planner import PlanGenerator, PlanningMode, PlanningPolicy, PlanningRoute
+from multiclaw.secrets.resolver import (
+    ResolvedCredentials,
+    SecretBytes,
+    SecretNotConfiguredError,
+)
 
 
 class TestProviderAdapters:
+    def test_custom_adapter_keeps_generic_response_validation_default(self):
+        class CustomAdapter(ProviderAdapter):
+            def build_request(
+                self,
+                model,
+                messages,
+                tools,
+                stream=False,
+            ):
+                return {}
+
+            def parse_response(self, raw):
+                return LLMResponse(content="")
+
+        adapter = CustomAdapter()
+
+        adapter.validate_response_payload({"custom": "payload"})
+
     def test_openai_adapter_formats_request(self):
         adapter = OpenAIAdapter(api_key="sk-test", base_url="https://api.openai.com/v1")
         request = adapter.build_request(
@@ -135,6 +168,388 @@ class TestModelRouter:
         mock_client.post.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_completion_bounds_malformed_tool_argument_json(self, router):
+        canary = "parse-response-canary"
+        mock_http_response = Mock()
+        mock_http_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_invalid",
+                                "function": {
+                                    "name": "submit_plan",
+                                    "arguments": json.dumps({"secret": canary})[:-1],
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        mock_http_response.raise_for_status = Mock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.return_value = mock_http_response
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(LLMResponseParseError) as exc_info,
+        ):
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert str(exc_info.value) == "invalid LLM response"
+        assert canary not in repr(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"choices": None, "canary": "openai-envelope-canary"},
+            {
+                "choices": [{"message": None}],
+                "canary": "openai-envelope-canary",
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_invalid",
+                                    "function": {
+                                        "name": "submit_plan",
+                                        "arguments": {
+                                            "canary": "openai-envelope-canary"
+                                        },
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        ],
+        ids=["null-choices", "null-message", "object-tool-arguments"],
+    )
+    @pytest.mark.asyncio
+    async def test_completion_bounds_openai_envelope_shape_errors(
+        self,
+        router,
+        payload,
+        caplog,
+    ):
+        mock_http_response = Mock()
+        mock_http_response.json.return_value = payload
+        mock_http_response.raise_for_status = Mock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.return_value = mock_http_response
+        credential_canary = "openai-credential-canary"
+        credentials = ResolvedCredentials(
+            provider_name="openai",
+            source="user",
+            base_url="https://tenant.example/v1",
+            api_key=SecretBytes(credential_canary.encode()),
+        )
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(LLMResponseParseError) as exc_info,
+        ):
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+                credentials=credentials,
+            )
+
+        assert str(exc_info.value) == "invalid LLM response"
+        assert "openai-envelope-canary" not in repr(exc_info.value)
+        assert credential_canary not in repr(exc_info.value)
+        assert "openai-envelope-canary" not in caplog.text
+        assert credential_canary not in caplog.text
+        assert credentials.api_key.is_zeroized()
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"content": None, "canary": "anthropic-envelope-canary"},
+            {"content": "anthropic-envelope-canary"},
+            {"content": ["anthropic-envelope-canary"]},
+        ],
+        ids=["null-content", "non-list-content", "non-mapping-block"],
+    )
+    @pytest.mark.asyncio
+    async def test_completion_bounds_anthropic_envelope_shape_errors(
+        self,
+        test_config_path,
+        payload,
+        caplog,
+    ):
+        settings = Settings(_config_file=str(test_config_path))
+        settings.llm.default_provider = "anthropic"
+        settings.llm.default_model = "claude-test"
+        settings.llm.providers = {
+            "anthropic": {
+                "api_key": "test-key",
+                "base_url": "https://tenant.example",
+            }
+        }
+        settings.llm.capability_tags = {"claude-test": ["text"]}
+        router = ModelRouter(settings)
+        mock_http_response = Mock()
+        mock_http_response.json.return_value = payload
+        mock_http_response.raise_for_status = Mock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.return_value = mock_http_response
+        credential_canary = "anthropic-credential-canary"
+        credentials = ResolvedCredentials(
+            provider_name="anthropic",
+            source="user",
+            base_url="https://tenant.example",
+            api_key=SecretBytes(credential_canary.encode()),
+        )
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(LLMResponseParseError) as exc_info,
+        ):
+            await router.completion(
+                model="claude-test",
+                messages=[{"role": "user", "content": "hello"}],
+                credentials=credentials,
+            )
+
+        assert str(exc_info.value) == "invalid LLM response"
+        assert "anthropic-envelope-canary" not in repr(exc_info.value)
+        assert credential_canary not in repr(exc_info.value)
+        assert "anthropic-envelope-canary" not in caplog.text
+        assert credential_canary not in caplog.text
+        assert credentials.api_key.is_zeroized()
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_provider_envelope_fails_open_for_auto_policy(
+        self,
+        router,
+    ):
+        mock_http_response = Mock()
+        mock_http_response.json.return_value = {
+            "choices": None,
+            "canary": "policy-envelope-canary",
+        }
+        mock_http_response.raise_for_status = Mock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.return_value = mock_http_response
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            decision = await PlanningPolicy(
+                router,
+                default_model="gpt-4o-mini",
+                classification_model="gpt-4o-mini",
+            ).decide("request", PlanningMode.AUTO)
+
+        assert decision.mode is PlanningRoute.DIRECT
+        assert decision.reason == "automatic classification unavailable"
+
+    @pytest.mark.asyncio
+    async def test_generator_repairs_one_malformed_provider_envelope(
+        self,
+        router,
+    ):
+        canary = "generator-envelope-canary"
+        invalid_response = Mock()
+        invalid_response.json.return_value = {
+            "choices": [{"message": None}],
+            "canary": canary,
+        }
+        invalid_response.raise_for_status = Mock()
+        valid_response = Mock()
+        valid_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "plan",
+                                "function": {
+                                    "name": "submit_plan",
+                                    "arguments": json.dumps(
+                                        {
+                                            "objective": "model objective",
+                                            "constraints": [],
+                                            "generation_reason": "Dependent work.",
+                                            "steps": [
+                                                {
+                                                    "logical_step_key": "inspect",
+                                                    "title": "Inspect",
+                                                    "description": "Inspect the code.",
+                                                    "expected_outcome": "Find the change.",
+                                                    "depends_on": [],
+                                                    "max_attempts": 2,
+                                                }
+                                            ],
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        valid_response.raise_for_status = Mock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.side_effect = [invalid_response, valid_response]
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            generated = await PlanGenerator(
+                router,
+                default_model="gpt-4o-mini",
+                generation_model="gpt-4o-mini",
+            ).generate("Deliver")
+
+        assert generated.objective == "Deliver"
+        assert mock_client.post.await_count == 2
+        repair_messages = mock_client.post.await_args_list[1].kwargs["json"][
+            "messages"
+        ]
+        assert "Invalid structured response" in repair_messages[-1]["content"]
+        assert canary not in str(repair_messages)
+
+    @pytest.mark.parametrize("failure_kind", ["transport", "status"])
+    @pytest.mark.asyncio
+    async def test_completion_bounds_http_provider_failures(
+        self,
+        router,
+        failure_kind,
+        caplog,
+    ):
+        canary = f"{failure_kind}-provider-canary"
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        if failure_kind == "transport":
+            mock_client.post.side_effect = httpx.ConnectError(canary)
+        else:
+            request = httpx.Request("POST", "https://api.example/v1/chat")
+            mock_client.post.return_value = httpx.Response(
+                503,
+                request=request,
+                text=canary,
+            )
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            pytest.raises(LLMProviderError) as exc_info,
+        ):
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert str(exc_info.value) == "LLM provider unavailable"
+        assert canary not in repr(exc_info.value)
+        assert canary not in caplog.text
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.asyncio
+    async def test_completion_bounds_known_credential_resolution_failure(
+        self,
+        test_config_path,
+    ):
+        canary = "credential-resolution-canary"
+
+        async def unavailable_credentials(_provider_name):
+            raise SecretNotConfiguredError(canary)
+
+        router = ModelRouter(
+            Settings(_config_file=str(test_config_path)),
+            credential_resolver=unavailable_credentials,
+        )
+
+        with pytest.raises(LLMProviderError) as exc_info:
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert str(exc_info.value) == "LLM provider unavailable"
+        assert canary not in repr(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.asyncio
+    async def test_completion_bounds_missing_adapter(self, router):
+        with (
+            patch.object(router, "get_adapter", return_value=None),
+            pytest.raises(LLMProviderError) as exc_info,
+        ):
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert str(exc_info.value) == "LLM provider unavailable"
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.parametrize("error_type", [AssertionError, AttributeError, TypeError])
+    @pytest.mark.asyncio
+    async def test_completion_propagates_adapter_programming_errors(
+        self,
+        router,
+        error_type,
+    ):
+        mock_http_response = Mock()
+        mock_http_response.json.return_value = {
+            "choices": [{"message": {"role": "assistant", "content": "unused"}}]
+        }
+        mock_http_response.raise_for_status = Mock()
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.post.return_value = mock_http_response
+        credentials = ResolvedCredentials(
+            provider_name="openai",
+            source="user",
+            base_url="https://tenant.example/v1",
+            api_key=SecretBytes(b"tenant-programming-error-key"),
+        )
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch.object(
+                OpenAIAdapter,
+                "parse_response",
+                side_effect=error_type("programmer invariant failed"),
+            ),
+            pytest.raises(error_type, match="programmer invariant failed"),
+        ):
+            await router.completion(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hello"}],
+                credentials=credentials,
+            )
+
+        assert credentials.api_key.is_zeroized()
+
+    @pytest.mark.asyncio
     async def test_completion_uses_per_call_credentials_and_zeroizes(self, router):
         mock_http_response = Mock()
         mock_http_response.json.return_value = {
@@ -243,3 +658,8 @@ class TestCapabilityTag:
         assert CapabilityTag.FUNCTION_CALLING == "function_calling"
         assert CapabilityTag.VISION == "vision"
         assert CapabilityTag.EXTENDED_THINKING == "extended_thinking"
+
+    def test_completion_contract_and_failure_taxonomy_are_exported(self):
+        assert CompletionRouter is router_module.CompletionRouter
+        assert LLMProviderError is router_module.LLMProviderError
+        assert LLMResponseParseError is router_module.LLMResponseParseError

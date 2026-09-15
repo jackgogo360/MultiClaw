@@ -1,7 +1,7 @@
 import { useEffect, useCallback, useRef, useSyncExternalStore, type ReactNode } from "react";
-import { generateId } from "ai";
 import type { UIMessage } from "@ai-sdk/react";
 import { sessionApi } from "@/lib/api";
+import { planStore } from "@/lib/plan-store";
 import { useAuth } from "@/lib/auth-context-store";
 import { sessionStore } from "@/lib/session-store";
 import { chatStore } from "@/lib/chat-store";
@@ -37,6 +37,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     authScopeRef.current = nextScope;
     sessionStore.reset();
     chatStore.resetServerState();
+    planStore.reset(null);
     if (userId && accountStatus === "active") {
       void loadSessions();
     }
@@ -48,6 +49,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     }
     lastResetVersion.current = state.resetVersion;
     chatStore.resetServerState();
+    planStore.reset(null);
   }, [state.resetVersion]);
 
   useEffect(() => {
@@ -55,6 +57,11 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     if (!sessionId) {
       return;
     }
+
+    // Clear the previous session's Plan snapshot immediately on switch. The
+    // network hydration may take a moment (or fail), but stale Plan cards must
+    // never remain visible under the newly selected session.
+    planStore.reset(sessionId);
 
     let cancelled = false;
 
@@ -67,11 +74,16 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         if (cancelled) {
           return;
         }
+        await planStore.hydrateSession(sessionId, messages);
+        if (cancelled) return;
         const uiMessages: UIMessage[] = messages.map((msg) => ({
-          id: generateId(),
+          id: msg.id,
           role: msg.role as "user" | "assistant",
           content: msg.content,
-          parts: [{ type: "text" as const, text: msg.content }],
+          parts: [
+            ...(msg.content ? [{ type: "text" as const, text: msg.content }] : []),
+            ...(msg.parts ?? []),
+          ],
           createdAt: msg.created_at ? new Date(msg.created_at) : new Date(),
         }));
         const approvalMessages: UIMessage[] = pendingApprovals.map((approval) => ({

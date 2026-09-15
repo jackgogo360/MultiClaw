@@ -7,19 +7,25 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Literal
 from uuid import uuid4
 
 import pytest
-from alembic import command
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import insert, select, text, update
 from starlette.requests import Request
 
+from alembic import command
 from multiclaw.api.dependencies import tenant_context
 from multiclaw.auth.models import UserRecord
 from multiclaw.cli import alembic_config
 from multiclaw.config import DatabaseSettings, Settings
+from multiclaw.events import EventRouter, EventScope
+from multiclaw.memory import MemoryEntry
+from multiclaw.planner import PlanDraft, PlanDraftStep, PlanTriggerMode
 from multiclaw.storage import Database
+from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.storage.schema import (
     agent_runs,
     approval_requests,
@@ -28,20 +34,27 @@ from multiclaw.storage.schema import (
 )
 from multiclaw.storage.uow import AuthUnitOfWork, TenantUnitOfWork
 from multiclaw.tenancy import TenantContext
-from multiclaw.workflow.coordinator import WorkflowCoordinator
+from multiclaw.workflow.coordinator import PostCommitEventQueue, WorkflowCoordinator
 from multiclaw.workflow.models import (
+    LEGAL_RUN_TRANSITIONS,
+    PHASE_PAYLOADS,
     ApprovalRecord,
     ApprovalStatus,
     CheckpointPhase,
+    CorruptCheckpointError,
     ExecutionStatus,
     InvalidTransitionError,
-    LeaseConflictError,
+    PlanAwaitingApprovalPayload,
+    PlanReplanRequiredPayload,
+    PlanStepReadyPayload,
     RunLease,
+    RunStartedPayload,
     RunStatus,
     StaleFenceError,
     TenantRunQuotaError,
     VersionConflictError,
 )
+from multiclaw.workflow.recovery import validate_phase_payload
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -54,7 +67,9 @@ def _sqlite_url(tmp_path: Path) -> str:
 
 async def _upgrade_database(url: str) -> Database:
     await asyncio.to_thread(command.upgrade, alembic_config(database_url=url), "head")
-    driver = "mysql" if url.startswith("mysql+aiomysql://") else "sqlite"
+    driver: Literal["mysql", "sqlite"] = (
+        "mysql" if url.startswith("mysql+aiomysql://") else "sqlite"
+    )
     return Database.create(DatabaseSettings(driver=driver, url=url))
 
 
@@ -87,6 +102,103 @@ async def _create_run_context(database: Database, suffix: str = "") -> TenantCon
     async with TenantUnitOfWork(database, context) as uow:
         session = await uow.sessions.create(title="Workflow Session")
     return context.for_run(session.id, str(uuid4()))
+
+
+def _plan_draft() -> PlanDraft:
+    return PlanDraft(
+        objective="Deliver the workflow change",
+        constraints=[],
+        generation_reason="The run crosses a durable boundary.",
+        steps=[
+            PlanDraftStep(
+                logical_step_key="implement",
+                title="Implement",
+                description="Implement the change.",
+                expected_outcome="The change is complete.",
+            )
+        ],
+    )
+
+
+async def _create_plan_for_run(
+    database: Database,
+    context: TenantContext,
+) -> tuple[str, str]:
+    plan_id = str(uuid4())
+    async with TenantUnitOfWork(database, context) as uow:
+        source = await uow.memory.save(
+            MemoryEntry(
+                content="Deliver the workflow change",
+                type="chat_message",
+                role="user",
+                turn_index=1,
+            )
+        )
+        plan = await uow.plans.for_context(context).create(
+            plan_id=plan_id,
+            source_message_id=source.id,
+            trigger_mode=PlanTriggerMode.EXPLICIT,
+            draft=_plan_draft(),
+        )
+    return plan_id, plan.current.content_digest
+
+
+async def _append_plan_version(
+    database: Database,
+    context: TenantContext,
+    plan_id: str,
+) -> str:
+    async with TenantUnitOfWork(database, context) as uow:
+        current = await uow.plans.for_context(context).get(plan_id)
+        assert current is not None
+        revised = await uow.plans.for_context(context).append_version(
+            plan_id=plan_id,
+            expected_version=current.aggregate_version,
+            draft=_plan_draft(),
+            parent_version=current.current_version,
+            revision_feedback="Revise workflow test Plan",
+            supersedes={
+                step.logical_step_key: step.step_id
+                for step in current.current.steps
+            },
+        )
+    return revised.current.content_digest
+
+
+def _plan_step_ready_data(
+    context: TenantContext,
+    plan_id: str,
+    plan_digest: str,
+) -> dict[str, Any]:
+    return {
+        "run_id": str(context.run_id),
+        "plan_id": plan_id,
+        "plan_version": 1,
+        "plan_digest": plan_digest,
+        "step_id": str(uuid4()),
+        "step_run_id": str(uuid4()),
+        "attempt": 1,
+        "execution_cursor": "dispatch_step",
+        "cursor": "dispatch_step",
+    }
+
+
+async def _start_plan_checkpoint_run(
+    database: Database,
+    *,
+    suffix: str,
+) -> tuple[TenantContext, WorkflowCoordinator, RunLease, str, str]:
+    context = await _create_run_context(database, suffix=suffix)
+    plan_id, plan_digest = await _create_plan_for_run(database, context)
+    coordinator = _coordinator(database)
+    lease = await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    return context, coordinator, lease, plan_id, plan_digest
 
 
 def _coordinator(database: Database, settings: Settings | None = None) -> WorkflowCoordinator:
@@ -280,7 +392,7 @@ async def test_terminal_run_cannot_be_reacquired_after_lease_expiry(
     )
 
     lease = await _coordinator(workflow_database).start_run(run_context, "runtime-1")
-    finished = await _coordinator(workflow_database).finish_run(lease, terminal_status)
+    await _coordinator(workflow_database).finish_run(lease, terminal_status)
     before = await _coordinator(workflow_database).get_run(run_context)
     assert before is not None
 
@@ -830,3 +942,799 @@ async def test_tenant_context_rejects_active_user_without_default_workspace():
         await tenant_context(request, user)
 
     assert exc_info.value.status_code == 403
+
+
+def test_plan_checkpoint_payloads_are_strict_and_cursor_bound():
+    awaiting = PlanAwaitingApprovalPayload(
+        run_id=str(uuid4()),
+        plan_id=str(uuid4()),
+        plan_version=1,
+        plan_digest="a" * 64,
+        decision_cursor="decision-1",
+        cursor="decision-1",
+    )
+    ready = PlanStepReadyPayload(
+        run_id=str(uuid4()),
+        plan_id=str(uuid4()),
+        plan_version=1,
+        plan_digest="a" * 64,
+        step_id=str(uuid4()),
+        step_run_id=str(uuid4()),
+        attempt=1,
+        execution_cursor="dispatch_step",
+        cursor="dispatch_step",
+    )
+    replan = PlanReplanRequiredPayload(
+        run_id=str(uuid4()),
+        plan_id=str(uuid4()),
+        plan_version=1,
+        plan_digest="a" * 64,
+        failed_step_run_id=str(uuid4()),
+        failure_digest="b" * 64,
+        revision_cursor="generate_revision",
+        cursor="generate_revision",
+    )
+
+    assert awaiting.next_step == "plan_decision"
+    assert ready.next_step == "plan_step_execution"
+    assert replan.next_step == "plan_revision"
+    assert (
+        PHASE_PAYLOADS[CheckpointPhase.PLAN_AWAITING_APPROVAL]
+        is PlanAwaitingApprovalPayload
+    )
+    assert PHASE_PAYLOADS[CheckpointPhase.PLAN_STEP_READY] is PlanStepReadyPayload
+    assert (
+        PHASE_PAYLOADS[CheckpointPhase.PLAN_REPLAN_REQUIRED]
+        is PlanReplanRequiredPayload
+    )
+
+    for payload in (awaiting, ready, replan):
+        with pytest.raises(ValidationError):
+            type(payload).model_validate(
+                {**payload.model_dump(), "cursor": "different"}
+            )
+        with pytest.raises(ValidationError):
+            type(payload).model_validate(
+                {**payload.model_dump(), "unexpected": "field"}
+            )
+
+    with pytest.raises(ValidationError):
+        PlanAwaitingApprovalPayload.model_validate(
+            {**awaiting.model_dump(), "plan_version": True}
+        )
+    with pytest.raises(ValidationError):
+        PlanAwaitingApprovalPayload.model_validate(
+            {**awaiting.model_dump(), "plan_digest": "short"}
+        )
+    with pytest.raises(ValidationError):
+        PlanAwaitingApprovalPayload.model_validate(
+            {**awaiting.model_dump(), "plan_digest": "z" * 64}
+        )
+    with pytest.raises(ValidationError):
+        PlanAwaitingApprovalPayload.model_validate(
+            {**awaiting.model_dump(), "run_id": "x" * 36}
+        )
+    with pytest.raises(ValidationError):
+        PlanAwaitingApprovalPayload.model_validate(
+            {**awaiting.model_dump(), "plan_id": "x" * 36}
+        )
+    with pytest.raises(ValidationError):
+        PlanStepReadyPayload.model_validate(
+            {**ready.model_dump(), "attempt": True}
+        )
+    with pytest.raises(ValidationError):
+        PlanStepReadyPayload.model_validate(
+            {**ready.model_dump(), "attempt": 21}
+        )
+    with pytest.raises(ValidationError):
+        PlanStepReadyPayload.model_validate(
+            {**ready.model_dump(), "execution_cursor": "generate_revision"}
+        )
+    with pytest.raises(ValidationError):
+        PlanReplanRequiredPayload.model_validate(
+            {**replan.model_dump(), "revision_cursor": "select_next"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("phase", "payload"),
+    (
+        (
+            CheckpointPhase.PLAN_AWAITING_APPROVAL,
+            PlanAwaitingApprovalPayload(
+                run_id="00000000-0000-0000-0000-000000000001",
+                plan_id="00000000-0000-0000-0000-000000000002",
+                plan_version=1,
+                plan_digest="a" * 64,
+                decision_cursor="plan-decision",
+                cursor="plan-decision",
+            ),
+        ),
+        (
+            CheckpointPhase.PLAN_STEP_READY,
+            PlanStepReadyPayload(
+                run_id="00000000-0000-0000-0000-000000000001",
+                plan_id="00000000-0000-0000-0000-000000000002",
+                plan_version=1,
+                plan_digest="a" * 64,
+                step_id="00000000-0000-0000-0000-000000000003",
+                step_run_id="00000000-0000-0000-0000-000000000004",
+                attempt=1,
+                execution_cursor="dispatch_step",
+                cursor="dispatch_step",
+            ),
+        ),
+        (
+            CheckpointPhase.PLAN_REPLAN_REQUIRED,
+            PlanReplanRequiredPayload(
+                run_id="00000000-0000-0000-0000-000000000001",
+                plan_id="00000000-0000-0000-0000-000000000002",
+                plan_version=1,
+                plan_digest="a" * 64,
+                failed_step_run_id="00000000-0000-0000-0000-000000000004",
+                failure_digest="b" * 64,
+                revision_cursor="generate_revision",
+                cursor="generate_revision",
+            ),
+        ),
+    ),
+)
+def test_validate_phase_payload_revalidates_mutated_plan_instances(
+    phase: CheckpointPhase,
+    payload: PlanAwaitingApprovalPayload
+    | PlanStepReadyPayload
+    | PlanReplanRequiredPayload,
+):
+    payload.cursor = "tampered-cursor"
+
+    with pytest.raises(CorruptCheckpointError):
+        validate_phase_payload(phase, payload)
+
+
+def test_validate_phase_payload_rebuilds_valid_legacy_typed_payload():
+    payload = RunStartedPayload(
+        tenant_id="00000000-0000-0000-0000-000000000001",
+        workspace_id="00000000-0000-0000-0000-000000000002",
+        session_id="00000000-0000-0000-0000-000000000003",
+        run_id="00000000-0000-0000-0000-000000000004",
+        started_at_ms=1,
+        model_cursor="model-inference",
+        cursor="model-inference",
+    )
+
+    phase, rebuilt = validate_phase_payload(CheckpointPhase.RUN_STARTED, payload)
+
+    assert phase is CheckpointPhase.RUN_STARTED
+    assert rebuilt == payload
+    assert rebuilt is not payload
+
+
+def test_waiting_run_can_resume_or_cancel_but_not_complete_directly():
+    assert LEGAL_RUN_TRANSITIONS[RunStatus.AWAITING_USER] == frozenset(
+        {RunStatus.RESUMING, RunStatus.CANCELLED}
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_plan_run_binds_versions_and_approval_checkpoint(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-plan-start")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    coordinator = _coordinator(workflow_database)
+
+    lease = await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    run = await coordinator.get_run(context)
+    rows = await _checkpoint_rows(workflow_database, context)
+
+    assert run is not None
+    assert run.status is RunStatus.AWAITING_USER
+    assert (
+        run.plan_id,
+        run.initial_plan_version,
+        run.active_plan_version,
+        run.cancel_requested_at,
+    ) == (plan_id, 1, 1, None)
+    assert lease.version == run.version
+    assert rows == [
+        {
+            "phase": CheckpointPhase.PLAN_AWAITING_APPROVAL.value,
+            "checkpoint_seq": 1,
+            "payload": {
+                "schema_version": 1,
+                "run_id": context.run_id,
+                "plan_id": plan_id,
+                "plan_version": 1,
+                "plan_digest": plan_digest,
+                "decision_cursor": f"plan:{plan_id}:v1:decision",
+                "next_step": "plan_decision",
+                "cursor": f"plan:{plan_id}:v1:decision",
+            },
+        }
+    ]
+
+
+@pytest.mark.parametrize("mismatch", ("version", "digest"))
+@pytest.mark.asyncio
+async def test_plan_run_start_rejects_unknown_version_or_digest_without_rows(
+    workflow_database: Database,
+    mismatch: str,
+):
+    context = await _create_run_context(workflow_database, suffix=f"-plan-{mismatch}")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    plan_version = 2 if mismatch == "version" else 1
+    supplied_digest = (
+        ("0" * 64 if plan_digest != "0" * 64 else "1" * 64)
+        if mismatch == "digest"
+        else plan_digest
+    )
+    coordinator = _coordinator(workflow_database)
+
+    with pytest.raises(StaleFenceError, match="Plan version"):
+        await coordinator.start_plan_run_with_checkpoint(
+            context,
+            "runtime-plan",
+            plan_id=plan_id,
+            plan_version=plan_version,
+            plan_digest=supplied_digest,
+        )
+
+    assert await coordinator.get_run(context) is None
+    assert await _checkpoint_rows(workflow_database, context) == []
+
+
+@pytest.mark.asyncio
+async def test_direct_run_hydration_keeps_plan_binding_empty(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-direct-binding")
+    coordinator = _coordinator(workflow_database)
+
+    await coordinator.start_run(context, "runtime-direct")
+    run = await coordinator.get_run(context)
+
+    assert run is not None
+    assert (
+        run.plan_id,
+        run.initial_plan_version,
+        run.active_plan_version,
+        run.cancel_requested_at,
+    ) == (None, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_approve_plan_resumes_with_new_fence_and_active_version(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-plan-resume")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    before = await coordinator.get_run(context)
+    assert before is not None
+    await _append_plan_version(workflow_database, context, plan_id)
+
+    lease = await coordinator.resume_waiting_plan_run(
+        context,
+        runtime_instance_id="runtime-resume",
+        plan_id=plan_id,
+        plan_version=2,
+        expected_run_version=before.version,
+    )
+    after = await coordinator.get_run(context)
+
+    assert after is not None
+    assert after.status is RunStatus.RESUMING
+    assert after.active_plan_version == 2
+    assert lease.fencing_token == before.fencing_token + 1
+    assert lease.version == before.version + 1
+
+
+@pytest.mark.asyncio
+async def test_plan_step_checkpoint_rejects_stale_fence_without_writing(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-plan-stale-step")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    coordinator = _coordinator(workflow_database)
+    stale = await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    checkpoints_before = await _checkpoint_rows(workflow_database, context)
+    current = await coordinator.heartbeat(stale)
+
+    with pytest.raises(StaleFenceError):
+        await coordinator.checkpoint(
+            stale,
+            CheckpointPhase.PLAN_STEP_READY,
+            PlanStepReadyPayload(
+                run_id=str(context.run_id),
+                plan_id=plan_id,
+                plan_version=1,
+                plan_digest=plan_digest,
+                step_id=str(uuid4()),
+                step_run_id=str(uuid4()),
+                attempt=1,
+                execution_cursor="dispatch_step",
+                cursor="dispatch_step",
+            ),
+        )
+
+    assert current.version > stale.version
+    assert await _checkpoint_rows(workflow_database, context) == checkpoints_before
+
+
+@pytest.mark.parametrize(
+    "invalid_fields",
+    (
+        {"attempt": True},
+        {"plan_digest": "not-a-sha256-digest"},
+        {"next_step": "model_inference"},
+        {"cursor": "continue_step"},
+    ),
+    ids=("boolean-attempt", "bad-digest", "wrong-next-step", "cursor-mismatch"),
+)
+@pytest.mark.asyncio
+async def test_constructed_invalid_plan_step_checkpoint_is_rejected_without_writing(
+    workflow_database: Database,
+    invalid_fields: dict[str, object],
+):
+    context, coordinator, lease, plan_id, plan_digest = await _start_plan_checkpoint_run(
+        workflow_database,
+        suffix="-constructed-invalid-plan-step",
+    )
+    data = _plan_step_ready_data(context, plan_id, plan_digest)
+    data.update(invalid_fields)
+    payload = PlanStepReadyPayload.model_construct(**data)
+    checkpoints_before = await _checkpoint_rows(workflow_database, context)
+
+    with pytest.raises(CorruptCheckpointError):
+        await coordinator.checkpoint(
+            lease,
+            CheckpointPhase.PLAN_STEP_READY,
+            payload,
+        )
+
+    assert await _checkpoint_rows(workflow_database, context) == checkpoints_before
+
+
+@pytest.mark.asyncio
+async def test_mutated_plan_step_checkpoint_is_rejected_without_writing(
+    workflow_database: Database,
+):
+    context, coordinator, lease, plan_id, plan_digest = await _start_plan_checkpoint_run(
+        workflow_database,
+        suffix="-mutated-plan-step",
+    )
+    payload = PlanStepReadyPayload.model_validate(
+        _plan_step_ready_data(context, plan_id, plan_digest)
+    )
+    payload.cursor = "continue_step"
+    checkpoints_before = await _checkpoint_rows(workflow_database, context)
+
+    with pytest.raises(CorruptCheckpointError):
+        await coordinator.checkpoint(
+            lease,
+            CheckpointPhase.PLAN_STEP_READY,
+            payload,
+        )
+
+    assert await _checkpoint_rows(workflow_database, context) == checkpoints_before
+
+
+@pytest.mark.asyncio
+async def test_valid_typed_plan_step_checkpoint_is_persisted(
+    workflow_database: Database,
+):
+    context, coordinator, lease, plan_id, plan_digest = await _start_plan_checkpoint_run(
+        workflow_database,
+        suffix="-valid-plan-step",
+    )
+    payload = PlanStepReadyPayload.model_validate(
+        _plan_step_ready_data(context, plan_id, plan_digest)
+    )
+    checkpoints_before = await _checkpoint_rows(workflow_database, context)
+
+    checkpoint = await coordinator.checkpoint(
+        lease,
+        CheckpointPhase.PLAN_STEP_READY,
+        payload,
+    )
+    checkpoints_after = await _checkpoint_rows(workflow_database, context)
+
+    assert checkpoint.phase is CheckpointPhase.PLAN_STEP_READY
+    assert len(checkpoints_after) == len(checkpoints_before) + 1
+    assert checkpoints_after[-1]["phase"] == CheckpointPhase.PLAN_STEP_READY.value
+    assert checkpoints_after[-1]["payload"] == payload.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_revision_fences_waiting_run_without_activating_new_version(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-plan-revision")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    before = await coordinator.get_run(context)
+    assert before is not None
+    revised_digest = await _append_plan_version(workflow_database, context, plan_id)
+
+    lease = await coordinator.fence_waiting_plan_run(
+        context,
+        runtime_instance_id="runtime-revision",
+        plan_id=plan_id,
+        plan_version=2,
+        expected_run_version=before.version,
+        plan_digest=revised_digest,
+    )
+    after = await coordinator.get_run(context)
+    rows = await _checkpoint_rows(workflow_database, context)
+
+    assert after is not None
+    assert after.status is RunStatus.AWAITING_USER
+    assert after.active_plan_version == 1
+    assert lease.fencing_token == before.fencing_token + 1
+    assert rows[-1]["phase"] == CheckpointPhase.PLAN_AWAITING_APPROVAL.value
+    payload = rows[-1]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["plan_version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cancel_waiting_plan_writes_terminal_checkpoint(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-plan-cancel")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    before = await coordinator.get_run(context)
+    assert before is not None
+
+    await coordinator.cancel_waiting_plan_run(
+        context,
+        runtime_instance_id="runtime-cancel",
+        plan_id=plan_id,
+        plan_version=1,
+        expected_run_version=before.version,
+    )
+    after = await coordinator.get_run(context)
+    rows = await _checkpoint_rows(workflow_database, context)
+
+    assert after is not None
+    assert after.status is RunStatus.CANCELLED
+    assert after.finished_at is not None
+    assert rows[-1]["phase"] == CheckpointPhase.RUN_TERMINAL.value
+    payload = rows[-1]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["terminal_status"] == RunStatus.CANCELLED.value
+
+
+@pytest.mark.asyncio
+async def test_request_cancellation_is_idempotent_and_immediately_finishes_waiting_plan(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-request-cancel")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+
+    first = await coordinator.request_cancellation(context)
+    second = await coordinator.request_cancellation(context)
+    checkpoint = (await _checkpoint_rows(workflow_database, context))[-1]
+
+    assert first.status is RunStatus.CANCELLED
+    assert first.finished_at is not None
+    assert second == first
+    assert checkpoint["phase"] == CheckpointPhase.RUN_TERMINAL.value
+
+
+@pytest.mark.asyncio
+async def test_waiting_plan_cancellation_emits_one_post_commit_status_event(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-waiting-cancel-event")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    router = EventRouter()
+    events = []
+
+    async def capture(event):
+        run = await _coordinator(workflow_database).get_run(context)
+        rows = await _checkpoint_rows(workflow_database, context)
+        assert run is not None and run.status is RunStatus.CANCELLED
+        assert rows[-1]["phase"] == CheckpointPhase.RUN_TERMINAL.value
+        events.append(event)
+
+    router.subscribe(EventScope.from_context(context), capture)
+    coordinator = WorkflowCoordinator(
+        workflow_database,
+        settings=Settings(_config_file="/nonexistent"),
+        event_router=router,
+    )
+    await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+
+    await coordinator.request_cancellation(context)
+    await coordinator.request_cancellation(context)
+
+    assert len(events) == 1
+    assert events[0].event_type == "plan.run_status"
+    assert events[0].data["status"] == "cancelled"
+    assert events[0].data["plan_id"] == plan_id
+
+
+@pytest.mark.asyncio
+async def test_external_transaction_cancellation_defers_one_event_until_owner_commits(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-external-cancel-event")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    router = EventRouter()
+    events = []
+
+    async def capture(event):
+        events.append(event)
+
+    router.subscribe(EventScope.from_context(context), capture)
+    post_commit_events = PostCommitEventQueue()
+
+    async with workflow_database.write_transaction() as conn:
+        coordinator = WorkflowCoordinator(
+            workflow_database,
+            settings=Settings(_config_file="/nonexistent"),
+            connection=conn,
+            event_router=router,
+            post_commit_events=post_commit_events,
+        )
+        await coordinator.start_plan_run_with_checkpoint(
+            context,
+            "runtime-plan",
+            plan_id=plan_id,
+            plan_version=1,
+            plan_digest=plan_digest,
+        )
+        with pytest.raises(ValueError, match="PostCommitEventQueue"):
+            await WorkflowCoordinator(
+                workflow_database,
+                settings=Settings(_config_file="/nonexistent"),
+                connection=conn,
+                event_router=router,
+            ).request_cancellation(context)
+        await coordinator.request_cancellation(context)
+
+        assert events == []
+        assert post_commit_events.pending_count == 1
+        with pytest.raises(RuntimeError, match="committed"):
+            await post_commit_events.publish(router)
+
+    await post_commit_events.publish(router)
+    await post_commit_events.publish(router)
+
+    assert len(events) == 1
+    assert events[0].event_type == "plan.run_status"
+    assert events[0].data["status"] == RunStatus.CANCELLED.value
+
+    replay = _coordinator(workflow_database)
+    await replay.request_cancellation(context)
+    assert post_commit_events.pending_count == 0
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_external_transaction_cancellation_discards_deferred_event_after_rollback(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-external-cancel-rollback")
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    await _coordinator(workflow_database).start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    router = EventRouter()
+    events = []
+
+    async def capture(event):
+        events.append(event)
+
+    router.subscribe(EventScope.from_context(context), capture)
+    post_commit_events = PostCommitEventQueue()
+
+    with pytest.raises(RuntimeError, match="force rollback"):
+        async with workflow_database.write_transaction() as conn:
+            coordinator = WorkflowCoordinator(
+                workflow_database,
+                settings=Settings(_config_file="/nonexistent"),
+                connection=conn,
+                event_router=router,
+                post_commit_events=post_commit_events,
+            )
+            await coordinator.request_cancellation(context)
+            assert post_commit_events.pending_count == 1
+            assert events == []
+            raise RuntimeError("force rollback")
+
+    await post_commit_events.publish(router)
+
+    run = await _coordinator(workflow_database).get_run(context)
+    assert run is not None and run.status is RunStatus.AWAITING_USER
+    assert post_commit_events.pending_count == 0
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_request_cancellation_persists_one_timestamp_for_running_plan(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-running-request-cancel")
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_run_with_checkpoint(context, "runtime-plan")
+    before = await coordinator.get_run(context)
+    assert before is not None
+
+    first = await coordinator.request_cancellation(context)
+    second = await coordinator.request_cancellation(context)
+
+    assert first.status is RunStatus.RUNNING
+    assert first.cancel_requested_at is not None
+    assert first.version == before.version + 1
+    assert second.cancel_requested_at == first.cancel_requested_at
+    assert second.version == first.version
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cancellation_requests_change_running_run_once(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-concurrent-cancel")
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_run_with_checkpoint(context, "runtime-plan")
+    before = await coordinator.get_run(context)
+    assert before is not None
+
+    first, second = await asyncio.gather(
+        coordinator.request_cancellation(context),
+        coordinator.request_cancellation(context),
+    )
+
+    assert first.cancel_requested_at is not None
+    assert second.cancel_requested_at == first.cancel_requested_at
+    assert first.version == second.version == before.version + 1
+
+
+@pytest.mark.asyncio
+async def test_request_cancellation_keeps_terminal_run_unchanged(
+    workflow_database: Database,
+):
+    context = await _create_run_context(workflow_database, suffix="-terminal-cancel")
+    coordinator = _coordinator(workflow_database)
+    lease = await coordinator.start_run_with_checkpoint(context, "runtime-plan")
+    await coordinator.finish_run_with_checkpoint(lease, RunStatus.COMPLETED)
+    before = await coordinator.get_run(context)
+    assert before is not None
+
+    after = await coordinator.request_cancellation(context)
+
+    assert after == before
+
+
+def test_run_hydration_rejects_partial_plan_binding():
+    row = {
+        "tenant_id": str(uuid4()),
+        "workspace_id": str(uuid4()),
+        "session_id": str(uuid4()),
+        "run_id": str(uuid4()),
+        "plan_id": str(uuid4()),
+        "initial_plan_version": 1,
+        "active_plan_version": None,
+        "cancel_requested_at": None,
+        "run_status": RunStatus.AWAITING_USER.value,
+        "runtime_instance_id": "runtime",
+        "lease_owner": "runtime",
+        "fencing_token": 1,
+        "lease_expires_at": 10_000,
+        "heartbeat_at": 1,
+        "version": 1,
+        "created_at": 1,
+        "updated_at": 1,
+        "finished_at": None,
+    }
+
+    with pytest.raises(ValueError, match="incomplete Plan binding"):
+        WorkflowRepository._run_from_row(row)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("resume", "cancel", "fence"))
+async def test_waiting_plan_mutations_reject_unknown_plan_version(
+    workflow_database: Database,
+    operation: str,
+):
+    context = await _create_run_context(
+        workflow_database,
+        suffix=f"-unknown-plan-version-{operation}",
+    )
+    plan_id, plan_digest = await _create_plan_for_run(workflow_database, context)
+    coordinator = _coordinator(workflow_database)
+    await coordinator.start_plan_run_with_checkpoint(
+        context,
+        "runtime-plan",
+        plan_id=plan_id,
+        plan_version=1,
+        plan_digest=plan_digest,
+    )
+    before = await coordinator.get_run(context)
+    assert before is not None
+    checkpoints_before = await _checkpoint_rows(workflow_database, context)
+
+    with pytest.raises(StaleFenceError):
+        if operation == "resume":
+            await coordinator.resume_waiting_plan_run(
+                context,
+                runtime_instance_id="runtime-stale",
+                plan_id=plan_id,
+                plan_version=2,
+                expected_run_version=before.version,
+            )
+        elif operation == "cancel":
+            await coordinator.cancel_waiting_plan_run(
+                context,
+                runtime_instance_id="runtime-stale",
+                plan_id=plan_id,
+                plan_version=2,
+                expected_run_version=before.version,
+            )
+        else:
+            await coordinator.fence_waiting_plan_run(
+                context,
+                runtime_instance_id="runtime-stale",
+                plan_id=plan_id,
+                plan_version=2,
+                expected_run_version=before.version,
+                plan_digest="b" * 64,
+            )
+
+    assert await coordinator.get_run(context) == before
+    assert await _checkpoint_rows(workflow_database, context) == checkpoints_before

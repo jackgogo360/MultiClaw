@@ -9,21 +9,33 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import exists, or_, select
-from sqlalchemy import exc as sa_exc
-
 from pydantic import ValidationError
+from sqlalchemy import exc as sa_exc
+from sqlalchemy import exists, or_, select
 
 from multiclaw.config import Settings
+from multiclaw.planner.models import (
+    PlanSnapshot,
+    PlanStatus,
+    PlanStepRunRecord,
+    PlanStepRunStatus,
+    PlanVersionRecord,
+)
 from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.workflow import WorkflowRepository
 from multiclaw.storage.schema import agent_runs, approval_requests
+from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
-from multiclaw.workflow.continuation import WorkflowContinuationService
-from multiclaw.workflow.continuation import ContinuationOutcome, ContinuationState
-from multiclaw.workflow.continuation import PersistedToolResult
+from multiclaw.workflow.continuation import (
+    ContinuationOutcome,
+    ContinuationState,
+    PersistedToolResult,
+    WorkflowContinuationService,
+)
 from multiclaw.workflow.coordinator import WorkflowCoordinator
 from multiclaw.workflow.models import (
+    PHASE_PAYLOADS,
+    TERMINAL_RUN_STATUSES,
     ApprovalStatus,
     AwaitingApprovalPayload,
     CheckpointPayload,
@@ -35,21 +47,19 @@ from multiclaw.workflow.models import (
     ExecutionResultObservedPayload,
     ExecutionStatus,
     IncompatibleCheckpointError,
-    InvalidTransitionError,
-    ModelOutputPayload,
-    PHASE_PAYLOADS,
     LeaseConflictError,
+    PlanAwaitingApprovalPayload,
+    PlanReplanRequiredPayload,
+    PlanStepReadyPayload,
     RecoveryAction,
     RecoveryOutcome,
     RecoveryStrategy,
     RunLeaseHandle,
-    TERMINAL_RUN_STATUSES,
-    RunStartedPayload,
     RunRecord,
+    RunStartedPayload,
     RunStatus,
     RunTerminalPayload,
 )
-
 
 SECRET_KEY_MARKERS = {"secret", "token", "password", "apikey", "authorization"}
 logger = logging.getLogger(__name__)
@@ -65,6 +75,18 @@ class EncodedCheckpointPayload:
     payload_json: str
     payload_hash: str
     schema_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlanRecoveryContext:
+    """Verified, scoped Plan facts used by a recovery continuation."""
+
+    plan: PlanSnapshot
+    version: PlanVersionRecord
+    running_step: PlanStepRunRecord | None
+    failed_step: PlanStepRunRecord | None
+    revision_awaiting_decision: bool
+    cursor: str
 
 
 def canonical_json(value: dict[str, Any]) -> bytes:
@@ -127,7 +149,12 @@ def validate_phase_payload(
     normalized_phase = parse_phase(phase)
     payload_model = PHASE_PAYLOADS[normalized_phase]
     try:
-        validated = payload if isinstance(payload, payload_model) else payload_model.model_validate(payload)
+        validation_input = (
+            payload.model_dump(mode="python")
+            if isinstance(payload, payload_model)
+            else payload
+        )
+        validated = payload_model.model_validate(validation_input)
     except ValidationError as error:
         raise CorruptCheckpointError("checkpoint payload does not match phase schema") from error
     return normalized_phase, validated
@@ -181,7 +208,7 @@ class RecoveryService:
 
         try:
             phase, payload = decode_checkpoint(checkpoint)
-            outcome = await self._classify(context, checkpoint, phase, payload)
+            outcome = await self._classify(context, checkpoint, phase, payload, run=run)
         except IncompatibleCheckpointError as error:
             return RecoveryOutcome(
                 status=RunStatus.BLOCKED_INCOMPATIBLE,
@@ -204,6 +231,11 @@ class RecoveryService:
 
         if outcome.action is RecoveryAction.TERMINAL_NOOP:
             return outcome
+        if outcome.action in {
+            RecoveryAction.AWAIT_USER,
+            RecoveryAction.AWAIT_PLAN_DECISION,
+        }:
+            return outcome
 
         lease = await self._acquire_recovery_lease(context, runtime_instance_id)
         return RecoveryOutcome(
@@ -211,6 +243,7 @@ class RecoveryService:
             status=outcome.status,
             lease=lease,
             execution_id=outcome.execution_id,
+            plan_recovery_context=outcome.plan_recovery_context,
             executions_started=0,
             reason=outcome.reason,
         )
@@ -233,7 +266,7 @@ class RecoveryService:
 
         try:
             phase, payload = decode_checkpoint(checkpoint)
-            outcome = await self._classify(context, checkpoint, phase, payload)
+            outcome = await self._classify(context, checkpoint, phase, payload, run=run)
         except IncompatibleCheckpointError as error:
             return RecoveryOutcome(
                 status=RunStatus.BLOCKED_INCOMPATIBLE,
@@ -262,15 +295,88 @@ class RecoveryService:
         checkpoint: CheckpointRecord,
         phase: CheckpointPhase,
         payload: CheckpointPayload,
+        *,
+        run: RunRecord | None = None,
     ) -> RecoveryOutcome:
+        plan_context = None
+        if run is not None and (run.plan_id is not None or _is_plan_phase(phase)):
+            plan_context = await self._validate_plan_context(
+                context, run, checkpoint, phase, payload
+            )
+
+        if phase is CheckpointPhase.PLAN_AWAITING_APPROVAL:
+            assert isinstance(payload, PlanAwaitingApprovalPayload)
+            if run is None:
+                return RecoveryOutcome(action=RecoveryAction.AWAIT_PLAN_DECISION)
+            assert plan_context is not None
+            if (
+                run.status is RunStatus.AWAITING_USER
+                and plan_context.plan.approved_version != plan_context.plan.current_version
+            ):
+                return RecoveryOutcome(
+                    action=RecoveryAction.AWAIT_PLAN_DECISION,
+                    plan_recovery_context=plan_context,
+                )
+            if run.status is RunStatus.RESUMING:
+                return RecoveryOutcome(
+                    action=RecoveryAction.RESUME_PLAN_STEP,
+                    plan_recovery_context=plan_context,
+                )
+            raise CorruptCheckpointError("Plan approval checkpoint has incompatible run state")
+
+        if phase is CheckpointPhase.PLAN_STEP_READY:
+            assert isinstance(payload, PlanStepReadyPayload)
+            if run is None:
+                return RecoveryOutcome(action=RecoveryAction.RESUME_PLAN_STEP)
+            assert plan_context is not None
+            if (
+                payload.execution_cursor == "final_summary"
+                and run.status is RunStatus.AWAITING_USER
+            ):
+                return RecoveryOutcome(
+                    action=RecoveryAction.AWAIT_USER,
+                    plan_recovery_context=plan_context,
+                )
+            if run.status not in {RunStatus.RUNNING, RunStatus.RESUMING}:
+                raise CorruptCheckpointError("Plan step checkpoint has incompatible run state")
+            return RecoveryOutcome(
+                action=RecoveryAction.RESUME_PLAN_STEP,
+                plan_recovery_context=plan_context,
+            )
+
+        if phase is CheckpointPhase.PLAN_REPLAN_REQUIRED:
+            assert isinstance(payload, PlanReplanRequiredPayload)
+            if run is None:
+                return RecoveryOutcome(action=RecoveryAction.RESUME_PLAN_REVISION)
+            assert plan_context is not None
+            if plan_context.revision_awaiting_decision:
+                return RecoveryOutcome(
+                    action=RecoveryAction.AWAIT_PLAN_DECISION,
+                    plan_recovery_context=plan_context,
+                )
+            if run.status not in {RunStatus.RUNNING, RunStatus.RESUMING}:
+                raise CorruptCheckpointError("Plan revision checkpoint has incompatible run state")
+            return RecoveryOutcome(
+                action=RecoveryAction.RESUME_PLAN_REVISION,
+                plan_recovery_context=plan_context,
+            )
+
         if phase in {
             CheckpointPhase.RUN_STARTED,
             CheckpointPhase.MODEL_OUTPUT_COMMITTED,
             CheckpointPhase.EXECUTION_RESULT_OBSERVED,
         }:
+            if phase is CheckpointPhase.RUN_STARTED and plan_context is not None:
+                return RecoveryOutcome(
+                    action=RecoveryAction.RESUME_PLAN_STEP,
+                    plan_recovery_context=plan_context,
+                )
             if phase is CheckpointPhase.EXECUTION_RESULT_OBSERVED:
                 await self._validate_execution_result(context, checkpoint, payload)
-            return RecoveryOutcome(action=RecoveryAction.RESUME_MODEL)
+            return RecoveryOutcome(
+                action=RecoveryAction.RESUME_MODEL,
+                plan_recovery_context=plan_context,
+            )
 
         if phase is CheckpointPhase.AWAITING_APPROVAL:
             approval_payload = payload if isinstance(payload, AwaitingApprovalPayload) else None
@@ -281,8 +387,8 @@ class RecoveryService:
             if approval.tool_call_id != approval_payload.tool_call_id:
                 raise CorruptCheckpointError("checkpoint tool_call_id does not match approval")
             if approval.status is ApprovalStatus.AWAITING_USER:
-                return RecoveryOutcome(action=RecoveryAction.AWAIT_USER)
-            return RecoveryOutcome(action=RecoveryAction.RESUME_MODEL)
+                return RecoveryOutcome(action=RecoveryAction.AWAIT_USER, plan_recovery_context=plan_context)
+            return RecoveryOutcome(action=RecoveryAction.RESUME_MODEL, plan_recovery_context=plan_context)
 
         if phase is CheckpointPhase.EXECUTION_DISPATCHING:
             dispatch_payload = payload if isinstance(payload, ExecutionDispatchingPayload) else None
@@ -291,6 +397,7 @@ class RecoveryService:
             return RecoveryOutcome(
                 action=_dispatch_recovery_action(dispatch_payload.recovery_strategy),
                 execution_id=dispatch_payload.execution_id,
+                plan_recovery_context=plan_context,
             )
 
         if phase is CheckpointPhase.RUN_TERMINAL:
@@ -302,6 +409,121 @@ class RecoveryService:
             )
 
         raise IncompatibleCheckpointError(f"unsupported checkpoint phase {phase.value}")
+
+    async def _validate_plan_context(
+        self,
+        context: TenantContext,
+        run: RunRecord,
+        checkpoint: CheckpointRecord,
+        phase: CheckpointPhase,
+        payload: CheckpointPayload,
+    ) -> PlanRecoveryContext:
+        if run.plan_id is None or run.initial_plan_version is None or run.active_plan_version is None:
+            raise CorruptCheckpointError("Plan recovery run binding is incomplete")
+        payload_plan_id = getattr(payload, "plan_id", run.plan_id)
+        if payload_plan_id != run.plan_id:
+            raise CorruptCheckpointError("checkpoint Plan does not match run binding")
+        async with TenantUnitOfWork(
+            self._database,
+            context,
+            planning_settings=self._settings.planning,
+            workflow_settings=self._settings.workflow,
+        ) as uow:
+            scoped_run = await uow.workflow.get_run(context)
+            if scoped_run is None or scoped_run != run:
+                raise CorruptCheckpointError("Plan recovery run changed during validation")
+            plan = await uow.plans.get(run.plan_id)
+            if plan is None:
+                raise CorruptCheckpointError("checkpoint references a missing Plan")
+            plan_version = getattr(payload, "plan_version", None) or run.active_plan_version
+            version = next(
+                (item for item in plan.versions if item.plan_version == plan_version),
+                None,
+            )
+            if version is None:
+                raise IncompatibleCheckpointError("checkpoint references a missing Plan version")
+            plan_digest = getattr(payload, "plan_digest", None) or version.content_digest
+            if plan_digest != version.content_digest:
+                raise CorruptCheckpointError("checkpoint Plan digest does not match version")
+            revision_awaiting_decision = (
+                isinstance(payload, PlanReplanRequiredPayload)
+                and plan.status is PlanStatus.AWAITING_APPROVAL
+                and run.status is RunStatus.AWAITING_USER
+                and run.active_plan_version == plan_version
+                and plan.approved_version == plan_version
+                and plan.current_version == plan_version + 1
+                and plan.current.parent_version == plan_version
+            )
+            if plan.current_version != plan.approved_version:
+                if not (
+                    revision_awaiting_decision
+                    or (
+                        phase is CheckpointPhase.PLAN_AWAITING_APPROVAL
+                        and plan.status is PlanStatus.AWAITING_APPROVAL
+                        and run.status is RunStatus.AWAITING_USER
+                    )
+                ):
+                    raise CorruptCheckpointError("unapproved Plan is not at approval boundary")
+            elif (
+                plan.status is not PlanStatus.APPROVED
+                or run.active_plan_version != plan.current_version
+            ):
+                raise CorruptCheckpointError("Plan active version is not approved")
+            running = await uow.plans.running_step_attempts(run_id=str(context.run_id))
+            if len(running) > 1:
+                raise CorruptCheckpointError("Plan recovery has multiple running attempts")
+            running_step = running[0] if running else None
+            if running_step is not None and (
+                running_step.plan_id != plan.plan_id
+                or running_step.plan_version != run.active_plan_version
+                or running_step.run_id != str(context.run_id)
+            ):
+                raise CorruptCheckpointError("Plan recovery running attempt is inconsistent")
+            if isinstance(payload, PlanAwaitingApprovalPayload) and running_step is not None:
+                raise CorruptCheckpointError("Plan approval boundary has a running step")
+            if isinstance(payload, PlanStepReadyPayload):
+                checkpoint_attempt = await uow.plans.step_run_by_id(
+                    run_id=str(context.run_id), step_run_id=payload.step_run_id
+                )
+                if (
+                    checkpoint_attempt is None
+                    or checkpoint_attempt.plan_id != plan.plan_id
+                    or checkpoint_attempt.plan_version != plan_version
+                    or checkpoint_attempt.step_id != payload.step_id
+                    or checkpoint_attempt.attempt != payload.attempt
+                ):
+                    raise CorruptCheckpointError("Plan step checkpoint attempt is inconsistent")
+                if payload.execution_cursor in {"dispatch_step", "continue_step"}:
+                    if (
+                        running_step is None
+                        or running_step.step_run_id != checkpoint_attempt.step_run_id
+                        or running_step.status is not PlanStepRunStatus.RUNNING
+                    ):
+                        raise CorruptCheckpointError("Plan step checkpoint is missing its running attempt")
+                elif running_step is not None:
+                    raise CorruptCheckpointError("Plan selection checkpoint has a running step")
+            failed_step = None
+            if isinstance(payload, PlanReplanRequiredPayload):
+                failed_step = await uow.plans.step_run_by_id(
+                    run_id=str(context.run_id),
+                    step_run_id=payload.failed_step_run_id,
+                )
+                if failed_step is None:
+                    raise CorruptCheckpointError("Plan revision references a missing step attempt")
+                if (
+                    failed_step.plan_id != plan.plan_id
+                    or failed_step.plan_version != plan_version
+                    or failed_step.status is not PlanStepRunStatus.FAILED_TERMINAL
+                ):
+                    raise CorruptCheckpointError("Plan revision failure attempt is inconsistent")
+        return PlanRecoveryContext(
+            plan=plan,
+            version=version,
+            running_step=running_step,
+            failed_step=failed_step,
+            revision_awaiting_decision=revision_awaiting_decision,
+            cursor=str(getattr(payload, "cursor", "")),
+        )
 
     async def _validate_execution_dispatch(
         self,
@@ -324,9 +546,11 @@ class RecoveryService:
             raise CorruptCheckpointError("checkpoint input_hash does not match execution")
         if execution.input_ref != payload.input_ref:
             raise CorruptCheckpointError("checkpoint input_ref does not match execution")
-        if payload.recovery_strategy is RecoveryStrategy.IDEMPOTENT_RETRY:
-            if payload.idempotency_key != execution.idempotency_key:
-                raise CorruptCheckpointError("checkpoint idempotency_key does not match execution")
+        if (
+            payload.recovery_strategy is RecoveryStrategy.IDEMPOTENT_RETRY
+            and payload.idempotency_key != execution.idempotency_key
+        ):
+            raise CorruptCheckpointError("checkpoint idempotency_key does not match execution")
 
     async def _validate_execution_result(
         self,
@@ -411,6 +635,18 @@ def _decode_json_object(payload_json: str) -> dict[str, Any]:
     return value
 
 
+def _validated_execution_input(input_payload_json: str, expected_hash: str) -> str:
+    value = _decode_json_object(input_payload_json)
+    reject_secret_fields(value)
+    encoded = canonical_json(value)
+    if hashlib.sha256(encoded).hexdigest() != expected_hash:
+        raise ValueError("persisted tool input hash mismatch")
+    canonical = encoded.decode("utf-8")
+    if input_payload_json != canonical:
+        raise ValueError("persisted tool input is not canonical")
+    return canonical
+
+
 def _validate_checkpoint_scope(checkpoint: CheckpointRecord, payload: CheckpointPayload) -> None:
     if payload.run_id != checkpoint.run_id:
         raise CorruptCheckpointError("checkpoint payload run_id does not match row scope")
@@ -436,6 +672,14 @@ def _dispatch_recovery_action(strategy: RecoveryStrategy) -> RecoveryAction:
     if strategy is RecoveryStrategy.IDEMPOTENT_RETRY:
         return RecoveryAction.RETRY_IDEMPOTENT
     return RecoveryAction.MARK_MANUAL_UNCERTAIN
+
+
+def _is_plan_phase(phase: CheckpointPhase) -> bool:
+    return phase in {
+        CheckpointPhase.PLAN_AWAITING_APPROVAL,
+        CheckpointPhase.PLAN_STEP_READY,
+        CheckpointPhase.PLAN_REPLAN_REQUIRED,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,13 +819,40 @@ class WorkflowRecoveryWorker:
                 if run is None or run.status in TERMINAL_RUN_STATUSES:
                     return
 
-                if candidate.awaiting_resolution and run.status is RunStatus.AWAITING_USER:
+                preflight = await self._recovery_service.validate_live_run(candidate.context)
+                if preflight.action in {
+                    RecoveryAction.AWAIT_USER,
+                    RecoveryAction.AWAIT_PLAN_DECISION,
+                    RecoveryAction.TERMINAL_NOOP,
+                }:
+                    return
+
+                if (
+                    run.status is RunStatus.AWAITING_USER
+                    and (
+                        candidate.awaiting_resolution
+                        or preflight.status
+                        in {RunStatus.BLOCKED_CORRUPT, RunStatus.BLOCKED_INCOMPATIBLE}
+                    )
+                ):
                     lease = await coordinator.resume_waiting_run(candidate.context, runtime_instance_id)
                 else:
                     lease = await coordinator.acquire_run(candidate.context, runtime_instance_id)
             except LeaseConflictError:
                 return
             run_lease_handle = RunLeaseHandle(lease)
+
+            if preflight.status in {
+                RunStatus.BLOCKED_CORRUPT,
+                RunStatus.BLOCKED_INCOMPATIBLE,
+            }:
+                await self._consume_outcome(
+                    runtime=runtime,
+                    context=candidate.context,
+                    run_lease_handle=run_lease_handle,
+                    outcome=preflight,
+                )
+                return
 
             if candidate.awaiting_resolution and await self._resume_resolved_approval_if_present(
                 runtime=runtime,
@@ -590,7 +861,7 @@ class WorkflowRecoveryWorker:
             ):
                 return
 
-            outcome = await self._recovery_service.recover(candidate.context, runtime_instance_id)
+            outcome = await self._recovery_service.validate_live_run(candidate.context)
             await self._consume_outcome(
                 runtime=runtime,
                 context=candidate.context,
@@ -627,6 +898,12 @@ class WorkflowRecoveryWorker:
                 status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
                 detail=content,
             )
+            if await self._consume_plan_terminal_result(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+            ):
+                return True
             await self._invoke_continuation(
                 runtime=runtime,
                 context=context,
@@ -651,6 +928,11 @@ class WorkflowRecoveryWorker:
                 status=ExecutionStatus.BLOCKED_INCOMPATIBLE,
                 detail="missing builder during recovery",
             )
+            await self._consume_plan_terminal_result(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+            )
             return True
         await runtime.scheduler.recover_execution(
             builder=builder,
@@ -661,6 +943,20 @@ class WorkflowRecoveryWorker:
             force_execute=True,
         )
         refreshed = await coordinator.get_execution_recovery(context, execution.execution_id)
+        if refreshed is not None and refreshed.status in {
+            ExecutionStatus.SUCCEEDED,
+            ExecutionStatus.FAILED_TERMINAL,
+            ExecutionStatus.UNCERTAIN,
+            ExecutionStatus.BLOCKED_CORRUPT,
+            ExecutionStatus.BLOCKED_INCOMPATIBLE,
+        }:
+            plan_result_consumed = await self._consume_plan_terminal_result(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+            )
+            if plan_result_consumed:
+                return True
         if refreshed is not None and refreshed.status in {
             ExecutionStatus.BLOCKED_CORRUPT,
             ExecutionStatus.BLOCKED_INCOMPATIBLE,
@@ -678,7 +974,42 @@ class WorkflowRecoveryWorker:
             )
             return True
         if refreshed is not None and refreshed.status is ExecutionStatus.SUCCEEDED:
-            await self._invoke_continuation(runtime=runtime, context=context, run_lease_handle=run_lease_handle)
+            outcome = await self._recovery_service.validate_live_run(context)
+            await self._consume_outcome(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+                outcome=outcome,
+            )
+        return True
+
+    async def _consume_plan_terminal_result(
+        self,
+        *,
+        runtime,
+        context: TenantContext,
+        run_lease_handle: RunLeaseHandle,
+    ) -> bool:
+        outcome = await self._recovery_service.validate_live_run(context)
+        if outcome.status in {
+            RunStatus.BLOCKED_CORRUPT,
+            RunStatus.BLOCKED_INCOMPATIBLE,
+        }:
+            await self._consume_outcome(
+                runtime=runtime,
+                context=context,
+                run_lease_handle=run_lease_handle,
+                outcome=outcome,
+            )
+            return True
+        if outcome.plan_recovery_context is None:
+            return False
+        await self._consume_outcome(
+            runtime=runtime,
+            context=context,
+            run_lease_handle=run_lease_handle,
+            outcome=outcome,
+        )
         return True
 
     async def _consume_outcome(
@@ -711,6 +1042,12 @@ class WorkflowRecoveryWorker:
                         ),
                         detail=outcome.reason or "recovery blocked",
                     )
+            await run_lease_handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    self._database,
+                    settings=self._settings,
+                ).finish_run_with_checkpoint(lease, outcome.status)
+            )
             return
         if outcome.action is None or outcome.action is RecoveryAction.TERMINAL_NOOP:
             return
@@ -748,15 +1085,27 @@ class WorkflowRecoveryWorker:
                 action=outcome.action,
                 run_lease_handle=run_lease_handle,
             )
+            if outcome.plan_recovery_context is not None:
+                await self._consume_plan_terminal_result(
+                    runtime=runtime,
+                    context=context,
+                    run_lease_handle=run_lease_handle,
+                )
+                return
             if outcome.action is not RecoveryAction.MARK_MANUAL_UNCERTAIN:
                 await self._invoke_continuation(
                     runtime=runtime,
                     context=context,
                     run_lease_handle=run_lease_handle,
+                    recovery_outcome=outcome,
                 )
             return
 
-        if outcome.action is RecoveryAction.RESUME_MODEL:
+        if outcome.action in {
+            RecoveryAction.RESUME_MODEL,
+            RecoveryAction.RESUME_PLAN_STEP,
+            RecoveryAction.RESUME_PLAN_REVISION,
+        }:
             await self._invoke_continuation(
                 runtime=runtime,
                 context=context,
@@ -825,10 +1174,6 @@ class RuntimeRecoveryContinuationService:
         recovered_tool_result: PersistedToolResult | None = None,
         recovered_tool_input_json: str | None = None,
     ) -> None:
-        callback = getattr(getattr(runtime, "agent", None), "resume_recovery", None)
-        if not callable(callback):
-            return
-
         database = getattr(runtime.agent, "database", None)
         settings = getattr(runtime.agent, "settings", None)
         if database is None or settings is None:
@@ -843,15 +1188,31 @@ class RuntimeRecoveryContinuationService:
                 assert result_payload is not None
                 execution = await workflow.get_execution_recovery(context, result_payload.execution_id)
                 if execution is not None:
-                    recovered_tool_input_json = execution.input_payload_json
-                    recovered_tool_result = await continuation.load_tool_result(
-                        context=context,
-                        result_ref=result_payload.result_ref,
-                        expected_digest=result_payload.result_digest,
-                        expected_execution_id=execution.execution_id,
-                        expected_tool_call_id=execution.tool_call_id,
-                        expected_tool_name=execution.tool_name,
-                    )
+                    try:
+                        recovered_tool_input_json = _validated_execution_input(
+                            execution.input_payload_json,
+                            execution.input_hash,
+                        )
+                        recovered_tool_result = await continuation.load_tool_result(
+                            context=context,
+                            result_ref=result_payload.result_ref,
+                            expected_digest=result_payload.result_digest,
+                            expected_execution_id=execution.execution_id,
+                            expected_tool_call_id=execution.tool_call_id,
+                            expected_tool_name=execution.tool_name,
+                        )
+                    except ValueError:
+                        if recovery_outcome.plan_recovery_context is None:
+                            raise
+                        await run_lease_handle.refresh(
+                            lambda lease: WorkflowCoordinator(
+                                database,
+                                settings=settings,
+                            ).finish_run_with_checkpoint(
+                                lease, RunStatus.BLOCKED_CORRUPT
+                            )
+                        )
+                        return
         current_run = await WorkflowCoordinator(database, settings=settings).get_run(context)
         if current_run is not None and current_run.status is RunStatus.RESUMING:
             await run_lease_handle.refresh(
@@ -860,6 +1221,35 @@ class RuntimeRecoveryContinuationService:
                     settings=settings,
                 ).transition_run(lease, RunStatus.RUNNING)
             )
+        plan_execution = getattr(runtime, "plan_execution", None)
+        if (
+            recovery_outcome.plan_recovery_context is not None
+            and plan_execution is not None
+            and hasattr(plan_execution, "resume")
+        ):
+            try:
+                await plan_execution.resume(
+                    runtime=runtime,
+                    context=context,
+                    run_lease_handle=run_lease_handle,
+                    recovery_outcome=recovery_outcome,
+                    recovered_tool_result=recovered_tool_result,
+                    recovered_tool_input_json=recovered_tool_input_json,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - terminalize only after cancellation propagates
+                await run_lease_handle.refresh(
+                    lambda lease: WorkflowCoordinator(
+                        database,
+                        settings=settings,
+                    ).finish_run_with_checkpoint(lease, RunStatus.FAILED_TERMINAL)
+                )
+            return
+
+        callback = getattr(getattr(runtime, "agent", None), "resume_recovery", None)
+        if not callable(callback):
+            return
         try:
             result = callback(
                 context=context,

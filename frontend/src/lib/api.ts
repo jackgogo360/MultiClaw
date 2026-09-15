@@ -10,10 +10,43 @@ export interface Session {
 }
 
 export interface Message {
+  id: string;
   role: "user" | "assistant";
   content: string;
-  created_at?: string;
+  created_at?: number | string;
+  parts: PersistedMessagePart[];
 }
+
+export type PlanStatus = "awaiting_approval" | "approved" | "rejected" | "archived";
+export type PlanStepStatus = "pending" | "running" | "succeeded" | "failed_retryable" | "failed_terminal" | "cancelled";
+export interface PlanReference {
+  schema_version: 1;
+  tenant_id: string;
+  workspace_id: string;
+  session_id: string;
+  run_id: string;
+  plan_id: string;
+  plan_version: number;
+  aggregate_version: number;
+}
+export type PersistedMessagePart = { type: "data-plan-created"; data: PlanReference };
+export interface PlanStepView {
+  step_id: string; logical_step_key: string; ordinal: number; title: string;
+  description: string; expected_outcome: string; depends_on: string[];
+  status: PlanStepStatus; attempt: number | null; result_summary: string | null; error_detail: string | null;
+}
+export interface PlanVersionView {
+  plan_version: number; objective: string; constraints: string[]; generation_reason: string;
+  parent_version: number | null; revision_feedback: string | null; content_digest: string; steps: PlanStepView[];
+}
+export interface PlanView {
+  schema_version: 1; plan_id: string; session_id: string; status: PlanStatus;
+  current_version: number; approved_version: number | null; aggregate_version: number;
+  active_run_id: string | null; run_status: string | null; cancel_requested_at: number | null;
+  summary_retry_available: boolean; versions: PlanVersionView[];
+  decisions: Array<{ decision_id: string; plan_version: number; action: "approve" | "reject" | "revise"; resulting_plan_version: number | null; created_at: number }>;
+}
+export type PlanDataPart = { type: `data-plan-${"created" | "revised" | "decision" | "step-status" | "run-status"}`; data: PlanReference & Record<string, unknown> };
 
 export interface SecretMetadata {
   providerKind: string;
@@ -207,6 +240,55 @@ async function request<T>(path: string, options: ApiOptions = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function streamMutation(path: string, body: object): Promise<Response> {
+  const options: ApiOptions = {
+    method: "POST",
+    body: JSON.stringify(body),
+  };
+  const headers = new Headers({ "Content-Type": "application/json" });
+  headers.set("X-CSRF-Token", await ensureCsrfToken());
+  const response = await fetch(resolveUrl(path, API_BASE), { ...options, credentials: "include", headers });
+  if (response.status === 401) throw new AuthError((await parseErrorResponse(response)).message);
+  if (!response.ok) {
+    const error = await parseErrorResponse(response);
+    if (isCsrfFailure(error)) {
+      await invalidateCsrfToken();
+      const retryHeaders = new Headers(headers);
+      retryHeaders.set("X-CSRF-Token", await ensureCsrfToken());
+      const retry = await fetch(resolveUrl(path, API_BASE), { ...options, credentials: "include", headers: retryHeaders });
+      if (!retry.ok) throw await parseErrorResponse(retry);
+      return retry;
+    }
+    throw error;
+  }
+  return response;
+}
+
+export async function consumePlanAction(response: Response, onPart: (part: PlanDataPart) => void): Promise<void> {
+  if (!response.body) throw new ApiError({ status: 502, message: "Missing action stream" });
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finished = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() ?? "";
+    if (done && buffer.trim()) { frames.push(buffer); buffer = ""; }
+    for (const frame of frames) {
+      const line = frame.split(/\r?\n/).find((item) => item.startsWith("data: "));
+      if (!line) continue;
+      const payload = JSON.parse(line.slice(6)) as { type?: unknown; data?: unknown; errorText?: unknown };
+      if (payload.type === "error") throw new Error(typeof payload.errorText === "string" ? payload.errorText : "Plan action failed");
+      if (payload.type === "finish") finished = true;
+      if (typeof payload.type === "string" && payload.type.startsWith("data-plan-")) onPart(payload as PlanDataPart);
+    }
+    if (done) break;
+  }
+  if (!finished) throw new Error("Plan action stream ended before completion");
+}
+
 function formatSecretProvider(providerKind: string, providerName: string) {
   return encodeURIComponent(`${providerKind}:${providerName}`);
 }
@@ -247,6 +329,19 @@ export const sessionApi = {
   messages: (id: string) => request<Message[]>(`/sessions/${id}/messages`),
   pendingApprovals: (id: string) =>
     request<PendingApprovalRecord[]>(`/sessions/${id}/pending-approvals`),
+};
+
+export const planApi = {
+  list: (sessionId: string) => request<PlanView[]>(`/sessions/${sessionId}/plans`),
+  get: (sessionId: string, planId: string) => request<PlanView>(`/plans/${planId}?session_id=${encodeURIComponent(sessionId)}`),
+  decision: (planId: string, body: object) => streamMutation(`/plans/${planId}/decision`, body),
+  rerun: (planId: string, sessionId: string) => streamMutation(`/plans/${planId}/runs`, { session_id: sessionId }),
+};
+
+export const runApi = {
+  get: (sessionId: string, runId: string) => request<Record<string, unknown>>(`/runs/${runId}?session_id=${encodeURIComponent(sessionId)}`),
+  cancel: (runId: string, sessionId: string) => streamMutation(`/runs/${runId}/cancel`, { session_id: sessionId }),
+  retrySummary: (runId: string, sessionId: string) => streamMutation(`/runs/${runId}/summary/retry`, { session_id: sessionId }),
 };
 
 export const secretApi = {

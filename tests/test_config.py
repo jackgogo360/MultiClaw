@@ -1,13 +1,152 @@
 import os
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
-from multiclaw.config.settings import Settings
+from multiclaw.config import Settings
+from multiclaw.planner import PlanningMode
 
 
 def write_config(tmp_path, text):
     config_file = tmp_path / "multiclaw.toml"
     config_file.write_text(text)
     return config_file
+
+
+def test_planning_defaults_and_hard_caps() -> None:
+    settings = Settings(_config_file="/nonexistent")
+
+    assert settings.planning.enabled is True
+    assert settings.planning.default_mode is PlanningMode.AUTO
+    assert settings.planning.classification_model == ""
+    assert settings.planning.generation_model == ""
+    assert settings.planning.max_steps == 20
+    assert settings.planning.max_dependency_depth == 10
+    assert settings.planning.max_revisions == 5
+    assert settings.planning.max_step_attempts == 2
+
+    for payload in (
+        {"max_steps": 21},
+        {"max_dependency_depth": 11},
+        {"max_revisions": 21},
+        {"max_step_attempts": 21},
+    ):
+        with pytest.raises(ValidationError):
+            Settings(_config_file="/nonexistent", planning=payload)
+
+
+def test_planning_settings_load_from_toml_mapping(tmp_path) -> None:
+    config_file = write_config(
+        tmp_path,
+        """
+[planning]
+enabled = false
+default_mode = "always"
+classification_model = "classifier"
+generation_model = "generator"
+max_steps = 7
+max_dependency_depth = 4
+max_revisions = 3
+max_step_attempts = 6
+""",
+    )
+
+    settings = Settings(_config_file=str(config_file))
+
+    assert settings.planning.model_dump() == {
+        "enabled": False,
+        "default_mode": PlanningMode.ALWAYS,
+        "classification_model": "classifier",
+        "generation_model": "generator",
+        "max_steps": 7,
+        "max_dependency_depth": 4,
+        "max_revisions": 3,
+        "max_step_attempts": 6,
+    }
+
+
+@pytest.mark.parametrize("relative_path", ["multiclaw.toml", "config/multiclaw.toml"])
+def test_deployment_configs_keep_planning_on_never_mode(relative_path) -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+
+    settings = Settings(_config_file=str(repository_root / relative_path))
+
+    assert settings.planning.model_dump() == {
+        "enabled": True,
+        "default_mode": PlanningMode.NEVER,
+        "classification_model": "",
+        "generation_model": "",
+        "max_steps": 20,
+        "max_dependency_depth": 10,
+        "max_revisions": 5,
+        "max_step_attempts": 2,
+    }
+
+
+@pytest.mark.parametrize("field", ["classification_model", "generation_model"])
+def test_planning_model_names_accept_max_length(field) -> None:
+    settings = Settings(
+        _config_file="/nonexistent",
+        planning={field: "x" * 255},
+    )
+
+    assert getattr(settings.planning, field) == "x" * 255
+
+
+@pytest.mark.parametrize("field", ["classification_model", "generation_model"])
+def test_planning_model_names_reject_overflow(field) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            _config_file="/nonexistent",
+            planning={field: "x" * 256},
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_steps", 1),
+        ("max_steps", 20),
+        ("max_dependency_depth", 1),
+        ("max_dependency_depth", 10),
+        ("max_revisions", 0),
+        ("max_revisions", 20),
+        ("max_step_attempts", 1),
+        ("max_step_attempts", 20),
+    ],
+)
+def test_planning_integer_limits_accept_boundaries(field, value) -> None:
+    settings = Settings(_config_file="/nonexistent", planning={field: value})
+
+    assert getattr(settings.planning, field) == value
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_steps", 0),
+        ("max_steps", 21),
+        ("max_dependency_depth", 0),
+        ("max_dependency_depth", 11),
+        ("max_revisions", -1),
+        ("max_revisions", 21),
+        ("max_step_attempts", 0),
+        ("max_step_attempts", 21),
+    ],
+)
+def test_planning_integer_limits_reject_out_of_range(field, value) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_config_file="/nonexistent", planning={field: value})
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["max_steps", "max_dependency_depth", "max_revisions", "max_step_attempts"],
+)
+@pytest.mark.parametrize("value", [1.0, "1", True])
+def test_planning_integer_limits_reject_non_integer_types(field, value) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_config_file="/nonexistent", planning={field: value})
 
 
 class TestSettings:

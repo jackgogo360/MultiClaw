@@ -8,6 +8,8 @@ import warnings
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from multiclaw.planner.models import PlanningMode
+
 
 def _sqlite_url_from_path(path: str) -> str:
     if path == ":memory:":
@@ -106,6 +108,17 @@ class SecretSettings(BaseModel):
 
 class DeletionSettings(BaseModel):
     retention_days: int = Field(default=7, ge=0, le=30, strict=True)
+
+
+class PlanningSettings(BaseModel):
+    enabled: bool = True
+    default_mode: PlanningMode = PlanningMode.AUTO
+    classification_model: str = Field(default="", max_length=255)
+    generation_model: str = Field(default="", max_length=255)
+    max_steps: int = Field(default=20, ge=1, le=20, strict=True)
+    max_dependency_depth: int = Field(default=10, ge=1, le=10, strict=True)
+    max_revisions: int = Field(default=5, ge=0, le=20, strict=True)
+    max_step_attempts: int = Field(default=2, ge=1, le=20, strict=True)
 
 
 class LLMProviderSettings(BaseModel):
@@ -263,6 +276,7 @@ class Settings(BaseSettings):
     workflow: WorkflowSettings = Field(default_factory=WorkflowSettings)
     secrets: SecretSettings = Field(default_factory=SecretSettings)
     deletion: DeletionSettings = Field(default_factory=DeletionSettings)
+    planning: PlanningSettings = Field(default_factory=PlanningSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
@@ -349,6 +363,8 @@ class Settings(BaseSettings):
             result["secrets"] = data["secrets"]
         if "deletion" in data:
             result["deletion"] = data["deletion"]
+        if "planning" in data:
+            result["planning"] = data["planning"]
         if "llm" in data:
             llm_data = dict(data["llm"])
             result["llm"] = {

@@ -5,7 +5,10 @@ import {
   MessagePrimitive,
   useAuiEvent,
   useAuiState,
+  makeAssistantDataUI,
 } from "@assistant-ui/react";
+import type { PlanReference } from "@/lib/api";
+import { PlanCard } from "@/components/plan/PlanCard";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import remarkGfm from "remark-gfm";
 import { ToolFallback } from "./tool-fallback";
@@ -15,6 +18,11 @@ type ToolLikePart = {
   toolName?: string;
   status?: { type?: string; reason?: string };
 };
+
+const PlanCreatedUI = makeAssistantDataUI<PlanReference>({
+  name: "plan-created",
+  render: ({ data }) => <PlanCard reference={data} />,
+});
 
 function ToolGroupBlock({
   indices,
@@ -193,6 +201,7 @@ export function Thread({
 
   return (
     <ThreadPrimitive.Root className="flex h-full flex-col bg-surface text-foreground">
+      <PlanCreatedUI />
       <ChatStatusBar chatError={chatError} requestState={requestState} />
       <ThreadPrimitive.Viewport className="flex-1 overflow-y-auto px-4 py-6">
         <ThreadPrimitive.Empty>
