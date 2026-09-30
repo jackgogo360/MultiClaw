@@ -11,6 +11,7 @@ MultiClaw 是一个面向单机部署的多租户 AI Agent 运行时，提供工
 - 运行 Agent、内置工具和 MCP 工具，并按策略处理高风险操作审批。
 - 通过 `tenant_id`、`workspace_id`、`session_id` 和 `run_id` 对持久化数据、运行时与事件流实施作用域隔离。
 - 使用租约、fencing token、CAS、检查点和恢复服务持久化工作流状态。
+- 支持 Durable Plans：先审核版本化计划，再按依赖顺序执行步骤，并提供取消、总结重试与重新运行入口。
 - 以 AES-256-GCM envelope 加密租户自带的模型与集成凭据；API 不返回明文 Secret。
 - 在 macOS Seatbelt 或 Linux nsjail 中运行受限 shell、代码执行和本地 stdio MCP 进程。
 - 通过同一套 SQLAlchemy/Alembic 边界支持 SQLite 与 MySQL。
@@ -91,6 +92,16 @@ npm run dev
 
 更完整的首次启动、真实邮件配置和停止步骤见[入门指南](docs/getting-started.md)。
 
+## 使用计划执行
+
+仓库的 `multiclaw.toml` 设置 `planning.enabled=true`、`planning.default_mode="never"`，普通消息保持直接聊天。完成登录并配置模型凭据后，可发送带 `plan:` 前缀的请求，例如：
+
+```text
+plan: 检查项目文档，列出需要更新的内容并提出修改建议
+```
+
+前端会显示计划卡片；审核步骤后选择批准、拒绝或填写反馈请求修订。批准计划后，具体工具仍可能需要单独审批。`planning.enabled=false` 会关闭计划功能，显式计划请求将失败。模式、恢复边界和操作说明见 [Durable Plans 指南](docs/durable-plans.md)。
+
 ## 架构概览
 
 ```mermaid
@@ -117,6 +128,7 @@ flowchart LR
 | 架构与模块 | [架构说明](docs/architecture.md) |
 | 配置与密钥 | [配置参考](docs/configuration.md) |
 | 开发流程 | [开发指南](docs/development.md) |
+| 计划执行与审核 | [Durable Plans 指南](docs/durable-plans.md) |
 | HTTP / SSE | [API 概览](docs/api.md) |
 | 测试矩阵 | [测试指南](docs/testing.md) |
 | 安全边界 | [安全模型](docs/security-model.md) |

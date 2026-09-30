@@ -9,6 +9,7 @@ src/multiclaw/          Python 运行时与 FastAPI 服务
 ├── auth/               邮箱认证、JWT 与中间件
 ├── governance/         审批、审计和原生沙箱
 ├── mcp/                MCP 配置、传输、客户端与工具适配
+├── planner/            计划策略、生成、验证与版本审核
 ├── runtime/            租户 RuntimeFactory/RuntimePool
 ├── secrets/            keyring、envelope、解析与轮换
 ├── storage/            SQLAlchemy schema、方言、仓储与 UoW

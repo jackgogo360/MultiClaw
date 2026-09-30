@@ -1,72 +1,64 @@
-# Durable Plans
+# Durable Plans 指南
 
-Durable Plans turn an explicitly requested objective into a reviewable,
-session-scoped execution record. The feature is opt-in during rollout: set
-`planning.default_mode = "never"` to preserve direct chat, `"auto"` to let the
-classifier choose, or `"always"` to require a Plan. A `plan:` prefix is an
-explicit `always` request and is removed from the stored objective.
+Durable Plans 将目标转为可审核、可恢复的会话级执行记录。计划版本、审核决定、步骤尝试与 run 状态持久化到数据库；前端计划卡片展示版本历史、步骤进度和运行控制。
 
-## Review and execution contract
+## 启用与触发
 
-The chat stream first emits a Plan reference. No execution tool is dispatched
-until the user approves the current version. Review actions are approve,
-reject, or revise; each request carries the session scope, current version,
-and an idempotency key. Repeating a decision returns its recorded result.
-Revisions append immutable version `N+1`; stale version `N` requests return
-`409` and cannot rewrite history. Rejection cancels the run and dispatches no
-tools.
+仓库根目录和 `config/` 下的示例 TOML 均设置 `planning.enabled=true`、`planning.default_mode="never"`，普通聊天默认不生成计划。Settings 模型的默认模式为 `auto`；未加载示例 TOML 时应确认实际配置。
 
-Steps form a bounded DAG and execute in deterministic topological order. Only
-one ready step is active for a run. Step attempts and dependency depth are
-validated before insertion and again in the transaction that writes state.
-Tool approval is separate from Plan approval: a Plan may be approved while an
-individual tool still requires its own user decision.
+| 配置或请求 | 行为 |
+|---|---|
+| `planning.default_mode="never"` | 普通请求直接聊天 |
+| `planning.default_mode="auto"` | 由分类模型判断是否需要计划；分类不可用时回退直接聊天 |
+| `planning.default_mode="always"` | 请求生成计划 |
+| 消息以 `plan:` 开头 | 显式请求计划，优先于请求模式和默认模式；存储的目标移除前缀 |
+| `planning.enabled=false` | 关闭计划；显式请求计划安全失败 |
 
-## Recovery, cancellation, and reuse
+API 调用方也可以在 `POST /api/chat` body 中传 `planning_mode`，取值为 `never`、`auto` 或 `always`。分类和生成模型配置为空时使用默认模型。登录、模型凭据和邮件配置分别见[入门指南](getting-started.md)与[配置参考](configuration.md)。
 
-Run leases and checkpoints make restart recovery fail closed. Missing, corrupt,
-foreign, or digest-mismatched context blocks the run instead of guessing. A
-cancellation request is persisted and checked before model calls, step writes,
-tool dispatch, and finalization. Cancellation cannot undo an external effect
-already accepted by a provider; such effects require the provider's own
-idempotency and reconciliation contract.
+## 审核与执行
 
-Retries are bounded by `planning.max_step_attempts`. Exhaustion creates a
-reviewable replan boundary. A reused result is accepted only when the step
-definition, dependency-result digests, and source attempt proof match; an
-existing `tool_call_id` is replayed without creating another execution row.
-Final summaries are persisted and may be retried or rerun from the durable
-Plan version.
+1. 在聊天中发送目标，例如 `plan: 检查项目文档并提出更新建议`。
+2. 查看计划卡片中的目标、约束、步骤和依赖关系。
+3. 选择批准、拒绝，或填写反馈请求修订。修订生成不可变的新版本，旧版本保留用于查看。
+4. 批准后按依赖顺序执行步骤；具体工具需要审批时，继续通过工具审批入口决策。
+5. 查看步骤结果与最终总结；界面根据运行状态提供取消、重试总结或重新运行入口。
 
-## Configuration and operations
+审核通过当前版本前不会派发执行工具。计划审核与工具审核分别进行，批准计划不会替代单个工具的权限决定。拒绝会取消等待中的 run，不派发工具。
 
-See [configuration](configuration.md) for all planning
-limits. The aggregate round ceiling is:
+决定请求携带当前计划版本、聚合版本和幂等 `decision_id`。重复提交相同决定返回已记录结果；过期版本或冲突请求返回 `409`，应刷新计划并重新审核。API 字段和路径见[API 概览](api.md#durable-plan-与-runsapiplansapiruns)。
 
-```
+步骤组成有界 DAG，以确定性拓扑顺序执行；一个 run 同时只有一个就绪步骤活动。尝试次数和依赖深度在验证层及事务写入层检查。
+
+## 恢复、取消与复用
+
+run 租约和检查点为重启恢复提供证据。上下文缺失、损坏、跨作用域或摘要不匹配时阻塞运行，不猜测状态。页面刷新和会话切换后通过作用域 GET 接口重建计划；SSE 通知只用于提示更新。
+
+取消请求先持久化，再在模型调用、步骤写入、工具派发和最终完成前检查。取消不能撤回外部服务已接受的副作用；此类操作仍依赖提供商的幂等与对账机制。
+
+步骤重试受 `planning.max_step_attempts` 限制；耗尽后进入可审核的重新规划边界。仅当步骤定义、依赖结果摘要和来源尝试证据匹配时复用结果；已有 `tool_call_id` 的重放不创建重复执行记录。
+
+最终总结持久化保存。`summary/retry` 只重试等待中的总结；重新运行通过 Plan 的 `/runs` 接口创建新 run，要求当前版本已批准且没有活动 run。
+
+## 配额与运维
+
+完整限制见[配置参考](configuration.md)。累计工具 round 上限为：
+
+```text
 planning.max_steps * planning.max_step_attempts * agent.max_tool_rounds
 ```
 
-The `multiclaw_plan_operations_total` metric uses only bounded
-`operation`, `status`, and `error_class` labels. Plan/run identifiers are
-sanitized trace attributes, never metric labels. Recovery, replan, completion,
-and cancellation outcomes are emitted after their durable transition.
+`multiclaw_plan_operations_total` 指标仅使用有界的 `operation`、`status` 和 `error_class` 标签。Plan/run 标识只作为脱敏 trace 属性，不能作为指标标签。恢复、重新规划、完成和取消结果在持久化转换之后发布。
 
-SQLite and MySQL use the same migration contract and deletion order. Session
-deletion and account purge remove Plan rows, attempts, checkpoints, tool
-executions, and session-scoped round ledger entries. Keep the rollout kill
-switch on until both backend suites and the release checks pass.
+SQLite 与 MySQL 使用相同迁移契约和删除顺序。会话删除和账号清除会移除关联计划、步骤尝试、检查点、工具执行与会话级 round ledger。扩大默认计划模式前应完成两个数据库后端及发布门禁。
 
-## API and manual browser checks
+## 发布前人工验证
 
-The scoped endpoints are documented in [API overview](api.md):
-`/api/plans`, `/api/runs`, and the existing chat/approval routes. Unknown or
-foreign resources are indistinguishable (`404`), while stale versions and
-conflicting decisions return `409`. SSE Plan notifications are advisory;
-refresh and session switching hydrate state through the scoped GET endpoints.
+按[测试指南](testing.md)完成自动化检查，并在浏览器验证：
 
-Before release, manually verify: Plan creation and review; reject with zero
-tool dispatch; revision and stale-version conflict; refresh and session
-switch; approval-required tools; bounded retry and replan; cancellation at
-each boundary; restart recovery; summary retry/rerun; and session/account
-deletion. Record identifiers only in private test notes, not documentation.
+- 计划创建、批准、拒绝且无工具派发、修订和旧版本冲突。
+- 刷新、会话切换、版本查看和工具独立审批。
+- 有界重试、重新规划、取消和重启恢复。
+- 总结重试、重新运行，以及会话删除和账号清除。
+
+实际资源标识只写入私有测试记录，不写入公开文档。
