@@ -67,6 +67,7 @@ mock 邮件模式只跳过 provider 调用，不返回验证码，因此适合�
 
 - `message`，或 assistant-ui `messages` 中最后一条用户文本；
 - `session_id`，兼容字段 `id`；两者都不提供时创建新 session。
+- `planning_mode`：`never`、`auto` 或 `always`；省略时使用部署配置。消息的 `plan:` 前缀优先强制请求计划。
 
 服务在返回流之前完成 session 作用域检查、用户消息持久化、runtime acquire、run lease 与初始 checkpoint 写入。并发超过租户 run 配额返回 `429`；runtime 容量或可用性不足返回 `503`，可能带 `Retry-After`。
 
@@ -96,24 +97,27 @@ mock 邮件模式只跳过 provider 调用，不返回验证码，因此适合�
 | `POST /api/approvals/{approval_id}/decision` | 会话 + CSRF | body 为 `approved` 与当前 `version`；以 CAS 决策 |
 | `POST /api/approve` | 会话 + CSRF | 兼容别名，body 还包含 `approval_id`；不进入 OpenAPI，新集成不要使用 |
 
+外租户/不存在的 approval 返回 `404`，已解决或 version 冲突返回 `409`，过期返回 `410`。客户端必须使用最近读取的 version，不能在冲突后盲目重试旧决策。
+
 ## Durable Plan 与 runs：`/api/plans`、`/api/runs`
 
-所有 Plan/run 请求都必须携带已认证的 tenant、workspace 和 `session_id`
-作用域。Plan 响应包含 `plan_id`、`current_version`、不可变 `versions`、
-`decisions` 与关联 `run_id`；run 响应包含 `run_id`、`run_status`、当前
-`plan_version` 和 checkpoint 摘要。典型操作如下：
+所有 Plan/run 请求需要有效登录会话；tenant/workspace 身份由服务端推导，客户端只提供 `session_id`。GET 使用查询参数，POST 使用 JSON body，并携带 CSRF header。Plan 响应包含 `current_version`、`aggregate_version`、不可变 `versions`、`decisions`、`runs` 和 `latest_attempts`；run 响应包含 `status`、`initial_plan_version`、`active_plan_version`、`cancel_requested_at`、`final_summary_available` 和 `latest_attempts`，不返回原始 checkpoint。
 
-| 方法 | 作用 |
+| 方法与路径 | 作用 |
 |---|---|
+| `GET /api/sessions/{session_id}/plans` | 列出会话的计划及其版本、决定和运行记录 |
 | `GET /api/plans/{plan_id}?session_id=...` | 读取当前作用域 Plan 及版本历史 |
-| `POST /api/plans/{plan_id}/decisions` | 以 `decision_id`、`action`、`expected_version` 提交 approve/reject/revise |
-| `GET /api/runs/{run_id}?session_id=...` | 读取当前作用域 run 与恢复状态 |
-| `POST /api/runs/{run_id}/cancel` | 持久化取消请求并返回新的 run 状态 |
+| `POST /api/plans/{plan_id}/decision` | 提交 approve/reject/revise；成功响应为 SSE |
+| `POST /api/plans/{plan_id}/runs` | 重新执行当前已批准版本；成功响应为 SSE |
+| `GET /api/runs/{run_id}?session_id=...` | 读取当前作用域 run 与步骤尝试状态 |
+| `POST /api/runs/{run_id}/cancel` | 持久化取消请求；以 SSE 返回 run 状态 |
+| `POST /api/runs/{run_id}/summary/retry` | 重试等待中的最终总结；成功响应为 SSE |
 
-未知或跨作用域资源统一返回 `404`。版本、CAS 或重复决策冲突返回
-`409`；SSE 事件只作通知，客户端应在刷新或切换会话时重新 GET hydration。
+决策 body 包含 `session_id`、`decision_id`、`plan_version`、`expected_version` 和 `action`。`plan_version` 对应当前计划版本，`expected_version` 对应 `aggregate_version`；只有 `revise` 必须提供非空 `feedback`，其他 action 不接受反馈。重试同一决定时保留 `decision_id` 和请求内容。其他 POST 的 body 为 `{"session_id":"..."}`。
 
-外租户/不存在返回 `404`，已解决或 version 冲突返回 `409`，过期返回 `410`。客户端必须使用最近读取的 version，不能在冲突后盲目重试旧决策。
+未知或跨作用域资源统一返回 `404`。版本、CAS 或重复决策冲突返回 `409`；决策冲突响应可包含 `detail.code=plan_decision_conflict` 和最新 Plan。重新运行要求当前版本已批准且没有活动 run；总结重试也需要可重试状态，否则返回 `409`。
+
+控制流可能发送 `data-plan-decision`、`data-plan-revised`、`data-plan-step-status` 和 `data-run-status`。SSE 通知不能替代持久化状态：客户端在刷新、切换会话或处理冲突后应重新 GET。取消请求落库不代表已经结束，也不能撤回外部服务已接受的副作用。完整流程见 [Durable Plans 指南](durable-plans.md)。
 
 ## Secret：`/api/secrets`
 

@@ -1,6 +1,6 @@
 # MultiClaw 前端
 
-该目录是 MultiClaw 的 React 19 + TypeScript + Vite 8 Web 界面，负责邮箱认证、会话列表、聊天流、工具审批、租户 Secret 与账号删除恢复。项目总览和后端启动方式见[根 README](../README.md)。
+该目录是 MultiClaw 的 React 19 + TypeScript + Vite 8 Web 界面，负责邮箱认证、会话列表、聊天流、计划审核与执行状态、工具审批、租户 Secret 与账号删除恢复。项目总览和后端启动方式见[根 README](../README.md)。
 
 ## 安装与开发
 
@@ -34,13 +34,17 @@ npm run build
 - `src/components/assistant-ui/`：assistant-ui 消息、线程和工具渲染。
 - `src/components/chat/`：聊天视图。
 - `src/components/session/`：会话加载、切换和列表。
+- `src/components/plan/`：计划卡片、版本选择、步骤状态、批准/拒绝/修订和运行控制。
 - `src/components/approval/`：工具审批交互。
 - `src/components/login/`：邮箱验证码登录。
 - `src/components/settings/`：Secret 和账号删除设置。
 - `src/lib/api.ts`：HTTP 请求、CSRF 和响应错误边界。
+- `src/lib/plan-store.ts`：按会话加载计划、处理流式通知并刷新持久化状态。
 - `src/lib/auth-context.tsx`：认证状态生命周期。
 - `src/lib/session-store.ts`、`src/lib/chat-store.ts`：会话与聊天状态。
 
 优先复用现有组件、store 和 `@/` 路径别名。认证请求必须携带 cookie；变更请求通过 `src/lib/security.ts` 获取并发送双提交 CSRF token。
 
 更多后端/前端联调、日志、静态资源和提交要求见[开发指南](../docs/development.md)与[贡献指南](../CONTRIBUTING.md)。
+
+计划入口与后端模式配置见 [Durable Plans 指南](../docs/durable-plans.md)。工具审批与计划审批分别处理；会话切换或页面刷新后通过作用域 API 重建计划状态。
