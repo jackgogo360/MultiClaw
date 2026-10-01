@@ -12,6 +12,8 @@ MultiClaw 是一个面向单机部署的多租户 AI Agent 运行时，提供工
 - 通过 `tenant_id`、`workspace_id`、`session_id` 和 `run_id` 对持久化数据、运行时与事件流实施作用域隔离。
 - 使用租约、fencing token、CAS、检查点和恢复服务持久化工作流状态。
 - 支持 Durable Plans：先审核版本化计划，再按依赖顺序执行步骤，并提供取消、总结重试与重新运行入口。
+- 支持后台任务、进度重连、补充指令和会话排队；关闭页面后任务继续运行，并提供 Token/时间额度及用量查看。
+- 在模型调用前压缩长上下文，保留完整工具交换；按租户工作区加载项目规则，并为大工具输出提供可读取的文件引用。
 - 以 AES-256-GCM envelope 加密租户自带的模型与集成凭据；API 不返回明文 Secret。
 - 在 macOS Seatbelt 或 Linux nsjail 中运行受限 shell、代码执行和本地 stdio MCP 进程。
 - 通过同一套 SQLAlchemy/Alembic 边界支持 SQLite 与 MySQL。

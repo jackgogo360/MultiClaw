@@ -58,6 +58,11 @@ driver 与 URL scheme 必须匹配：SQLite 使用 `sqlite+aiosqlite://`，MySQL
 | `runtime.max_resident_tenants` | `MULTICLAW_RUNTIME__MAX_RESIDENT_TENANTS` | int / `32` / `1..1024` | 容量参数 |
 | `runtime.idle_ttl_seconds` | `MULTICLAW_RUNTIME__IDLE_TTL_SECONDS` | int / `900` / `>=30` | 容量参数 |
 | `runtime.max_concurrent_runs_per_tenant` | `MULTICLAW_RUNTIME__MAX_CONCURRENT_RUNS_PER_TENANT` | int / `2` / `1..32` | 租户配额 |
+| `runtime.max_run_seconds` | `MULTICLAW_RUNTIME__MAX_RUN_SECONDS` | int / `1800` / `1..86400` | 每段活动执行的时间上限；审批等待不占用活动执行时间 |
+| `runtime.max_run_tokens` | `MULTICLAW_RUNTIME__MAX_RUN_TOKENS` | int / `250000` / `>=1` | 每 run 累计输入和输出额度，恢复后继续累计 |
+| `runtime.tenant_daily_token_limit` | `MULTICLAW_RUNTIME__TENANT_DAILY_TOKEN_LIMIT` | int / `0` / `>=0` | UTC 日额度；0 为不限制；会话删除不会返还额度 |
+| `runtime.max_queued_messages` | `MULTICLAW_RUNTIME__MAX_QUEUED_MESSAGES` | int / `20` / `1..100` | 会话排队和待消费补充指令上限 |
+| `runtime.max_stream_events` | `MULTICLAW_RUNTIME__MAX_STREAM_EVENTS` | int / `10000` / `100..100000` | 会话进度日志保留上限 |
 
 `max_resident_tenants` 是进程内 resident runtime 数，不等于数据库租户数。达到上限且没有可安全回收的 idle runtime 时 API 返回 `503` 和 `Retry-After`。
 
@@ -122,8 +127,18 @@ JSON 合约：
 | `llm.default_model` | `MULTICLAW_LLM__DEFAULT_MODEL` | string / `gpt-4o` | 普通 |
 | `llm.providers` | `MULTICLAW_LLM__PROVIDERS` | map<string,map<string,string>> / `{}` | `base_url` 部署相关，`api_key` 敏感；整个映射可用 JSON |
 | `llm.capability_tags` | `MULTICLAW_LLM__CAPABILITY_TAGS` | map<string,string[]> / `{}` | 普通；声明模型能力标签 |
+| `llm.model_providers` | `MULTICLAW_LLM__MODEL_PROVIDERS` | map<string,string> / `{}` | 明确绑定模型与 provider；未绑定模型使用 default_provider |
+| `llm.max_retries` | `MULTICLAW_LLM__MAX_RETRIES` | int / `2` / `0..5` | 瞬时上游失败的额外尝试次数 |
+| `llm.retry_base_seconds` | `MULTICLAW_LLM__RETRY_BASE_SECONDS` | float / `0.25` / `0..30` | 指数退避起点 |
+| `llm.request_timeout_seconds` | `MULTICLAW_LLM__REQUEST_TIMEOUT_SECONDS` | float / `60` / `0<value<=600` | 非流式请求超时 |
+| `llm.stream_timeout_seconds` | `MULTICLAW_LLM__STREAM_TIMEOUT_SECONDS` | float / `300` / `0<value<=3600` | 流式 HTTP 超时，另受 run 时间上限限制 |
+| `llm.token_prices` | `MULTICLAW_LLM__TOKEN_PRICES` | map<string,map<string,float>> / `{}` | 可选模型单价，按每百万 Token 的 input_per_million/output_per_million 估算金额 |
 
 嵌套 provider 也可按路径覆盖，例如 `MULTICLAW_LLM__PROVIDERS__OPENAI__BASE_URL`。配置中的 provider API key 是部署级回退来源；租户 BYOK 应通过 `/api/secrets` 存储。默认 `allow_platform_fallback=false` 时两者不会静默混用。
+
+自定义 provider 配置 `adapter="openai"` 或 `adapter="anthropic"`，并通过 `model_providers` 显式绑定模型。未知 provider/adapter 安全失败。只有 429、5xx 和连接/超时错误会重试；已向调用方交付流事件后不会自动重试，工具副作用也不会由模型 HTTP 重试重放。
+
+用量优先采用 provider 报告；缺失时标记为估计。上下文和预留额度采用确定性估算，并非模型专用 tokenizer。金额只在配置单价后提供，缺失价格不会显示成零费用。部署方应按自己的账单配置价格。
 
 ## 上下文与记忆：`memory`
 
@@ -139,6 +154,8 @@ JSON 合约：
 | `memory.context_l1_ratio` | `MULTICLAW_MEMORY__CONTEXT_L1_RATIO` | float / `0.6` / `0<value<1` | 上下文预算 |
 
 没有显式 Pydantic 边界的数值仍应保持正值和业务合理范围；配置模型不会替部署方推断模型真实 context window。
+
+生产运行时在每次模型调用前统一计入消息、工具 schema 与响应预留，无论初始历史是否启用 progressive 策略。超限历史按完整工具交换压缩；目标、指令和最新用户输入保留。模型摘要失败或摘要请求本身过大时使用本地摘要。大工具输出保存到当前租户工作区 `.multiclaw/tool-results/`，模型获得有界预览及 `read_file` 路径。项目指令仅加载工作区内的 `AGENTS.md`、`CLAUDE.md` 和已访问目录的适用规则，不读取宿主机父目录或跟随符号链接。
 
 ## 治理与沙箱：`governance`
 

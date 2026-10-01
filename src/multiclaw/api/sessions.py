@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from multiclaw.api.dependencies import tenant_uow
+from multiclaw.api.dependencies import tenant_uow, tenant_context
+from multiclaw.tenancy import TenantContext
 from multiclaw.auth.middleware import require_recent_auth
 from multiclaw.observability import increment_metric, record_trace_event
 from multiclaw.security.redaction import redact
@@ -107,14 +108,24 @@ async def restore_session(
 @router.delete("/sessions/{session_id}")
 async def delete_session(
     session_id: str,
+    request: Request,
     _recent_user=Depends(require_recent_auth),
-    uow: TenantUnitOfWork = Depends(tenant_uow),
+    context: TenantContext = Depends(tenant_context),
 ):
     del _recent_user
-    session = await uow.sessions.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    await uow.sessions.delete(session_id)
+    session_context = context.for_session(session_id)
+    async with request.app.state.database.connect() as conn:
+        from multiclaw.storage.repositories.sessions import SessionRepository
+        sessions = SessionRepository(conn, context, request.app.state.database.dialect)
+        if await sessions.get(session_id) is None:
+            raise HTTPException(status_code=404, detail="session not found")
+    manager = getattr(request.app.state, "background_runs", None)
+    if manager is not None:
+        await manager.cancel_session(session_context)
+    async with TenantUnitOfWork(request.app.state.database, context,
+            planning_settings=request.app.state.settings.planning,
+            workflow_settings=request.app.state.settings.workflow) as uow:
+        await uow.sessions.delete(session_id)
     return {"ok": True}
 
 

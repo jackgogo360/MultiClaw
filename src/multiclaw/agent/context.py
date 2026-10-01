@@ -13,6 +13,7 @@ class ContextRequest:
     context: TenantContext
     context_window_limit: int
     skill_prompts: list[tuple[str, str]] = field(default_factory=list)
+    project_instructions: list[tuple[str, str]] = field(default_factory=list)
 
 
 class ContextBuilder:
@@ -55,6 +56,8 @@ class ContextBuilder:
 
     async def _build_legacy_result(self, request: ContextRequest) -> ContextBuildResult:
         messages: list[dict] = [{"role": "system", "content": request.system_prompt}]
+        instruction_messages = self._project_instruction_messages(request)
+        messages.extend(instruction_messages)
         anchor_message = self._temporal_anchor_message()
         messages.append({"role": "system", "content": anchor_message})
 
@@ -82,6 +85,7 @@ class ContextBuilder:
                 used_tokens_by_level={
                     "L0": estimate_tokens(request.system_prompt)
                     + estimate_tokens(anchor_message)
+                    + sum(estimate_tokens(message["content"]) for message in instruction_messages)
                     + estimate_tokens(request.user_input),
                     "L1": sum(estimate_tokens(body) for _, body in request.skill_prompts)
                     + sum(estimate_tokens(entry.content) for entry in recent_entries),
@@ -93,10 +97,14 @@ class ContextBuilder:
 
     async def _build_progressive_result(self, request: ContextRequest) -> ContextBuildResult:
         messages: list[dict] = [{"role": "system", "content": request.system_prompt}]
+        instruction_messages = self._project_instruction_messages(request)
+        messages.extend(instruction_messages)
         available_tokens = max(request.context_window_limit - self.response_reserve_tokens, 0)
         anchor_message = self._temporal_anchor_message()
 
-        system_tokens = estimate_tokens(request.system_prompt)
+        system_tokens = estimate_tokens(request.system_prompt) + sum(
+            estimate_tokens(message["content"]) for message in instruction_messages
+        )
         anchor_tokens = estimate_tokens(anchor_message)
         user_tokens = estimate_tokens(request.user_input)
         l0_tokens = system_tokens + user_tokens
@@ -146,6 +154,13 @@ class ContextBuilder:
                 },
             ),
         )
+
+    @staticmethod
+    def _project_instruction_messages(request: ContextRequest) -> list[dict]:
+        return [
+            {"role": "system", "content": f"Project instructions ({name}):\n{body}"}
+            for name, body in request.project_instructions
+        ]
 
     async def _recent_chat_entries(self, context: TenantContext) -> list[MemoryEntry]:
         recent_entries = await self.memory.recent(

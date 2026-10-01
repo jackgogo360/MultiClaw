@@ -339,10 +339,49 @@ export const planApi = {
 };
 
 export const runApi = {
+  list: (sessionId: string) => request<TaskRun[]>(`/sessions/${encodeURIComponent(sessionId)}/runs`),
+  usage: (sessionId: string, runId: string) => request<RunUsage>(`/runs/${encodeURIComponent(runId)}/usage?session_id=${encodeURIComponent(sessionId)}`),
+  events: async (sessionId: string, runId: string, signal: AbortSignal, cursor = "0"): Promise<Response> => {
+    const response = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/events?session_id=${encodeURIComponent(sessionId)}&cursor=${encodeURIComponent(cursor)}`, { credentials: "include", signal });
+    if (!response.ok) throw await parseErrorResponse(response);
+    return response;
+  },
+  steer: (sessionId: string, runId: string, message: string) => request<{ status: string }>(`/runs/${encodeURIComponent(runId)}/steer`, { method: "POST", body: JSON.stringify({ session_id: sessionId, message }) }),
+  queue: (sessionId: string, message: string) => request<{ queue_id: string; status: string }>(`/sessions/${encodeURIComponent(sessionId)}/queue`, { method: "POST", body: JSON.stringify({ message }) }),
+  queued: (sessionId: string) => request<QueuedTask[]>(`/sessions/${encodeURIComponent(sessionId)}/queue`),
   get: (sessionId: string, runId: string) => request<Record<string, unknown>>(`/runs/${runId}?session_id=${encodeURIComponent(sessionId)}`),
   cancel: (runId: string, sessionId: string) => streamMutation(`/runs/${runId}/cancel`, { session_id: sessionId }),
   retrySummary: (runId: string, sessionId: string) => streamMutation(`/runs/${runId}/summary/retry`, { session_id: sessionId }),
 };
+
+export interface TaskRun {
+  run_id: string;
+  session_id: string;
+  status: string;
+  created_at: number;
+  updated_at: number;
+  cancel_requested_at: number | null;
+}
+
+export interface RunUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  model_calls?: number;
+  estimated?: boolean;
+  estimated_cost?: number | null;
+  cost_complete?: boolean;
+  limits?: { max_run_tokens: number; max_run_seconds: number; tenant_daily_token_limit: number };
+}
+
+export interface QueuedTask {
+  queue_id: string;
+  message: string;
+  status: string;
+  error?: string | null;
+  run_id?: string | null;
+  created_at: number;
+}
 
 export const secretApi = {
   list: () => request<SecretMetadata[]>("/secrets"),

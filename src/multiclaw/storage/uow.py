@@ -199,10 +199,11 @@ class TenantUnitOfWork(_BaseUnitOfWork["TenantUnitOfWork"]):
         database: Database,
         context: TenantContext,
         *,
+        read_only: bool = False,
         planning_settings: PlanningSettings | None = None,
         workflow_settings: WorkflowSettings | None = None,
     ) -> None:
-        super().__init__(database)
+        super().__init__(database, read_only=read_only)
         self._context = context
         self._planning_settings = planning_settings or PlanningSettings()
         self._workflow_settings = workflow_settings or WorkflowSettings()

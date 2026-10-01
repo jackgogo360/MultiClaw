@@ -8,6 +8,8 @@ import {
   makeAssistantDataUI,
 } from "@assistant-ui/react";
 import type { PlanReference } from "@/lib/api";
+import { runApi } from "@/lib/api";
+import { chatStore } from "@/lib/chat-store";
 import { PlanCard } from "@/components/plan/PlanCard";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import remarkGfm from "remark-gfm";
@@ -271,7 +273,12 @@ export function Thread({
         <div className="flex items-center justify-between mt-3">
           <div className="flex items-center gap-2" />
           <div className="flex items-center gap-2">
-            <ComposerPrimitive.Cancel className="flex items-center gap-1.5 rounded-lg border border-danger/30 px-3 py-1.5 text-sm text-danger hover:bg-danger/10 transition-colors">
+            <ComposerPrimitive.Cancel onClick={() => {
+              const run = chatStore.getActiveRun();
+              if (run) void runApi.cancel(run.runId, run.sessionId).then((response) => response.text()).catch(() => {
+                // The task panel retains status and allows cancellation to be retried.
+              });
+            }} className="flex items-center gap-1.5 rounded-lg border border-danger/30 px-3 py-1.5 text-sm text-danger hover:bg-danger/10 transition-colors">
               <svg
                 width="14"
                 height="14"

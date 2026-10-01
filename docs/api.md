@@ -87,7 +87,22 @@ mock 邮件模式只跳过 provider 调用，不返回验证码，因此适合�
 - transient `data-event`，包含精确 tenant/workspace/session/run 作用域和已脱敏数据；
 - `finish-step` 与 `finish`，或 `error`。
 
-等待审批时 `finishReason` 为 `tool-calls`，run 持久化为 `AWAITING_USER`，并不等于 run 完成。正常结束使用 `stop`。客户端断开后应重新读取 session pending approvals 和持久化消息，不应凭本地 UI 推断数据库终态。
+等待审批时 `finishReason` 为 `tool-calls`，run 持久化为 `AWAITING_USER`，并不等于 run 完成。正常结束使用 `stop`。客户端断开只结束订阅，任务在服务端继续；同一会话已有活动执行时直接提交返回 `409`，可使用排队接口。刷新后从会话 Tasks 面板查看任务及进度，并重新读取 pending approvals 和持久化消息。
+
+### 后台任务与控制
+
+| 方法与路径 | 作用 |
+|---|---|
+| `GET /api/sessions/{session_id}/runs` | 最近 100 个当前会话 run 的持久状态 |
+| `GET /api/runs/{run_id}/events?session_id=...&cursor=0` | 读取并订阅已脱敏 SSE 日志；`id` 为会话内序号，可用 cursor 或 Last-Event-ID 续传 |
+| `GET /api/runs/{run_id}/usage?session_id=...` | 累计输入/输出 Token、调用次数、估计标记、可选估计费用及配置上限 |
+| `POST /api/runs/{run_id}/steer` | body 为 session_id/message；持久化补充指令，在后续模型调用边界消费 |
+| `POST /api/sessions/{session_id}/queue` | body 为 message；按会话 FIFO 排队，不阻塞当前订阅 |
+| `GET /api/sessions/{session_id}/queue` | 读取排队请求及执行/失败状态 |
+
+全部接口需要当前租户认证；变更需要 CSRF，越界资源返回 404。取消仍使用 `/api/runs/{run_id}/cancel`，会停止当前活动生产者；关闭页面或停止本地读流不会取消服务端工作。审批和沙箱要求在后台保持有效。进度日志只用于交付重放，不触发模型或工具重新执行。
+
+排队请求的状态持久化，服务进程重启后未完成队列显示 interrupted，需用户重新提交。已开始的 run 继续遵循现有检查点恢复规则；非幂等工具结果不确定时仍进入人工处理路径。Token 使用量跨恢复累计；时间上限约束每段活动执行。审批等待不保持运行生产者。
 
 ## 审批：`/api/approvals`
 

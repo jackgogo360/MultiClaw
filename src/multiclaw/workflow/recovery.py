@@ -696,11 +696,13 @@ class WorkflowRecoveryWorker:
         settings: Settings | None = None,
         runtime_pool,
         batch_size: int = 20,
+        background_runs=None,
     ) -> None:
         self._database = database
         self._settings = settings or Settings(_config_file="/nonexistent")
         self._runtime_pool = runtime_pool
         self._batch_size = batch_size
+        self._background_runs = background_runs
         self._recovery_service = RecoveryService(database, settings=self._settings)
         self._schema_unavailable_logged = False
 
@@ -799,6 +801,26 @@ class WorkflowRecoveryWorker:
         ]
 
     async def _process_candidate(self, candidate: _RecoveryCandidate) -> None:
+        if self._background_runs is None:
+            await self._execute_candidate(candidate)
+            return
+        if self._background_runs.session_busy(candidate.context):
+            return
+        from multiclaw.stream import DataStreamEncoder
+
+        async def stream():
+            encoder = DataStreamEncoder()
+            yield encoder.run_metadata(str(candidate.context.session_id), str(candidate.context.run_id))
+            await self._execute_candidate(candidate)
+            run = await WorkflowCoordinator(self._database, settings=self._settings).get_run(candidate.context)
+            if run is not None:
+                yield encoder.run_status({"run_id": str(candidate.context.run_id), "status": run.status.value})
+            yield encoder.finish("stop")
+
+        async with self._background_runs.session_admission(candidate.context):
+            await self._background_runs.start(candidate.context, stream())
+
+    async def _execute_candidate(self, candidate: _RecoveryCandidate) -> None:
         runtime = await self._maybe_await(
             self._runtime_pool.acquire(
                 TenantContext(

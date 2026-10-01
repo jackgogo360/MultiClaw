@@ -87,6 +87,11 @@ class RuntimeSettings(BaseModel):
     max_resident_tenants: int = Field(default=32, ge=1, le=1024)
     idle_ttl_seconds: int = Field(default=900, ge=30)
     max_concurrent_runs_per_tenant: int = Field(default=2, ge=1, le=32)
+    max_run_seconds: int = Field(default=1800, ge=1, le=86400)
+    max_run_tokens: int = Field(default=250000, ge=1)
+    tenant_daily_token_limit: int = Field(default=0, ge=0)
+    max_queued_messages: int = Field(default=20, ge=1, le=100)
+    max_stream_events: int = Field(default=10000, ge=100, le=100000)
 
 
 class WorkflowSettings(BaseModel):
@@ -131,6 +136,12 @@ class LLMSettings(BaseModel):
     default_model: str = "gpt-4o"
     providers: dict[str, dict[str, str]] = {}
     capability_tags: dict[str, list[str]] = {}
+    model_providers: dict[str, str] = Field(default_factory=dict)
+    max_retries: int = Field(default=2, ge=0, le=5)
+    retry_base_seconds: float = Field(default=0.25, ge=0, le=30)
+    request_timeout_seconds: float = Field(default=60, gt=0, le=600)
+    stream_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    token_prices: dict[str, dict[str, float]] = Field(default_factory=dict)
 
 
 class MemorySettings(BaseModel):
