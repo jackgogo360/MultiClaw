@@ -224,6 +224,11 @@ class AgentSettings(BaseModel):
     resilience_enabled: bool = False
     no_progress_repeat_limit: int = Field(default=3, ge=2, le=10)
     reflection_max_attempts: int = Field(default=1, ge=0, le=3)
+    subagents_enabled: bool = False
+    subagent_max_tasks: int = Field(default=3, ge=1, le=3)
+    subagent_max_rounds: int = Field(default=3, ge=1, le=10)
+    subagent_max_tokens: int = Field(default=20000, ge=1024, le=100000)
+    subagent_timeout_seconds: int = Field(default=180, ge=1, le=1800)
     system_prompt: str = (
         "You are MultiClaw, an AI assistant with access to tools. "
         "You are powered by a large language model. "

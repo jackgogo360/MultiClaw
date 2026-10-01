@@ -187,9 +187,16 @@ JSON 合约：
 | `agent.resilience_enabled` | `MULTICLAW_AGENT__RESILIENCE_ENABLED` | bool / `false` | 行为策略 |
 | `agent.no_progress_repeat_limit` | `MULTICLAW_AGENT__NO_PROGRESS_REPEAT_LIMIT` | int / `3` / `2..10` | 韧性策略 |
 | `agent.reflection_max_attempts` | `MULTICLAW_AGENT__REFLECTION_MAX_ATTEMPTS` | int / `1` / `0..3` | 韧性策略 |
+| `agent.subagents_enabled` | `MULTICLAW_AGENT__SUBAGENTS_ENABLED` | bool / `false` | 启用只读 `delegate_tasks`；默认关闭以避免额外模型调用 |
+| `agent.subagent_max_tasks` | `MULTICLAW_AGENT__SUBAGENT_MAX_TASKS` | int / `3` / `1..3` | 每次委派的子任务上限；子任务并行执行 |
+| `agent.subagent_max_rounds` | `MULTICLAW_AGENT__SUBAGENT_MAX_ROUNDS` | int / `3` / `1..10` | 每个子任务的工具轮次上限；必要时另有一次无工具总结调用 |
+| `agent.subagent_max_tokens` | `MULTICLAW_AGENT__SUBAGENT_MAX_TOKENS` | int / `20000` / `1024..100000` | 每个子任务的估算 Token 上限，仍受父 Run 总额度约束 |
+| `agent.subagent_timeout_seconds` | `MULTICLAW_AGENT__SUBAGENT_TIMEOUT_SECONDS` | int / `180` / `1..1800` | 单次委派工具最长执行时间，仍受父 Run 截止时间约束 |
 | `agent.system_prompt` | `MULTICLAW_AGENT__SYSTEM_PROMPT` | string / 代码内置默认 prompt | 安全敏感行为输入；变更需评估工具与数据泄露风险 |
 
 只读并行不允许把变更工具、需要审批的工具或同 run 恢复序列并行化。`web_fetch_allow_private_networks=true` 会放开内网目标，必须由独立网络边界和审计支撑。
+
+启用子 Agent 后，`delegate_tasks` 只向子任务开放内置 `read_file`、`glob`、`grep`、`list_dir` 和 `find_dir`；不开放网络、写入、Shell、代码执行、MCP 或再次委派。子任务可选默认模型或 `llm.model_providers` 中显式配置的模型。子任务继承父 Run 的租户作用域、取消和总 Token 额度，结果按输入顺序返回。崩溃恢复可重新执行这一只读委派，可能重复消耗模型 Token；子任务尚无独立持久化 Run。
 
 ## Skills：`skills`
 

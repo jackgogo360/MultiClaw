@@ -153,6 +153,45 @@ class InferenceBudget:
 _BUDGET: ContextVar[InferenceBudget | None] = ContextVar("multiclaw_inference_budget", default=None)
 
 
+@dataclass
+class SubagentInferenceBudget:
+    max_tokens: int
+    total_tokens: int = 0
+
+    def remaining_after_input(self, input_tokens: int) -> int:
+        remaining = self.max_tokens - self.total_tokens - input_tokens
+        if remaining <= 0:
+            raise RunBudgetExceeded("Subagent inference budget exceeded")
+        return remaining
+
+    def record(self, usage: Any, input_estimate: int, output: str) -> None:
+        if hasattr(usage, "model_dump"):
+            usage = usage.model_dump()
+        if not isinstance(usage, dict):
+            usage = {}
+        self.total_tokens += max(
+            input_estimate + estimate_tokens(output),
+            int(usage.get("total_tokens") or 0),
+        )
+
+
+_SUBAGENT_BUDGET: ContextVar[SubagentInferenceBudget | None] = ContextVar(
+    "multiclaw_subagent_inference_budget", default=None
+)
+
+
+@contextmanager
+def subagent_inference_scope(*, max_tokens: int):
+    if max_tokens < 1:
+        raise ValueError("subagent max_tokens must be positive")
+    budget = SubagentInferenceBudget(max_tokens)
+    token = _SUBAGENT_BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _SUBAGENT_BUDGET.reset(token)
+
+
 def current_inference_budget() -> InferenceBudget | None:
     return _BUDGET.get()
 
@@ -194,12 +233,13 @@ class InferenceRouter:
         from multiclaw.agent.instructions import load_project_instructions
 
         budget = current_inference_budget()
+        child_budget = _SUBAGENT_BUDGET.get()
         if budget is not None:
             from multiclaw.runtime.run_control import check_cancel, collect_steering
             await check_cancel(budget.context)
             await budget.load()
             budget.check()
-            if not budget.objective:
+            if child_budget is None and not budget.objective:
                 budget.objective = next((item.get("content", "") for item in reversed(messages) if item.get("role") == "user" and isinstance(item.get("content"), str)), "")
                 try:
                     objective_data = json.loads(budget.objective)
@@ -207,14 +247,15 @@ class InferenceRouter:
                     objective_data = None
                 if isinstance(objective_data, dict) and isinstance(objective_data.get("objective"), str):
                     budget.objective = objective_data["objective"]
-            budget.steering.extend(await collect_steering(budget.context))
-            for text in budget.steering:
-                if not any(item.get("role") == "user" and item.get("content") == text for item in messages):
-                    messages.append({"role": "user", "content": text})
-            if budget.objective and sum(item.get("role") == "user" for item in messages) > 1:
-                objective = f"Current task objective:\n{budget.objective}"
-                if not any(item.get("content") == objective for item in messages):
-                    messages.insert(1, {"role": "system", "content": objective})
+            if child_budget is None:
+                budget.steering.extend(await collect_steering(budget.context))
+                for text in budget.steering:
+                    if not any(item.get("role") == "user" and item.get("content") == text for item in messages):
+                        messages.append({"role": "user", "content": text})
+                if budget.objective and sum(item.get("role") == "user" for item in messages) > 1:
+                    objective = f"Current task objective:\n{budget.objective}"
+                    if not any(item.get("content") == objective for item in messages):
+                        messages.insert(1, {"role": "system", "content": objective})
         workspace_root = self._workspace_root or (budget.workspace_root if budget else None)
         if workspace_root is not None:
             messages[:] = [item for item in messages if not (
@@ -230,7 +271,7 @@ class InferenceRouter:
                         continue
                     if isinstance(arguments, dict):
                         paths.extend(value for key, value in arguments.items() if key in {"path", "file_path", "cwd"} and isinstance(value, str))
-            if budget is not None:
+            if budget is not None and child_budget is None:
                 budget.project_paths = list(dict.fromkeys([*budget.project_paths, *paths]))
                 paths = budget.project_paths
             insertion = 1
@@ -253,12 +294,19 @@ class InferenceRouter:
                 raise ValueError("Summary request exceeds context window")
             if budget is not None and summary_estimate + budget.total_tokens >= self._settings.runtime.max_run_tokens:
                 raise RunBudgetExceeded("Run inference budget exceeded")
+            child_remaining = child_budget.remaining_after_input(summary_estimate) if child_budget else None
             reservation = await self._reserve(budget, summary_estimate)
             try:
+                summary_kwargs = (
+                    {"max_output_tokens": min(1000, child_remaining)}
+                    if child_remaining is not None else {}
+                )
                 response = await self._router.completion(model=self._settings.llm.default_model, messages=summary_messages, tools=None,
-                                                        **self._output_limit(summary_estimate, reservation, {}))
+                                                        **self._output_limit(summary_estimate, reservation, summary_kwargs))
                 if budget is not None:
                     await budget.record(self._settings.llm.default_model, getattr(response, "usage", {}), summary_estimate, response.content)
+                if child_budget is not None:
+                    child_budget.record(getattr(response, "usage", {}), summary_estimate, response.content)
                 return response.content
             finally:
                 await self._release(budget, reservation)
@@ -311,17 +359,32 @@ class InferenceRouter:
     def _output_limit(self, estimate, reservation, kwargs):
         if getattr(self._router, "supports_output_limit", False):
             maximum = reservation - estimate if reservation else self._settings.memory.context_response_reserve_tokens
-            kwargs = {**kwargs, "max_output_tokens": max(1, min(self._settings.memory.context_response_reserve_tokens, maximum))}
+            requested = kwargs.get("max_output_tokens")
+            kwargs = {**kwargs, "max_output_tokens": max(1, min(
+                self._settings.memory.context_response_reserve_tokens,
+                maximum,
+                requested if requested is not None else maximum,
+            ))}
         return kwargs
 
     async def completion(self, model, messages, tools=None, **kwargs):
         prepared, estimate, budget = await self._prepare(messages, tools)
+        child_budget = _SUBAGENT_BUDGET.get()
+        if child_budget is not None:
+            child_remaining = child_budget.remaining_after_input(estimate)
+            requested = kwargs.get("max_output_tokens")
+            kwargs["max_output_tokens"] = min(
+                child_remaining,
+                requested if requested is not None else child_remaining,
+            )
         reservation = await self._reserve(budget, estimate)
         try:
             response = await self._router.completion(model=model, messages=prepared, tools=tools, **self._output_limit(estimate, reservation, kwargs))
+            output = response.content + getattr(response, "reasoning_content", "") + json.dumps([call.model_dump() if hasattr(call, "model_dump") else call for call in getattr(response, "tool_calls", [])])
             if budget is not None:
-                output = response.content + getattr(response, "reasoning_content", "") + json.dumps([call.model_dump() if hasattr(call, "model_dump") else call for call in getattr(response, "tool_calls", [])])
                 await budget.record(model, getattr(response, "usage", {}), estimate, output)
+            if child_budget is not None:
+                child_budget.record(getattr(response, "usage", {}), estimate, output)
             return response
         finally:
             await self._release(budget, reservation)

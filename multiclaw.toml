@@ -97,6 +97,11 @@ read_hidden_workspace_paths = [".env", ".env.*"]
 [agent]
 max_tool_rounds = 100
 resilience_enabled = true
+subagents_enabled = false
+subagent_max_tasks = 3
+subagent_max_rounds = 3
+subagent_max_tokens = 20000
+subagent_timeout_seconds = 180
 
 [auth]
 # Set MULTICLAW_AUTH_JWT_SIGNING_KEY in the environment when needed.

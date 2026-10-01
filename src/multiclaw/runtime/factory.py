@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy import exc as sa_exc
 
 from multiclaw.agent import MultiClawAgent
+from multiclaw.agent.delegation import ReadOnlyDelegationRunner
 from multiclaw.config import Settings
 from multiclaw.events import EventBus, EventRouter
 from multiclaw.governance import (
@@ -38,6 +39,7 @@ from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy import TenantContext, WorkspaceResolver
 from multiclaw.tools import CoreToolScheduler, ToolRegistry
 from multiclaw.tools.code_exec import CodeExecToolBuilder
+from multiclaw.tools.delegate_tasks import DelegateTasksToolBuilder
 from multiclaw.tools.edit_file import EditFileToolBuilder, UndoEditToolBuilder
 from multiclaw.tools.find_dir import FindDirToolBuilder
 from multiclaw.tools.glob import GlobToolBuilder
@@ -168,6 +170,7 @@ class RuntimeFactory:
             scheduler = self._build_scheduler(event_bus)
             scheduler.event_router = event_router
             router = self._build_router(context)
+            self._register_delegation(registry, scheduler, router, event_router)
             plan_generator = PlanGenerator(
                 router,
                 default_model=self.settings.llm.default_model,
@@ -334,6 +337,24 @@ class RuntimeFactory:
             database=self.database,
             settings=self.settings,
         )
+
+    def _register_delegation(
+        self,
+        registry: ToolRegistry,
+        scheduler: CoreToolScheduler,
+        router: ModelRouter,
+        event_router: EventRouter,
+    ) -> None:
+        if not self.settings.agent.subagents_enabled:
+            return
+        runner = ReadOnlyDelegationRunner(
+            settings=self.settings,
+            router=router,
+            registry=registry,
+            scheduler=scheduler,
+            event_router=event_router,
+        )
+        registry.register(DelegateTasksToolBuilder(settings=self.settings, runner=runner))
 
     def _build_registry(
         self,

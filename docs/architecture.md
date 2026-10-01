@@ -23,6 +23,7 @@ MultiClaw `0.1.0` 是单进程、单机 `standalone` Agent 运行时。它在一
 | 删除生命周期 | [`deletion/service.py`](../src/multiclaw/deletion/service.py) · [`deletion/worker.py`](../src/multiclaw/deletion/worker.py) | 延迟删除、恢复窗口和最终清除 |
 | Web 界面 | [`frontend/src/`](../frontend/src/) | 认证、会话、聊天流、审批、Secret 与删除恢复 |
 | Durable Plan | [`planner/`](../src/multiclaw/planner/) · [`workflow/`](../src/multiclaw/workflow/) | 版本化 Plan、DAG 步骤、审批、租约、检查点和恢复 |
+| 只读子 Agent | [`agent/delegation.py`](../src/multiclaw/agent/delegation.py) · [`tools/delegate_tasks.py`](../src/multiclaw/tools/delegate_tasks.py) | 在一个父 Run 内并行调查、限制工具/轮次/额度，并记录作用域事件 |
 
 ## 组件关系
 
@@ -114,6 +115,8 @@ WorkflowCoordinator 负责 run/lease/checkpoint/tool execution 的可变状态�
 [`POST /api/chat`](../src/multiclaw/api/chat.py) 为每次消息创建或验证 session，生成新的 `run_id`，先持久化 run 与初始 checkpoint，再启动 SSE。流的前几个控制 chunk 依次为 `start`、瞬时 `data-session`、瞬时 `data-run` 和 `start-step`；之后才是文本、推理、工具、审批和作用域事件。公开事件数据在编码前经过脱敏。
 
 SSE 断开不等于数据库 run 自动完成。workflow heartbeat、终态持久化与恢复服务共同决定后续处置。
+
+可选的 `delegate_tasks` 工具在父 Run 内并行启动最多三个只读子 Agent。每个子 Agent 拥有独立模型消息历史，但继续使用父 Run 的 `TenantContext`、取消控制和推理总额度；执行时还检查子任务自己的轮次、估算 Token 和工具白名单。`subagent.started`、`subagent.completed`、`subagent.failed` 事件通过父 Run 的精确作用域投递并进入现有事件重放日志。子 Agent 本身不是独立 Run：它随父工具调用结束，崩溃后的只读重放可能再次消耗模型额度。
 
 ## 可恢复工作流
 
