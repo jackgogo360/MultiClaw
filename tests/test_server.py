@@ -915,11 +915,11 @@ def test_plan_api_scopes_reads_and_streams_approved_execution(migrated_database,
 
 
 @pytest.mark.asyncio
-async def test_plan_execution_disconnect_terminalizes_durable_leases(
+async def test_plan_execution_disconnect_preserves_run_until_explicit_cancel(
     migrated_database,
     monkeypatch,
 ):
-    """Cancelling any Plan execution SSE stream must release its durable lease."""
+    """Disconnecting an SSE consumer preserves execution until explicit cancellation."""
     from multiclaw import server
     from multiclaw.api import plans as plans_api
     from multiclaw.api import runs as runs_api
@@ -1038,7 +1038,11 @@ async def test_plan_execution_disconnect_terminalizes_durable_leases(
         consume_task.cancel()
         await asyncio.gather(consume_task, return_exceptions=True)
         await response.body_iterator.aclose()
-        return _decode_sse_messages("".join(chunks))[0]["data"]["run_id"]
+        metadata = _decode_sse_messages("".join(chunks))[0]["data"]
+        run_context = root.for_run(metadata["session_id"], metadata["run_id"])
+        assert server.app.state.background_runs.active(run_context)
+        await server.app.state.background_runs.cancel(run_context)
+        return metadata["run_id"]
 
     with TestClient(server.app):
         user_id, _ = await _seed_user(migrated_database, "plan-disconnect@example.com")
@@ -1091,7 +1095,7 @@ async def test_plan_execution_disconnect_terminalizes_durable_leases(
         approval_context = root.for_run(session_id, approval_run_id)
         assert (
             await _run_status(migrated_database, approval_context)
-            == RunStatus.FAILED_TERMINAL.value
+            == RunStatus.CANCELLED.value
         )
 
         runtime = captured["runtime"]
@@ -1111,7 +1115,7 @@ async def test_plan_execution_disconnect_terminalizes_durable_leases(
         rerun_context = root.for_run(session_id, rerun_run_id)
         assert (
             await _run_status(migrated_database, rerun_context)
-            == RunStatus.FAILED_TERMINAL.value
+            == RunStatus.CANCELLED.value
         )
         assert runtime.active_executing_run_count == captured["executing_runs_before_stream"]
         assert runtime.active_run_count == captured["active_runs_before_stream"]
@@ -1153,7 +1157,7 @@ async def test_plan_execution_disconnect_terminalizes_durable_leases(
         assert retried_run_id == summary_run_id
         assert await _run_status(
             migrated_database, root.for_run(summary_session_id, summary_run_id)
-        ) == RunStatus.FAILED_TERMINAL.value
+        ) == RunStatus.CANCELLED.value
         assert runtime.active_executing_run_count == captured["executing_runs_before_stream"]
         assert runtime.active_run_count == captured["active_runs_before_stream"]
 
@@ -4421,32 +4425,17 @@ async def test_chat_stream_persists_assistant_output_and_model_checkpoint_before
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
             response = await chat_api.chat(chat_api.ChatRequest(message="hello"), request, context, uow)
 
-        chunks: list[str] = []
-
-        async def consume() -> None:
-            async for chunk in response.body_iterator:
-                chunks.append(chunk)
-
-        consume_task = asyncio.create_task(consume())
         await checkpoint_started.wait()
-
-        run_event = next(
-            json.loads(chunk[6:])
-            for chunk in chunks
-            if chunk.startswith("data: ") and '"type":"data-run"' in chunk
-        )
         run_context = context.for_run(
-            run_event["data"]["session_id"],
-            run_event["data"]["run_id"],
+            response.headers["X-Session-ID"],
+            response.headers["X-Run-ID"],
         )
         assert await _assistant_chat_messages(migrated_database, run_context) == []
         assert [row["phase"] for row in await _checkpoint_rows(migrated_database, run_context)] == [
             CheckpointPhase.RUN_STARTED.value
         ]
-        assert not any('"type":"finish"' in chunk for chunk in chunks)
-
         release_checkpoint.set()
-        await consume_task
+        chunks = [chunk async for chunk in response.body_iterator]
 
     assistant_messages = await _assistant_chat_messages(migrated_database, run_context)
     checkpoints = await _checkpoint_rows(migrated_database, run_context)
@@ -5015,7 +5004,7 @@ async def test_chat_passes_run_lease_handle_with_refreshed_snapshot(migrated_dat
 
 
 @pytest.mark.asyncio
-async def test_chat_client_cancel_stops_lease_heartbeat_updates(migrated_database, monkeypatch):
+async def test_chat_disconnect_keeps_heartbeats_until_explicit_cancel(migrated_database, monkeypatch):
     import multiclaw.server as server
     from multiclaw.storage.uow import TenantUnitOfWork
     from multiclaw.workflow.coordinator import WorkflowCoordinator
@@ -5071,6 +5060,9 @@ async def test_chat_client_cancel_stops_lease_heartbeat_updates(migrated_databas
         await asyncio.gather(consume_task, return_exceptions=True)
         await response.body_iterator.aclose()
         await asyncio.sleep(0.18)
+        disconnected_snapshot = await captured["run_lease_handle"].current()
+        assert disconnected_snapshot.version > mid_version
+        await server.app.state.background_runs.cancel(captured["context"])
         final_snapshot = await captured["run_lease_handle"].current()
         await asyncio.sleep(0.18)
         stable_snapshot = await captured["run_lease_handle"].current()
@@ -5184,7 +5176,7 @@ def test_chat_runtime_signal_resets_after_stream_error(migrated_database, monkey
 
 
 @pytest.mark.asyncio
-async def test_chat_runtime_signal_resets_after_client_disconnect(migrated_database, monkeypatch):
+async def test_chat_runtime_signal_stays_active_after_client_disconnect(migrated_database, monkeypatch):
     import multiclaw.server as server
     from multiclaw.storage.uow import TenantUnitOfWork
 
@@ -5242,6 +5234,10 @@ async def test_chat_runtime_signal_resets_after_client_disconnect(migrated_datab
             pending_chunk.cancel()
             await asyncio.gather(pending_chunk, return_exceptions=True)
             await response.body_iterator.aclose()
+            runtime = holder["runtime"]
+            assert runtime.active_executing_run_count == 1
+            producer_context = next(iter(server.app.state.background_runs._producers.values())).context
+            await server.app.state.background_runs.cancel(producer_context)
 
     runtime = holder["runtime"]
     assert runtime.active_executing_run_count == 0
@@ -5300,6 +5296,8 @@ async def test_chat_runtime_signal_resets_when_client_closes_after_first_chunk(
             assert runtime.active_run_count == 1
             await anext(response.body_iterator)
             await response.body_iterator.aclose()
+            producer_context = next(iter(server.app.state.background_runs._producers.values())).context
+            await server.app.state.background_runs.wait(producer_context)
 
     runtime = holder["runtime"]
     assert runtime.active_executing_run_count == 0

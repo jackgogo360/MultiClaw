@@ -19,6 +19,11 @@ root = "data/workspaces"
 max_resident_tenants = 32
 idle_ttl_seconds = 900
 max_concurrent_runs_per_tenant = 2
+max_run_seconds = 1800
+max_run_tokens = 250000
+tenant_daily_token_limit = 0
+max_queued_messages = 20
+max_stream_events = 10000
 
 [workflow]
 heartbeat_ms = 5000
@@ -46,6 +51,14 @@ max_step_attempts = 2
 [llm]
 default_provider = "deepseek"
 default_model = "deepseek-v4-pro"
+max_retries = 2
+retry_base_seconds = 0.25
+
+[llm.model_providers]
+"gpt-4o-mini" = "openai"
+"claude-sonnet-4-6" = "anthropic"
+"deepseek-chat" = "deepseek"
+"deepseek-v4-pro" = "deepseek"
 
 [llm.providers.openai]
 api_key = ""
@@ -68,6 +81,8 @@ base_url = "https://api.deepseek.com/v1"
 [memory]
 short_term_limit = 100
 context_window_limit = 128000
+progressive_context_enabled = true
+context_response_reserve_tokens = 4096
 
 [governance]
 audit_enabled = true
@@ -80,7 +95,8 @@ write_protected_workspace_paths = [".git"]
 read_hidden_workspace_paths = [".env", ".env.*"]
 
 [agent]
-max_tool_rounds = 10
+max_tool_rounds = 100
+resilience_enabled = true
 
 [auth]
 # Set MULTICLAW_AUTH_JWT_SIGNING_KEY in the environment when needed.

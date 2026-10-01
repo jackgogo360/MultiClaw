@@ -31,6 +31,8 @@ from multiclaw.planner.models import (
 from multiclaw.planner.service import PlanningService
 from multiclaw.planner.validation import sanitize_plan_text
 from multiclaw.runtime.pool import RuntimeUnavailableError
+from multiclaw.runtime.background import background_response, background_manager
+from multiclaw.runtime.run_control import cancellation_status
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.stream import DataStreamEncoder
 from multiclaw.tenancy import TenantContext
@@ -227,7 +229,15 @@ async def _terminalize_cancelled_stream(
     handle: RunLeaseHandle,
 ) -> None:
     """Finish durable cleanup before propagating an SSE cancellation."""
-    cleanup_task = asyncio.create_task(_terminalize_stream_error(request, handle))
+    async def terminalize():
+        with suppress(Exception):
+            await handle.refresh(
+                lambda lease: WorkflowCoordinator(
+                    request.app.state.database, settings=request.app.state.settings
+                ).finish_run_with_checkpoint(lease, cancellation_status(lease.context))
+            )
+
+    cleanup_task = asyncio.create_task(terminalize())
     while not cleanup_task.done():
         try:
             await asyncio.shield(cleanup_task)
@@ -297,6 +307,7 @@ async def _scoped_uow(
     async with TenantUnitOfWork(
         request.app.state.database,
         session_context,
+        read_only=True,
         planning_settings=request.app.state.settings.planning,
         workflow_settings=request.app.state.settings.workflow,
     ) as uow:
@@ -372,104 +383,105 @@ async def decide_plan(
             request, context, body.session_id, plan_id
         )
 
-    runtime = await request.app.state.runtime_pool.acquire(session_context)
-    coordinator = getattr(runtime, "plan_execution", None)
-    if coordinator is None:
-        raise HTTPException(status_code=503, detail="runtime temporarily unavailable")
-    service: PlanningService | None = getattr(coordinator, "planning_service", None)
-    if service is None:
-        raise HTTPException(status_code=503, detail="runtime temporarily unavailable")
-    try:
-        result = await service.decide(
-            decision_request,
-            decided_by=context.tenant_id,
-            runtime_instance_id=runtime.runtime_instance_id,
-        )
-    except PlanNotFoundError as error:
-        raise _not_found() from error
-    except PlanDecisionIdempotencyError:
-        return await _decision_conflict_response(
-            request, context, body.session_id, plan_id
-        )
-    except PlanVersionConflictError as error:
-        async for uow, _ in _scoped_uow(request, context, body.session_id):
-            latest = await build_plan_response(uow, error.latest)
-        return JSONResponse(
-            {
-                "detail": {
-                    "code": "plan_version_conflict",
-                    "latest": latest.model_dump(mode="json"),
-                }
-            },
-            status_code=409,
-        )
-
-    runtime_lease = None
-    handle = None
-    if result.lease is not None and not result.idempotent_replay:
+    async with background_manager(request).session_admission(session_context):
+        runtime = await request.app.state.runtime_pool.acquire(session_context)
+        coordinator = getattr(runtime, "plan_execution", None)
+        if coordinator is None:
+            raise HTTPException(status_code=503, detail="runtime temporarily unavailable")
+        service: PlanningService | None = getattr(coordinator, "planning_service", None)
+        if service is None:
+            raise HTTPException(status_code=503, detail="runtime temporarily unavailable")
         try:
-            runtime_lease = runtime.begin_run()
-        except RuntimeError as error:
-            with suppress(Exception):
-                await WorkflowCoordinator(
-                    request.app.state.database, settings=request.app.state.settings
-                ).finish_run_with_checkpoint(result.lease, RunStatus.CANCELLED)
-            raise RuntimeUnavailableError(
-                request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
-            ) from error
-        handle = RunLeaseHandle(result.lease)
+            result = await service.decide(
+                decision_request,
+                decided_by=context.tenant_id,
+                runtime_instance_id=runtime.runtime_instance_id,
+            )
+        except PlanNotFoundError as error:
+            raise _not_found() from error
+        except PlanDecisionIdempotencyError:
+            return await _decision_conflict_response(
+                request, context, body.session_id, plan_id
+            )
+        except PlanVersionConflictError as error:
+            async for uow, _ in _scoped_uow(request, context, body.session_id):
+                latest = await build_plan_response(uow, error.latest)
+            return JSONResponse(
+                {
+                    "detail": {
+                        "code": "plan_version_conflict",
+                        "latest": latest.model_dump(mode="json"),
+                    }
+                },
+                status_code=409,
+            )
 
-    async def stream() -> AsyncIterator[str]:
-        encoder = DataStreamEncoder()
-        try:
-            yield encoder.run_metadata(body.session_id, str(result.run.context.run_id))
-            if result.decision.action is PlanDecisionAction.REVISE:
-                yield encoder.plan_revised(
+        runtime_lease = None
+        handle = None
+        if result.lease is not None and not result.idempotent_replay:
+            try:
+                runtime_lease = runtime.begin_run()
+            except RuntimeError as error:
+                with suppress(Exception):
+                    await WorkflowCoordinator(
+                        request.app.state.database, settings=request.app.state.settings
+                    ).finish_run_with_checkpoint(result.lease, RunStatus.CANCELLED)
+                raise RuntimeUnavailableError(
+                    request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
+                ) from error
+            handle = RunLeaseHandle(result.lease)
+
+        async def stream() -> AsyncIterator[str]:
+            encoder = DataStreamEncoder()
+            try:
+                yield encoder.run_metadata(body.session_id, str(result.run.context.run_id))
+                if result.decision.action is PlanDecisionAction.REVISE:
+                    yield encoder.plan_revised(
+                        {
+                            "plan_id": result.snapshot.plan_id,
+                            "current_version": result.snapshot.current_version,
+                        }
+                    )
+                yield encoder.plan_decision(
                     {
                         "plan_id": result.snapshot.plan_id,
-                        "current_version": result.snapshot.current_version,
+                        "decision": PlanDecisionResponse(
+                            **asdict(result.decision)
+                        ).model_dump(mode="json"),
+                        "idempotent_replay": result.idempotent_replay,
                     }
                 )
-            yield encoder.plan_decision(
-                {
-                    "plan_id": result.snapshot.plan_id,
-                    "decision": PlanDecisionResponse(
-                        **asdict(result.decision)
-                    ).model_dump(mode="json"),
-                    "idempotent_replay": result.idempotent_replay,
-                }
-            )
-            if handle is not None:
-                outcome = await coordinator.execute_with_final_summary(
-                    context=result.run.context,
-                    run_lease_handle=handle,
-                    runner=runtime.agent,
-                )
-                async for uow, _ in _scoped_uow(request, context, body.session_id):
-                    persisted = await uow.workflow.get_run(result.run.context)
-                    if persisted is not None:
-                        response = await build_run_response(uow, persisted)
-                        for attempt in response.latest_attempts:
-                            yield encoder.plan_step_status(attempt.model_dump(mode="json"))
-                if outcome.state == "awaiting_user":
-                    yield encoder.run_status(
-                        {"run_id": str(result.run.context.run_id), "status": "awaiting_user"}
+                if handle is not None:
+                    outcome = await coordinator.execute_with_final_summary(
+                        context=result.run.context,
+                        run_lease_handle=handle,
+                        runner=runtime.agent,
                     )
-            yield encoder.finish("stop")
-        except asyncio.CancelledError:
-            if handle is not None:
-                await _terminalize_cancelled_stream(request, handle)
-            raise
-        except Exception:  # noqa: BLE001 - SSE must terminalize any internal failure.
-            if handle is not None:
-                await _terminalize_stream_error(request, handle)
-            yield encoder.error("Plan execution failed")
-            yield encoder.finish("error")
-        finally:
-            if runtime_lease is not None:
-                runtime_lease.close()
+                    async for uow, _ in _scoped_uow(request, context, body.session_id):
+                        persisted = await uow.workflow.get_run(result.run.context)
+                        if persisted is not None:
+                            response = await build_run_response(uow, persisted)
+                            for attempt in response.latest_attempts:
+                                yield encoder.plan_step_status(attempt.model_dump(mode="json"))
+                    if outcome.state == "awaiting_user":
+                        yield encoder.run_status(
+                            {"run_id": str(result.run.context.run_id), "status": "awaiting_user"}
+                        )
+                yield encoder.finish("stop")
+            except asyncio.CancelledError:
+                if handle is not None:
+                    await _terminalize_cancelled_stream(request, handle)
+                raise
+            except Exception:  # noqa: BLE001 - SSE must terminalize any internal failure.
+                if handle is not None:
+                    await _terminalize_stream_error(request, handle)
+                yield encoder.error("Plan execution failed")
+                yield encoder.finish("error")
+            finally:
+                if runtime_lease is not None:
+                    runtime_lease.close()
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+        return await background_response(request, result.run.context, stream(), runtime_lease=runtime_lease, run_lease_handle=handle)
 
 
 @router.post("/plans/{plan_id}/runs")
@@ -482,84 +494,85 @@ async def rerun_plan(
     session_context = context.for_session(body.session_id)
     async for uow, checked_context in _scoped_uow(request, context, body.session_id):
         await _load_scoped_plan(uow, checked_context, plan_id)
-    runtime = await request.app.state.runtime_pool.acquire(session_context)
-    run_context = session_context.for_run(body.session_id, str(uuid4()))
-    try:
-        async with TenantUnitOfWork(
-            request.app.state.database,
-            session_context,
-            planning_settings=request.app.state.settings.planning,
-            workflow_settings=request.app.state.settings.workflow,
-        ) as uow:
-            await _require_session(uow, body.session_id)
-            plan = await uow.plans.lock_aggregate(plan_id)
-            if (
-                plan.status.value != "approved"
-                or plan.approved_version is None
-                or plan.approved_version != plan.current_version
-            ):
-                raise HTTPException(status_code=409, detail="Plan is not approved")
-            runs = await uow.workflow.list_plan_runs(
-                session_context, plan_id, for_update=True
-            )
-            if any(run.status not in _TERMINAL_RUN_STATUSES for run in runs):
-                raise HTTPException(status_code=409, detail="Plan already has an active run")
-            workflow = WorkflowCoordinator(
-                request.app.state.database,
-                settings=request.app.state.settings,
-                connection=uow.conn,
-            )
-            # Existing Coordinator owns quota, lease and RUN_STARTED durability.
-            lease = await workflow.start_approved_plan_run_with_checkpoint(
-                run_context,
-                runtime.runtime_instance_id,
-                plan_id=plan.plan_id,
-                plan_version=plan.current_version,
-                plan_digest=plan.current.content_digest,
-            )
-    except PlanNotFoundError as error:
-        raise _not_found() from error
-    except TenantRunQuotaError as error:
-        raise HTTPException(status_code=429, detail=str(error)) from error
-
-    try:
-        runtime_lease = runtime.begin_run()
-    except RuntimeError as error:
-        with suppress(Exception):
-            await WorkflowCoordinator(
-                request.app.state.database, settings=request.app.state.settings
-            ).finish_run_with_checkpoint(lease, RunStatus.CANCELLED)
-        raise RuntimeUnavailableError(
-            request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
-        ) from error
-    handle = RunLeaseHandle(lease)
-
-    async def stream() -> AsyncIterator[str]:
-        encoder = DataStreamEncoder()
+    async with background_manager(request).session_admission(session_context):
+        runtime = await request.app.state.runtime_pool.acquire(session_context)
+        run_context = session_context.for_run(body.session_id, str(uuid4()))
         try:
-            yield encoder.run_metadata(body.session_id, str(run_context.run_id))
-            attempts = await coordinator_execute_and_emit(
-                request=request,
-                context=context,
-                session_id=body.session_id,
-                runtime=runtime,
-                run_context=run_context,
-                handle=handle,
-            )
-            for attempt in attempts:
-                yield encoder.plan_step_status(attempt)
-            yield encoder.finish("stop")
-        except asyncio.CancelledError:
-            await _terminalize_cancelled_stream(request, handle)
-            raise
-        except Exception:  # noqa: BLE001 - SSE must terminalize any internal failure.
-            await _terminalize_stream_error(request, handle)
-            yield encoder.error("Plan execution failed")
-            yield encoder.finish("error")
-        finally:
-            runtime_lease.close()
+            async with TenantUnitOfWork(
+                request.app.state.database,
+                session_context,
+                planning_settings=request.app.state.settings.planning,
+                workflow_settings=request.app.state.settings.workflow,
+            ) as uow:
+                await _require_session(uow, body.session_id)
+                plan = await uow.plans.lock_aggregate(plan_id)
+                if (
+                    plan.status.value != "approved"
+                    or plan.approved_version is None
+                    or plan.approved_version != plan.current_version
+                ):
+                    raise HTTPException(status_code=409, detail="Plan is not approved")
+                runs = await uow.workflow.list_plan_runs(
+                    session_context, plan_id, for_update=True
+                )
+                if any(run.status not in _TERMINAL_RUN_STATUSES for run in runs):
+                    raise HTTPException(status_code=409, detail="Plan already has an active run")
+                workflow = WorkflowCoordinator(
+                    request.app.state.database,
+                    settings=request.app.state.settings,
+                    connection=uow.conn,
+                )
+                # Existing Coordinator owns quota, lease and RUN_STARTED durability.
+                lease = await workflow.start_approved_plan_run_with_checkpoint(
+                    run_context,
+                    runtime.runtime_instance_id,
+                    plan_id=plan.plan_id,
+                    plan_version=plan.current_version,
+                    plan_digest=plan.current.content_digest,
+                )
+        except PlanNotFoundError as error:
+            raise _not_found() from error
+        except TenantRunQuotaError as error:
+            raise HTTPException(status_code=429, detail=str(error)) from error
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+        try:
+            runtime_lease = runtime.begin_run()
+        except RuntimeError as error:
+            with suppress(Exception):
+                await WorkflowCoordinator(
+                    request.app.state.database, settings=request.app.state.settings
+                ).finish_run_with_checkpoint(lease, RunStatus.CANCELLED)
+            raise RuntimeUnavailableError(
+                request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
+            ) from error
+        handle = RunLeaseHandle(lease)
+
+        async def stream() -> AsyncIterator[str]:
+            encoder = DataStreamEncoder()
+            try:
+                yield encoder.run_metadata(body.session_id, str(run_context.run_id))
+                attempts = await coordinator_execute_and_emit(
+                    request=request,
+                    context=context,
+                    session_id=body.session_id,
+                    runtime=runtime,
+                    run_context=run_context,
+                    handle=handle,
+                )
+                for attempt in attempts:
+                    yield encoder.plan_step_status(attempt)
+                yield encoder.finish("stop")
+            except asyncio.CancelledError:
+                await _terminalize_cancelled_stream(request, handle)
+                raise
+            except Exception:  # noqa: BLE001 - SSE must terminalize any internal failure.
+                await _terminalize_stream_error(request, handle)
+                yield encoder.error("Plan execution failed")
+                yield encoder.finish("error")
+            finally:
+                runtime_lease.close()
+
+        return await background_response(request, run_context, stream(), runtime_lease=runtime_lease, run_lease_handle=handle)
 
 
 async def coordinator_execute_and_emit(

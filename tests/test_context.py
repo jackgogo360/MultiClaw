@@ -382,3 +382,18 @@ async def test_progressive_context_drops_oversized_skill_and_keeps_newest_chat_t
     assert "fit" in contents(result.messages)
     assert "x" * 200 not in contents(result.messages)
     assert result.report.dropped_by_level["L1"] == 1
+
+
+@pytest.mark.parametrize("progressive", [False, True])
+async def test_project_instructions_are_included_before_history(progressive: bool) -> None:
+    from multiclaw.agent.context import ContextBuilder
+
+    builder = ContextBuilder(_ScopedMemoryFake(), 8, 0.5, progressive_enabled=progressive)
+    result = await builder.build_with_report(request(
+        project_instructions=[("AGENTS.md", "workspace instructions")],
+    ))
+    instructions = [m for m in result.messages if "workspace instructions" in m["content"]]
+    assert len(instructions) == 1
+    assert instructions[0]["role"] == "system"
+    assert "AGENTS.md" in instructions[0]["content"]
+    assert result.messages.index(instructions[0]) < len(result.messages) - 1

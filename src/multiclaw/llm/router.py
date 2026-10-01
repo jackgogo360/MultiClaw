@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -17,6 +18,7 @@ from multiclaw.llm.providers import (
     LLMResponse,
     OpenAIAdapter,
     ProviderAdapter,
+    StreamState,
 )
 
 if TYPE_CHECKING:
@@ -61,22 +63,26 @@ def _truncate(s: str, n: int = 500) -> str:
 
 
 class ModelRouter:
+    supports_output_limit = True
+
     def __init__(self, settings: Settings, *, credential_resolver=None) -> None:
         self._settings = settings
         self._capability_tags: dict[str, list[str]] = settings.llm.capability_tags
         self._credential_resolver = credential_resolver
         self._provider_configs: dict[str, dict[str, object]] = {}
-        self._model_provider: dict[str, str] = {}
+        self._model_provider: dict[str, str] = dict(
+            getattr(settings.llm, "model_providers", {})
+        )
 
         for provider_name, provider_config in settings.llm.providers.items():
-            adapter_cls = _PROVIDER_MAP.get(provider_name)
+            adapter_cls = _PROVIDER_MAP.get(
+                provider_config.get("adapter", provider_name)
+            )
             if adapter_cls:
                 self._provider_configs[provider_name] = {
                     "adapter_cls": adapter_cls,
                     "base_url": provider_config.get("base_url", ""),
                 }
-                for model in self._capability_tags:
-                    self._model_provider[model] = provider_name
 
     def list_models(self) -> list[str]:
         return list(self._capability_tags)
@@ -103,16 +109,51 @@ class ModelRouter:
         return candidates[0]
 
     def get_adapter(self, model: str) -> ProviderAdapter | None:
-        provider = self._model_provider.get(model) or self._settings.llm.default_provider
+        provider = self._provider_for_model(model)
         config = self._provider_configs.get(provider)
         if not config:
             return None
         adapter_cls = cast(type[ProviderAdapter], config["adapter_cls"])
         return adapter_cls(api_key="", base_url=str(config["base_url"]))
 
-    # ------------------------------------------------------------------
-    # non-streaming
-    # ------------------------------------------------------------------
+    def _provider_for_model(self, model: str) -> str:
+        # Explicit mappings are authoritative, including unknown provider names.
+        if model in self._model_provider:
+            return self._model_provider[model]
+        default = self._settings.llm.default_provider
+        if default in self._provider_configs:
+            return default
+        if len(self._settings.llm.providers) == 1:
+            return next(iter(self._settings.llm.providers))
+        return default
+
+    def _retryable(self, error: httpx.HTTPError) -> bool:
+        if isinstance(error, httpx.HTTPStatusError):
+            return (
+                error.response.status_code == 429
+                or 500 <= error.response.status_code <= 599
+            )
+        return isinstance(error, (httpx.ConnectError, httpx.TimeoutException))
+
+    async def _retry_delay(self, attempt: int) -> None:
+        await asyncio.sleep(
+            getattr(self._settings.llm, "retry_base_seconds", 0.25) * 2**attempt
+        )
+
+    async def _credentials_for_call(self, provider: str, explicit):
+        from multiclaw.secrets.resolver import (
+            SecretNotConfiguredError,
+            UserSecretInvalidError,
+        )
+
+        unavailable = False
+        try:
+            resolved = await self._resolve_credentials(provider, explicit)
+        except (SecretNotConfiguredError, UserSecretInvalidError):
+            unavailable = True
+        if unavailable:
+            raise LLMProviderError("LLM provider unavailable")
+        return resolved
 
     async def completion(
         self,
@@ -120,76 +161,69 @@ class ModelRouter:
         messages: list[dict],
         tools: list[dict] | None = None,
         credentials: ResolvedCredentials | None = None,
+        max_output_tokens: int | None = None,
     ) -> LLMResponse:
-        from multiclaw.secrets.resolver import (
-            SecretNotConfiguredError,
-            UserSecretInvalidError,
-        )
-
-        provider = self._model_provider.get(model) or self._settings.llm.default_provider
-        adapter = self.get_adapter(model)
-        if adapter is None:
-            raise LLMProviderError("LLM provider unavailable")
-
-        credentials_unavailable = False
+        resolved = credentials
         try:
-            resolved = await self._resolve_credentials(provider, credentials)
-        except (SecretNotConfiguredError, UserSecretInvalidError):
-            credentials_unavailable = True
-        if credentials_unavailable:
-            raise LLMProviderError("LLM provider unavailable")
-
-        try:
-            request = self._build_request(adapter, resolved, model, messages, tools or [])
-            _log_request(request)
-
-            provider_unavailable = False
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    response = await client.post(
-                        request["url"],
-                        headers=request["headers"],
-                        json=request["body"],
-                    )
-                _log_response(response)
-                response.raise_for_status()
-            except httpx.HTTPError:
-                provider_unavailable = True
-            if provider_unavailable:
+            provider = self._provider_for_model(model)
+            adapter = self.get_adapter(model)
+            if adapter is None:
                 raise LLMProviderError("LLM provider unavailable")
-
-            response_invalid = False
+            resolved = await self._credentials_for_call(provider, credentials)
+            request = self._build_request(
+                adapter,
+                resolved,
+                model,
+                messages,
+                tools or [],
+                **(
+                    {"max_output_tokens": max_output_tokens}
+                    if max_output_tokens is not None
+                    else {}
+                ),
+            )
+            _log_request(request)
+            max_retries = getattr(self._settings.llm, "max_retries", 2)
+            timeout = getattr(self._settings.llm, "request_timeout_seconds", 60.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                for attempt in range(max_retries + 1):
+                    failed = False
+                    retry = False
+                    try:
+                        response = await client.post(
+                            request["url"],
+                            headers=request["headers"],
+                            json=request["body"],
+                        )
+                        _log_response(response)
+                        response.raise_for_status()
+                    except httpx.HTTPError as error:
+                        failed = True
+                        retry = attempt < max_retries and self._retryable(error)
+                    if not failed:
+                        break
+                    if not retry:
+                        raise LLMProviderError("LLM provider unavailable")
+                    await self._retry_delay(attempt)
+            invalid = False
             try:
-                raw_response = response.json()
-                adapter.validate_response_payload(raw_response)
+                raw = response.json()
+                adapter.validate_response_payload(raw)
+                parsed = adapter.parse_response(raw)
             except (json.JSONDecodeError, ValidationError):
-                response_invalid = True
-            if response_invalid:
+                invalid = True
+            if invalid:
                 raise LLMResponseParseError("invalid LLM response")
-
-            adapter_response_invalid = False
-            try:
-                parsed = adapter.parse_response(
-                    cast(dict[str, object], raw_response)
-                )
-            except (json.JSONDecodeError, ValidationError):
-                adapter_response_invalid = True
-            if adapter_response_invalid:
-                raise LLMResponseParseError("invalid LLM response")
-
             logger.info(
-                "LLM response: content=%s tool_calls=%s reasoning=%d",
-                _truncate(parsed.content, 300),
-                [tc.name for tc in parsed.tool_calls],
+                "LLM response: tool_calls=%d reasoning_length=%d text_length=%d",
+                len(parsed.tool_calls),
                 len(parsed.reasoning_content),
+                len(parsed.content),
             )
             return parsed
         finally:
-            resolved.close()
-
-    # ------------------------------------------------------------------
-    # streaming
-    # ------------------------------------------------------------------
+            if resolved is not None:
+                resolved.close()
 
     async def stream_completion(
         self,
@@ -197,109 +231,115 @@ class ModelRouter:
         messages: list[dict],
         tools: list[dict] | None = None,
         credentials: ResolvedCredentials | None = None,
+        max_output_tokens: int | None = None,
     ) -> AsyncIterator[dict]:
-        """Stream LLM response, yielding {'type':'token','content':...} or
-        {'type':'tool_calls','calls':[...]} at the end."""
-        provider = self._model_provider.get(model) or self._settings.llm.default_provider
-        adapter = self.get_adapter(model)
-        if adapter is None:
-            raise ValueError(f"No adapter found for model '{model}'")
-        resolved = await self._resolve_credentials(provider, credentials)
-        request = self._build_request(adapter, resolved, model, messages, tools or [], stream=True)
-        _log_request(request)
-
-        token_count = 0
-        tool_calls_acc: dict[int, dict] = {}
-        reasoning_content = ""
-        full_text = ""
-
+        """Yield normalized token, reasoning, usage and final tool-call events."""
+        resolved = credentials
+        delivered = False
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
-                async with client.stream(
-                    "POST", request["url"], headers=request["headers"], json=request["body"]
-                ) as response:
-                    status = getattr(response, "status_code", 0)
-                    logger.info("response status=%s", status)
-                    if isinstance(status, int) and status >= 400:
-                        try:
-                            body = await response.aread()
-                            logger.error("LLM error response body: %s", _truncate(body.decode(errors="replace"), 2000))
-                        except Exception:
-                            pass
-                    response.raise_for_status()
-
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        data = line[6:]
-                        if data.strip() == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-
-                        delta = self._extract_stream_delta(chunk)
-                        if delta is None:
-                            continue
-
-                        if delta.get("reasoning_content"):
-                            rc = delta["reasoning_content"]
-                            reasoning_content += rc
-                            yield {"type": "reasoning", "content": rc}
-
-                        if delta.get("content"):
-                            token_count += 1
-                            full_text += delta["content"]
-                            yield {"type": "token", "content": delta["content"]}
-
-                        for tc_delta in delta.get("tool_calls") or []:
-                            idx = tc_delta.get("index", 0)
-                            if idx not in tool_calls_acc:
-                                tool_calls_acc[idx] = {
-                                    "id": "",
-                                    "name": "",
-                                    "arguments": "",
-                                }
-                            entry = tool_calls_acc[idx]
-                            if tc_delta.get("id"):
-                                entry["id"] = tc_delta["id"]
-                            if tc_delta.get("function", {}).get("name"):
-                                entry["name"] = tc_delta["function"]["name"]
-                            if tc_delta.get("function", {}).get("arguments"):
-                                entry["arguments"] += tc_delta["function"]["arguments"]
+            provider = self._provider_for_model(model)
+            adapter = self.get_adapter(model)
+            if adapter is None:
+                raise LLMProviderError("LLM provider unavailable")
+            resolved = await self._credentials_for_call(provider, credentials)
+            request = self._build_request(
+                adapter,
+                resolved,
+                model,
+                messages,
+                tools or [],
+                stream=True,
+                **(
+                    {"max_output_tokens": max_output_tokens}
+                    if max_output_tokens is not None
+                    else {}
+                ),
+            )
+            _log_request(request)
+            max_retries = getattr(self._settings.llm, "max_retries", 2)
+            timeout = getattr(self._settings.llm, "stream_timeout_seconds", 300.0)
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout, connect=min(timeout, 30.0))
+            ) as client:
+                for attempt in range(max_retries + 1):
+                    state = StreamState()
+                    failed = False
+                    retry = False
+                    stream_error = False
+                    malformed = False
+                    try:
+                        async with client.stream(
+                            "POST",
+                            request["url"],
+                            headers=request["headers"],
+                            json=request["body"],
+                        ) as response:
+                            _log_response(response)
+                            response.raise_for_status()
+                            async for line in response.aiter_lines():
+                                if not line.startswith("data:"):
+                                    continue
+                                data = line[5:].lstrip()
+                                if data.strip() == "[DONE]":
+                                    break
+                                if not data:
+                                    continue
+                                try:
+                                    chunk = json.loads(data)
+                                    if not isinstance(chunk, dict):
+                                        raise TypeError("invalid stream payload")
+                                    if chunk.get("type") == "error" or chunk.get(
+                                        "error"
+                                    ):
+                                        stream_error = True
+                                        break
+                                    events = adapter.parse_stream_events(chunk, state)
+                                except (
+                                    ValueError,
+                                    KeyError,
+                                    TypeError,
+                                    ValidationError,
+                                ):
+                                    malformed = True
+                                    break
+                                for event in events:
+                                    delivered = True
+                                    yield event
+                    except httpx.HTTPError as error:
+                        failed = True
+                        retry = (
+                            not delivered
+                            and attempt < max_retries
+                            and self._retryable(error)
+                        )
+                    if malformed:
+                        raise LLMResponseParseError("invalid LLM response")
+                    if stream_error:
+                        raise LLMProviderError("LLM provider unavailable")
+                    if failed:
+                        if not retry:
+                            raise LLMProviderError("LLM provider unavailable")
+                        await self._retry_delay(attempt)
+                        continue
+                    invalid = False
+                    try:
+                        final_events = state.finish()
+                    except (ValueError, ValidationError):
+                        invalid = True
+                    if invalid:
+                        raise LLMResponseParseError("invalid LLM response")
+                    for event in final_events:
+                        delivered = True
+                        yield event
+                    break
         finally:
-            resolved.close()
-
-        logger.info(
-            "stream done: tokens=%d tool_calls=%d reasoning=%d text_len=%d",
-            token_count, len(tool_calls_acc), len(reasoning_content), len(full_text),
-        )
-        if full_text:
-            logger.info("LLM response text: %s", _truncate(full_text, 1000))
-        if reasoning_content:
-            logger.info("LLM reasoning: %s", _truncate(reasoning_content, 500))
-
-        if tool_calls_acc:
-            calls = []
-            for idx in sorted(tool_calls_acc):
-                entry = tool_calls_acc[idx]
-                try:
-                    args = json.loads(entry["arguments"]) if entry["arguments"] else {}
-                except json.JSONDecodeError:
-                    args = {}
-                calls.append(
-                    {"id": entry["id"], "name": entry["name"], "arguments": args}
-                )
-            logger.info("LLM tool_calls: %s", json.dumps(calls, ensure_ascii=False))
-            yield {"type": "tool_calls", "calls": calls, "reasoning_content": reasoning_content}
+            if resolved is not None:
+                resolved.close()
 
     @staticmethod
     def _extract_stream_delta(chunk: dict) -> dict | None:
         choices = chunk.get("choices", [])
-        if not choices:
-            return None
-        return choices[0].get("delta")
+        return choices[0].get("delta") if choices else None
 
     async def _resolve_credentials(
         self,
@@ -324,7 +364,9 @@ class ModelRouter:
             base_url=str(config["base_url"]),
             api_key=SecretBytes(
                 str(
-                    self._settings.llm.providers.get(provider_name, {}).get("api_key", "")
+                    self._settings.llm.providers.get(provider_name, {}).get(
+                        "api_key", ""
+                    )
                 ).encode("utf-8")
             ),
         )
@@ -338,6 +380,7 @@ class ModelRouter:
         tools: list[dict],
         *,
         stream: bool = False,
+        max_output_tokens: int | None = None,
     ) -> dict:
         adapter_cls = type(adapter)
         with credentials.api_key.reveal() as api_key:
@@ -345,6 +388,14 @@ class ModelRouter:
                 api_key=bytes(api_key).decode("utf-8"),
                 base_url=credentials.base_url,
             )
+            if max_output_tokens is not None:
+                return configured.build_request(
+                    model,
+                    messages,
+                    tools,
+                    stream=stream,
+                    max_output_tokens=max_output_tokens,
+                )
             return configured.build_request(model, messages, tools, stream=stream)
 
 
@@ -352,35 +403,16 @@ class ModelRouter:
 # request / response logging
 # ------------------------------------------------------------------
 
+
 def _log_request(request: dict) -> None:
     body = request["body"]
-    msgs = body.get("messages", [])
-    tools = body.get("tools", [])
+    # URLs, message text, tool arguments and response bodies may contain secrets.
     logger.info(
-        "LLM request -> %s model=%s messages=%d tools=%d stream=%s",
-        request["url"],
-        body.get("model", "?"),
-        len(msgs),
-        len(tools),
+        "LLM request: messages=%d tools=%d stream=%s",
+        len(body.get("messages", [])),
+        len(body.get("tools", [])),
         body.get("stream", False),
     )
-    # Log role summary for each message
-    for i, msg in enumerate(msgs):
-        role = msg.get("role", "?")
-        content = msg.get("content")
-        tc = msg.get("tool_calls")
-        tc_id = msg.get("tool_call_id")
-        if tc:
-            names = [t.get("function", {}).get("name", "?") for t in tc]
-            logger.info("  msg[%d] role=%s tool_calls=%s", i, role, names)
-        elif tc_id:
-            logger.info("  msg[%d] role=%s tool_call_id=%s content=%s", i, role, tc_id, _truncate(str(content), 200))
-        else:
-            logger.info("  msg[%d] role=%s content=%s", i, role, _truncate(str(content), 200))
-    if tools:
-        tool_names = [t.get("function", {}).get("name", "?") for t in tools]
-        logger.info("  tools sent: %s", tool_names)
-    logger.debug("  full body: %s", _truncate(json.dumps(body, ensure_ascii=False), 4000))
 
 
 def _log_response(response) -> None:

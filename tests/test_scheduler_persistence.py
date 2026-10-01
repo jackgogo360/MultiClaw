@@ -645,13 +645,15 @@ async def test_same_run_scheduler_calls_use_single_live_execution_slot(workflow_
     active = 0
     max_active = 0
     release = asyncio.Event()
+    started = asyncio.Event()
 
     async def runner(params: PersistedParams) -> ToolExecutionResult:
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)
+        started.set()
         try:
-            await asyncio.wait_for(release.wait(), timeout=0.2)
+            await asyncio.wait_for(release.wait(), timeout=5)
             return ToolExecutionResult(status=ToolStatus.SUCCESS, content=params.label)
         finally:
             active -= 1
@@ -675,7 +677,7 @@ async def test_same_run_scheduler_calls_use_single_live_execution_slot(workflow_
             run_lease_handle=lease_handle,
         )
     )
-    await asyncio.sleep(0.02)
+    await asyncio.wait_for(started.wait(), timeout=5)
     second = asyncio.create_task(
         scheduler.run(
             builder,
@@ -685,10 +687,12 @@ async def test_same_run_scheduler_calls_use_single_live_execution_slot(workflow_
             run_lease_handle=lease_handle,
         )
     )
-    await asyncio.sleep(0.02)
-    release.set()
-
-    results = await asyncio.gather(first, second, return_exceptions=True)
+    try:
+        second_result = (await asyncio.gather(second, return_exceptions=True))[0]
+    finally:
+        release.set()
+    first_result = (await asyncio.gather(first, return_exceptions=True))[0]
+    results = [first_result, second_result]
 
     scheduler_module = __import__("multiclaw.tools.scheduler", fromlist=["ExecutionConflictError"])
     assert max_active == 1

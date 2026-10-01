@@ -61,6 +61,7 @@ class RuntimePool:
         self._capacity_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self.background_runs = None
 
     def _retry_after_seconds(self) -> int:
         return max(1, math.ceil(self.idle_ttl_ms / 1000))
@@ -100,6 +101,8 @@ class RuntimePool:
         return self._runtimes.get(tenant_id)
 
     async def revoke(self, tenant_id: str) -> None:
+        if self.background_runs is not None:
+            await self.background_runs.revoke(tenant_id)
         async with self._tenant_lock(tenant_id):
             runtime = self._runtimes.get(tenant_id)
             if runtime is None:
@@ -145,6 +148,8 @@ class RuntimePool:
             return True
 
     async def close(self) -> None:
+        if self.background_runs is not None:
+            await self.background_runs.close()
         async with self._close_lock:
             if self._closed and not self._runtimes:
                 return

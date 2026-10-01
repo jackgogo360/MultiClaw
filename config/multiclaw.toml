@@ -19,6 +19,11 @@ root = "data/workspaces"
 max_resident_tenants = 32
 idle_ttl_seconds = 900
 max_concurrent_runs_per_tenant = 2
+max_run_seconds = 1800
+max_run_tokens = 250000
+tenant_daily_token_limit = 0
+max_queued_messages = 20
+max_stream_events = 10000
 
 [workflow]
 heartbeat_ms = 5000
@@ -46,6 +51,14 @@ max_step_attempts = 2
 [llm]
 default_provider = "openai"
 default_model = "gpt-4o"
+max_retries = 2
+retry_base_seconds = 0.25
+
+[llm.model_providers]
+"gpt-4o" = "openai"
+"gpt-4o-mini" = "openai"
+"claude-opus-4-7" = "anthropic"
+"claude-sonnet-4-6" = "anthropic"
 
 [llm.providers.openai]
 api_key = ""
@@ -64,6 +77,12 @@ base_url = "https://api.anthropic.com"
 [memory]
 short_term_limit = 100
 context_window_limit = 128000
+progressive_context_enabled = true
+context_response_reserve_tokens = 4096
+
+[agent]
+max_tool_rounds = 100
+resilience_enabled = true
 
 [governance]
 audit_enabled = true

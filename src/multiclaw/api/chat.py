@@ -27,6 +27,8 @@ from multiclaw.planner.generator import PlanGenerationError
 from multiclaw.planner.policy import PlanningPolicy, PlanningUnavailableError
 from multiclaw.planner.service import PlanningService
 from multiclaw.runtime.pool import RuntimeUnavailableError
+from multiclaw.runtime.background import background_manager, background_response
+from multiclaw.runtime.run_control import cancellation_status
 from multiclaw.security.redaction import public_error_message, redact
 from multiclaw.session import SessionStatus
 from multiclaw.storage.repositories.memory import MemoryRepository
@@ -170,8 +172,7 @@ async def iterate_message_stream(
         yield item
 
 
-@router.post("/chat")
-async def chat(
+async def _chat(
     req: ChatRequest,
     request: Request,
     context: TenantContext = Depends(tenant_context),
@@ -205,6 +206,7 @@ async def chat(
     assert session is not None
     run_id = str(uuid4())
     run_context = context.for_run(session.id, run_id)
+    background_manager(request).bind_setup_run(run_context)
     runtime = await request.app.state.runtime_pool.acquire(run_context)
     session_memory = MemoryRepository(
         uow.conn,
@@ -226,575 +228,583 @@ async def chat(
     # the durable Plan provenance reference.
     await uow.commit()
 
-    objective, planning_mode, trigger_mode = normalize_planning_request(
-        message,
-        req.planning_mode,
-        request.app.state.settings.planning.default_mode,
-    )
-    planning_policy = getattr(runtime, "planning_policy", None)
-    if planning_policy is None:
-        # Test doubles and legacy runtimes may expose only the execution
-        # agent, without a model router or planning components. Preserve the
-        # existing direct-chat path for those runtimes instead of failing
-        # during policy bootstrap.
-        agent_router = getattr(runtime.agent, "router", None)
-        if agent_router is None:
-            if planning_mode is PlanningMode.ALWAYS:
-                raise HTTPException(status_code=503, detail="planning is unavailable")
-            planning_decision = PlanningDecision(
-                mode=PlanningRoute.DIRECT,
-                reason="planning components unavailable",
+    from multiclaw.runtime.inference import inference_scope
+    with inference_scope(run_context, settings=request.app.state.settings,
+            database=request.app.state.database, workspace_root=getattr(runtime, "workspace_root", None)) as inference_budget:
+        inference_budget.objective = message
+        async with asyncio.timeout(request.app.state.settings.runtime.max_run_seconds):
+            objective, planning_mode, trigger_mode = normalize_planning_request(
+                message,
+                req.planning_mode,
+                request.app.state.settings.planning.default_mode,
             )
-        else:
-            planning_policy = PlanningPolicy(
-                agent_router,
-                default_model=request.app.state.settings.llm.default_model,
-                classification_model=request.app.state.settings.planning.classification_model,
-                enabled=request.app.state.settings.planning.enabled,
-            )
-    if planning_policy is not None:
-        try:
-            planning_decision = await planning_policy.decide(objective, planning_mode)
-        except PlanningUnavailableError as error:
+            planning_policy = getattr(runtime, "planning_policy", None)
+            if planning_policy is None:
+                # Test doubles and legacy runtimes may expose only the execution
+                # agent, without a model router or planning components. Preserve the
+                # existing direct-chat path for those runtimes instead of failing
+                # during policy bootstrap.
+                agent_router = getattr(runtime.agent, "router", None)
+                if agent_router is None:
+                    if planning_mode is PlanningMode.ALWAYS:
+                        raise HTTPException(status_code=503, detail="planning is unavailable")
+                    planning_decision = PlanningDecision(
+                        mode=PlanningRoute.DIRECT,
+                        reason="planning components unavailable",
+                    )
+                else:
+                    planning_policy = PlanningPolicy(
+                        agent_router,
+                        default_model=request.app.state.settings.llm.default_model,
+                        classification_model=request.app.state.settings.planning.classification_model,
+                        enabled=request.app.state.settings.planning.enabled,
+                    )
+            if planning_policy is not None:
+                try:
+                    planning_decision = await planning_policy.decide(objective, planning_mode)
+                except PlanningUnavailableError as error:
+                    record_plan_operation(
+                        "classification",
+                        status="failed",
+                        error_class="planning_unavailable",
+                        attributes={"error": str(error)},
+                    )
+                    raise HTTPException(status_code=503, detail="planning is unavailable") from error
+
             record_plan_operation(
                 "classification",
-                status="failed",
-                error_class="planning_unavailable",
-                attributes={"error": str(error)},
-            )
-            raise HTTPException(status_code=503, detail="planning is unavailable") from error
-
-    record_plan_operation(
-        "classification",
-        status="succeeded",
-        attributes={"route": planning_decision.mode.value},
-    )
-
-    if planning_decision.mode is PlanningRoute.PLAN:
-        generator = getattr(runtime, "plan_generator", None)
-        if generator is None:
-            generator = getattr(getattr(runtime, "plan_execution", None), "planning_service", None)
-            generator = getattr(generator, "_generator", None)
-        service = getattr(getattr(runtime, "plan_execution", None), "planning_service", None)
-        if service is None:
-            service = PlanningService(
-                request.app.state.database,
-                settings=request.app.state.settings,
-                generator=generator,
+                status="succeeded",
+                attributes={"route": planning_decision.mode.value},
             )
 
-        async def failed_plan_stream(error: BaseException):
-            enc = DataStreamEncoder()
-            yield enc.start()
-            yield encode_session_metadata(session.model_dump(mode="json"))
-            yield encode_run_metadata(session.id, run_id)
-            yield enc.error(public_error_message(error))
-            yield enc.finish("stop")
+            if planning_decision.mode is PlanningRoute.PLAN:
+                generator = getattr(runtime, "plan_generator", None)
+                if generator is None:
+                    generator = getattr(getattr(runtime, "plan_execution", None), "planning_service", None)
+                    generator = getattr(generator, "_generator", None)
+                service = getattr(getattr(runtime, "plan_execution", None), "planning_service", None)
+                if service is None:
+                    service = PlanningService(
+                        request.app.state.database,
+                        settings=request.app.state.settings,
+                        generator=generator,
+                    )
 
-        try:
-            generated = await generator.generate(
-                objective,
-                max_steps=request.app.state.settings.planning.max_steps,
-                max_depth=request.app.state.settings.planning.max_dependency_depth,
-                max_attempts=request.app.state.settings.planning.max_step_attempts,
-            )
-        except PlanGenerationError as error:
-            record_plan_operation(
-                "generation",
-                status="failed",
-                error_class="generation_error",
-                attributes={"error": str(error), "run_id": run_id},
-            )
-            # A Plan route that cannot produce a valid draft is terminal. It
-            # must not be disguised as direct execution, including auto mode.
-            await _persist_unbound_failure_run(
-                request.app.state.database,
-                request.app.state.settings,
-                run_context,
-                runtime.runtime_instance_id,
-            )
-            return StreamingResponse(
-                failed_plan_stream(error),
-                media_type="text/event-stream",
-                headers={"X-Vercel-AI-Data-Stream": "v1"},
-            )
-        except Exception as error:
-            record_plan_operation(
-                "generation",
-                status="failed",
-                error_class=type(error).__name__,
-                attributes={"error": str(error), "run_id": run_id},
-            )
-            # Unexpected generator failures are still a failed Plan request,
-            # but only the generator's explicit terminal error gets an
-            # unbound run/checkpoint (the durable contract).
-            return StreamingResponse(
-                failed_plan_stream(error),
-                media_type="text/event-stream",
-                headers={"X-Vercel-AI-Data-Stream": "v1"},
-            )
+                async def failed_plan_stream(error: BaseException):
+                    enc = DataStreamEncoder()
+                    yield enc.start()
+                    yield encode_session_metadata(session.model_dump(mode="json"))
+                    yield encode_run_metadata(session.id, run_id)
+                    yield enc.error(public_error_message(error))
+                    yield enc.finish("stop")
 
-        try:
-            draft = service.draft_from_generated(generated)
-            materialized = await service.materialize_initial(
-                MaterializeInitialPlan(
-                    context=run_context,
-                    runtime_instance_id=runtime.runtime_instance_id,
-                    source_message_id=saved_user.id,
-                    assistant_turn_index=user_turn_index + 1,
-                    trigger_mode=trigger_mode,
-                    draft=draft,
-                )
-            )
-        except Exception as error:
-            record_plan_operation(
-                "materialization",
-                status="failed",
-                error_class=type(error).__name__,
-                attributes={"error": str(error), "run_id": run_id},
-            )
-            # materialize_initial owns one transaction; on failure its UoW
-            # rolls back Plan/version/steps/run/checkpoint/reference rows. Do
-            # not add an unrelated unbound run here.
-            return StreamingResponse(
-                failed_plan_stream(error),
-                media_type="text/event-stream",
-                headers={"X-Vercel-AI-Data-Stream": "v1"},
-            )
-
-        record_plan_operation(
-            "materialization",
-            status="succeeded",
-            attributes={
-                "plan_id": materialized.plan.plan_id,
-                "run_id": run_id,
-            },
-        )
-
-        async def plan_stream():
-            enc = DataStreamEncoder()
-            yield enc.start()
-            yield encode_session_metadata(session.model_dump(mode="json"))
-            yield encode_run_metadata(session.id, run_id)
-            yield enc.plan_created(materialized.reference.model_dump(mode="json"))
-            yield enc.finish("tool-calls")
-        # ``materialize_initial`` has committed and closed its transaction by
-        # this point. Publish the lifecycle event only after that commit so
-        # subscribers never observe a Plan that can still roll back.
-        await runtime.event_router.publish(materialized.event)
-        return StreamingResponse(
-            plan_stream(),
-            media_type="text/event-stream",
-            headers={"X-Vercel-AI-Data-Stream": "v1"},
-        )
-
-    # Direct route continues through the existing workflow/agent stream using
-    # the original user message (the normalized objective is only for policy).
-    # The source-message transaction is already committed. Use a fresh
-    # coordinator/transaction for the direct run boundary.
-    workflow = build_workflow_coordinator(
-        request.app.state.database,
-        request.app.state.settings,
-    )
-    workflow_continuation = build_workflow_continuation_service(
-        request.app.state.database,
-        request.app.state.settings,
-    )
-    workflow_recovery = build_workflow_recovery_service(
-        request.app.state.database,
-        request.app.state.settings,
-    )
-
-    async def _cleanup_prestream_failure(
-        primary: BaseException,
-        *,
-        workflow_lease,
-        recovery_outcome: RecoveryOutcome | None,
-    ) -> None:
-        target = RunStatus.FAILED_TERMINAL
-        if recovery_outcome is not None and recovery_outcome.status in {
-            RunStatus.BLOCKED_CORRUPT,
-            RunStatus.BLOCKED_INCOMPATIBLE,
-        }:
-            target = recovery_outcome.status
-
-        coordinator = build_workflow_coordinator(
-            request.app.state.database,
-            request.app.state.settings,
-        )
-        try:
-            await coordinator.finish_run_with_checkpoint(workflow_lease, target)
-            return
-        except Exception:
-            primary.add_note("pre-stream terminal checkpoint cleanup failed")
-        try:
-            await coordinator.finish_run(workflow_lease, target)
-        except Exception:
-            primary.add_note("pre-stream terminal state cleanup failed")
-
-    workflow_lease = None
-    try:
-        workflow_lease = await workflow.start_run_with_checkpoint(
-            run_context,
-            runtime.runtime_instance_id,
-        )
-        await uow.commit()
-        live_recovery = await workflow_recovery.validate_live_run(run_context)
-        if live_recovery.action is not RecoveryAction.RESUME_MODEL:
-            raise RuntimeError("live workflow checkpoint validation failed")
-    except TenantRunQuotaError as error:
-        raise HTTPException(status_code=429, detail=str(error)) from error
-    except Exception as error:
-        if workflow_lease is not None:
-            await _cleanup_prestream_failure(
-                error,
-                workflow_lease=workflow_lease,
-                recovery_outcome=locals().get("live_recovery"),
-            )
-        raise
-
-    try:
-        run_lease = runtime.begin_run()
-    except RuntimeError as error:
-        if workflow_lease is not None:
-            await build_workflow_coordinator(
-                request.app.state.database,
-                request.app.state.settings,
-            ).finish_run_with_checkpoint(workflow_lease, RunStatus.CANCELLED)
-        if str(error) == "runtime is unavailable":
-            raise RuntimeUnavailableError(
-                request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
-            ) from error
-        raise
-
-    async def event_stream():
-        async with observability_scope(
-            metrics=getattr(request.app.state, "operational_metrics", None),
-            trace_sink=getattr(request.app.state, "trace_sink", None),
-        ):
-            logger.info("SSE stream started session=%s run=%s", session.id, run_id)
-            enc = DataStreamEncoder()
-            text_part_id: str | None = None
-            reasoning_part_id: str | None = None
-            step_open = False
-            pending_tool_results = 0
-            emitted_tool_inputs: set[str] = set()
-            subscription = None
-            stream_task: asyncio.Task | None = None
-            heartbeat_task: asyncio.Task | None = None
-            assert workflow_lease is not None
-            workflow_lease_handle = RunLeaseHandle(workflow_lease)
-            terminal_persisted = False
-            fence_lost = False
-            awaiting_user_paused = False
-
-            async def persist_terminal(status: RunStatus) -> None:
-                nonlocal terminal_persisted
-                if terminal_persisted:
-                    return
-                await workflow_lease_handle.refresh(
-                    lambda lease: build_workflow_coordinator(
+                try:
+                    generated = await generator.generate(
+                        objective,
+                        max_steps=request.app.state.settings.planning.max_steps,
+                        max_depth=request.app.state.settings.planning.max_dependency_depth,
+                        max_attempts=request.app.state.settings.planning.max_step_attempts,
+                    )
+                except PlanGenerationError as error:
+                    record_plan_operation(
+                        "generation",
+                        status="failed",
+                        error_class="generation_error",
+                        attributes={"error": str(error), "run_id": run_id},
+                    )
+                    # A Plan route that cannot produce a valid draft is terminal. It
+                    # must not be disguised as direct execution, including auto mode.
+                    await _persist_unbound_failure_run(
                         request.app.state.database,
                         request.app.state.settings,
-                    ).finish_run_with_checkpoint(lease, status)
-                )
-                terminal_persisted = True
-
-            def close_text_part() -> list[str]:
-                nonlocal text_part_id
-                if text_part_id is None:
-                    return []
-                chunks = [enc.text_end(text_part_id)]
-                text_part_id = None
-                return chunks
-
-            def close_reasoning_part() -> list[str]:
-                nonlocal reasoning_part_id
-                if reasoning_part_id is None:
-                    return []
-                chunks = [enc.reasoning_end(reasoning_part_id)]
-                reasoning_part_id = None
-                return chunks
-
-            def close_open_parts() -> list[str]:
-                return [*close_reasoning_part(), *close_text_part()]
-
-            def open_step() -> list[str]:
-                nonlocal step_open
-                if step_open:
-                    return []
-                step_open = True
-                return [enc.start_step()]
-
-            def close_step() -> list[str]:
-                nonlocal step_open
-                if not step_open:
-                    return []
-                step_open = False
-                return [enc.finish_step()]
-
-            def drain_event_queue() -> list[str]:
-                chunks: list[str] = []
-                while not event_queue.empty():
-                    evt = event_queue.get_nowait()
-                    chunks.append(encode_scoped_event(evt))
-                    if evt.event_type == "tool.awaiting_approval":
-                        chunks.extend(open_step())
-                        chunks.extend(close_open_parts())
-                        approval_id = evt.data.get("approval_id") or evt.data.get("request_id") or ""
-                        tool_call_id = (
-                            evt.data.get("call_id")
-                            or evt.data.get("tool_call_id")
-                            or approval_id
-                            or ""
-                        )
-                        if tool_call_id and tool_call_id not in emitted_tool_inputs:
-                            emitted_tool_inputs.add(tool_call_id)
-                            chunks.append(
-                                enc.tool_input_available(
-                                    tool_call_id,
-                                    evt.data.get("tool", ""),
-                                    redact(evt.data.get("params", {})),
-                                )
-                            )
-                        chunks.append(
-                            enc.tool_approval_request(
-                                approval_id,
-                                tool_call_id,
-                            )
-                        )
-                return chunks
-
-            try:
-                yield enc.start()
-                yield encode_session_metadata(session.model_dump(mode="json"))
-                yield encode_run_metadata(session.id, run_id)
-                for chunk in open_step():
-                    yield chunk
-
-                token_queue: asyncio.Queue[dict] = asyncio.Queue()
-                event_queue: asyncio.Queue[ScopedEvent] = asyncio.Queue()
-                heartbeat_stop = asyncio.Event()
-
-                async def collector(event: ScopedEvent):
-                    await event_queue.put(event)
-
-                subscription = runtime.event_router.subscribe(EventScope.from_context(run_context), collector)
-
-                async def run_stream():
-                    try:
-                        async for item in iterate_message_stream(
-                            runtime.agent.handle_message_stream,
-                            message,
-                            context=run_context,
-                            run_lease=await workflow_lease_handle.current(),
-                            run_lease_handle=workflow_lease_handle,
-                            workflow_recovery=workflow_recovery,
-                            workflow_continuation=workflow_continuation,
-                            persisted_user_turn_index=user_turn_index,
-                        ):
-                            await token_queue.put(item)
-                    except Exception as exc:
-                        logger.error("stream error error_type=%s", type(exc).__name__)
-                        await token_queue.put({"type": "error", "content": public_error_message(exc)})
-
-                async def heartbeat_run_lease() -> None:
-                    nonlocal fence_lost
-                    interval_seconds = max(
-                        0.001,
-                        request.app.state.settings.workflow.heartbeat_ms / 1000,
+                        run_context,
+                        runtime.runtime_instance_id,
                     )
-                    while True:
-                        try:
-                            await asyncio.wait_for(heartbeat_stop.wait(), timeout=interval_seconds)
-                            return
-                        except asyncio.TimeoutError:
-                            pass
-                        if terminal_persisted:
-                            continue
-                        try:
-                            await workflow_lease_handle.refresh(
-                                lambda lease: build_workflow_coordinator(
-                                    request.app.state.database,
-                                    request.app.state.settings,
-                                ).heartbeat(lease)
-                            )
-                        except StaleFenceError as exc:
-                            fence_lost = True
-                            increment_metric(
-                                "multiclaw_stale_fence_total",
-                                labels={"backend": "unknown", "operation": "chat_heartbeat", "status": "error", "error_class": "stale_fence"},
-                            )
-                            record_trace_event("stale_fence", attributes={"operation": "chat_heartbeat", "error": str(exc)})
-                            logger.error("run lease heartbeat lost current fence")
-                            if stream_task is not None:
-                                stream_task.cancel()
-                            await token_queue.put({"type": "error", "content": public_error_message(exc)})
-                            return
-                        except Exception as exc:
-                            logger.error("run lease heartbeat failed error_type=%s", type(exc).__name__)
-                            await token_queue.put({"type": "error", "content": public_error_message(exc)})
-                            return
+                    return await background_response(
+                        request, run_context, failed_plan_stream(error),
+                        headers={"X-Vercel-AI-Data-Stream": "v1"},
+                    )
+                except Exception as error:
+                    record_plan_operation(
+                        "generation",
+                        status="failed",
+                        error_class=type(error).__name__,
+                        attributes={"error": str(error), "run_id": run_id},
+                    )
+                    # Unexpected generator failures are still a failed Plan request,
+                    # but only the generator's explicit terminal error gets an
+                    # unbound run/checkpoint (the durable contract).
+                    return await background_response(
+                        request, run_context, failed_plan_stream(error),
+                        headers={"X-Vercel-AI-Data-Stream": "v1"},
+                    )
 
-                stream_task = asyncio.create_task(run_stream())
-                heartbeat_task = asyncio.create_task(heartbeat_run_lease())
+                try:
+                    draft = service.draft_from_generated(generated)
+                    materialized = await service.materialize_initial(
+                        MaterializeInitialPlan(
+                            context=run_context,
+                            runtime_instance_id=runtime.runtime_instance_id,
+                            source_message_id=saved_user.id,
+                            assistant_turn_index=user_turn_index + 1,
+                            trigger_mode=trigger_mode,
+                            draft=draft,
+                        )
+                    )
+                except Exception as error:
+                    record_plan_operation(
+                        "materialization",
+                        status="failed",
+                        error_class=type(error).__name__,
+                        attributes={"error": str(error), "run_id": run_id},
+                    )
+                    # materialize_initial owns one transaction; on failure its UoW
+                    # rolls back Plan/version/steps/run/checkpoint/reference rows. Do
+                    # not add an unrelated unbound run here.
+                    return await background_response(
+                        request, run_context, failed_plan_stream(error),
+                        headers={"X-Vercel-AI-Data-Stream": "v1"},
+                    )
 
-                while True:
-                    while True:
-                        try:
-                            item = token_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
+                record_plan_operation(
+                    "materialization",
+                    status="succeeded",
+                    attributes={
+                        "plan_id": materialized.plan.plan_id,
+                        "run_id": run_id,
+                    },
+                )
 
-                        if item["type"] == "token":
-                            for chunk in open_step():
-                                yield chunk
-                            for chunk in close_reasoning_part():
-                                yield chunk
-                            if text_part_id is None:
-                                text_part_id = uuid4().hex
-                                yield enc.text_start(text_part_id)
-                            yield enc.text_delta(text_part_id, item["content"])
-                        elif item["type"] == "done":
-                            done_data = item.get("data") if isinstance(item.get("data"), dict) else {}
-                            if done_data.get("state") == RunStatus.AWAITING_USER.value:
-                                awaiting_user_paused = True
-                                while pending_tool_results > 0:
-                                    pending_tool_results -= 1
-                                    run_lease.mark_tool_execution_finished()
-                                run_lease.mark_awaiting_user(checkpoint_persisted=True)
-                                for chunk in drain_event_queue():
-                                    yield chunk
-                                for chunk in close_open_parts():
-                                    yield chunk
-                                for chunk in close_step():
-                                    yield chunk
-                                yield enc.finish("tool-calls")
-                                return
-                            if fence_lost:
-                                continue
-                            await persist_terminal(RunStatus.COMPLETED)
-                            for chunk in drain_event_queue():
-                                yield chunk
-                            for chunk in close_open_parts():
-                                yield chunk
-                            for chunk in close_step():
-                                yield chunk
-                            yield enc.finish("stop")
-                            return
-                        elif item["type"] == "error":
-                            if not fence_lost:
-                                await persist_terminal(RunStatus.FAILED_TERMINAL)
-                            for chunk in drain_event_queue():
-                                yield chunk
-                            for chunk in close_open_parts():
-                                yield chunk
-                            for chunk in close_step():
-                                yield chunk
-                            yield enc.error(item["content"])
-                            return
-                        elif item["type"] == "tool_call":
-                            for chunk in open_step():
-                                yield chunk
-                            for chunk in close_open_parts():
-                                yield chunk
-                            pending_tool_results += 1
-                            run_lease.mark_tool_execution_started()
-                            tool_call_id = item.get("call_id") or uuid4().hex
-                            emitted_tool_inputs.add(tool_call_id)
-                            yield enc.tool_input_available(
-                                tool_call_id,
-                                item["name"],
-                                redact(item.get("arguments", {})),
-                            )
-                        elif item["type"] == "tool_result":
-                            for chunk in close_open_parts():
-                                yield chunk
-                            tool_call_id = item.get("call_id", "")
-                            if item.get("is_error", False):
-                                yield enc.tool_output_error(tool_call_id, public_error_message(RuntimeError(str(item.get("content", "")))))
-                            else:
-                                yield enc.tool_output_available(
-                                    tool_call_id,
-                                    {"content": item.get("content", "")},
-                                )
-                            if pending_tool_results > 0:
-                                pending_tool_results -= 1
-                                run_lease.mark_tool_execution_finished()
-                            if pending_tool_results == 0:
-                                for chunk in close_step():
-                                    yield chunk
-                        elif item["type"] == "reasoning":
-                            for chunk in open_step():
-                                yield chunk
-                            for chunk in close_text_part():
-                                yield chunk
-                            if reasoning_part_id is None:
-                                reasoning_part_id = uuid4().hex
-                                yield enc.reasoning_start(reasoning_part_id)
-                            yield enc.reasoning_delta(reasoning_part_id, item["content"])
-                        else:
-                            yield enc.data_part("data-state", {"item": redact(item)}, transient=True)
+                async def plan_stream():
+                    enc = DataStreamEncoder()
+                    yield enc.start()
+                    yield encode_session_metadata(session.model_dump(mode="json"))
+                    yield encode_run_metadata(session.id, run_id)
+                    yield enc.plan_created(materialized.reference.model_dump(mode="json"))
+                    yield enc.finish("tool-calls")
+                # ``materialize_initial`` has committed and closed its transaction by
+                # this point. Publish the lifecycle event only after that commit so
+                # subscribers never observe a Plan that can still roll back.
+                await runtime.event_router.publish(materialized.event)
+                return await background_response(
+                    request, run_context, plan_stream(),
+                    headers={"X-Vercel-AI-Data-Stream": "v1"},
+                )
 
-                    for chunk in drain_event_queue():
-                        yield chunk
-                    if stream_task.done():
-                        exc = stream_task.exception()
-                        if exc:
-                            if not fence_lost:
-                                await persist_terminal(RunStatus.FAILED_TERMINAL)
-                            for chunk in drain_event_queue():
-                                yield chunk
-                            for chunk in close_open_parts():
-                                yield chunk
-                            for chunk in close_step():
-                                yield chunk
-                            yield enc.error(public_error_message(exc))
-                        else:
-                            for chunk in drain_event_queue():
-                                yield chunk
-                            for chunk in close_open_parts():
-                                yield chunk
-                            for chunk in close_step():
-                                yield chunk
-                            yield enc.finish("stop")
-                        return
+            # Direct route continues through the existing workflow/agent stream using
+            # the original user message (the normalized objective is only for policy).
+            # The source-message transaction is already committed. Use a fresh
+            # coordinator/transaction for the direct run boundary.
+            workflow = build_workflow_coordinator(
+                request.app.state.database,
+                request.app.state.settings,
+            )
+            workflow_continuation = build_workflow_continuation_service(
+                request.app.state.database,
+                request.app.state.settings,
+            )
+            workflow_recovery = build_workflow_recovery_service(
+                request.app.state.database,
+                request.app.state.settings,
+            )
 
-                    await asyncio.sleep(0.02)
-            finally:
-                if heartbeat_task is not None:
-                    heartbeat_stop.set()
-                    await asyncio.gather(heartbeat_task, return_exceptions=True)
-                if stream_task is not None:
-                    stream_task.cancel()
-                    await asyncio.gather(stream_task, return_exceptions=True)
-                if subscription is not None:
-                    subscription.close()
-                if not terminal_persisted and not fence_lost and not awaiting_user_paused:
-                    try:
-                        await persist_terminal(RunStatus.CANCELLED)
-                    except Exception:
-                        logger.error("failed to persist terminal run status")
-                run_lease.close()
-                logger.info("SSE stream ended session=%s run=%s", session.id, run_id)
+            async def _cleanup_prestream_failure(
+                primary: BaseException,
+                *,
+                workflow_lease,
+                recovery_outcome: RecoveryOutcome | None,
+            ) -> None:
+                target = RunStatus.FAILED_TERMINAL
+                if recovery_outcome is not None and recovery_outcome.status in {
+                    RunStatus.BLOCKED_CORRUPT,
+                    RunStatus.BLOCKED_INCOMPATIBLE,
+                }:
+                    target = recovery_outcome.status
 
-    try:
-        return StreamingResponse(
-            event_stream(),
-            media_type="text/event-stream",
-            headers={"X-Vercel-AI-Data-Stream": "v1"},
-        )
-    except BaseException:
-        if workflow_lease is not None:
-            try:
-                await build_workflow_coordinator(
+                coordinator = build_workflow_coordinator(
                     request.app.state.database,
                     request.app.state.settings,
-                ).finish_run_with_checkpoint(workflow_lease, RunStatus.CANCELLED)
-            except Exception:
-                logger.error("failed to cancel run after streaming setup error")
-        run_lease.close()
-        raise
+                )
+                try:
+                    await coordinator.finish_run_with_checkpoint(workflow_lease, target)
+                    return
+                except Exception:
+                    primary.add_note("pre-stream terminal checkpoint cleanup failed")
+                try:
+                    await coordinator.finish_run(workflow_lease, target)
+                except Exception:
+                    primary.add_note("pre-stream terminal state cleanup failed")
+
+            workflow_lease = None
+            try:
+                workflow_lease = await workflow.start_run_with_checkpoint(
+                    run_context,
+                    runtime.runtime_instance_id,
+                )
+                live_recovery = await workflow_recovery.validate_live_run(run_context)
+                if live_recovery.action is not RecoveryAction.RESUME_MODEL:
+                    raise RuntimeError("live workflow checkpoint validation failed")
+            except TenantRunQuotaError as error:
+                raise HTTPException(status_code=429, detail=str(error)) from error
+            except Exception as error:
+                if workflow_lease is not None:
+                    await _cleanup_prestream_failure(
+                        error,
+                        workflow_lease=workflow_lease,
+                        recovery_outcome=locals().get("live_recovery"),
+                    )
+                raise
+
+            try:
+                run_lease = runtime.begin_run()
+            except RuntimeError as error:
+                if workflow_lease is not None:
+                    await build_workflow_coordinator(
+                        request.app.state.database,
+                        request.app.state.settings,
+                    ).finish_run_with_checkpoint(workflow_lease, RunStatus.CANCELLED)
+                if str(error) == "runtime is unavailable":
+                    raise RuntimeUnavailableError(
+                        request.app.state.runtime_pool.idle_ttl_ms // 1000 or 1
+                    ) from error
+                raise
+
+            async def event_stream():
+                async with observability_scope(
+                    metrics=getattr(request.app.state, "operational_metrics", None),
+                    trace_sink=getattr(request.app.state, "trace_sink", None),
+                ):
+                    logger.info("SSE stream started session=%s run=%s", session.id, run_id)
+                    enc = DataStreamEncoder()
+                    text_part_id: str | None = None
+                    reasoning_part_id: str | None = None
+                    step_open = False
+                    pending_tool_results = 0
+                    emitted_tool_inputs: set[str] = set()
+                    subscription = None
+                    stream_task: asyncio.Task | None = None
+                    heartbeat_task: asyncio.Task | None = None
+                    assert workflow_lease is not None
+                    workflow_lease_handle = RunLeaseHandle(workflow_lease)
+                    terminal_persisted = False
+                    fence_lost = False
+                    awaiting_user_paused = False
+
+                    async def persist_terminal(status: RunStatus) -> None:
+                        nonlocal terminal_persisted
+                        if terminal_persisted:
+                            return
+                        await workflow_lease_handle.refresh(
+                            lambda lease: build_workflow_coordinator(
+                                request.app.state.database,
+                                request.app.state.settings,
+                            ).finish_run_with_checkpoint(lease, status)
+                        )
+                        terminal_persisted = True
+
+                    def close_text_part() -> list[str]:
+                        nonlocal text_part_id
+                        if text_part_id is None:
+                            return []
+                        chunks = [enc.text_end(text_part_id)]
+                        text_part_id = None
+                        return chunks
+
+                    def close_reasoning_part() -> list[str]:
+                        nonlocal reasoning_part_id
+                        if reasoning_part_id is None:
+                            return []
+                        chunks = [enc.reasoning_end(reasoning_part_id)]
+                        reasoning_part_id = None
+                        return chunks
+
+                    def close_open_parts() -> list[str]:
+                        return [*close_reasoning_part(), *close_text_part()]
+
+                    def open_step() -> list[str]:
+                        nonlocal step_open
+                        if step_open:
+                            return []
+                        step_open = True
+                        return [enc.start_step()]
+
+                    def close_step() -> list[str]:
+                        nonlocal step_open
+                        if not step_open:
+                            return []
+                        step_open = False
+                        return [enc.finish_step()]
+
+                    def drain_event_queue() -> list[str]:
+                        chunks: list[str] = []
+                        while not event_queue.empty():
+                            evt = event_queue.get_nowait()
+                            chunks.append(encode_scoped_event(evt))
+                            if evt.event_type == "tool.awaiting_approval":
+                                chunks.extend(open_step())
+                                chunks.extend(close_open_parts())
+                                approval_id = evt.data.get("approval_id") or evt.data.get("request_id") or ""
+                                tool_call_id = (
+                                    evt.data.get("call_id")
+                                    or evt.data.get("tool_call_id")
+                                    or approval_id
+                                    or ""
+                                )
+                                if tool_call_id and tool_call_id not in emitted_tool_inputs:
+                                    emitted_tool_inputs.add(tool_call_id)
+                                    chunks.append(
+                                        enc.tool_input_available(
+                                            tool_call_id,
+                                            evt.data.get("tool", ""),
+                                            redact(evt.data.get("params", {})),
+                                        )
+                                    )
+                                chunks.append(
+                                    enc.tool_approval_request(
+                                        approval_id,
+                                        tool_call_id,
+                                    )
+                                )
+                        return chunks
+
+                    try:
+                        token_queue: asyncio.Queue[dict] = asyncio.Queue()
+                        event_queue: asyncio.Queue[ScopedEvent] = asyncio.Queue()
+                        heartbeat_stop = asyncio.Event()
+
+                        async def collector(event: ScopedEvent):
+                            await event_queue.put(event)
+
+                        subscription = runtime.event_router.subscribe(EventScope.from_context(run_context), collector)
+
+                        async def run_stream():
+                            try:
+                                async for item in iterate_message_stream(
+                                    runtime.agent.handle_message_stream,
+                                    message,
+                                    context=run_context,
+                                    run_lease=await workflow_lease_handle.current(),
+                                    run_lease_handle=workflow_lease_handle,
+                                    workflow_recovery=workflow_recovery,
+                                    workflow_continuation=workflow_continuation,
+                                    persisted_user_turn_index=user_turn_index,
+                                ):
+                                    await token_queue.put(item)
+                            except Exception as exc:
+                                logger.error("stream error error_type=%s", type(exc).__name__)
+                                await token_queue.put({"type": "error", "content": public_error_message(exc)})
+
+                        async def heartbeat_run_lease() -> None:
+                            nonlocal fence_lost
+                            interval_seconds = max(
+                                0.001,
+                                request.app.state.settings.workflow.heartbeat_ms / 1000,
+                            )
+                            while True:
+                                try:
+                                    await asyncio.wait_for(heartbeat_stop.wait(), timeout=interval_seconds)
+                                    return
+                                except asyncio.TimeoutError:
+                                    pass
+                                if terminal_persisted:
+                                    continue
+                                try:
+                                    await workflow_lease_handle.refresh(
+                                        lambda lease: build_workflow_coordinator(
+                                            request.app.state.database,
+                                            request.app.state.settings,
+                                        ).heartbeat(lease)
+                                    )
+                                except StaleFenceError as exc:
+                                    fence_lost = True
+                                    increment_metric(
+                                        "multiclaw_stale_fence_total",
+                                        labels={"backend": "unknown", "operation": "chat_heartbeat", "status": "error", "error_class": "stale_fence"},
+                                    )
+                                    record_trace_event("stale_fence", attributes={"operation": "chat_heartbeat", "error": str(exc)})
+                                    logger.error("run lease heartbeat lost current fence")
+                                    if stream_task is not None:
+                                        stream_task.cancel()
+                                    await token_queue.put({"type": "error", "content": public_error_message(exc)})
+                                    return
+                                except Exception as exc:
+                                    logger.error("run lease heartbeat failed error_type=%s", type(exc).__name__)
+                                    await token_queue.put({"type": "error", "content": public_error_message(exc)})
+                                    return
+
+                        stream_task = asyncio.create_task(run_stream())
+                        heartbeat_task = asyncio.create_task(heartbeat_run_lease())
+
+                        yield enc.start()
+                        yield encode_session_metadata(session.model_dump(mode="json"))
+                        yield encode_run_metadata(session.id, run_id)
+                        for chunk in open_step():
+                            yield chunk
+
+                        while True:
+                            while True:
+                                try:
+                                    item = token_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+
+                                if item["type"] == "token":
+                                    for chunk in open_step():
+                                        yield chunk
+                                    for chunk in close_reasoning_part():
+                                        yield chunk
+                                    if text_part_id is None:
+                                        text_part_id = uuid4().hex
+                                        yield enc.text_start(text_part_id)
+                                    yield enc.text_delta(text_part_id, item["content"])
+                                elif item["type"] == "done":
+                                    done_data = item.get("data") if isinstance(item.get("data"), dict) else {}
+                                    if done_data.get("state") == RunStatus.AWAITING_USER.value:
+                                        awaiting_user_paused = True
+                                        while pending_tool_results > 0:
+                                            pending_tool_results -= 1
+                                            run_lease.mark_tool_execution_finished()
+                                        run_lease.mark_awaiting_user(checkpoint_persisted=True)
+                                        for chunk in drain_event_queue():
+                                            yield chunk
+                                        for chunk in close_open_parts():
+                                            yield chunk
+                                        for chunk in close_step():
+                                            yield chunk
+                                        yield enc.finish("tool-calls")
+                                        return
+                                    if fence_lost:
+                                        continue
+                                    await persist_terminal(RunStatus.COMPLETED)
+                                    for chunk in drain_event_queue():
+                                        yield chunk
+                                    for chunk in close_open_parts():
+                                        yield chunk
+                                    for chunk in close_step():
+                                        yield chunk
+                                    yield enc.finish("stop")
+                                    return
+                                elif item["type"] == "error":
+                                    if not fence_lost:
+                                        await persist_terminal(RunStatus.FAILED_TERMINAL)
+                                    for chunk in drain_event_queue():
+                                        yield chunk
+                                    for chunk in close_open_parts():
+                                        yield chunk
+                                    for chunk in close_step():
+                                        yield chunk
+                                    yield enc.error(item["content"])
+                                    return
+                                elif item["type"] == "tool_call":
+                                    for chunk in open_step():
+                                        yield chunk
+                                    for chunk in close_open_parts():
+                                        yield chunk
+                                    pending_tool_results += 1
+                                    run_lease.mark_tool_execution_started()
+                                    tool_call_id = item.get("call_id") or uuid4().hex
+                                    emitted_tool_inputs.add(tool_call_id)
+                                    yield enc.tool_input_available(
+                                        tool_call_id,
+                                        item["name"],
+                                        redact(item.get("arguments", {})),
+                                    )
+                                elif item["type"] == "tool_result":
+                                    for chunk in close_open_parts():
+                                        yield chunk
+                                    tool_call_id = item.get("call_id", "")
+                                    if item.get("is_error", False):
+                                        yield enc.tool_output_error(tool_call_id, public_error_message(RuntimeError(str(item.get("content", "")))))
+                                    else:
+                                        yield enc.tool_output_available(
+                                            tool_call_id,
+                                            {"content": item.get("content", "")},
+                                        )
+                                    if pending_tool_results > 0:
+                                        pending_tool_results -= 1
+                                        run_lease.mark_tool_execution_finished()
+                                    if pending_tool_results == 0:
+                                        for chunk in close_step():
+                                            yield chunk
+                                elif item["type"] == "reasoning":
+                                    for chunk in open_step():
+                                        yield chunk
+                                    for chunk in close_text_part():
+                                        yield chunk
+                                    if reasoning_part_id is None:
+                                        reasoning_part_id = uuid4().hex
+                                        yield enc.reasoning_start(reasoning_part_id)
+                                    yield enc.reasoning_delta(reasoning_part_id, item["content"])
+                                else:
+                                    yield enc.data_part("data-state", {"item": redact(item)}, transient=True)
+
+                            for chunk in drain_event_queue():
+                                yield chunk
+                            if stream_task.done():
+                                # A producer can publish its final queue item
+                                # between the last nonblocking drain and this
+                                # completion check. Yield once so that item is
+                                # interpreted before a generic stop finish.
+                                if not token_queue.empty():
+                                    continue
+                                await asyncio.sleep(0)
+                                if not token_queue.empty():
+                                    continue
+                                exc = stream_task.exception()
+                                if exc:
+                                    if not fence_lost:
+                                        await persist_terminal(RunStatus.FAILED_TERMINAL)
+                                    for chunk in drain_event_queue():
+                                        yield chunk
+                                    for chunk in close_open_parts():
+                                        yield chunk
+                                    for chunk in close_step():
+                                        yield chunk
+                                    yield enc.error(public_error_message(exc))
+                                else:
+                                    for chunk in drain_event_queue():
+                                        yield chunk
+                                    for chunk in close_open_parts():
+                                        yield chunk
+                                    for chunk in close_step():
+                                        yield chunk
+                                    yield enc.finish("stop")
+                                return
+
+                            await asyncio.sleep(0.02)
+                    finally:
+                        if heartbeat_task is not None:
+                            heartbeat_stop.set()
+                            await asyncio.gather(heartbeat_task, return_exceptions=True)
+                        if stream_task is not None:
+                            stream_task.cancel()
+                            await asyncio.gather(stream_task, return_exceptions=True)
+                        if subscription is not None:
+                            subscription.close()
+                        if not terminal_persisted and not fence_lost and not awaiting_user_paused:
+                            try:
+                                await persist_terminal(cancellation_status(run_context))
+                            except Exception:
+                                logger.error("failed to persist terminal run status")
+                        run_lease.close()
+                        logger.info("SSE stream ended session=%s run=%s", session.id, run_id)
+
+            try:
+                return await background_response(
+                    request, run_context, event_stream(), response_class=StreamingResponse,
+                    headers={"X-Vercel-AI-Data-Stream": "v1"},
+                )
+            except BaseException:
+                if workflow_lease is not None:
+                    try:
+                        await build_workflow_coordinator(
+                            request.app.state.database,
+                            request.app.state.settings,
+                        ).finish_run_with_checkpoint(workflow_lease, RunStatus.CANCELLED)
+                    except Exception:
+                        logger.error("failed to cancel run after streaming setup error")
+                run_lease.close()
+                raise
 
 
 def _resolve_chat_message(req: ChatRequest) -> str:
@@ -831,3 +841,44 @@ def _extract_message_text(message: dict[str, Any]) -> str:
                 parts.append(part["text"])
         return "".join(parts)
     return ""
+
+
+@router.post("/chat")
+async def chat(
+    req: ChatRequest,
+    request: Request,
+    context: TenantContext = Depends(tenant_context),
+    uow: TenantUnitOfWork = Depends(tenant_uow, scope="function"),
+):
+    # Setup owns a fresh UOW and outlives the HTTP waiter just like the SSE producer.
+    _resolve_chat_message(req)
+    requested = req.session_id if req.session_id is not None else req.id
+    if req.session_id is not None or req.id is not None:
+        session = await uow.sessions.get(requested) if requested else None
+        if session is None:
+            raise HTTPException(404, "session not found")
+        if session.status is SessionStatus.ARCHIVED:
+            raise HTTPException(409, "session is archived")
+    else:
+        session = await uow.sessions.create()
+    manager = background_manager(request)
+    session_context = context.for_session(session.id)
+    manager.reserve_session(session_context)
+    try:
+        await uow.commit()
+    except BaseException:
+        manager.release_session(session_context)
+        raise
+    scoped_request = req.model_copy(update={"session_id": session.id})
+
+    async def setup():
+        async with TenantUnitOfWork(request.app.state.database, context,
+                planning_settings=request.app.state.settings.planning,
+                workflow_settings=request.app.state.settings.workflow) as owned_uow:
+            user = await owned_uow.users.get_current()
+            workspace = await owned_uow.workspaces.get_current()
+            if user.status != "active" or workspace.status != "active":
+                raise HTTPException(403, "Account unavailable")
+            return await _chat(scoped_request, request, context, owned_uow)
+
+    return await manager.run_setup(session_context, setup, release_admission=True)

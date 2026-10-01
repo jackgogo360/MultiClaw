@@ -74,6 +74,7 @@ async def test_chat_streams_are_isolated_by_exact_run_scope(migrated_database, m
         context = TenantContext(user_id, workspace_id)
         async with TenantUnitOfWork(server.app.state.database, context) as uow:
             session = await uow.sessions.create(title="Shared Session")
+            second_session = await uow.sessions.create(title="Parallel Session")
         original_acquire = server.app.state.runtime_pool.acquire
         shared_runtime = await original_acquire(context.for_session(session.id))
 
@@ -83,7 +84,7 @@ async def test_chat_streams_are_isolated_by_exact_run_scope(migrated_database, m
         foreign_published = asyncio.Event()
 
         async def fake_handle_message_stream(user_input: str, *, context: TenantContext):
-            assert context.session_id == session.id
+            assert context.session_id in {session.id, second_session.id}
             assert context.run_id is not None
 
             run_scope = EventScope.from_context(context)
@@ -171,7 +172,7 @@ async def test_chat_streams_are_isolated_by_exact_run_scope(migrated_database, m
             )
         async with TenantUnitOfWork(server.app.state.database, context) as uow_b:
             response_b = await chat_api.chat(
-                chat_api.ChatRequest(message="second", session_id=session.id),
+                chat_api.ChatRequest(message="second", session_id=second_session.id),
                 request,
                 context,
                 uow_b,
@@ -200,7 +201,7 @@ async def test_chat_streams_are_isolated_by_exact_run_scope(migrated_database, m
     tool_inputs_b = [payload for payload in payloads_b if payload["type"] == "tool-input-available"]
 
     assert run_meta_a["data"]["session_id"] == session.id
-    assert run_meta_b["data"]["session_id"] == session.id
+    assert run_meta_b["data"]["session_id"] == second_session.id
     assert run_meta_a["data"]["run_id"] != run_meta_b["data"]["run_id"]
     assert foreign_published.is_set() is True
     assert {payload["data"]["run_id"] for payload in scoped_a} == {run_meta_a["data"]["run_id"]}

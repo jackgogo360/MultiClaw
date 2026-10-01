@@ -26,8 +26,9 @@ from multiclaw.mcp import MCPClientManager
 from multiclaw.memory import MemoryEntry, MemoryProtocol
 from multiclaw.planner.execution import PlanExecutionCoordinator
 from multiclaw.planner.generator import PlanGenerator
-from multiclaw.planner.service import PlanningService
 from multiclaw.planner.policy import PlanningPolicy
+from multiclaw.planner.service import PlanningService
+from multiclaw.runtime.inference import InferenceRouter
 from multiclaw.runtime.models import RuntimeClock, TenantRuntime
 from multiclaw.secrets.resolver import ResolvedCredentials
 from multiclaw.skills import SkillManager
@@ -310,7 +311,11 @@ class RuntimeFactory:
                 platform_value=api_key,
             )
 
-        return ModelRouter(self.settings, credential_resolver=credential_resolver)
+        return InferenceRouter(
+            ModelRouter(self.settings, credential_resolver=credential_resolver),
+            settings=self.settings,
+            workspace_root=self.workspace_resolver.resolve(context),
+        )
 
     def _build_scheduler(self, event_bus: EventBus) -> CoreToolScheduler:
         return CoreToolScheduler(

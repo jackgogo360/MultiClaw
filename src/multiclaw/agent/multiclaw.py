@@ -54,6 +54,8 @@ REFLECTION_PROMPT = (
 def _build_assistant_tool_calls_msg(
     calls: list[dict[str, Any]],
     reasoning_content: str = "",
+    *,
+    reasoning_blocks: list[dict[str, Any]] | None = None,
 ) -> dict:
     msg: dict = {
         "role": "assistant",
@@ -72,6 +74,8 @@ def _build_assistant_tool_calls_msg(
     }
     if reasoning_content:
         msg["reasoning_content"] = reasoning_content
+    if reasoning_blocks:
+        msg["reasoning_blocks"] = reasoning_blocks
     return msg
 
 
@@ -242,6 +246,13 @@ class MultiClawAgent(ToolCallAgent):
         )
 
     async def _raise_if_cancel_requested(self, context: TenantContext) -> None:
+        from multiclaw.runtime.inference import current_inference_budget
+        from multiclaw.runtime.run_control import check_cancel
+
+        await check_cancel(context)
+        budget = current_inference_budget()
+        if budget is not None:
+            budget.check()
         database = getattr(getattr(self, "scheduler", None), "database", None)
         if context.run_id is None or database is None:
             return
@@ -362,6 +373,7 @@ class MultiClawAgent(ToolCallAgent):
                         _build_assistant_tool_calls_msg(
                             normalized_calls,
                             response.reasoning_content,
+                            reasoning_blocks=getattr(response, "reasoning_blocks", None),
                         )
                     )
                     outcomes = await self._execute_tool_batch(
@@ -484,6 +496,7 @@ class MultiClawAgent(ToolCallAgent):
                 assistant_msg = _build_assistant_tool_calls_msg(
                     normalized_calls,
                     response.reasoning_content,
+                    reasoning_blocks=getattr(response, "reasoning_blocks", None),
                 )
                 messages.append(assistant_msg)
                 outcomes = await self._execute_tool_batch(normalized_calls, context=context)
@@ -739,6 +752,7 @@ class MultiClawAgent(ToolCallAgent):
                             tool_calls_msg = _build_assistant_tool_calls_msg(
                                 normalized_calls,
                                 reasoning,
+                                reasoning_blocks=event.get("reasoning_blocks"),
                             )
                             messages.append(tool_calls_msg)
                             outcomes = await self._execute_tool_batch(
@@ -1022,6 +1036,7 @@ class MultiClawAgent(ToolCallAgent):
                 _build_assistant_tool_calls_msg(
                     normalized_calls,
                     response.reasoning_content,
+                    reasoning_blocks=getattr(response, "reasoning_blocks", None),
                 )
             )
             outcomes = await self._execute_tool_batch(

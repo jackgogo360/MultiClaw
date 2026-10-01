@@ -540,6 +540,9 @@ async def lifespan(app: FastAPI):
         app.state.allowed_origins = allowed_origins
         app.state.database = runtime_factory.database
         app.state.runtime_pool = runtime_pool
+        from multiclaw.runtime.background import BackgroundRunManager
+        app.state.background_runs = BackgroundRunManager(runtime_factory.database, runtime_factory.settings)
+        runtime_pool.background_runs = app.state.background_runs
         app.state.workspace_resolver = runtime_factory.workspace_resolver
         app.state.settings = runtime_factory.settings
         app.state.operational_metrics = OperationalMetrics()
@@ -584,6 +587,7 @@ async def lifespan(app: FastAPI):
                     trace_sink=app.state.trace_sink,
                 ):
                     worker = WorkflowRecoveryWorker(
+                        background_runs=app.state.background_runs,
                         database=runtime_factory.database,
                         settings=runtime_factory.settings,
                         runtime_pool=runtime_pool,
@@ -676,6 +680,13 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         primary: BaseException | None = None
+
+        background_runs = getattr(app.state, "background_runs", None)
+        if background_runs is not None:
+            try:
+                await background_runs.close()
+            except BaseException as error:
+                primary = error
 
         if recovery_stop is not None:
             recovery_stop.set()
