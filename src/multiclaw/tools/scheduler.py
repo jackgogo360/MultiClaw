@@ -304,7 +304,9 @@ class CoreToolScheduler:
                 )
 
             try:
-                result = await self.execution_guard.run(dispatch)
+                result = await self.execution_guard.run(
+                    dispatch, timeout=getattr(builder, "timeout_seconds", None)
+                )
             except (StaleFenceError, VersionConflictError, LeaseConflictError):
                 raise
             except Exception:
@@ -424,7 +426,9 @@ class CoreToolScheduler:
                 self._event_data(builder.name, call_id),
                 context=context,
             )
-            result = await self.execution_guard.run(invocation.execute)
+            result = await self.execution_guard.run(
+                invocation.execute, timeout=getattr(builder, "timeout_seconds", None)
+            )
         except Exception:
             result = ToolExecutionResult(
                 status=ToolStatus.ERROR,

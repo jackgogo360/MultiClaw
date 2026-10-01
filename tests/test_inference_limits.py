@@ -209,6 +209,73 @@ async def test_steering_survives_a_reflection_copy(tmp_path):
     assert any(item.get("content") == "new constraint" for item in observed[-1])
 
 
+async def test_subagent_inference_does_not_take_parent_objective_or_steering(tmp_path):
+    from multiclaw.runtime.inference import (
+        InferenceRouter, inference_scope, subagent_inference_scope,
+    )
+    from multiclaw.runtime.run_control import RunControl, current_run_control
+
+    context = TenantContext("tenant", "workspace", "session", "run")
+    control = RunControl(context)
+    control.steering.append("private parent correction")
+    observed = []
+
+    async def completion(**kwargs):
+        observed.append([item.copy() for item in kwargs["messages"]])
+        return SimpleNamespace(content="ok", usage={})
+
+    settings = configuration(tmp_path)
+    router = InferenceRouter(SimpleNamespace(completion=completion), settings=settings)
+    token = current_run_control.set(control)
+    try:
+        with inference_scope(context, settings=settings) as budget:
+            budget.objective = "private parent objective"
+            with subagent_inference_scope(max_tokens=2000):
+                await router.completion(model="test", messages=[
+                    {"role": "system", "content": "child"},
+                    {"role": "user", "content": "inspect files"},
+                ])
+            assert list(control.steering) == ["private parent correction"]
+            assert budget.steering == []
+            await router.completion(model="test", messages=[
+                {"role": "system", "content": "parent"},
+                {"role": "user", "content": "parent task"},
+            ])
+    finally:
+        current_run_control.reset(token)
+
+    child_text = str(observed[0])
+    assert "private parent correction" not in child_text
+    assert "private parent objective" not in child_text
+    assert "private parent correction" in str(observed[1])
+
+
+async def test_subagent_output_limit_respects_caller_and_prepared_prompt(tmp_path):
+    from multiclaw.runtime.inference import (
+        InferenceRouter, RunBudgetExceeded, inference_scope, subagent_inference_scope,
+    )
+
+    (tmp_path / "AGENTS.md").write_text("project rule " * 500, encoding="utf-8")
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(content="done", usage={})
+
+    settings = configuration(tmp_path)
+    provider = SimpleNamespace(completion=completion, supports_output_limit=True)
+    router = InferenceRouter(provider, settings=settings, workspace_root=tmp_path)
+    context = TenantContext("tenant", "workspace", "session", "run")
+    with inference_scope(context, settings=settings):
+        with subagent_inference_scope(max_tokens=100):
+            with pytest.raises(RunBudgetExceeded):
+                await router.completion(model="test", messages=[{"role": "user", "content": "inspect"}])
+        assert calls == []
+        with subagent_inference_scope(max_tokens=5000):
+            await router.completion(model="test", messages=[{"role": "user", "content": "inspect"}], max_output_tokens=7)
+    assert calls[0]["max_output_tokens"] == 7
+
+
 async def test_concurrent_calls_reserve_run_budget(tmp_path):
     import asyncio
 

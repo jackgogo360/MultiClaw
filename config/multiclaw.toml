@@ -83,6 +83,11 @@ context_response_reserve_tokens = 4096
 [agent]
 max_tool_rounds = 100
 resilience_enabled = true
+subagents_enabled = false
+subagent_max_tasks = 3
+subagent_max_rounds = 3
+subagent_max_tokens = 20000
+subagent_timeout_seconds = 180
 
 [governance]
 audit_enabled = true
