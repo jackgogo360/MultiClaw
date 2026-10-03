@@ -1,0 +1,278 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1800" height="1260" viewBox="0 0 1800 1260" role="img" aria-labelledby="architecture-title architecture-description">
+  <title id="architecture-title">MultiClaw 分层架构</title>
+  <desc id="architecture-description">单进程、单机、多租户 AI Agent 运行时。五层分别是交互、接口与认证、Agent 编排、工具与治理、持久化与执行。TenantContext 按 tenant、workspace、session、run 逐级收窄作用域。RuntimePool 与 CollaborationService 管理主运行时和独立成员 Run；MCP 只向主运行时开放，成员不可再次委派。状态通过 EventRouter 和 SSE 返回，Run 通过持久化检查点恢复。数据库为 SQLite 或 MySQL。Writer 在独立 Git worktree 写入，经过 Diff 与 digest 审阅确认后才应用到主项目。</desc>
+  <defs>
+    <linearGradient id="canvas" x2="1" y2="1">
+      <stop stop-color="#080f22"/>
+      <stop offset=".5" stop-color="#101b31"/>
+      <stop offset="1" stop-color="#08151f"/>
+    </linearGradient>
+    <radialGradient id="atmosphere">
+      <stop stop-color="#245177" stop-opacity=".32"/>
+      <stop offset="1" stop-color="#102239" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="spectrum">
+      <stop stop-color="#559bff"/>
+      <stop offset=".25" stop-color="#44d8ee"/>
+      <stop offset=".5" stop-color="#ffc366"/>
+      <stop offset=".75" stop-color="#b393ff"/>
+      <stop offset="1" stop-color="#58e4b7"/>
+    </linearGradient>
+    <linearGradient id="blue" x2="1" y2=".6">
+      <stop stop-color="#1a3559" stop-opacity=".88"/>
+      <stop offset="1" stop-color="#122039" stop-opacity=".95"/>
+    </linearGradient>
+    <linearGradient id="cyan" x2="1" y2=".6">
+      <stop stop-color="#163b49" stop-opacity=".88"/>
+      <stop offset="1" stop-color="#102531" stop-opacity=".95"/>
+    </linearGradient>
+    <linearGradient id="amber" x2="1" y2=".6">
+      <stop stop-color="#3d3429" stop-opacity=".88"/>
+      <stop offset="1" stop-color="#272632" stop-opacity=".95"/>
+    </linearGradient>
+    <linearGradient id="violet" x2="1" y2=".6">
+      <stop stop-color="#332b4a" stop-opacity=".88"/>
+      <stop offset="1" stop-color="#202039" stop-opacity=".95"/>
+    </linearGradient>
+    <linearGradient id="mint" x2="1" y2=".6">
+      <stop stop-color="#193c38" stop-opacity=".88"/>
+      <stop offset="1" stop-color="#12282d" stop-opacity=".95"/>
+    </linearGradient>
+    <linearGradient id="glass" x2="0" y2="1">
+      <stop stop-color="#ffffff" stop-opacity=".085"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity=".02"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#89bbec" opacity=".12"/>
+    </pattern>
+    <filter id="glow" x="-15%" y="-35%" width="130%" height="170%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="shadow" x="-15%" y="-25%" width="130%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#020813" flood-opacity=".5"/>
+    </filter>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 7 4 0 8" fill="none" stroke="#8aafd0" stroke-width="2"/>
+    </marker>
+    <marker id="cyan-arrow" markerWidth="10" markerHeight="10" refX="7" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 8 5 0 10" fill="none" stroke="#55d9ef" stroke-width="2.2"/>
+    </marker>
+    <marker id="amber-arrow" markerWidth="10" markerHeight="10" refX="7" refY="5" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 8 5 0 10" fill="none" stroke="#ffc366" stroke-width="2.2"/>
+    </marker>
+    <symbol id="chat" viewBox="0 0 24 24">
+      <path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-6 4V6a2 2 0 0 1 2-2Z"/>
+      <path d="M7 9h10M7 13h7"/>
+    </symbol>
+    <symbol id="shield" viewBox="0 0 24 24">
+      <path d="m12 2 9 4v6c0 5-5 8-9 10-4-2-9-5-9-10V6l9-4Z"/>
+      <path d="m8 12 3 3 5-6"/>
+    </symbol>
+    <symbol id="flow" viewBox="0 0 24 24">
+      <rect x="8" y="2" width="8" height="6" rx="1.5"/>
+      <rect x="2" y="16" width="7" height="6" rx="1.5"/>
+      <rect x="15" y="16" width="7" height="6" rx="1.5"/>
+      <path d="M12 8v5M5.5 16v-3h13v3"/>
+    </symbol>
+    <symbol id="tool" viewBox="0 0 24 24">
+      <path d="M14 4a6 6 0 0 0-7 8L2 17a3 3 0 0 0 5 5l5-5a6 6 0 0 0 8-7l-4 4-5-5 3-5Z"/>
+    </symbol>
+    <symbol id="database" viewBox="0 0 24 24">
+      <ellipse cx="12" cy="5" rx="9" ry="3"/>
+      <path d="M3 5v14c0 2 4 3 9 3s9-1 9-3V5M3 12c0 2 4 3 9 3s9-1 9-3"/>
+    </symbol>
+    <symbol id="branch" viewBox="0 0 24 24">
+      <circle cx="6" cy="4" r="2"/><circle cx="18" cy="4" r="2"/><circle cx="6" cy="20" r="2"/>
+      <path d="M6 6v12M18 6c0 7-12 4-12 10"/>
+    </symbol>
+    <symbol id="check" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9"/><path d="m7 12 3 3 7-7"/>
+    </symbol>
+    <symbol id="code" viewBox="0 0 24 24">
+      <path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-15-2 18"/>
+    </symbol>
+    <style>
+      text { font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif; }
+      .layer-title { font-size: 28px; font-weight: 650; fill: #f2f6ff; }
+      .eyebrow { font-size: 16px; letter-spacing: 1.6px; fill: #a1b7d1; }
+      .node-title { font-size: 25px; font-weight: 600; fill: #eef5ff; }
+      .node-body { font-size: 20px; fill: #b8cbe1; }
+      .note { font-size: 18px; fill: #9fb5cd; }
+      .node { fill: url(#glass); stroke: #b4d7ff; stroke-opacity: .16; stroke-width: 1.2; }
+      .icon { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+      .connector { fill: none; stroke: #8aafd0; stroke-width: 2.5; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <!-- Self-contained vector art: no scripts, remote fonts, images or links. -->
+  <rect width="1800" height="1260" rx="30" fill="url(#canvas)"/>
+  <ellipse cx="1150" cy="520" rx="820" ry="650" fill="url(#atmosphere)"/>
+  <rect x="20" y="20" width="1760" height="1220" rx="24" fill="url(#grid)" stroke="#86b4d8" stroke-opacity=".12"/>
+  <path d="M76 80h14m-7-7v14" stroke="#5bdeec" stroke-width="3"/>
+  <text x="108" y="104" font-size="62" font-weight="730" fill="#f4f8ff">MultiClaw</text>
+  <text x="471" y="101" font-size="31" font-weight="550" fill="#9ebdde">分层架构</text>
+  <text x="78" y="151" font-size="26" fill="#aebfd6">多租户 AI Agent · 可协作，可恢复，可审阅</text>
+  <rect x="1403" y="62" width="323" height="53" rx="26" fill="#1a333b" stroke="#59dcc1" stroke-opacity=".55"/>
+  <circle cx="1431" cy="88" r="5" fill="#62e3bd"/>
+  <text x="1567" y="98" text-anchor="middle" font-size="25" font-weight="600" fill="#a5eddb">单进程 · 单机部署</text>
+  <text x="1723" y="152" text-anchor="end" font-size="20" fill="#a1b4cc">v0.1.0 · 开发阶段</text>
+  <rect x="76" y="175" width="1650" height="2" rx="1" fill="url(#spectrum)" opacity=".7"/>
+
+  <!-- Cross-cutting tenant scope. Scope is identity, not an extra service. -->
+  <g id="tenant-scope">
+    <rect x="43" y="204" width="152" height="838" rx="22" fill="#122539" stroke="#5fa8ed" stroke-opacity=".42"/>
+    <text x="119" y="249" text-anchor="middle" font-size="25" font-weight="600" fill="#b9dcff">租户边界</text>
+    <text x="119" y="283" text-anchor="middle" font-size="19" fill="#88b8e4">TenantContext</text>
+    <use xlink:href="#shield" x="96" y="315" width="46" height="46" class="icon" color="#6caeff"/>
+    <g text-anchor="middle" font-size="21" font-weight="550" fill="#d5e6f8">
+      <rect x="57" y="397" width="124" height="50" rx="13" fill="#1b3954" stroke="#5d97c8" stroke-opacity=".35"/>
+      <text x="119" y="429">tenant</text>
+      <rect x="57" y="484" width="124" height="50" rx="13" fill="#1b3954" stroke="#5d97c8" stroke-opacity=".35"/>
+      <text x="119" y="516" font-size="19">workspace</text>
+      <rect x="57" y="571" width="124" height="50" rx="13" fill="#1b3954" stroke="#5d97c8" stroke-opacity=".35"/>
+      <text x="119" y="603">session</text>
+      <rect x="57" y="658" width="124" height="50" rx="13" fill="#1b3954" stroke="#5d97c8" stroke-opacity=".35"/>
+      <text x="119" y="690">run</text>
+    </g>
+    <path d="M119 452v24m0 63v24m0 63v24" class="connector"/>
+    <text x="119" y="801" text-anchor="middle" font-size="24" fill="#b7d5f4">逐级收窄</text>
+    <text x="119" y="839" text-anchor="middle" font-size="20" fill="#8daecb">数据 / 运行时</text>
+    <text x="119" y="868" text-anchor="middle" font-size="20" fill="#8daecb">事件 / 文件</text>
+    <path d="M77 906h84" stroke="#6caeff" stroke-opacity=".3"/>
+    <text x="119" y="949" text-anchor="middle" font-size="20" fill="#8daecb">越界拒绝</text>
+    <text x="119" y="980" text-anchor="middle" font-size="20" fill="#8daecb">作用域隔离</text>
+  </g>
+  <path d="M196 451h20M196 623h20M196 795h20M196 967h20" stroke="#679ed0" stroke-width="2" stroke-dasharray="3 5" opacity=".55"/>
+
+  <!-- Five color-coded functional layers. -->
+  <g id="layer-1">
+    <rect x="222" y="204" width="1356" height="150" rx="22" fill="url(#blue)" filter="url(#shadow)"/>
+    <rect x="222" y="204" width="1356" height="150" rx="22" fill="none" stroke="#559bff" stroke-opacity=".65" filter="url(#glow)"/>
+    <circle cx="264" cy="252" r="20" fill="#264e7a"/>
+    <text x="264" y="259" text-anchor="middle" font-size="20" font-weight="600" fill="#90c0ff">01</text>
+    <text x="305" y="262" class="layer-title">交互层</text>
+    <text x="305" y="292" class="eyebrow">WEB EXPERIENCE</text>
+    <use xlink:href="#chat" x="254" y="302" width="30" height="30" class="icon" color="#78b4ff"/>
+    <g><rect x="526" y="233" width="248" height="82" rx="15" class="node"/><text x="548" y="266" class="node-title" style="font-size:21px">React / assistant-ui</text><text x="548" y="296" class="node-body">Web 交互界面</text></g>
+    <g><rect x="786" y="233" width="248" height="82" rx="15" class="node"/><text x="808" y="266" class="node-title">聊天与会话</text><text x="808" y="296" class="node-body">流式对话 / 历史记录</text></g>
+    <g><rect x="1046" y="233" width="248" height="82" rx="15" class="node"/><text x="1068" y="266" class="node-title">计划与工具审批</text><text x="1068" y="296" class="node-body">人工审核 / 反馈修订</text></g>
+    <g><rect x="1306" y="233" width="248" height="82" rx="15" class="node"/><text x="1328" y="266" class="node-title">协作面板</text><text x="1328" y="296" class="node-body">任务板 / 消息 / Diff</text></g>
+    <text x="526" y="338" class="note">查看进度 · 补充指令 · 取消任务 · 显式审阅交付</text>
+  </g>
+  <path d="M425 357v13" class="connector"/>
+
+  <g id="layer-2">
+    <rect x="222" y="376" width="1356" height="150" rx="22" fill="url(#cyan)" filter="url(#shadow)"/>
+    <rect x="222" y="376" width="1356" height="150" rx="22" fill="none" stroke="#44d8ee" stroke-opacity=".65" filter="url(#glow)"/>
+    <circle cx="264" cy="424" r="20" fill="#205160"/>
+    <text x="264" y="431" text-anchor="middle" font-size="20" font-weight="600" fill="#81e5f4">02</text>
+    <text x="305" y="434" class="layer-title">接口与认证</text>
+    <text x="305" y="464" class="eyebrow">API / AUTH</text>
+    <use xlink:href="#shield" x="254" y="474" width="30" height="30" class="icon" color="#75deee"/>
+    <g><rect x="526" y="405" width="248" height="82" rx="15" class="node"/><text x="548" y="438" class="node-title">FastAPI</text><text x="548" y="468" class="node-body">HTTP / JSON API</text></g>
+    <g><rect x="786" y="405" width="248" height="82" rx="15" class="node"/><text x="808" y="438" class="node-title">JWT / CSRF</text><text x="808" y="468" class="node-body">身份与变更请求校验</text></g>
+    <g><rect x="1046" y="405" width="248" height="82" rx="15" class="node"/><text x="1068" y="438" class="node-title">会话与 Run API</text><text x="1068" y="468" class="node-body">资源读取 / 状态控制</text></g>
+    <g><rect x="1306" y="405" width="248" height="82" rx="15" class="node"/><text x="1328" y="438" class="node-title">SSE 事件流</text><text x="1328" y="468" class="node-body">进度与审批通知</text></g>
+    <text x="526" y="510" class="note">服务端构造作用域 · 按作用域读取资源与投递事件</text>
+  </g>
+  <path d="M425 529v13" class="connector"/>
+
+  <g id="layer-3">
+    <rect x="222" y="548" width="1356" height="150" rx="22" fill="url(#amber)" filter="url(#shadow)"/>
+    <rect x="222" y="548" width="1356" height="150" rx="22" fill="none" stroke="#ffc366" stroke-opacity=".65" filter="url(#glow)"/>
+    <circle cx="264" cy="596" r="20" fill="#62503a"/>
+    <text x="264" y="603" text-anchor="middle" font-size="20" font-weight="600" fill="#ffda9d">03</text>
+    <text x="305" y="606" class="layer-title">Agent 编排</text>
+    <text x="305" y="636" class="eyebrow">RUNTIME / TEAMS</text>
+    <use xlink:href="#flow" x="254" y="646" width="30" height="30" class="icon" color="#ffd192"/>
+    <g><rect x="526" y="577" width="248" height="82" rx="15" class="node"/><text x="548" y="610" class="node-title">RuntimePool</text><text x="548" y="640" class="node-body">模型路由 / 上下文</text></g>
+    <g><rect x="786" y="577" width="248" height="82" rx="15" class="node"/><text x="808" y="610" class="node-title">Durable Plans</text><text x="808" y="640" class="node-body">计划版本 / 依赖执行</text></g>
+    <g><rect x="1046" y="577" width="248" height="82" rx="15" class="node"/><text x="1068" y="610" class="node-title">协作调度</text><text x="1068" y="640" class="node-body" style="font-size:18px">CollaborationService</text></g>
+    <g><rect x="1306" y="577" width="248" height="82" rx="15" class="node"/><text x="1328" y="610" class="node-title">独立成员 Run</text><text x="1328" y="640" class="node-body">子 Agent / Agent Team</text></g>
+    <text x="526" y="682" class="note">独立上下文与权限 · 任务依赖与成员消息 · 成员不开放 MCP 或再次委派</text>
+  </g>
+  <path d="M425 701v13" class="connector"/>
+
+  <g id="layer-4">
+    <rect x="222" y="720" width="1356" height="150" rx="22" fill="url(#violet)" filter="url(#shadow)"/>
+    <rect x="222" y="720" width="1356" height="150" rx="22" fill="none" stroke="#b393ff" stroke-opacity=".65" filter="url(#glow)"/>
+    <circle cx="264" cy="768" r="20" fill="#514270"/>
+    <text x="264" y="775" text-anchor="middle" font-size="20" font-weight="600" fill="#d5c2ff">04</text>
+    <text x="305" y="778" class="layer-title">工具与治理</text>
+    <text x="305" y="808" class="eyebrow">TOOLS / SAFETY</text>
+    <use xlink:href="#tool" x="254" y="818" width="30" height="30" class="icon" color="#c4abff"/>
+    <g><rect x="526" y="749" width="248" height="82" rx="15" class="node"/><text x="548" y="782" class="node-title">内置工具 / Skills</text><text x="548" y="812" class="node-body">项目规则 / 工具能力</text></g>
+    <g><rect x="786" y="749" width="248" height="82" rx="15" class="node"/><text x="808" y="782" class="node-title">MCP 集成</text><text x="808" y="812" class="node-body">仅主运行时开放</text></g>
+    <g><rect x="1046" y="749" width="248" height="82" rx="15" class="node"/><text x="1068" y="782" class="node-title">权限与治理</text><text x="1068" y="812" class="node-body">审批 / 审计 / Secret</text></g>
+    <g><rect x="1306" y="749" width="248" height="82" rx="15" class="node"/><text x="1328" y="782" class="node-title">Git worktree</text><text x="1328" y="812" class="node-body">成员 Writer 隔离写入</text></g>
+    <text x="526" y="854" class="note">工具继续受审批与沙箱约束 · 隔离写入不会自动修改主项目</text>
+  </g>
+  <path d="M425 873v13" class="connector"/>
+
+  <g id="layer-5">
+    <rect x="222" y="892" width="1356" height="150" rx="22" fill="url(#mint)" filter="url(#shadow)"/>
+    <rect x="222" y="892" width="1356" height="150" rx="22" fill="none" stroke="#58e4b7" stroke-opacity=".65" filter="url(#glow)"/>
+    <circle cx="264" cy="940" r="20" fill="#255a4c"/>
+    <text x="264" y="947" text-anchor="middle" font-size="20" font-weight="600" fill="#9bf2d4">05</text>
+    <text x="305" y="950" class="layer-title">持久化与执行</text>
+    <text x="305" y="980" class="eyebrow">STATE / SANDBOX</text>
+    <use xlink:href="#database" x="254" y="990" width="30" height="30" class="icon" color="#82ecc7"/>
+    <g><rect x="526" y="921" width="248" height="82" rx="15" class="node"/><text x="548" y="954" class="node-title">SQLAlchemy</text><text x="548" y="984" class="node-body">事务仓储 / Alembic</text></g>
+    <g><rect x="786" y="921" width="248" height="82" rx="15" class="node"/><text x="808" y="954" class="node-title">SQLite 或 MySQL</text><text x="808" y="984" class="node-body">二选一的部署后端</text></g>
+    <g><rect x="1046" y="921" width="248" height="82" rx="15" class="node"/><text x="1068" y="954" class="node-title">持久化状态</text><text x="1068" y="984" class="node-body" style="font-size:18px">Run / 检查点 / 任务与消息</text></g>
+    <g><rect x="1306" y="921" width="248" height="82" rx="15" class="node"/><text x="1328" y="954" class="node-title">原生沙箱</text><text x="1328" y="984" class="node-body">Seatbelt / nsjail</text></g>
+    <text x="526" y="1026" class="note">持久化状态是事实源 · 租户 Secret 加密保存 · 执行环境与作用域隔离</text>
+  </g>
+
+  <!-- Return path is separate from the conceptual downward call chain. -->
+  <g id="event-progress">
+    <rect x="1606" y="204" width="152" height="838" rx="22" fill="#102937" stroke="#49d3e3" stroke-opacity=".4"/>
+    <text x="1682" y="249" text-anchor="middle" font-size="23" font-weight="600" fill="#a8e5ec">事件与进度</text>
+    <text x="1682" y="284" text-anchor="middle" font-size="19" fill="#75b9ca">EventRouter</text>
+    <path d="M1682 775V342" fill="none" stroke="#55d9ef" stroke-width="3" stroke-dasharray="5 8" marker-end="url(#cyan-arrow)"/>
+    <g text-anchor="middle" font-size="21" fill="#b8e6ed">
+      <rect x="1623" y="354" width="118" height="46" rx="13" fill="#173e4d" stroke="#4abacb" stroke-opacity=".35"/>
+      <text x="1682" y="385">SSE</text>
+      <rect x="1623" y="452" width="118" height="46" rx="13" fill="#173e4d" stroke="#4abacb" stroke-opacity=".35"/>
+      <text x="1682" y="483">状态通知</text>
+      <rect x="1623" y="550" width="118" height="46" rx="13" fill="#173e4d" stroke="#4abacb" stroke-opacity=".35"/>
+      <text x="1682" y="581">进度重连</text>
+      <rect x="1623" y="648" width="118" height="46" rx="13" fill="#173e4d" stroke="#4abacb" stroke-opacity=".35"/>
+      <text x="1682" y="679">事件重放</text>
+    </g>
+    <path d="M1656 809h52" stroke="#55d9ef" stroke-opacity=".25"/>
+    <text x="1682" y="861" text-anchor="middle" font-size="23" fill="#e9c995">恢复路径</text>
+    <text x="1682" y="901" text-anchor="middle" font-size="20" fill="#c0ad92">检查点校验</text>
+    <text x="1682" y="932" text-anchor="middle" font-size="20" fill="#c0ad92">原 Run 继续</text>
+    <path d="M1662 984a20 20 0 1 1 34 9m0-9v11h-11" fill="none" stroke="#ffc366" stroke-width="2"/>
+  </g>
+  <path d="M1603 324H1586V277H1580" fill="none" stroke="#55d9ef" stroke-width="2" stroke-dasharray="4 6" marker-end="url(#cyan-arrow)"/>
+  <path d="M1170 1006v53h422V623h-12" fill="none" stroke="#ffc366" stroke-width="2" stroke-dasharray="5 7" opacity=".8" marker-end="url(#amber-arrow)"/>
+
+  <!-- Review is an explicit bridge, never automatic merge into the project. -->
+  <g id="reviewed-delivery">
+    <rect x="222" y="1090" width="1536" height="106" rx="22" fill="#182432" stroke="#ffc366" stroke-opacity=".4"/>
+    <use xlink:href="#branch" x="246" y="1124" width="34" height="34" class="icon" color="#ffc366"/>
+    <text x="298" y="1134" font-size="27" font-weight="600" fill="#f5dfb9">隔离写入 · 显式交付</text>
+    <text x="298" y="1168" font-size="20" fill="#aebed0">Writer 变更必须经审阅确认</text>
+    <rect x="641" y="1113" width="228" height="61" rx="14" fill="#25354a" stroke="#8dafff" stroke-opacity=".4"/>
+    <text x="755" y="1152" text-anchor="middle" font-size="24" fill="#ccd9ff">独立 worktree</text>
+    <path d="M878 1144h36" class="connector"/>
+    <rect x="924" y="1113" width="224" height="61" rx="14" fill="#3d3426" stroke="#ffd191" stroke-opacity=".4"/>
+    <text x="1036" y="1152" text-anchor="middle" font-size="24" fill="#f2d7ae">Diff + digest 审阅</text>
+    <path d="M1157 1144h36" class="connector"/>
+    <rect x="1203" y="1113" width="223" height="61" rx="14" fill="#303441" stroke="#d1b0ff" stroke-opacity=".4"/>
+    <text x="1315" y="1152" text-anchor="middle" font-size="24" fill="#d8c5ff">用户明确确认</text>
+    <path d="M1435 1144h36" class="connector"/>
+    <rect x="1481" y="1113" width="249" height="61" rx="14" fill="#1e3d36" stroke="#75deb6" stroke-opacity=".4"/>
+    <text x="1605" y="1152" text-anchor="middle" font-size="24" fill="#b4eed7">应用到主项目</text>
+  </g>
+  <path d="M78 1225h29" stroke="#8aafd0" stroke-width="2.5"/>
+  <text x="121" y="1232" font-size="19" fill="#92a9c3">概念调用链</text>
+  <path d="M316 1225h29" stroke="#55d9ef" stroke-width="2.5" stroke-dasharray="4 5"/>
+  <text x="359" y="1232" font-size="19" fill="#92a9c3">事件返回</text>
+  <path d="M529 1225h29" stroke="#ffc366" stroke-width="2.5" stroke-dasharray="4 5"/>
+  <text x="572" y="1232" font-size="19" fill="#92a9c3">检查点恢复</text>
+  <text x="1723" y="1232" text-anchor="end" font-size="20" fill="#adc0d5">作用域贯穿各层 · 高风险操作仍需审批</text>
+</svg>
