@@ -198,6 +198,22 @@ JSON 合约：
 
 启用子 Agent 后，`delegate_tasks` 只向子任务开放内置 `read_file`、`glob`、`grep`、`list_dir` 和 `find_dir`；不开放网络、写入、Shell、代码执行、MCP 或再次委派。子任务可选默认模型或 `llm.model_providers` 中显式配置的模型。子任务继承父 Run 的租户作用域、取消和总 Token 额度，结果按输入顺序返回。崩溃恢复可重新执行这一只读委派，可能重复消耗模型 Token；子任务尚无独立持久化 Run。
 
+## 协作：collaboration
+
+独立子任务与 Agent Team 使用下面的 `collaboration` 开关；上述 `delegate_tasks` 是旧的只读工具调用。
+
+| 字段 | 默认值 / 范围 | 用途 |
+|---|---|---|
+| `collaboration.enabled` | `false` | 开启独立子 Agent 与团队 |
+| `collaboration.max_workers` | `3` / `1..8` | 后台成员并发槽位，仍受租户 Run 配额限制 |
+| `collaboration.max_jobs_per_session` | `100` / `1..500` | 会话累计分派上限 |
+| `collaboration.max_job_tokens` | `20000` / `1024..100000` | 每个分派的 Token 分配与上限 |
+| `collaboration.max_job_seconds` | `300` / `1..1800` | 每段活动执行最长时间 |
+| `collaboration.max_job_rounds` | `10` / `1..50` | 成员工具轮次上限 |
+| `collaboration.max_team_tokens` | `250000` / `20000..1000000` | 团队累计分派 Token 分配上限 |
+
+对应环境变量使用 `MULTICLAW_COLLABORATION__` 加大写字段名。行为、审批与 Git 写入边界见[协作指南](collaboration.md)。日志目录可用 `MULTICLAW_LOG_DIR` 指定，默认在用户的 `.multiclaw/logs`。
+
 ## Skills：`skills`
 
 TOML 分组名使用复数 `skills`，但 Settings 字段名和环境变量路径使用单数 `skill`。这是当前加载契约，不能把两种形式互换。

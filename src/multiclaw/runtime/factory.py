@@ -251,6 +251,48 @@ class RuntimeFactory:
             raise
         return runtime
 
+    async def create_member(self, context: TenantContext, *, workspace_root: Path,
+                            profile: str, model: str | None, instructions: str, max_tokens: int | None = None) -> TenantRuntime:
+        settings = self.settings.model_copy(deep=True)
+        settings.agent.subagents_enabled = False
+        settings.collaboration.enabled = False
+        settings.mcp.enabled = False
+        settings.agent.max_tool_rounds = settings.collaboration.max_job_rounds
+        settings.runtime.max_run_tokens = min(settings.runtime.max_run_tokens, settings.collaboration.max_job_tokens)
+        if max_tokens is not None:
+            settings.runtime.max_run_tokens = min(settings.runtime.max_run_tokens, max_tokens)
+        settings.runtime.max_run_seconds = min(settings.runtime.max_run_seconds, settings.collaboration.max_job_seconds)
+        if model:
+            if model not in {settings.llm.default_model, *settings.llm.model_providers}:
+                raise ValueError("member model is not configured")
+            settings.llm.default_model = model
+        settings.agent.system_prompt += "\nYou are an independent assigned Agent. " + instructions
+        tenant_id, workspace_id = context.tenant_id, context.workspace_id
+
+        class BoundResolver:
+            def resolve(self, scope, *, create=False):
+                if (scope.tenant_id, scope.workspace_id) != (tenant_id, workspace_id):
+                    raise ValueError("member workspace scope mismatch")
+                return workspace_root
+
+        factory = RuntimeFactory(settings=settings, database=self.database,
+            workspace_resolver=BoundResolver(), secret_resolver=self.secret_resolver,
+            sandbox_controller_factory=self._sandbox_controller_factory)
+        runtime = await factory.create(context)
+        from multiclaw.collaboration.permissions import MemberPermissionChecker
+        runtime.scheduler.permission_checker = MemberPermissionChecker(
+            guarded_tools={"write_file", "edit_file", "undo_edit", "shell", "code_exec"})
+        allowed = {"read_file", "glob", "grep", "list_dir", "find_dir"}
+        if profile == "writer":
+            allowed |= {"write_file", "edit_file", "undo_edit", "shell", "code_exec"}
+        elif profile != "reader":
+            await runtime.close()
+            raise ValueError("unknown member profile")
+        for builder in runtime.registry.list_all():
+            if builder.name not in allowed:
+                runtime.registry.unregister(builder.name)
+        return runtime
+
     def probe_startup(self) -> tuple[SandboxReadiness, tuple[Any, ...]]:
         event_bus = EventBus()
         controller = self._sandbox_controller_factory(self.workspace_resolver.root, event_bus)
@@ -345,6 +387,10 @@ class RuntimeFactory:
         router: ModelRouter,
         event_router: EventRouter,
     ) -> None:
+        service = getattr(self, "collaboration_service", None)
+        if self.settings.collaboration.enabled and service is not None:
+            from multiclaw.collaboration.tools import register_parent_tools
+            register_parent_tools(registry, service)
         if not self.settings.agent.subagents_enabled:
             return
         runner = ReadOnlyDelegationRunner(

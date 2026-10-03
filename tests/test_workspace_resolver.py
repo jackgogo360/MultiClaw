@@ -87,6 +87,14 @@ def test_resolver_rejects_symlink_escape(tmp_path: Path) -> None:
         WorkspaceResolver(root).resolve(TenantContext("tenant-a", "workspace-a"))
 
 
+def test_resolver_rejects_alias_to_another_tenant_inside_root(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    (root / "tenant-b" / "workspace-b").mkdir(parents=True)
+    (root / "tenant-a").symlink_to(root / "tenant-b", target_is_directory=True)
+    with pytest.raises(WorkspaceContainmentError):
+        WorkspaceResolver(root).resolve(TenantContext("tenant-a", "workspace-b"))
+
+
 def test_workspace_resolver_creates_missing_directories_with_owner_only_permissions(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()

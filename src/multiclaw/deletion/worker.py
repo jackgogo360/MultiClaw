@@ -111,13 +111,23 @@ class DeletionWorker:
                 return False
 
         try:
+            agent_storage = set()
             for workspace_id in workspace_ids:
                 refreshed = await self._heartbeat_job(job)
                 if refreshed is None:
                     return False
                 job = refreshed
                 workspace = self._workspace_resolver.resolve(TenantContext(job.tenant_id, workspace_id))
+                storage = workspace.parent / ".agent-workspaces"
+                if hasattr(self._workspace_resolver, "root") and storage.exists():
+                    expected_tenant = self._workspace_resolver.root / job.tenant_id
+                    if (workspace.parent != expected_tenant or expected_tenant.resolve() != expected_tenant
+                            or storage.is_symlink() or storage.resolve() != expected_tenant / ".agent-workspaces"):
+                        raise ValueError("invalid agent workspace containment")
+                    agent_storage.add(storage)
                 self._remove_workspace_tree(workspace)
+            for storage in agent_storage:
+                self._remove_workspace_tree(storage)
         except Exception as error:
             await self._record_retryable_error(job, type(error).__name__)
             return False

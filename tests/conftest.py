@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 @pytest.fixture(autouse=True)
-def clear_multiclaw_env(monkeypatch):
+def clear_multiclaw_env(monkeypatch, tmp_path):
     for key in list(os.environ):
         if key.startswith("MULTICLAW_"):
             monkeypatch.delenv(key, raising=False)
@@ -14,6 +14,7 @@ def clear_multiclaw_env(monkeypatch):
         "MULTICLAW_AUTH_JWT_SIGNING_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MULTICLAW_LOG_DIR", str(tmp_path / "logs"))
 
 
 @pytest.fixture

@@ -89,6 +89,15 @@ subagent_max_rounds = 3
 subagent_max_tokens = 20000
 subagent_timeout_seconds = 180
 
+[collaboration]
+enabled = false
+max_workers = 3
+max_jobs_per_session = 100
+max_job_tokens = 20000
+max_job_seconds = 300
+max_job_rounds = 10
+max_team_tokens = 250000
+
 [governance]
 audit_enabled = true
 

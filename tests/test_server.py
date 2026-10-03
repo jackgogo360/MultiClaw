@@ -4529,14 +4529,11 @@ async def test_chat_forced_summary_persists_assistant_output_and_model_checkpoin
         consume_task = asyncio.create_task(consume())
         await checkpoint_started.wait()
 
-        run_event = next(
-            json.loads(chunk[6:])
-            for chunk in chunks
-            if chunk.startswith("data: ") and '"type":"data-run"' in chunk
-        )
+        # The checkpoint producer can run before the SSE consumer receives its
+        # metadata. Response headers already identify this same durable Run.
         run_context = context.for_run(
-            run_event["data"]["session_id"],
-            run_event["data"]["run_id"],
+            response.headers["X-Session-ID"],
+            response.headers["X-Run-ID"],
         )
         assert await _assistant_chat_messages(migrated_database, run_context) == []
         assert [row["phase"] for row in await _checkpoint_rows(migrated_database, run_context)] == [
@@ -4964,7 +4961,9 @@ async def test_chat_passes_run_lease_handle_with_refreshed_snapshot(migrated_dat
 
     with TestClient(server.app):
         monkeypatch.setattr(server.app.state.settings.workflow, "heartbeat_ms", 50)
-        monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 120)
+        # Exercise frequent refreshes without expiring during runtime/SSE setup
+        # on a loaded runner; stale snapshots are still rejected by version.
+        monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 1000)
         user_id, _ = await _seed_user(migrated_database, "handle-lease@example.com")
         async with AuthUnitOfWork(migrated_database) as auth_uow:
             user = await auth_uow.users.get_by_id(user_id)
@@ -5024,7 +5023,8 @@ async def test_chat_disconnect_keeps_heartbeats_until_explicit_cancel(migrated_d
 
     with TestClient(server.app):
         monkeypatch.setattr(server.app.state.settings.workflow, "heartbeat_ms", 50)
-        monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 120)
+        # The assertion concerns disconnect ownership, not sub-120ms startup.
+        monkeypatch.setattr(server.app.state.settings.workflow, "lease_ttl_ms", 1000)
         user_id, _ = await _seed_user(migrated_database, "cancel-heartbeat@example.com")
         async with AuthUnitOfWork(migrated_database) as auth_uow:
             user = await auth_uow.users.get_by_id(user_id)

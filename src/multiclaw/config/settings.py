@@ -244,6 +244,16 @@ class AgentSettings(BaseModel):
     )
 
 
+class CollaborationSettings(BaseModel):
+    enabled: bool = False
+    max_workers: int = Field(default=3, ge=1, le=8)
+    max_jobs_per_session: int = Field(default=100, ge=1, le=500)
+    max_job_tokens: int = Field(default=20000, ge=1024, le=100000)
+    max_job_seconds: int = Field(default=300, ge=1, le=1800)
+    max_job_rounds: int = Field(default=10, ge=1, le=50)
+    max_team_tokens: int = Field(default=250000, ge=20000, le=1000000)
+
+
 class SkillSettings(BaseModel):
     enabled: bool = True
     max_active: int = 5
@@ -284,6 +294,7 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
     )
 
+    log_dir: str = ""
     app: AppSettings = Field(default_factory=AppSettings)
     deployment: DeploymentSettings = Field(default_factory=DeploymentSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
@@ -298,6 +309,7 @@ class Settings(BaseSettings):
     governance: GovernanceSettings = Field(default_factory=GovernanceSettings)
     tools: ToolSettings = Field(default_factory=ToolSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
+    collaboration: CollaborationSettings = Field(default_factory=CollaborationSettings)
     skill: SkillSettings = Field(default_factory=SkillSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     email: EmailSettings = Field(default_factory=EmailSettings)
@@ -396,6 +408,8 @@ class Settings(BaseSettings):
             result["tools"] = data["tools"]
         if "agent" in data:
             result["agent"] = data["agent"]
+        if "collaboration" in data:
+            result["collaboration"] = data["collaboration"]
         if "skills" in data:
             result["skill"] = data["skills"]
         if "auth" in data:

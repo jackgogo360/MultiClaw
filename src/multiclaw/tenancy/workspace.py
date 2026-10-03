@@ -31,12 +31,16 @@ class WorkspaceResolver:
             tenant_candidate.mkdir(parents=True, exist_ok=True, mode=0o700)
         tenant_root = tenant_candidate.resolve(strict=create)
         self._ensure_contained(tenant_root)
+        if tenant_candidate.is_symlink() or tenant_root != self.root / tenant_id:
+            raise WorkspaceContainmentError(str(tenant_candidate))
 
         candidate = tenant_root / workspace_id
         if create:
             candidate.mkdir(exist_ok=True, mode=0o700)
         resolved = candidate.resolve(strict=create)
         self._ensure_contained(resolved)
+        if candidate.is_symlink() or resolved != tenant_root / workspace_id:
+            raise WorkspaceContainmentError(str(candidate))
         return resolved
 
     def _validate_segment(self, value: str) -> str:

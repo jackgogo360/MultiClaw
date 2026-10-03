@@ -99,6 +99,10 @@ class BackgroundRunManager:
     def active(self, context: TenantContext) -> bool:
         return run_key(context) in self._producers
 
+    async def record_event(self, context: TenantContext, chunk: str) -> int:
+        """Journal a separately owned worker event under its exact Run scope."""
+        return await self._append(context, redact_encoded_event(chunk))
+
     def active_session(self, context: TenantContext) -> bool:
         key = session_key(context)
         return key in self._setups or any(run[:3] == key for run in self._producers)

@@ -123,8 +123,8 @@ async def test_upgrade_to_durable_plan_head_matches_metadata(tmp_path):
     await asyncio.to_thread(command.upgrade, config, "head")
     database = Database.create(DatabaseSettings(driver="sqlite", url=database_url))
     try:
-        assert ScriptDirectory.from_config(config).get_current_head() == "20260905_0002"
-        assert await _current_revision(database) == "20260905_0002"
+        assert ScriptDirectory.from_config(config).get_current_head() == "20261002_0003"
+        assert await _current_revision(database) == "20261002_0003"
         async with database.connect() as conn:
             tables = await conn.run_sync(lambda sync: set(inspect(sync).get_table_names()))
             columns = await conn.run_sync(lambda sync: inspect(sync).get_columns("agent_runs"))
@@ -137,7 +137,9 @@ async def test_upgrade_to_durable_plan_head_matches_metadata(tmp_path):
         await database.dispose()
 
     assert PLAN_TABLES <= tables
-    assert tables - {"alembic_version"} == EXPECTED_BASELINE_TABLES | PLAN_TABLES
+    assert tables - {"alembic_version"} == EXPECTED_BASELINE_TABLES | PLAN_TABLES | {
+        "agent_jobs", "agent_teams", "agent_team_members", "agent_team_tasks", "agent_team_messages",
+    }
     assert {column["name"] for column in columns} >= {
         "plan_id",
         "initial_plan_version",
@@ -177,7 +179,7 @@ async def test_upgrade_preserves_legacy_direct_run_with_existing_reference(tmp_p
 
     migrated = Database.create(DatabaseSettings(driver="sqlite", url=database_url))
     try:
-        assert await _current_revision(migrated) == "20260905_0002"
+        assert await _current_revision(migrated) == "20261002_0003"
         async with migrated.connect() as conn:
             binding = (
                 await conn.execute(
@@ -292,7 +294,7 @@ async def test_failed_sqlite_upgrade_restores_state_and_can_retry(
 
     migrated = Database.create(DatabaseSettings(driver="sqlite", url=database_url))
     try:
-        assert await _current_revision(migrated) == "20260905_0002"
+        assert await _current_revision(migrated) == "20261002_0003"
         async with migrated.connect() as conn:
             final_foreign_keys = await conn.scalar(text("PRAGMA foreign_keys"))
             final_tables = await conn.run_sync(
@@ -421,7 +423,7 @@ async def test_sqlite_upgrade_fails_closed_for_divergent_batch_temp_table(tmp_pa
 
     migrated = Database.create(DatabaseSettings(driver="sqlite", url=database_url))
     try:
-        assert await _current_revision(migrated) == "20260905_0002"
+        assert await _current_revision(migrated) == "20261002_0003"
         async with migrated.connect() as conn:
             final_rows = (
                 await conn.execute(text("SELECT * FROM memory_entries ORDER BY id"))

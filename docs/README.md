@@ -15,6 +15,7 @@
 - [API 概览](api.md)：认证、会话、聊天、审批、Secret、删除和健康接口。
 - [测试指南](testing.md)：后端、前端、文档、MySQL 和原生沙箱门禁。
 - [Durable Plans 指南](durable-plans.md)：启用方式、Plan 审核、版本、恢复、配额和发布检查。
+- [子 Agent 与 Agent Team](collaboration.md)：独立运行、共享任务与消息、隔离写入和审阅。
 - [贡献指南](../CONTRIBUTING.md)：提交、测试、Lore trailer 和 Pull Request 规范。
 
 ## 安全
