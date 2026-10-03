@@ -331,6 +331,17 @@ class InferenceRouter:
             return 0
         async with self._quota_lock:
             remaining = self._settings.runtime.max_run_tokens - budget.total_tokens - budget.reserved_tokens
+            if budget.database is not None:
+                from sqlalchemy import func
+                from multiclaw.storage.schema import agent_jobs
+                async with budget.database.connect() as connection:
+                    allocated = await connection.scalar(select(func.coalesce(func.sum(agent_jobs.c.budget_tokens), 0)).where(
+                        agent_jobs.c.tenant_id == budget.context.tenant_id,
+                        agent_jobs.c.workspace_id == budget.context.workspace_id,
+                        agent_jobs.c.session_id == budget.context.session_id,
+                        agent_jobs.c.parent_run_id == budget.context.run_id,
+                    ))
+                remaining -= int(allocated)
             if remaining <= estimate:
                 raise RunBudgetExceeded("Run inference budget exceeded")
             reserve = estimate + min(self._settings.memory.context_response_reserve_tokens, remaining - estimate)

@@ -35,7 +35,7 @@ EXPECTED_TABLES = {
     "users",
     "verification_codes",
     "workspaces",
-} | PLAN_TABLES
+} | PLAN_TABLES | {"agent_jobs", "agent_teams", "agent_team_members", "agent_team_tasks", "agent_team_messages"}
 
 EXPECTED_PRIMARY_UUID_COLUMNS = {
     ("users", "id"),

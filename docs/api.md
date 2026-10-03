@@ -134,6 +134,28 @@ mock 邮件模式只跳过 provider 调用，不返回验证码，因此适合�
 
 控制流可能发送 `data-plan-decision`、`data-plan-revised`、`data-plan-step-status` 和 `data-run-status`。SSE 通知不能替代持久化状态：客户端在刷新、切换会话或处理冲突后应重新 GET。取消请求落库不代表已经结束，也不能撤回外部服务已接受的副作用。完整流程见 [Durable Plans 指南](durable-plans.md)。
 
+## 协作接口
+
+协作接口继续使用 Cookie 认证和变更请求的 CSRF 检查。
+
+所有查询携带父 `session_id`，POST body 也包含它。错误或跨作用域 ID 返回 404，状态冲突返回 409。功能未开启时操作返回 503。
+
+| 路由 | 行为 |
+|---|---|
+| `GET /api/collaboration?session_id=...` | 功能状态、会话的分派和团队 |
+| `POST /api/agents` | 创建并立即返回子任务句柄 |
+| `GET /api/agents/{id}` | 分派状态与结果 |
+| `GET /api/agents/{id}/transcript` | 成员对话、近期进度和待审批操作 |
+| `POST /api/agents/{id}/steer` · `/cancel` | 持久化补充指令或取消 |
+| `GET /api/agents/{id}/changes` · `POST /api/agents/{id}/accept` | 单独任务的 diff 与 digest 绑定接受 |
+| `POST /api/teams` · `GET /api/teams/{id}` | 创建团队、成员与任务板 |
+| `POST /api/teams/{id}/tasks` | 创建任务、依赖与成员分派 |
+| `GET` · `POST /api/teams/{id}/messages` | 用户到成员或广播消息 |
+| `POST /api/teams/{id}/cancel` | 取消成员运行与待执行任务 |
+| `GET /api/teams/{id}/changes` · `POST /api/teams/{id}/accept` | 完成团队的 Writer 改动整体审阅与接受 |
+
+团队成员改动只能走整体接受；重叠文件和基线变化会被拒绝。内部 Agent 会话不用于普通聊天。生命周期见[协作指南](collaboration.md)。
+
 ## Secret：`/api/secrets`
 
 `provider` path 参数不含冒号时视为 LLM provider，例如 `openai` → kind `llm`、name `openai`；也可以使用 `{kind}:{providerName}`。

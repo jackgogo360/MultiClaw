@@ -1081,3 +1081,6 @@ __all__ = [
     "verification_codes",
     "workspaces",
 ]
+from multiclaw.collaboration.schema import define_tables as _define_collaboration_tables
+
+globals().update(_define_collaboration_tables(metadata, UUID_CHAR, PAYLOAD_TEXT))

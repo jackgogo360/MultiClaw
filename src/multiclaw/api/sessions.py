@@ -122,10 +122,16 @@ async def delete_session(
     manager = getattr(request.app.state, "background_runs", None)
     if manager is not None:
         await manager.cancel_session(session_context)
+    collaboration = getattr(request.app.state, "collaboration", None)
+    if collaboration is not None:
+        await collaboration.cancel_session(session_context)
+        await collaboration.discard_session_artifacts(session_context)
     async with TenantUnitOfWork(request.app.state.database, context,
             planning_settings=request.app.state.settings.planning,
             workflow_settings=request.app.state.settings.workflow) as uow:
         await uow.sessions.delete(session_id)
+    if collaboration is not None:
+        collaboration.release_deleted_session(session_context)
     return {"ok": True}
 
 

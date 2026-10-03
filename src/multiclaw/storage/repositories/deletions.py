@@ -648,6 +648,10 @@ class DeletionJobRepository(_ScopedDeletionRepository):
         retained_email = str(current_user["email"])
         now_ms = self._dialect.db_now_ms()
 
+        from multiclaw.storage.schema import agent_jobs, agent_teams, agent_team_members, agent_team_tasks, agent_team_messages
+        for table in (agent_team_messages, agent_jobs, agent_team_tasks, agent_team_members, agent_teams):
+            await self._conn.execute(delete(table).where(table.c.tenant_id == scoped_tenant_id))
+
         await self._conn.execute(
             update(users)
             .where(users.c.id == scoped_tenant_id)

@@ -23,7 +23,7 @@ from multiclaw.planner.models import (
 )
 from multiclaw.storage.engine import Database
 from multiclaw.storage.repositories.workflow import WorkflowRepository
-from multiclaw.storage.schema import agent_runs, approval_requests
+from multiclaw.storage.schema import agent_jobs, agent_runs, approval_requests
 from multiclaw.storage.uow import TenantUnitOfWork
 from multiclaw.tenancy.context import TenantContext
 from multiclaw.workflow.continuation import (
@@ -720,6 +720,10 @@ class WorkflowRecoveryWorker:
                     candidate.context.run_id,
                 )
 
+    async def resume_owned_run(self, context: TenantContext) -> None:
+        """Resume a Run using this worker's explicitly bound runtime provider."""
+        await self._execute_candidate(_RecoveryCandidate(context=context, awaiting_resolution=True))
+
     async def _load_candidates(self) -> list[_RecoveryCandidate]:
         now_ms = self._database.dialect.db_now_ms()
         try:
@@ -743,6 +747,12 @@ class WorkflowRecoveryWorker:
                         ).label("awaiting_resolution"),
                     )
                     .where(
+                        ~exists(select(1).select_from(agent_jobs).where(
+                            agent_jobs.c.tenant_id == agent_runs.c.tenant_id,
+                            agent_jobs.c.workspace_id == agent_runs.c.workspace_id,
+                            agent_jobs.c.child_session_id == agent_runs.c.session_id,
+                            agent_jobs.c.child_run_id == agent_runs.c.run_id,
+                        )),
                         or_(
                             (
                                 (agent_runs.c.run_status == RunStatus.AWAITING_USER.value)
@@ -781,7 +791,7 @@ class WorkflowRecoveryWorker:
                 rows = result.mappings().all()
         except (sa_exc.OperationalError, sa_exc.ProgrammingError) as error:
             missing = self._missing_workflow_table_name(error)
-            if missing in {"agent_runs", "approval_requests", "tool_executions", "execution_checkpoints"}:
+            if missing in {"agent_runs", "approval_requests", "tool_executions", "execution_checkpoints", "agent_jobs"}:
                 if not self._schema_unavailable_logged:
                     logger.info("workflow recovery worker disabled until workflow schema exists")
                     self._schema_unavailable_logged = True
@@ -835,6 +845,8 @@ class WorkflowRecoveryWorker:
             runtime_lease = begin_run()
         runtime_instance_id = getattr(runtime, "runtime_instance_id", "recovery-worker")
         coordinator = WorkflowCoordinator(self._database, settings=self._settings)
+        heartbeat_stop = asyncio.Event()
+        heartbeat_task = None
         try:
             try:
                 run = await coordinator.get_run(candidate.context)
@@ -864,6 +876,15 @@ class WorkflowRecoveryWorker:
                 return
             run_lease_handle = RunLeaseHandle(lease)
 
+            async def heartbeat_owned_lease():
+                while not heartbeat_stop.is_set():
+                    try:
+                        await asyncio.wait_for(heartbeat_stop.wait(), self._settings.workflow.heartbeat_ms / 1000)
+                    except TimeoutError:
+                        await run_lease_handle.refresh(lambda current: coordinator.heartbeat(current))
+
+            heartbeat_task = asyncio.create_task(heartbeat_owned_lease())
+
             if preflight.status in {
                 RunStatus.BLOCKED_CORRUPT,
                 RunStatus.BLOCKED_INCOMPATIBLE,
@@ -891,6 +912,10 @@ class WorkflowRecoveryWorker:
                 outcome=outcome,
             )
         finally:
+            heartbeat_stop.set()
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
             if runtime_lease is not None:
                 runtime_lease.close()
 

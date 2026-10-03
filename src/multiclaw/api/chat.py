@@ -199,6 +199,8 @@ async def _chat(
             raise HTTPException(status_code=404, detail="session not found")
         if session.status == SessionStatus.ARCHIVED:
             raise HTTPException(status_code=409, detail="session is archived")
+        if session.metadata.get("kind") == "agent_job":
+            raise HTTPException(status_code=409, detail="use the Agent controls for this internal session")
     else:
         session = await uow.sessions.create()
 

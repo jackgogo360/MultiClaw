@@ -695,6 +695,11 @@ async def test_purge_account_uses_restricted_fk_order_and_retains_other_tenant_r
         ]
 
     assert seen_tables == [
+        "agent_team_messages",
+        "agent_jobs",
+        "agent_team_tasks",
+        "agent_team_members",
+        "agent_teams",
         "users",
         "agent_plan_step_runs",
         "execution_checkpoints",

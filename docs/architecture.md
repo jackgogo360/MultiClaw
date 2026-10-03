@@ -120,6 +120,8 @@ SSE 断开不等于数据库 run 自动完成。workflow heartbeat、终态持�
 
 ## 可恢复工作流
 
+独立协作由 [`CollaborationService`](../src/multiclaw/collaboration/service.py) 调度，每个分派使用独立内部会话和 Run。成员运行时拥有自己的 Agent、registry、Skills 与沙箱，成员对话互相隔离。团队任务领取使用版本检查和作用域外键，消息持久化在本团队内。协作 Run 由专用执行器恢复，通用 recovery worker 跳过它们，避免以父工作区或父权限重建成员。产品边界见[协作指南](collaboration.md)。
+
 [`WorkflowCoordinator`](../src/multiclaw/workflow/coordinator.py) 和 [`WorkflowRepository`](../src/multiclaw/storage/repositories/workflow.py) 通过以下机制阻止重复或过期执行：
 
 - acquire/run start 写入 owner、递增 fencing token、version 与 lease expiry。

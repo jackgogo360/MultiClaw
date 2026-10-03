@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
+import os
 import re
 import tempfile
 import threading
@@ -14,7 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-LOG_DIR = Path.home() / ".multiclaw" / "logs"
+LOG_DIR = Path(os.environ.get("MULTICLAW_LOG_DIR", str(Path.home() / ".multiclaw" / "logs")))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -526,6 +527,9 @@ async def lifespan(app: FastAPI):
     deletion_task: asyncio.Task | None = None
     auth_cleanup_stop: asyncio.Event | None = None
     auth_cleanup_task: asyncio.Task | None = None
+    collaboration = None
+    collaboration_stop = asyncio.Event()
+    collaboration_task = None
     try:
         runtime_factory = create_runtime_factory()
         runtime_pool = RuntimePool(
@@ -545,6 +549,32 @@ async def lifespan(app: FastAPI):
         runtime_pool.background_runs = app.state.background_runs
         app.state.workspace_resolver = runtime_factory.workspace_resolver
         app.state.settings = runtime_factory.settings
+        app.state.collaboration = None
+        if getattr(getattr(runtime_factory.settings, "collaboration", None), "enabled", False):
+            from multiclaw.collaboration.execution import AgentJobExecutor
+            from multiclaw.collaboration.service import CollaborationService
+            executor = AgentJobExecutor(runtime_factory.database, settings=runtime_factory.settings,
+                runtime_factory=runtime_factory, background_runs=app.state.background_runs)
+            collaboration = CollaborationService(runtime_factory.database, executor=executor,
+                max_workers=runtime_factory.settings.collaboration.max_workers,
+                max_jobs=runtime_factory.settings.collaboration.max_jobs_per_session)
+            executor.service = collaboration
+            runtime_factory.collaboration_service = collaboration
+            runtime_pool.collaboration = collaboration
+            app.state.collaboration = collaboration
+
+            async def collaboration_loop():
+                while not collaboration_stop.is_set():
+                    try:
+                        await collaboration.tick()
+                    except Exception as error:
+                        logger.warning("collaboration dispatcher failed error_type=%s", type(error).__name__)
+                    try:
+                        await asyncio.wait_for(collaboration_stop.wait(), timeout=1)
+                    except TimeoutError:
+                        pass
+
+            collaboration_task = asyncio.create_task(collaboration_loop())
         app.state.operational_metrics = OperationalMetrics()
         app.state.trace_sink = TraceEventSink()
         app.state.secret_resolver = getattr(runtime_factory, "secret_resolver", None)
@@ -638,6 +668,11 @@ async def lifespan(app: FastAPI):
             auth_cleanup_task = asyncio.create_task(auth_cleanup_loop())
     except BaseException as primary:
         try:
+            collaboration_stop.set()
+            if collaboration is not None:
+                await collaboration.close()
+            if collaboration_task is not None:
+                await collaboration_task
             if recovery_stop is not None:
                 recovery_stop.set()
             if deletion_stop is not None:
@@ -680,6 +715,15 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         primary: BaseException | None = None
+
+        collaboration_stop.set()
+        if collaboration is not None:
+            try:
+                await collaboration.close()
+                if collaboration_task is not None:
+                    await collaboration_task
+            except BaseException as error:
+                primary = error
 
         background_runs = getattr(app.state, "background_runs", None)
         if background_runs is not None:
@@ -750,6 +794,8 @@ app.include_router(chat_router)
 app.include_router(secrets_router)
 app.include_router(plans_router)
 app.include_router(runs_router)
+from multiclaw.api.collaboration import router as collaboration_router
+app.include_router(collaboration_router)
 
 
 def _runtime_error_response(retry_after_seconds: int) -> JSONResponse:

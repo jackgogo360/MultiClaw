@@ -27,6 +27,7 @@ REQUIRED_FILES = (
     "docs/multi-tenant-operations.md",
     "docs/sandbox-deployment.md",
     "docs/durable-plans.md",
+    "docs/collaboration.md",
     "frontend/README.md",
 )
 

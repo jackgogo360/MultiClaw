@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from sqlalchemy import and_, delete, func, insert, select, update
+from sqlalchemy import and_, delete, exists, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from multiclaw.session.models import ChatSession, InvalidSessionTitleError, SessionStatus
@@ -25,6 +25,7 @@ from multiclaw.storage.schema import (
     memory_entries,
     agent_runs,
     tool_executions,
+    agent_jobs, agent_teams, agent_team_members, agent_team_tasks, agent_team_messages,
 )
 from multiclaw.tenancy.context import TenantContext
 
@@ -137,6 +138,11 @@ class SessionRepository:
             .where(
                 chat_sessions.c.tenant_id == self._context.tenant_id,
                 chat_sessions.c.workspace_id == self._context.workspace_id,
+                ~exists(select(1).select_from(agent_jobs).where(
+                    agent_jobs.c.tenant_id == chat_sessions.c.tenant_id,
+                    agent_jobs.c.workspace_id == chat_sessions.c.workspace_id,
+                    agent_jobs.c.child_session_id == chat_sessions.c.id,
+                )),
             )
             .order_by(
                 func.coalesce(chat_sessions.c.last_message_at, chat_sessions.c.created_at).desc(),
@@ -170,6 +176,20 @@ class SessionRepository:
         return await self._set_status(session_id, SessionStatus.ACTIVE)
 
     async def delete(self, session_id: str) -> None:
+        child_sessions = (await self._conn.execute(select(agent_jobs.c.child_session_id).where(
+            agent_jobs.c.tenant_id == self._context.tenant_id,
+            agent_jobs.c.workspace_id == self._context.workspace_id,
+            agent_jobs.c.session_id == session_id,
+            agent_jobs.c.child_session_id.is_not(None),
+        ))).scalars().all()
+        for table in (agent_team_messages, agent_jobs, agent_team_tasks, agent_team_members, agent_teams):
+            await self._conn.execute(delete(table).where(
+                table.c.tenant_id == self._context.tenant_id,
+                table.c.workspace_id == self._context.workspace_id,
+                table.c.session_id == session_id,
+            ))
+        for child_session in child_sessions:
+            await self.delete(child_session)
         def scoped(table):
             return (
                 table.c.tenant_id == self._context.tenant_id,
