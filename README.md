@@ -1,10 +1,12 @@
 # MultiClaw
 
-![MultiClaw 标志](multiclaw.png)
+<img src="multiclaw.png" alt="MultiClaw 标志" width="50%" />
 
 MultiClaw 是一个面向单机部署的多租户 AI Agent 运行时，提供工具调用、MCP、可恢复工作流、租户级 Secret 和 Web 管理界面。
 
 > **项目状态：** 当前版本为 `0.1.0`，仍处于开发阶段，尚未正式发布。API、配置和数据模型可能在后续版本中调整，请勿把当前版本直接用于关键生产负载。
+
+![MultiClaw 核心能力：多 Agent 协作、持久化工作流、隔离写入与租户安全](docs/assets/multiclaw-capabilities.png)
 
 ## 核心能力
 
@@ -107,6 +109,13 @@ plan: 检查项目文档，列出需要更新的内容并提出修改建议
 
 ## 架构概览
 
+![MultiClaw 分层架构：交互、接口与认证、Agent 编排、工具与治理、持久化与执行](docs/assets/multiclaw-architecture.svg)
+
+由 Web 交互到持久化与沙箱执行分为五层，租户作用域和事件进度贯穿各层。独立成员使用自己的 Run，Writer 的 worktree 改动必须经过审阅确认后才应用到主项目；SQLite 与 MySQL 是二选一的部署后端。
+
+<details>
+<summary>查看文本版架构图</summary>
+
 ```mermaid
 flowchart LR
     Browser[浏览器 / React] --> API[FastAPI / Auth]
@@ -119,7 +128,14 @@ flowchart LR
     Pool --> Secrets[SecretResolver]
     Workflow --> DB
     Secrets --> DB
+    Context --> Collaboration[CollaborationService / Team]
+    Collaboration --> Members[独立成员 Run]
+    Collaboration --> DB
+    Members --> Isolated[Git worktree / 原生沙箱]
+    Isolated -->|Diff 审阅确认后应用| Project[主项目]
 ```
+
+</details>
 
 认证成功后，服务端从用户的默认工作区构造租户上下文；仓储、运行时、工作流和事件订阅都使用该上下文缩小作用域。完整的不变量、故障恢复和数据生命周期见[架构说明](docs/architecture.md)。
 
